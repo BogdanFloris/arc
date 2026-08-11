@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+.direnv/
+
+# ARC runtime state (event log, SQLite index, identity file)
+/data/

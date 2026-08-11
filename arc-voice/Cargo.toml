@@ -1,0 +1,12 @@
+[package]
+name = "arc-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-core.workspace = true
+arc-proto.workspace = true
+
+[lints]
+workspace = true
