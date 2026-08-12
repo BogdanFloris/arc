@@ -30,6 +30,7 @@
 
 pub mod antigravity;
 pub mod oauth;
+pub mod sse;
 
 use std::future::Future;
 use std::pin::Pin;

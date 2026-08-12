@@ -1,4 +1,4 @@
-//! The Antigravity (Code Assist) backend, up to the first byte of a response.
+//! The Antigravity (Code Assist) backend.
 //!
 //! Google's Code Assist endpoint is a unified gateway: one Gemini-shaped API in
 //! front of Gemini, Claude and others, reachable with the Antigravity desktop
@@ -7,15 +7,16 @@
 //! wrapper, the headers — is copied from the community plugin named below and
 //! checked against a live call.
 //!
-//! This module owns the eager half of a completion: resolve a project, build a
-//! body, send it, and hand back a [`reqwest::Response`] whose status has been
-//! checked and whose body has not been touched. Turning those bytes into
-//! [`CompletionDelta`](super::CompletionDelta)s, and with them the
-//! [`Provider`](super::Provider) impl that ties the two halves together, is task
-//! 4.4. The split follows the error contract in
-//! [`Provider::complete`](super::Provider::complete): everything that can fail
-//! before the first byte fails here, as a plain `Err`, and nothing in this file
-//! constructs [`Error::MalformedStream`].
+//! A completion has two halves, split where the error contract in
+//! [`Provider::complete`](super::Provider::complete) splits. This file owns the
+//! eager half: resolve a project, build a body, send it, and hand back a
+//! [`reqwest::Response`] whose status has been checked and whose body has not
+//! been touched. Everything that can fail before the first byte fails here, as a
+//! plain `Err`, and nothing in this file constructs [`Error::MalformedStream`].
+//! [`stream`] owns the rest — response bytes to
+//! [`CompletionDelta`](super::CompletionDelta)s, and the errors that only a
+//! started response can produce. The [`Provider`](super::Provider) impl below is
+//! the seam between the two.
 //!
 //! # Onboarding
 //!
@@ -36,6 +37,8 @@
 //! refresh), and the third would send someone else's project id. When
 //! resolution fails, this module says so.
 
+mod stream;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,7 +51,7 @@ use tracing::field::Empty;
 use uuid::Uuid;
 
 use super::oauth::TokenManager;
-use super::{CompletionRequest, Error, Message};
+use super::{CompletionRequest, CompletionStream, Error, Message, Provider};
 
 // Wire details below — paths, header values, body shapes — come from the
 // community plugin that speaks this API, cross-checked between its
@@ -62,9 +65,9 @@ use super::{CompletionRequest, Error, Message};
 
 /// Name this backend goes by in traces and `SessionCreated.provider`.
 ///
-/// Task 4.4 returns it from
-/// [`Provider::name`](super::Provider::name); it lives here so both halves of
-/// the backend spell it the same way.
+/// A constant rather than only a [`Provider::name`] return value: the daemon
+/// records the provider on a session it has not built yet, and both spellings
+/// have to be the same one.
 pub const NAME: &str = "antigravity";
 
 /// Production Code Assist endpoint, and the default.
@@ -419,6 +422,38 @@ impl Antigravity {
     fn with_onboard_poll(mut self, poll: Duration) -> Self {
         self.onboard_poll = poll;
         self
+    }
+}
+
+impl Provider for Antigravity {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    /// Sends the request, then hands back the response body as deltas.
+    ///
+    /// The two halves of a completion, composed: [`send`](Self::send) fails
+    /// eagerly and returns nothing streamable, and everything after the first
+    /// byte is reported inside the stream. Nothing is read from the body here —
+    /// the first poll of the returned stream is what starts reading.
+    ///
+    /// The span opened here stays open until the stream is dropped, so a trace
+    /// shows a completion lasting as long as it really did, and the closing
+    /// event ([`stream`]) lands inside it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`send`](Self::send) failed with. Stream-side failures are not
+    /// errors here: they arrive as `Err` items in the returned stream.
+    #[tracing::instrument(
+        level = "info",
+        name = "antigravity.complete",
+        skip_all,
+        fields(provider = NAME, model = %request.model)
+    )]
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
+        let response = self.send(&request).await?;
+        Ok(stream::deltas(response, tracing::Span::current()))
     }
 }
 
@@ -800,13 +835,15 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::Role;
+    use futures::StreamExt;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use wiremock::matchers::{body_json_string, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::super::oauth::{OauthConfig, TokenManager};
-    use super::{Antigravity, CompletionRequest, Error, Message, detail, retry_delay};
+    use super::super::{CompletionDelta, Usage};
+    use super::{Antigravity, CompletionRequest, Error, Message, Provider, detail, retry_delay};
 
     /// The only credential these tests know. Nothing here is or resembles a
     /// real token (invariant 5), and nothing reads `data/secrets/`.
@@ -1265,6 +1302,87 @@ mod tests {
         // Nothing in `send` consumed it, so the frames are all still here.
         let body = response.text().await.expect("body");
         assert_eq!(body, SSE_FRAME);
+    }
+
+    /// One real completion, captured live. The parsing it exercises is
+    /// [`super::stream`]'s; what this file tests with it is that the two halves
+    /// are wired together at all.
+    const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/antigravity_stream.sse");
+
+    /// The whole trait, end to end: a request goes out and the response body
+    /// comes back as deltas.
+    #[tokio::test]
+    async fn a_completion_arrives_as_text_then_a_closing_usage() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().expect("temp dir");
+        mount_load(
+            &server,
+            json!({ "cloudaicompanionProject": "test-project" }),
+            1,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(query_param("alt", "sse"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(FIXTURE, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider(&server, &dir);
+        let deltas: Vec<_> = provider
+            .complete(request())
+            .await
+            .expect("stream")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, Error>>()
+            .expect("deltas");
+
+        assert_eq!(provider.name(), "antigravity");
+        assert_eq!(
+            deltas,
+            [
+                CompletionDelta::Text("hello arc".to_owned()),
+                CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: 11,
+                        // 2 tokens of reply and 73 of thinking, both billed.
+                        output_tokens: 75,
+                    },
+                },
+            ]
+        );
+    }
+
+    /// The eager half stays eager through the trait: a rejected request is an
+    /// `Err` from `complete`, not an item in a stream the caller now has to
+    /// drain.
+    #[tokio::test]
+    async fn a_rejected_completion_yields_no_stream_at_all() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().expect("temp dir");
+        mount_load(
+            &server,
+            json!({ "cloudaicompanionProject": "test-project" }),
+            1,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = provider(&server, &dir)
+            .complete(request())
+            .await
+            .err()
+            .expect("401 should fail before any stream exists");
+
+        assert!(matches!(error, Error::Auth(_)), "{error:?}");
     }
 
     /// Every status the contract names, mapped from the completion call.
