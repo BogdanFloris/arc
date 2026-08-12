@@ -35,7 +35,7 @@ Loose ends (fold into the next touch of the relevant file, no own task): `log::E
 |---|------|----------|--------|
 | 4.1 | `Provider` trait + `CompletionRequest` / `CompletionDelta` types | claude | done |
 | 4.2 | Google OAuth: loopback flow with the community-documented public client, token cache in `data/secrets/` (0600), refresh | claude | in review |
-| 4.3 | Antigravity provider: `loadCodeAssist`/`onboardUser` onboarding, request building + required headers against `cloudcode-pa.googleapis.com` | claude | in review |
+| 4.3 | Antigravity provider: `loadCodeAssist`/`onboardUser` onboarding, request building + required headers against `cloudcode-pa.googleapis.com` | claude | done |
 | 4.4 | SSE stream parsing → `CompletionDelta` stream, with parser unit tests against captured fixtures (no secrets in fixtures) | claude | todo |
 
 ## 5. Daemon (`arcd`)
