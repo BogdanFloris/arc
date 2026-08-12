@@ -12,8 +12,8 @@ use super::{Error, format};
 /// Reads framed events from one segment file.
 ///
 /// [`SegmentReader`] is a mechanical parser: it reports disk reality and holds
-/// no policy. Whether a torn tail is a normal crash artifact or damage is the
-/// caller's judgment ([`LogReader`] makes it based on segment position).
+/// no policy. What a torn tail means for the log as a whole is the caller's
+/// judgment; [`LogReader`] makes it.
 ///
 /// The iterator fuses on any error: after yielding `Some(Err(_))` it only
 /// yields `None`, so a caller draining it cannot loop forever on a bad record.
@@ -105,6 +105,21 @@ impl Iterator for SegmentReader {
         self.offset += format::HEADER_SIZE as u64;
         let header = format::decode_header(&header);
 
+        // A length past the cap is checked first, before the length is trusted
+        // for anything else. A crashed append cannot produce one: a torn header
+        // is a *short* header, caught above, so eight header bytes present means
+        // the length is exactly what the writer wrote, and the writer refuses
+        // anything over the cap. So this is damage, not truncation — and
+        // rejecting it here is what keeps a corrupt header from sizing an
+        // allocation, however much of the segment follows it.
+        if header.len > format::MAX_RECORD_LEN {
+            let path = self.path.clone();
+            return Some(self.fail(Error::Corruption {
+                path,
+                offset: start_offset,
+            }));
+        }
+
         // Validate the length against what the file actually holds before
         let payload_len = u64::from(header.len);
         if payload_len > self.file_len - self.offset {
@@ -164,8 +179,11 @@ pub struct RecoveryPoint {
 }
 
 /// Iterates events across an ordered list of segments, enforcing the policy
-/// [`SegmentReader`] deliberately doesn't: seq continuity across boundaries,
-/// and torn tails tolerated only on the last segment.
+/// [`SegmentReader`] deliberately doesn't: seq continuity across segment
+/// boundaries, and a torn tail read as the end of one segment's events rather
+/// than as damage. Continuity is what makes that second part safe — nothing can
+/// go missing behind a torn tail without the next segment's first seq giving it
+/// away.
 #[derive(Debug)]
 pub struct LogReader {
     segments: std::vec::IntoIter<PathBuf>,
@@ -195,6 +213,17 @@ impl LogReader {
         tracing::error!(%error, "log replay failed");
         self.finished = true;
         Err(error)
+    }
+
+    /// Moves to the next segment. `Ok(false)` means there was none and
+    /// iteration is over.
+    fn open_next(&mut self) -> Result<bool, Error> {
+        let Some(path) = self.segments.next() else {
+            self.finished = true;
+            return Ok(false);
+        };
+        self.current_reader = Some(SegmentReader::open(path)?);
+        Ok(true)
     }
 
     /// The exact point where appending resumes, once iteration has ended
@@ -237,10 +266,6 @@ impl Iterator for LogReader {
                 }
             };
 
-            // The path iterator has already advanced past the current
-            // segment, so empty means "nothing after the one being read".
-            let is_last_segment = self.segments.as_slice().is_empty();
-
             match reader.next() {
                 Some(Ok(event)) => {
                     if let Some(last) = self.last_seq {
@@ -257,15 +282,24 @@ impl Iterator for LogReader {
                     self.last_seq = Some(event.seq);
                     return Some(Ok(event));
                 }
-                // A torn tail on the last segment is a normal crash artifact.
-                Some(Err(Error::TornTail { offset, .. })) if is_last_segment => {
+                // A torn tail is the signature of an append the machine died in
+                // the middle of: the record never committed, so this segment's
+                // events end here. On the last segment that ends the replay.
+                // On an earlier one it means crash recovery sealed the torn
+                // segment and started a new one (see [`Log`]), which is why
+                // this is tolerated rather than refused — the strictness that
+                // matters is not lost, because the seq-continuity check above
+                // still has to pass across the segment boundary. A torn tail
+                // that really did swallow committed records surfaces there, as
+                // a seq gap.
+                //
+                // [`Log`]: super::Log
+                Some(Err(Error::TornTail { offset, .. })) => {
                     tracing::warn!(
                         path = %reader.path.display(),
                         offset,
-                        "torn tail on last segment; replay ends here"
+                        "torn tail; segment replay ends here"
                     );
-                    self.finished = true;
-                    return None;
                 }
                 Some(Err(error)) => return Some(self.fail(error)),
                 None => {
@@ -274,15 +308,15 @@ impl Iterator for LogReader {
                         bytes = reader.offset(),
                         "segment replayed"
                     );
-                    let Some(path) = self.segments.next() else {
-                        self.finished = true;
-                        return None;
-                    };
-                    match SegmentReader::open(path) {
-                        Ok(next_reader) => self.current_reader = Some(next_reader),
-                        Err(error) => return Some(self.fail(error)),
-                    }
                 }
+            }
+
+            // Both clean ends of a segment — exhausted, or torn — continue
+            // into the next one.
+            match self.open_next() {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => return Some(self.fail(error)),
             }
         }
     }
@@ -452,23 +486,54 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_on_a_non_last_segment_is_an_error() {
+    fn torn_tail_on_an_earlier_segment_continues_into_the_next() {
+        // The crash-recovery shape: a segment torn by a crash, sealed as-is,
+        // and a new one opened at the seq the torn record never reached.
         let dir = TempDir::new().expect("temp dir");
         let seg1 = dir.path().join("000001.log");
         let seg2 = dir.path().join("000002.log");
-        let valid_end = torn_segment(&seg1, &["a", "b"], 4);
+        torn_segment(&seg1, &["a", "b"], 4);
         write_segment(&seg2, 2, &["c"]);
+
+        let mut reader = LogReader::new(vec![seg1, seg2.clone()]);
+        let events: Vec<Event> = reader.by_ref().map(|r| r.expect("event")).collect();
+
+        assert_eq!(contents_of(&events), ["a", "b", "c"]);
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(
+            reader.recovery_point(),
+            RecoveryPoint {
+                path: Some(seg2.clone()),
+                offset: file_len(&seg2),
+                next_seq: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_torn_tail_hiding_missing_records_still_surfaces_as_a_gap() {
+        // Same shape, except the next segment does not pick up where the torn
+        // one stopped: records went missing, and continuity says so.
+        let dir = TempDir::new().expect("temp dir");
+        let seg1 = dir.path().join("000001.log");
+        let seg2 = dir.path().join("000002.log");
+        torn_segment(&seg1, &["a", "b"], 4);
+        write_segment(&seg2, 9, &["c"]);
 
         let mut reader = LogReader::new(vec![seg1, seg2]);
         assert!(reader.next().expect("first").is_ok());
         assert!(reader.next().expect("second").is_ok());
 
-        let error = reader
-            .next()
-            .expect("third")
-            .expect_err("torn tail must surface");
+        let error = reader.next().expect("third").expect_err("gap must surface");
         assert!(
-            matches!(error, Error::TornTail { offset, .. } if offset == valid_end),
+            matches!(
+                error,
+                Error::SeqGap {
+                    expected: 2,
+                    found: 9,
+                    ..
+                }
+            ),
             "got: {error:?}"
         );
         assert!(reader.next().is_none(), "must fuse after an error");
@@ -491,6 +556,32 @@ mod tests {
             .next()
             .expect("record")
             .expect_err("corruption must surface");
+        assert!(
+            matches!(error, Error::Corruption { offset: 0, .. }),
+            "got: {error:?}"
+        );
+        assert!(reader.next().is_none(), "must fuse after an error");
+    }
+
+    #[test]
+    fn a_header_claiming_more_than_the_record_cap_is_corruption() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("000001.log");
+
+        // A header promising one byte past the cap, over a file that holds
+        // almost none of it. Without the cap check this would read as a torn
+        // tail — tolerated, and sized for on the way there.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&(format::MAX_RECORD_LEN + 1).to_le_bytes());
+        forged.extend_from_slice(&0u32.to_le_bytes());
+        forged.extend_from_slice(b"not sixteen mebibytes");
+        fs::write(&path, forged).expect("write forged segment");
+
+        let mut reader = LogReader::new(vec![path]);
+        let error = reader
+            .next()
+            .expect("record")
+            .expect_err("an absurd length must surface");
         assert!(
             matches!(error, Error::Corruption { offset: 0, .. }),
             "got: {error:?}"

@@ -16,7 +16,8 @@
 //!
 //! - `len` counts the payload only; the 8 framing bytes are excluded.
 //! - `crc` is CRC32 (`crc32fast`) over the payload bytes only, not over `len`.
-//! - `payload` is a prost-encoded [`arc_proto::v1::Event`].
+//! - `payload` is a prost-encoded [`arc_proto::v1::Event`], at most
+//!   [`MAX_RECORD_LEN`] bytes.
 //!
 //! The two integrity mechanisms are split:
 //!
@@ -40,8 +41,16 @@ pub const CRC_SIZE: usize = 4;
 /// Byte width of the full record header (`len` + `crc`).
 pub const HEADER_SIZE: usize = LEN_SIZE + CRC_SIZE;
 
-/// Largest payload the framing can describe, imposed by the u32 length prefix.
-pub const MAX_PAYLOAD_LEN: usize = u32::MAX as usize;
+/// Largest payload a record may carry, in bytes: 16 MiB.
+///
+/// The u32 length prefix could describe 4 GiB, but nothing in ARC has any
+/// business writing an event that large, and a header is only eight bytes of
+/// disk — eight bytes a corrupt or foreign file can set to anything. Capping
+/// the length well below the prefix's reach means a reader can reject an absurd
+/// header outright instead of trusting it far enough to allocate for it.
+///
+/// A framed record is therefore at most `MAX_RECORD_LEN + HEADER_SIZE` bytes.
+pub const MAX_RECORD_LEN: u32 = 16 * 1024 * 1024;
 
 /// The framing fields that precede a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,10 +74,12 @@ pub fn checksum(payload: &[u8]) -> u32 {
 ///
 /// # Errors
 ///
-/// [`Error::RecordTooLarge`] if the payload does not fit the u32 length prefix.
+/// [`Error::RecordTooLarge`] if the payload exceeds [`MAX_RECORD_LEN`].
 pub fn encode_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
-    let len =
-        u32::try_from(payload.len()).map_err(|_| Error::RecordTooLarge { len: payload.len() })?;
+    let len = u32::try_from(payload.len())
+        .ok()
+        .filter(|len| *len <= MAX_RECORD_LEN)
+        .ok_or(Error::RecordTooLarge { len: payload.len() })?;
 
     let mut record = Vec::with_capacity(HEADER_SIZE + payload.len());
     record.extend_from_slice(&len.to_le_bytes());
@@ -99,7 +110,10 @@ pub fn verify(header: &Header, payload: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_SIZE, Header, checksum, decode_header, encode_record, verify};
+    use super::{
+        HEADER_SIZE, Header, MAX_RECORD_LEN, checksum, decode_header, encode_record, verify,
+    };
+    use crate::log::Error;
 
     #[test]
     fn encode_record_lays_bytes_out_per_spec() {
@@ -135,6 +149,21 @@ mod tests {
             }
         );
         assert!(verify(&header, &record[HEADER_SIZE..]));
+    }
+
+    #[test]
+    fn payload_at_the_cap_frames_and_one_byte_over_is_refused() {
+        let at_cap = vec![0u8; MAX_RECORD_LEN as usize];
+        let record = encode_record(&at_cap).expect("a payload at the cap is legal");
+        assert_eq!(record.len(), HEADER_SIZE + at_cap.len());
+        assert_eq!(&record[0..4], &MAX_RECORD_LEN.to_le_bytes());
+
+        let over_cap = vec![0u8; MAX_RECORD_LEN as usize + 1];
+        let err = encode_record(&over_cap).expect_err("one byte over the cap must be refused");
+        assert!(
+            matches!(err, Error::RecordTooLarge { len } if len == over_cap.len()),
+            "got: {err:?}"
+        );
     }
 
     #[test]

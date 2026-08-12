@@ -5,17 +5,21 @@
 //!
 //! [`format`] owns the on-disk record layout. [`SegmentWriter`] appends records
 //! to one segment file; [`SegmentReader`] reads one back, and [`LogReader`]
-//! replays an ordered list of segments. Segment rollover lives elsewhere.
+//! replays an ordered list of segments. [`Log`] is the layer above all of them:
+//! it names segments, discovers them, rolls over by size, and recovers the
+//! append point at startup. Daemons want [`Log`]; the rest is its machinery.
 //!
 //! I/O is synchronous `std::fs` on purpose: the log layer stays runtime-agnostic
 //! and the caller decides how to schedule blocking writes.
 
+mod dir;
 pub mod format;
 mod reader;
 mod writer;
 
 use std::path::{Path, PathBuf};
 
+pub use dir::{DEFAULT_MAX_SEGMENT_LEN, Log, discover_segments, segment_first_seq, segment_name};
 pub use reader::{LogReader, RecoveryPoint, SegmentReader};
 pub use writer::SegmentWriter;
 
@@ -28,8 +32,13 @@ pub enum Error {
     #[error("event has no payload; refusing to append")]
     MissingPayload,
 
-    /// The encoded event exceeds what the u32 length prefix can describe.
-    #[error("record payload of {len} bytes exceeds the u32 length prefix")]
+    /// The encoded event exceeds [`format::MAX_RECORD_LEN`]. A record that big
+    /// is a bug upstream, not a legitimate event: nothing is written and no
+    /// sequence number is consumed.
+    #[error(
+        "record payload of {len} bytes exceeds the {} byte record cap",
+        format::MAX_RECORD_LEN
+    )]
     RecordTooLarge {
         /// Payload size that was rejected, in bytes.
         len: usize,
@@ -45,9 +54,9 @@ pub enum Error {
     },
 
     /// A record ran past the end of the segment: a partial header, or a
-    /// payload the length prefix promises but the file does not hold. A
-    /// normal crash artifact on the last segment; damage anywhere else —
-    /// that judgment belongs to the caller, not this variant.
+    /// payload the length prefix promises but the file does not hold. The
+    /// signature of an append a crash interrupted; what that means for the log
+    /// as a whole is the caller's judgment, not this variant's.
     #[error("log segment {path}: torn record at offset {offset}")]
     TornTail {
         /// Segment holding the torn record.

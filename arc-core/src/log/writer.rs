@@ -280,6 +280,28 @@ mod tests {
     }
 
     #[test]
+    fn refuses_an_oversized_event_and_leaves_the_file_untouched() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = segment(&dir);
+        let mut writer = SegmentWriter::open(&path, 1).expect("open");
+        writer.append(event("first")).expect("append");
+        let before = fs::read(&path).expect("read segment");
+
+        // One byte of content over the cap is enough: the encoded event is
+        // larger than its content.
+        let huge = event(&"x".repeat(format::MAX_RECORD_LEN as usize + 1));
+        let err = writer
+            .append(huge)
+            .expect_err("an event over the record cap must be refused");
+
+        assert!(matches!(err, Error::RecordTooLarge { .. }), "got: {err:?}");
+        assert_eq!(fs::read(&path).expect("read segment"), before);
+        // The rejected event burned no sequence number.
+        assert_eq!(writer.next_seq(), 2);
+        assert_eq!(writer.append(event("second")).expect("append"), 2);
+    }
+
+    #[test]
     fn reopening_appends_after_the_existing_records() {
         let dir = TempDir::new().expect("temp dir");
         let path = segment(&dir);
