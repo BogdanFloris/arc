@@ -1,3 +1,62 @@
 syntax = "proto3";
 
 package arc.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message SendMessage {
+  string session_id = 1;
+  string content = 2;
+  // 3, 4 reserved for provider/model override
+}
+
+message SessionInfo {
+  string id = 1;
+  string title = 2;
+  google.protobuf.Timestamp started_at = 3;
+}
+
+message ListSessions {}
+
+message ClientFrame {
+  uint64 request_id = 1; // client-chosen, echoed back
+  oneof msg {
+    SendMessage send_message = 11;
+    ListSessions list_sessions = 12;
+  }
+}
+
+message MessageAccepted {
+  string session_id = 1;
+}
+
+message Delta {
+  string session_id = 1;
+  string text = 2;
+}
+
+message StreamEnd {
+  string session_id = 1;
+  uint32 input_tokens = 2;
+  uint32 output_tokens = 3;
+}
+
+message Error {
+  string code = 1;
+  string msg = 2;
+}
+
+message SessionList {
+  repeated SessionInfo sessions = 1;
+}
+
+message ServerFrame {
+  uint64 request_id = 1; // 0 = unsolicited
+  oneof msg {
+    SessionList session_list = 10;
+    MessageAccepted message_accepted = 11;
+    Delta delta = 12;
+    StreamEnd stream_end = 13;
+    Error error = 14;
+  }
+}
