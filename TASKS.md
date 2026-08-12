@@ -4,6 +4,8 @@ Working agreement: Bogdan assigns each task (`bogdan` or `claude`). The implemen
 
 Tasks are ordered by dependency; anything at the same number can go in parallel.
 
+Loose ends (fold into the next touch of the relevant file, no own task): `log::Error::Io`'s field doc says "segment" but the variant also carries directory paths (from `sync_parent_dir`, `discover_segments`).
+
 ## 1. Schemas (`arc-proto`)
 
 | # | Task | Assignee | Status |
