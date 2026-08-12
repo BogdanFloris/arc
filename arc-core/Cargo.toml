@@ -7,14 +7,17 @@ license.workspace = true
 [dependencies]
 arc-proto = { workspace = true }
 crc32fast = { workspace = true }
+futures = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+reqwest = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

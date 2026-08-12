@@ -27,6 +27,7 @@ anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+futures = "0.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-tungstenite = "0.30"
 crc32fast = "1"
