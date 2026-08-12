@@ -10,15 +10,15 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 |---|------|----------|--------|
 | 1.1 | `events.proto`: `Event` envelope (seq, ts, source, oneof payload) + `SessionEvent` (session created, message appended; fork fields reserved) | bogdan | done |
 | 1.2 | `wire.proto`: minimal protocol — send message (empty session_id creates a session), streamed deltas, list sessions, error frame | bogdan | done |
-| 1.3 | prost generation in `build.rs` + a round-trip encode/decode smoke test | claude | in review |
+| 1.3 | prost generation in `build.rs` + a round-trip encode/decode smoke test | claude | done |
 
 ## 2. Event log (`arc-core`)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 2.1 | Segment writer: length-prefixed protobuf append, fsync policy, monotonic gapless seq | — | todo |
-| 2.2 | Segment reader: iterate events across segment files, detect/stop at torn tail | — | todo |
-| 2.3 | Segment rollover by size + segment file naming | — | todo |
+| 2.1 | Segment writer: length-prefix + CRC32 framing, protobuf append, fsync policy, monotonic gapless seq. Refuse to write an `Event` with `payload: None` | claude | in review |
+| 2.2 | Segment reader: iterate events across segment files, detect/stop at torn tail. Truncation detection comes from the length prefix, corruption from the CRC — never from decode failure (empty/partial bytes decode "successfully" in proto3); `payload: None` on a full-length record is a hard error | bogdan | todo |
+| 2.3 | Segment rollover by size + segment file naming | claude | todo |
 
 ## 3. SQLite projection (`arc-core`)
 

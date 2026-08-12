@@ -33,7 +33,7 @@ A future `arc-mobile` app consumes the same wire protocol; it is a separate (non
 
 ## 3. The event log
 
-The event log is the single source of truth for everything durable except the identity file. It is an append-only sequence of length-prefixed protobuf messages on disk under `data/log/`, segmented into files by size for backup friendliness.
+The event log is the single source of truth for everything durable except the identity file. It is an append-only sequence of length-prefixed protobuf messages on disk under `data/log/`, each record carrying a CRC32 of its payload (truncation is caught by the length prefix; corruption by the CRC), segmented into files by size for backup friendliness.
 
 ```proto
 message Event {
