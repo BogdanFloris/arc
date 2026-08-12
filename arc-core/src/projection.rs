@@ -25,6 +25,8 @@ use arc_proto::v1::{Event, MessageAppended, SessionCreated, event, session_event
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
+use crate::log;
+
 /// Layout version of the tables this module creates.
 ///
 /// Bumped whenever the DDL below changes shape. A database written by a
@@ -127,6 +129,85 @@ pub enum Error {
     /// the same event was applied twice — see [`Projection::apply`].
     #[error("projection index: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+/// What a [`replay`] pass did: how many events it applied and how many it
+/// skipped as already projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayStats {
+    /// Events applied to the index by this pass.
+    pub applied: u64,
+    /// Events skipped because the index already held them.
+    pub skipped: u64,
+}
+
+/// A [`replay`] failure: either side of the composition can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayError {
+    /// The projection refused or failed to apply an event. The index keeps
+    /// everything committed before the failing event; a later replay resumes
+    /// from there.
+    #[error("projection error: {source}")]
+    Projection { source: Error },
+    /// The log could not be read — replay stops at the last applied event.
+    #[error("log error: {source}")]
+    Log { source: log::Error },
+}
+
+/// Replay is used to turn a log directory into an up-to-date index
+///
+/// Resumes from `Projection::last_seq()`
+///
+/// # Errors
+///
+/// - [`ReplayError::Projection`] for a projection error
+/// - [`ReplayError::Log`] for a log reader error
+#[tracing::instrument(
+    level = "debug",
+    name = "projection.replay",
+    skip_all
+    fields(
+        applied = tracing::field::Empty,
+        skipped = tracing::field::Empty,
+        last_seq = tracing::field::Empty,
+    )
+)]
+pub fn replay(
+    reader: log::LogReader,
+    projection: &mut Projection,
+) -> Result<ReplayStats, ReplayError> {
+    let mut stats = ReplayStats {
+        applied: 0,
+        skipped: 0,
+    };
+    let resume_after = projection
+        .last_seq()
+        .map_err(|source| ReplayError::Projection { source })?;
+    let mut last_seq = resume_after;
+    for event_res in reader {
+        match event_res {
+            Ok(event) => {
+                if last_seq.is_some_and(|last| event.seq <= last) {
+                    stats.skipped += 1;
+                    continue;
+                }
+                projection
+                    .apply(&event)
+                    .map_err(|source| ReplayError::Projection { source })?;
+                last_seq = Some(event.seq);
+                stats.applied += 1;
+            }
+            Err(e) => return Err(ReplayError::Log { source: e }),
+        }
+    }
+
+    let span = tracing::Span::current();
+    span.record("applied", stats.applied);
+    span.record("skipped", stats.skipped);
+    if let Some(last) = last_seq {
+        span.record("last_seq", last);
+    }
+    Ok(stats)
 }
 
 /// The `SQLite` index over the event log.
@@ -414,6 +495,8 @@ fn epoch_micros(ts: Option<&Timestamp>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use arc_proto::v1::{
         Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, event, session_event,
     };
@@ -421,7 +504,8 @@ mod tests {
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
-    use super::{Error, Projection};
+    use super::{Error, Projection, ReplayError, ReplayStats, replay};
+    use crate::log::{Log, LogReader, discover_segments};
 
     /// 2023-11-14T22:13:20.123456789Z, chosen so the nanos truncate visibly.
     const TS_SECONDS: i64 = 1_700_000_000;
@@ -731,5 +815,183 @@ mod tests {
             .expect("query")
             .flatten();
         assert_eq!(started_at, None);
+    }
+
+    // --- replay driver ---
+
+    /// A log directory with one session and three messages (seqs 0..=3).
+    /// The tiny segment cap forces several segments, so replay always crosses
+    /// segment boundaries in these tests.
+    fn build_log(dir: &Path) -> Log {
+        let mut log = Log::open_with_max_segment_len(dir, 64).expect("open log");
+        log.append(session_created(0)).expect("append");
+        for (i, content) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            log.append(message_appended(i as u64 + 1, content))
+                .expect("append");
+        }
+        log
+    }
+
+    /// Every user-visible row in the index, in deterministic order. Two
+    /// projections are the same state exactly when their dumps are equal.
+    fn dump(projection: &Projection) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut stmt = projection
+            .conn
+            .prepare(
+                "SELECT 's', id, coalesce(title, ''), coalesce(started_at, -1)
+                 FROM sessions ORDER BY id",
+            )
+            .expect("prepare");
+        rows.extend(
+            stmt.query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query")
+            .map(|r| r.expect("row")),
+        );
+        let mut stmt = projection
+            .conn
+            .prepare(
+                "SELECT 'm', session_id, seq, role, content, coalesce(ts, -1)
+                 FROM messages ORDER BY seq",
+            )
+            .expect("prepare");
+        rows.extend(
+            stmt.query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("query")
+            .map(|r| r.expect("row")),
+        );
+        rows
+    }
+
+    #[test]
+    fn replay_is_deterministic_across_fresh_indexes() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = build_log(dir.path());
+
+        let mut first = Projection::open(":memory:").expect("open");
+        let mut second = Projection::open(":memory:").expect("open");
+        let stats = replay(log.reader().expect("reader"), &mut first).expect("replay");
+        assert_eq!(
+            stats,
+            ReplayStats {
+                applied: 4,
+                skipped: 0
+            },
+            "a fresh index applies everything — seq 0 included"
+        );
+        replay(log.reader().expect("reader"), &mut second).expect("replay");
+
+        assert_eq!(dump(&first), dump(&second));
+        assert_eq!(first.last_seq().expect("last_seq"), Some(3));
+    }
+
+    #[test]
+    fn a_second_replay_applies_nothing_and_changes_nothing() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = build_log(dir.path());
+
+        let mut projection = Projection::open(":memory:").expect("open");
+        replay(log.reader().expect("reader"), &mut projection).expect("first replay");
+        let before = dump(&projection);
+
+        let stats = replay(log.reader().expect("reader"), &mut projection).expect("second replay");
+
+        assert_eq!(
+            stats,
+            ReplayStats {
+                applied: 0,
+                skipped: 4
+            }
+        );
+        assert_eq!(dump(&projection), before);
+    }
+
+    #[test]
+    fn a_partial_replay_resumes_to_the_same_state_as_a_one_shot() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = build_log(dir.path());
+
+        // Replay only the first segment, as if the daemon crashed mid-rebuild.
+        let segments = discover_segments(log.dir()).expect("discover");
+        assert!(segments.len() > 1, "the test needs several segments");
+        let mut resumed = Projection::open(":memory:").expect("open");
+        let partial =
+            replay(LogReader::new(segments[..1].to_vec()), &mut resumed).expect("partial replay");
+        assert!(partial.applied < 4, "the partial replay must be partial");
+
+        // Resuming over the full log completes it...
+        let stats = replay(log.reader().expect("reader"), &mut resumed).expect("resume");
+        assert_eq!(stats.applied + stats.skipped, 4);
+        assert_eq!(stats.skipped, partial.applied, "resume skips what landed");
+
+        // ...to exactly the state a one-shot replay produces.
+        let mut one_shot = Projection::open(":memory:").expect("open");
+        replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
+        assert_eq!(dump(&resumed), dump(&one_shot));
+    }
+
+    #[test]
+    fn a_failed_apply_keeps_the_resume_point_and_a_later_replay_completes() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = build_log(dir.path());
+
+        // Sabotage: a hand-inserted row already occupies seq 2, so replay
+        // applies 0 and 1, then hits a primary-key violation.
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .conn
+            .execute(
+                "INSERT INTO messages (session_id, seq, role, content) VALUES ('s-01', 2, 0, 'x')",
+                [],
+            )
+            .expect("sabotage");
+
+        let err = replay(log.reader().expect("reader"), &mut projection)
+            .expect_err("the occupied seq must fail the replay");
+        assert!(
+            matches!(err, ReplayError::Projection { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            projection.last_seq().expect("last_seq"),
+            Some(1),
+            "everything before the failure stays committed"
+        );
+
+        // Clear the sabotage; the next replay resumes past 1 and completes.
+        projection
+            .conn
+            .execute("DELETE FROM messages WHERE seq = 2", [])
+            .expect("clear sabotage");
+        let stats = replay(log.reader().expect("reader"), &mut projection).expect("resume");
+        assert_eq!(
+            stats,
+            ReplayStats {
+                applied: 2,
+                skipped: 2
+            }
+        );
+
+        let mut one_shot = Projection::open(":memory:").expect("open");
+        replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
+        assert_eq!(dump(&projection), dump(&one_shot));
     }
 }
