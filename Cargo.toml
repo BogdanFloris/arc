@@ -29,6 +29,8 @@ serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-tungstenite = "0.30"
+crc32fast = "1"
+tempfile = "3"
 
 arc-core = { path = "arc-core" }
 arc-proto = { path = "arc-proto" }
