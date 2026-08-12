@@ -1,3 +1,50 @@
 syntax = "proto3";
 
 package arc.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  SOURCE_MODEL = 1;
+  SOURCE_USER = 2;
+  SOURCE_SYSTEM = 3;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SYSTEM = 1;
+  ROLE_USER = 2;
+  ROLE_ASSISTANT = 3;
+}
+
+message SessionCreated {
+  string session_id = 1;
+  string title = 2;
+  string provider = 3;
+  string model = 4;
+  reserved 5, 6; // reserved for parent_session and fork_point
+}
+
+message MessageAppended {
+  string session_id = 1;
+  Role role = 2;
+  string content = 3;
+}
+
+message SessionEvent {
+  oneof event {
+    SessionCreated session_created = 1;
+    MessageAppended message_appended = 2;
+  }
+}
+
+message Event {
+  uint64 seq = 1;
+  google.protobuf.Timestamp ts = 2;
+  Source source = 3;
+  oneof payload {
+    SessionEvent session = 10;
+  }
+  reserved 11, 12;
+}
