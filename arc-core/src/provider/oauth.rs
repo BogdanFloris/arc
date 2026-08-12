@@ -1312,7 +1312,7 @@ mod tests {
         assert!(matches!(error, Error::Auth(message) if message.contains("access_denied")));
     }
 
-    /// The browser half of the flow is exercised by `examples/login.rs`, but
+    /// The browser half of the flow is exercised by `arcd login`, but
     /// the listener under it is ordinary TCP and worth pinning here: a
     /// speculative connection that never speaks and an unrelated request must
     /// not stop the real callback from being served.

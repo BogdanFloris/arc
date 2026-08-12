@@ -1,7 +1,7 @@
 //! Smoke test for the whole provider stack: one real completion through
 //! `Provider::complete`, deltas printed as they arrive.
 //!
-//! Needs a signed-in token file (`cargo run -p arc-core --example login`).
+//! Needs a signed-in token file (`cargo run -p arcd -- login`).
 //!
 //! ```text
 //! cargo run -p arc-core --example complete -- "your prompt here"
