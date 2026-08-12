@@ -211,3 +211,4 @@ Deferred deliberately; decide when the phase forces them:
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
 - Multi-machine story beyond backup/restore (log sync). (Post-v1.)
 - Startup recovery is a full log replay today; a checkpoint bounds it when the log grows. (When startup time or traces say so.)
+- Whether a partial model reply (stream cut before its final usage frame) is appended to the log, and marked how. (Phase 1, the daemon's session engine forces it.)
