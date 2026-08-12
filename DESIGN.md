@@ -150,7 +150,7 @@ trait Provider {
 }
 ```
 
-v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is implemented only if and when the providers' terms of service permit third-party harness use — the auth abstraction exists precisely so this is a config change, not a redesign. Should be preferred for API tokens for cost reasons. Local models (an OpenAI-compatible endpoint pointed at llama.cpp/vLLM) are a planned third implementation.
+v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is preferred over API keys for cost. For Google, Phase 1 authenticates with the Antigravity (Code Assist) OAuth flow using the community-documented public client against `cloudcode-pa.googleapis.com` — a known ToS gray area for third-party harnesses, accepted deliberately for personal use (decided 2026-08; Google has reportedly blocked accounts of abusive plugins, so revisit if that risk materializes). The auth layer keeps an API-key backend a config change, not a redesign, if this path closes. Local models (an OpenAI-compatible endpoint pointed at llama.cpp/vLLM) are a planned third implementation.
 
 Provider choice is per-completion: a global default, optionally overridden per request. Sessions don't own a provider; the log records what actually ran. Tool-calling and system-prompt differences are normalized in `arc-core`, not leaked to clients. Providers are hot-swappable mid-session — by a voice request, or by the agent itself deciding to use a cheap model for a subtask.
 
@@ -183,7 +183,7 @@ No robotics code exists in this repo until Phase 5.
 
 - Runtime state lives under `data/` (log, index, identity, traces).
 - Backup: rustic, encrypted at the repository level, covering `data/log/`, `data/identity.md`, and snapshots. `data/index.db` and `data/traces/` are excluded — both are rebuildable/disposable.
-- Provider credentials live in the OS keychain or an encrypted secrets file, never in the log and never in backups.
+- Provider credentials live in the OS keychain or an encrypted secrets file, never in the log and never in backups. Phase 1 simplification: OAuth tokens sit in a plaintext file under `data/secrets/` with 0600 permissions, excluded from backups; keychain integration comes later.
 - The WebSocket binds localhost only; remote access is Tailscale's problem, by design.
 
 ## 11. Phases

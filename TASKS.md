@@ -27,15 +27,16 @@ Loose ends (fold into the next touch of the relevant file, no own task): `log::E
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 3.1 | Schema: `sessions` + `messages` tables, projection struct over rusqlite | claude | done |
-| 3.2 | Replay: log in → state out, resumable from last projected seq; deterministic replay test | bogdan | in review |
+| 3.2 | Replay: log in → state out, resumable from last projected seq; deterministic replay test | bogdan | done |
 
 ## 4. Provider (`arc-core`)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 4.1 | `Provider` trait + `CompletionRequest` / `CompletionDelta` types | — | todo |
-| 4.2 | Gemini provider: request building, API-key auth from env/config | — | todo |
-| 4.3 | Gemini SSE stream parsing → `CompletionDelta` stream, with parser unit tests against captured fixtures (no secrets in fixtures) | — | todo |
+| 4.1 | `Provider` trait + `CompletionRequest` / `CompletionDelta` types | claude | todo |
+| 4.2 | Google OAuth: loopback flow with the community-documented public client, token cache in `data/secrets/` (0600), refresh | claude | todo |
+| 4.3 | Antigravity provider: `loadCodeAssist`/`onboardUser` onboarding, request building + required headers against `cloudcode-pa.googleapis.com` | claude | todo |
+| 4.4 | SSE stream parsing → `CompletionDelta` stream, with parser unit tests against captured fixtures (no secrets in fixtures) | claude | todo |
 
 ## 5. Daemon (`arcd`)
 
