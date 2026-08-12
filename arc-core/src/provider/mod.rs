@@ -28,6 +28,8 @@
 //! [`CompletionDelta`] grows a variant when that work starts. Leaving the
 //! types out now means no half-designed tool-call vocabulary to migrate off.
 
+pub mod oauth;
+
 use std::future::Future;
 use std::pin::Pin;
 

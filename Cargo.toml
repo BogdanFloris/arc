@@ -26,8 +26,13 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json"] }
 futures = "0.3"
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.4"
+wiremock = "0.6"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-tungstenite = "0.30"
 crc32fast = "1"
