@@ -145,13 +145,13 @@ trait Provider {
 
 v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is implemented only if and when the providers' terms of service permit third-party harness use — the auth abstraction exists precisely so this is a config change, not a redesign. Should be preferred for API tokens for cost reasons. Local models (an OpenAI-compatible endpoint pointed at llama.cpp/vLLM) are a planned third implementation.
 
-Provider choice is per-session with a global default. Tool-calling and system-prompt differences are normalized in `arc-core`, not leaked to clients. They should be hot-swappable even by a voice request in the future and even by the agent if for example it decides to use a cheap model to do something.
+Provider choice is per-completion: a global default, optionally overridden per request. Sessions don't own a provider; the log records what actually ran. Tool-calling and system-prompt differences are normalized in `arc-core`, not leaked to clients. Providers are hot-swappable mid-session — by a voice request, or by the agent itself deciding to use a cheap model for a subtask.
 
 ## 7. Wire protocol and clients
 
 Protobuf over WebSocket (`wire.proto`), served by `arcd` on localhost. Remote access (mobile) is Tailscale reaching the same socket; ARC does not implement its own tunnel, TLS termination, or auth beyond a local token in v1.
 
-The protocol is client-agnostic: subscribe to a session, send a message, fork, receive streamed deltas and tool-call events, query the session tree. Clients hold no durable state.
+The protocol is client-agnostic: subscribe to a session, send a message, fork, receive streamed deltas and tool-call events, query the session tree. Sessions are created implicitly — a message sent with an empty session id starts a new session, and the daemon replies with the assigned id. Clients hold no durable state.
 
 - `arc` (TUI): first client, exercises everything — session tree navigation, streaming, memory tool visibility. Should connect over UDS for fast communication if local, websocket if not
 - `arc-voice`: wake word via openWakeWord or Porcupine, local ASR via whisper.cpp/faster-whisper, TTS local, or gemini voice api, decide later. It is a thin client: audio in, text over the socket, audio out. No model logic.

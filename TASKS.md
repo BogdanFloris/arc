@@ -9,8 +9,8 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 1.1 | `events.proto`: `Event` envelope (seq, ts, source, oneof payload) + `SessionEvent` (session created, message appended; fork fields reserved) | bogdan | done |
-| 1.2 | `wire.proto`: minimal protocol — create session, send message, streamed deltas, list sessions, error frame | — | todo |
-| 1.3 | prost generation in `build.rs` + a round-trip encode/decode smoke test | — | todo |
+| 1.2 | `wire.proto`: minimal protocol — send message (empty session_id creates a session), streamed deltas, list sessions, error frame | bogdan | done |
+| 1.3 | prost generation in `build.rs` + a round-trip encode/decode smoke test | claude | todo |
 
 ## 2. Event log (`arc-core`)
 
