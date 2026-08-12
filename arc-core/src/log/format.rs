@@ -58,7 +58,7 @@ pub fn checksum(payload: &[u8]) -> u32 {
     crc32fast::hash(payload)
 }
 
-/// Frames one payload into a complete record, ready to be appended verbatim.
+/// Frames one payload into a complete record, ready to be appended.
 ///
 /// The returned buffer is written as a single unit; records are never assembled
 /// from separate writes.
