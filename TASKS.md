@@ -26,7 +26,7 @@ Loose ends (fold into the next touch of the relevant file, no own task): `log::E
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 3.1 | Schema: `sessions` + `messages` tables, projection struct over rusqlite | claude | in review |
+| 3.1 | Schema: `sessions` + `messages` tables, projection struct over rusqlite | claude | done |
 | 3.2 | Replay: log in → state out, resumable from last projected seq; deterministic replay test | bogdan | todo |
 
 ## 4. Provider (`arc-core`)

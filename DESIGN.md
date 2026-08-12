@@ -59,7 +59,7 @@ Rules that make the model work:
 
 1. **Nothing mutates durable state except by appending an event.** Model-initiated memory writes, user hand-edits, and system migrations all append; they never edit prior bytes.
 2. **All state is a projection.** The SQLite index, the current distilled-memory state, and session trees are all deterministic replays of the log. Any projection can be deleted and rebuilt at any time.
-3. **Schema evolution is additive.** Fields are never renumbered or repurposed; old events must always decode.
+3. **Schema evolution is additive.** Fields are never renumbered or repurposed; old events must always decode. Forward compatibility (new events on an old binary) has one deliberate boundary: a new *kind* inside an existing payload arm is skipped safely during replay, but a new top-level `Event.payload` arm decodes as empty on an older binary and reads as corruption — replaying a log requires a binary at least as new as its newest payload arm. Acceptable for a single-user system whose writer and reader ship together; revisit if that stops being true.
 
 Consequences: backup is "back up the log segments" (rustic handles append-only files efficiently), transfer to a new machine is "copy log + identity file, replay," and there is no live-database backup problem because SQLite is disposable.
 
