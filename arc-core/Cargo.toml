@@ -8,6 +8,8 @@ license.workspace = true
 arc-proto = { workspace = true }
 crc32fast = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true }
+rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
