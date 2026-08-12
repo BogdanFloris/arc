@@ -28,6 +28,7 @@
 //! [`CompletionDelta`] grows a variant when that work starts. Leaving the
 //! types out now means no half-designed tool-call vocabulary to migrate off.
 
+pub mod antigravity;
 pub mod oauth;
 
 use std::future::Future;
@@ -139,10 +140,11 @@ pub trait Provider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Any [`Error`] variant, depending on where setup failed: [`Error::Auth`]
-    /// when there is no usable credential, [`Error::Transport`] when the
-    /// request never completed, [`Error::Http`] or [`Error::RateLimited`] when
-    /// the backend rejected it.
+    /// Any [`Error`] variant, depending on where setup failed:
+    /// [`Error::InvalidRequest`] when the request cannot be expressed at all,
+    /// [`Error::Auth`] when there is no usable credential,
+    /// [`Error::Transport`] when the request never completed, [`Error::Http`]
+    /// or [`Error::RateLimited`] when the backend rejected it.
     fn complete(
         &self,
         request: CompletionRequest,
@@ -152,6 +154,18 @@ pub trait Provider: Send + Sync {
 /// Everything a provider call can fail with, at setup or mid-stream.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The [`CompletionRequest`] cannot be expressed in the backend's wire
+    /// format, so nothing was sent. A caller bug, not a backend condition:
+    /// retrying the same request produces the same error.
+    ///
+    /// This is where a provider says no rather than guessing. A backend with no
+    /// place for a [`Role::System`] message inside the history, for instance,
+    /// could quietly fold it into the system prompt — and then the log and the
+    /// prompt would disagree about what was sent. Refusing keeps the caller
+    /// honest about which field it meant.
+    #[error("provider cannot send this request: {0}")]
+    InvalidRequest(String),
+
     /// The request never reached the backend, or the connection broke under
     /// it: DNS, TLS, timeout, socket. Retryable in the way network failures
     /// are.

@@ -27,6 +27,7 @@ anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json"] }
+uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 serde_json = "1"
 base64 = "0.22"
