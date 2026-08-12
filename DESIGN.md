@@ -35,6 +35,13 @@ A future `arc-mobile` app consumes the same wire protocol; it is a separate (non
 
 The event log is the single source of truth for everything durable except the identity file. It is an append-only sequence of length-prefixed protobuf messages on disk under `data/log/`, each record carrying a CRC32 of its payload (truncation is caught by the length prefix; corruption by the CRC), segmented into files by size for backup friendliness.
 
+Segment mechanics, fixed by implementation and load-bearing for durability:
+
+- **Naming.** A segment is named by the seq of its first event, zero-padded to 20 digits (`00000000000000004711.log`): name order is log order, and any seq is locatable without opening files. If a name is spent by a segment that died on its very first record, the replacement takes a `_1`, `_2`, … suffix — ordering still holds; this is deliberate, not a bug.
+- **Sealing.** A segment is sealed exactly when a later segment exists. No marker files; creating the successor is the seal.
+- **Recovery seals, never truncates.** A torn tail (an append the machine died inside) stays on disk untouched; the next segment starts at the recovered seq. Replay tolerates torn bytes and proves integrity through seq continuity instead: gapless seqs across every boundary, and a full replay must start at seq 0 — so neither a tear nor a lost segment (head included) can hide missing records.
+- **Record cap.** One encoded event is at most 16 MiB. This is a product constraint, not framing trivia: no memory record or tool result may exceed it, and it is what lets the reader refuse an absurd length prefix before trusting it with an allocation.
+
 ```proto
 message Event {
   uint64 seq = 1;            // monotonic, gapless
@@ -203,3 +210,4 @@ Deferred deliberately; decide when the phase forces them:
 - Whether identity edits ever move into the event log. (Revisit if hand-editing becomes a bottleneck.)
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
 - Multi-machine story beyond backup/restore (log sync). (Post-v1.)
+- Startup recovery is a full log replay today; a checkpoint bounds it when the log grows. (When startup time or traces say so.)

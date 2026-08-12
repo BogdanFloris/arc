@@ -18,7 +18,7 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 |---|------|----------|--------|
 | 2.1 | Segment writer: length-prefix + CRC32 framing, protobuf append, fsync policy, monotonic gapless seq. Refuse to write an `Event` with `payload: None` | claude | done |
 | 2.2 | Segment reader: iterate events across segment files, detect/stop at torn tail. Truncation detection comes from the length prefix, corruption from the CRC — never from decode failure (empty/partial bytes decode "successfully" in proto3); `payload: None` on a full-length record is a hard error | bogdan | done |
-| 2.3 | Segment rollover by size + segment file naming. Add a shared `MAX_RECORD_LEN` sanity cap to `log::format` (writer enforces, reader rejects) | claude | in review |
+| 2.3 | Segment rollover by size + segment file naming. Add a shared `MAX_RECORD_LEN` sanity cap to `log::format` (writer enforces, reader rejects) | claude | done |
 
 ## 3. SQLite projection (`arc-core`)
 
