@@ -168,6 +168,9 @@ impl Log {
     ///   [`Error::Decode`], [`Error::EmptyEvent`] — surfaces here. Damage is
     ///   reported, never worked around: the caller decides what to do about a
     ///   log that does not replay.
+    /// - [`Error::SeqGap`] with `expected: 0` if the log's first replayed
+    ///   event is not seq 0: the head of the log is missing or emptied, which
+    ///   the continuity check alone cannot see.
     #[tracing::instrument(
         level = "debug",
         name = "log.recover",
@@ -191,12 +194,29 @@ impl Log {
         fs::create_dir_all(&dir).map_err(|source| Error::io(&dir, source))?;
         let segments = discover_segments(&dir)?;
         span.record("segments", segments.len());
+        let head = segments.first().cloned();
 
         let mut reader = LogReader::new(segments);
+        let mut first_seq = None;
         let mut events: u64 = 0;
         for result in &mut reader {
-            result?;
+            let event = result?;
+            if first_seq.is_none() {
+                first_seq = Some(event.seq);
+            }
             events += 1;
+        }
+        // A full-directory replay must start at the beginning of history.
+        // The seq-continuity check cannot enforce this — the first event has
+        // nothing earlier to be compared against — so a lost or emptied head
+        // (a torn-empty or deleted first segment, taking seqs 0..n with it)
+        // is caught here instead.
+        if let Some(found) = first_seq.filter(|&seq| seq != 0) {
+            return Err(Error::SeqGap {
+                path: head.unwrap_or_else(|| dir.join(segment_name(0))),
+                expected: 0,
+                found,
+            });
         }
         let point = reader.recovery_point();
         span.record("events", events);
@@ -736,6 +756,52 @@ mod tests {
             ["00000000000000000000.log", "00000000000000000000_1.log"]
         );
         assert_eq!(contents_of(&replay(dir.path())), ["m00"]);
+    }
+
+    #[test]
+    fn a_missing_or_emptied_log_head_is_detected_at_open() {
+        // Head torn down to zero valid events, a later segment carries on
+        // from seq 4: records 0..=3 are gone, and continuity alone cannot
+        // notice because the first replayed event has nothing before it.
+        let dir = TempDir::new().expect("temp dir");
+        tear(&dir.path().join(segment_name(0)), 0, 5);
+        let mut writer =
+            SegmentWriter::open(dir.path().join(segment_name(4)), 4).expect("open writer");
+        writer.append(event("m04")).expect("append");
+        drop(writer);
+
+        let err = Log::open(dir.path()).expect_err("a lost log head must not open");
+        assert!(
+            matches!(
+                err,
+                Error::SeqGap {
+                    expected: 0,
+                    found: 4,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+
+        // Same with the head segment missing entirely.
+        let dir = TempDir::new().expect("temp dir");
+        let mut writer =
+            SegmentWriter::open(dir.path().join(segment_name(2)), 2).expect("open writer");
+        writer.append(event("m02")).expect("append");
+        drop(writer);
+
+        let err = Log::open(dir.path()).expect_err("a missing log head must not open");
+        assert!(
+            matches!(
+                err,
+                Error::SeqGap {
+                    expected: 0,
+                    found: 2,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
     }
 
     #[test]
