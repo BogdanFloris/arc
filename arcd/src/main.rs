@@ -60,11 +60,14 @@ async fn main() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
 
-    // After the config (nothing before it is worth tracing) and before
-    // anything touches disk (everything after it is).
-    telemetry::init()?;
-
     let dirs = DataDirs::new(&config.data_dir);
+
+    // After the config (nothing before it is worth tracing) and before
+    // anything else touches disk (everything after it is). The trace file is
+    // the one exception it makes to that order — it is what the rest gets
+    // recorded into.
+    telemetry::init(dirs.traces())?;
+
     match cli.command {
         Command::Run => daemon::run(config, dirs).await,
         Command::Login => login::run(&dirs).await,

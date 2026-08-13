@@ -22,7 +22,7 @@ pub struct DataDirs {
     tokens: PathBuf,
     /// `data/index.db` — the `SQLite` projection. Disposable.
     index: PathBuf,
-    /// `data/traces/` — Perfetto traces (task 7.1). Disposable.
+    /// `data/traces/` — Perfetto traces. Disposable.
     traces: PathBuf,
     /// `data/identity.md` — human-owned, never written by ARC (§5.1).
     identity: PathBuf,
@@ -94,9 +94,8 @@ impl DataDirs {
         &self.index
     }
 
-    /// Perfetto trace directory (task 7.1).
+    /// Perfetto trace directory: one `.pftrace` per run.
     #[must_use]
-    #[allow(dead_code, reason = "task 7.1 writes traces here")]
     pub fn traces(&self) -> &Path {
         &self.traces
     }
