@@ -17,6 +17,10 @@ const MARGIN: u16 = 2;
 /// Matches the markdown renderer's own continuation indent.
 const CONTINUATION: &str = "  ";
 
+/// A blank row between the last message and the status rule, so a bottom-
+/// anchored transcript does not crowd the input line.
+const GAP: u16 = 1;
+
 /// The wordmark: always at the top of the pane, transcript or no transcript.
 const WORDMARK: [&str; WORDMARK_ROWS as usize] = [
     r"  __ _ _ __ ___ ",
@@ -38,8 +42,9 @@ const WORDMARK_ROWS: u16 = 4;
 const MASTHEAD_FLOOR: u16 = 12;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [transcript, rule, input] = Layout::vertical([
+    let [transcript, _gap, rule, input] = Layout::vertical([
         Constraint::Fill(1),
+        Constraint::Length(GAP),
         Constraint::Length(1),
         Constraint::Length(1),
     ])

@@ -7,6 +7,7 @@
 mod app;
 mod markdown;
 mod net;
+mod syntax;
 mod theme;
 mod ui;
 

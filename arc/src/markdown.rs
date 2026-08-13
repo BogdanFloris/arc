@@ -20,7 +20,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use textwrap::core::display_width;
 
-use crate::theme;
+use crate::{syntax, theme};
 
 /// How far continuation lines sit in from the first line of a block. Two
 /// columns: enough to read as "still the same paragraph", not so much that a
@@ -37,15 +37,27 @@ const CODE_INDENT: &str = "    ";
 pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let width = width.max(8);
     let mut out = Vec::new();
-    let mut fenced = false;
+    // `Some` while inside a fence: the language its info string named, and
+    // whatever the last line left open. Both reset at every fence, so a
+    // half-streamed block cannot leak its state into the next one.
+    let mut fenced: Option<(syntax::Language, syntax::Carry)> = None;
 
-    for raw in text.split('\n') {
-        if is_fence(raw) {
-            fenced = !fenced;
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (at, raw) in lines.iter().enumerate() {
+        if let Some(info) = fence_info(raw) {
+            fenced = match fenced {
+                Some(_) => None,
+                // An untagged fence gets its language sniffed from the block
+                // it opens, which means looking ahead to the closing fence.
+                None if info.trim().is_empty() => {
+                    Some((syntax::sniff(block_after(&lines, at)), syntax::Carry::None))
+                }
+                None => Some((syntax::language(info), syntax::Carry::None)),
+            };
             continue;
         }
-        if fenced {
-            push_code(&mut out, raw, width);
+        if let Some((language, carry)) = fenced {
+            fenced = Some((language, push_code(&mut out, raw, width, language, carry)));
             continue;
         }
         let line = raw.trim_end();
@@ -102,35 +114,69 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     out
 }
 
-/// ```` ``` ```` or `~~~`, with an optional info string after it.
-fn is_fence(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+/// The lines of the block opened at `at`, up to its closing fence.
+///
+/// An unclosed block runs to the end of the text — which is every block, half
+/// the time, since a reply is drawn while it is still streaming. Sniffing what
+/// has arrived so far is the point: the language is settled from the first few
+/// lines and does not flicker as the rest lands.
+fn block_after<'a>(lines: &'a [&'a str], at: usize) -> &'a [&'a str] {
+    let body = &lines[at + 1..];
+    let end = body
+        .iter()
+        .position(|line| fence_info(line).is_some())
+        .unwrap_or(body.len());
+    &body[..end]
 }
 
-/// A fenced line, verbatim and indented.
+/// A ```` ``` ```` or `~~~` fence, and the info string after it.
+fn fence_info(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("```")
+        .or_else(|| trimmed.strip_prefix("~~~"))
+}
+
+/// A fenced line, highlighted and indented. Returns what it leaves open for
+/// the next line of the block.
 ///
 /// Hard-wrapped at the display width rather than word-wrapped: code means what
 /// its columns say, and dropping the overflow off the right edge would hide it
-/// entirely.
-fn push_code(out: &mut Vec<Line<'static>>, raw: &str, width: usize) {
+/// entirely. The wrap splits styled spans, so a long string keeps its colour
+/// across the break.
+fn push_code(
+    out: &mut Vec<Line<'static>>,
+    raw: &str,
+    width: usize,
+    language: syntax::Language,
+    carry: syntax::Carry,
+) -> syntax::Carry {
     let room = width.saturating_sub(CODE_INDENT.len()).max(1);
-    let mut rest: &str = raw;
-    loop {
-        let take = rest
-            .char_indices()
-            .nth(room)
-            .map_or(rest.len(), |(at, _)| at);
-        let (head, tail) = rest.split_at(take);
-        out.push(Line::from(vec![
-            Span::raw(CODE_INDENT),
-            Span::styled(head.to_owned(), theme::CODE),
-        ]));
-        if tail.is_empty() {
-            return;
+    let (spans, carry) = syntax::highlight(raw, language, carry);
+
+    let mut row: Vec<Span<'static>> = vec![Span::raw(CODE_INDENT)];
+    let mut col = 0;
+    for (text, style) in spans {
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            let take = rest
+                .char_indices()
+                .nth(room - col)
+                .map_or(rest.len(), |(at, _)| at);
+            let (head, tail) = rest.split_at(take);
+            col += head.chars().count();
+            row.push(Span::styled(head.to_owned(), style));
+            if tail.is_empty() {
+                break;
+            }
+            out.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::raw(CODE_INDENT));
+            col = 0;
+            rest = tail;
         }
-        rest = tail;
     }
+    out.push(Line::from(row));
+    carry
 }
 
 /// `---`, `***` or `___` alone on a line, drawn as a dim rule.
@@ -474,7 +520,11 @@ mod tests {
             ["before", "    fn main() {}", "after"],
             "the fences themselves are not drawn"
         );
-        assert_eq!(styles("```\nlet x = 1;\n```", 40)[1].1, theme::CODE);
+        assert_eq!(
+            styles("```\nlet x = 1;\n```", 40)[1].1,
+            theme::SYN_KEYWORD,
+            "an untagged block is sniffed, so `let` still reads as Rust"
+        );
     }
 
     #[test]
@@ -483,6 +533,42 @@ mod tests {
             text("```\nabcdefghijkl\n```", 12),
             ["    abcdefgh", "    ijkl"],
             "hard wrap at the width; nothing is dropped"
+        );
+    }
+
+    /// An untagged fence is the common case from a small local model, so the
+    /// language has to come from the block itself.
+    #[test]
+    fn an_untagged_block_is_highlighted_by_what_is_in_it() {
+        let reply = "Here it is:\n\n```\ndef example():\n    return 1\n```";
+        let lines = render(reply, 40, theme::PLAIN);
+        let code: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.to_string().contains("def"))
+            .collect();
+
+        assert_eq!(code.len(), 1);
+        assert_eq!(
+            code[0].spans[1].style,
+            theme::SYN_KEYWORD,
+            "`def` is a keyword, not flat text"
+        );
+    }
+
+    /// The tag wins even when the content disagrees: the author said what it
+    /// is, and second-guessing them is how a highlighter earns distrust.
+    #[test]
+    fn a_tagged_block_is_not_sniffed() {
+        let lines = render("```text\ndef example():\n```", 40, theme::PLAIN);
+        let code = lines
+            .iter()
+            .find(|l| l.to_string().contains("def"))
+            .expect("the code line");
+
+        assert_eq!(
+            code.spans[1].style,
+            theme::CODE,
+            "an explicit unknown tag stays plain"
         );
     }
 

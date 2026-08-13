@@ -49,3 +49,27 @@ pub const EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
 
 /// List bullets and ordinals, so the text outranks its marker.
 pub const MARKER: Style = Style::new().fg(Color::DarkGray);
+
+// Syntax highlighting inside a code block. The roles and their slots are
+// gruvbox's own editor layout — red keywords, green strings, purple numbers,
+// aqua types, yellow calls, grey comments — expressed as ANSI palette indices,
+// so the block reads as familiar code in the user's own theme. Plain code
+// keeps `CODE`, which is what an unhighlighted block was already using.
+
+/// `//` and `#` comments.
+pub const SYN_COMMENT: Style = Style::new().fg(Color::DarkGray);
+
+/// String and char literals.
+pub const SYN_STRING: Style = Style::new().fg(Color::Green);
+
+/// Numeric literals, and the word-shaped ones (`true`, `None`).
+pub const SYN_NUMBER: Style = Style::new().fg(Color::Magenta);
+
+/// Language keywords, and shell flags.
+pub const SYN_KEYWORD: Style = Style::new().fg(Color::Red);
+
+/// Type-shaped names, and shell variables.
+pub const SYN_TYPE: Style = Style::new().fg(Color::Cyan);
+
+/// A name with a `(` after it.
+pub const SYN_CALL: Style = Style::new().fg(Color::Yellow);

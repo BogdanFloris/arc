@@ -57,6 +57,9 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 
 | 6.2 | TUI polish: bottom-anchored transcript, persistent wordmark, wrap indent, picker labels, markdown rendering, `--help` | claude | in review |
 | 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | in review |
+| 6.4 | TUI punch list, gathered by Bogdan while using it (see below) | claude | in review |
+
+6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; mouse-wheel and page-key scrolling.
 
 Scope for 6.2 (2026-08-13, from driving the app together — six items, all `arc`-only):
 1. **Bottom-anchored transcript.** Content grows up from the input rule instead of down from the top; a short turn no longer leaves ~18 rows of dead space. Once the transcript is taller than the pane, it pins to the bottom and the existing `j k` / `ctrl-d/u` / `G gg` scrolling takes over.
