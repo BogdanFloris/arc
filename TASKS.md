@@ -48,7 +48,7 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | done |
 | 5.3 | Identity file: load `data/identity.md` into system context (read-only) | bogdan | done |
 | 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | done |
-| 5.5 | systemd user unit for arcd: always-on, restart on failure, journal logging. The unit file lands in the repo; installing and enabling it on erebor is Bogdan's call, after he reads it | claude | todo |
+| 5.5 | systemd user unit for arcd: always-on, restart on failure, journal logging. The unit file lands in the repo; installing and enabling it on erebor is Bogdan's call, after he reads it | claude | in review |
 
 ## 6. TUI (`arc`)
 
@@ -115,7 +115,20 @@ Idle VRAM, settled 2026-08-13: `llama-server` holds its device allocation for th
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | claude | in progress |
-| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | claude | todo |
+| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | claude | in review |
+| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | claude | in review |
 
-Next session picks up here (banked 2026-08-13): 6.1 and 7.1–7.3 reviewed and done. In flight: 6.2 and 6.3 (claude). Then assign 8.x — the earlier suggestion was an implementer agent with a checkable output (a trace that opens in the Perfetto UI). Also pending, no task yet: how arcd runs long-term (currently a hand-started tmux session; a systemd user unit is the natural shape now that arcd supervises its own sidecar). Machine notes that bit us today live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
+8.x as built (2026-08-13). The subset of Perfetto's schema ARC emits is vendored in `arc-proto/proto/perfetto.proto` — third-party field numbers, each checked against upstream, and the header says how the schema invariants read differently there. The layer is `arc-core/src/trace/`; `arcd` layers it beside the stderr one over the same filter.
+
+Decisions, and what they cost:
+- **A track per span instance, not per thread.** ARC's work is async: a span is entered and exited on whatever thread polls it, so thread tracks would draw polls instead of work, and one LLM call would be thousands of slivers. Tracks nest the way spans do, so the UI still draws the span tree. The cost is a track per span instance — verbose in the track list, exact in the timings.
+- **A span's packets are written when it closes.** `session.send_message` only learns its `session_id` after it opens, and token counts arrive at the end; emitting at close is what lets a slice carry them. Perfetto sorts by timestamp, not by file order, so a late write costs nothing. The cost: a span that never closes (daemon killed mid-turn) leaves no slice at all.
+- **The span that first names a session opens that session's row.** DESIGN.md §8's "track per session", and the first trace proved the naive rule wrong: parent-first put every turn under `client connected` and no session track was ever created.
+- **Fields named `counter.*` are counter samples, not annotations.** The layer stays ignorant of tokens; Phase 2's memory metrics get counters for free by naming a field. The cost is one uglier field name in the stderr log (`counter.output_tokens=387`).
+- **A `ClockSnapshot` is not optional.** The first real trace parsed but was empty: without one, Perfetto reads timestamps as boot time and drops every packet it cannot convert (41 of 41). Timestamps are REALTIME so a slice can be matched against a log event; a clock step during a turn would skew that turn.
+
+Verification: `trace_processor_shell` is in the dev shell (`flake.nix`, upstream prebuilt pinned by hash — nixpkgs has no perfetto). Against a trace of a real turn on erebor: no import errors or data loss, the tree reads `session 6873fcb9` → `session.send_message` (5.19s) → `openai.complete` (5.18s), and the counter tracks hold 13 in / 387 out. Opening the same file in the Perfetto UI is Bogdan's check — `trace_processor` is the UI's own parser, so this is the same answer minus the eyes.
+
+Found while shutting the daemon down for that test, fixed in the same batch: arcd only handled Ctrl-C, so a `SIGTERM` — what any service manager sends — killed it before the shutdown path ran and orphaned llama-server holding 5.7 GiB of VRAM. It now stops on both.
+
+Next session picks up here (banked 2026-08-13, second batch): 6.2–6.4 reviewed and done, and every Phase 1 task is now built. In review: 8.1, 8.2, 5.5 (claude). What is left before Phase 1 can be called finished is not code — it is Bogdan opening a trace in the Perfetto UI, deciding whether to enable the systemd unit, and then daily use answering the exit criterion. Machine notes that bit us live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
