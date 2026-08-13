@@ -15,6 +15,12 @@ use std::collections::VecDeque;
 use arc_proto::v1::{Role, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
+pub const PAGE: usize = 10;
+
+/// Lines one mouse-wheel notch moves.
+pub const WHEEL: usize = 3;
+
 /// What the connection task is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -130,8 +136,43 @@ impl App {
         }
     }
 
+    /// Scrolls the transcript by `lines`, or moves the picker if it is open.
+    ///
+    /// The wheel and the page keys both land here. When the picker is open it
+    /// takes the gesture: scrolling the transcript behind a modal reads as the
+    /// wrong thing moving.
+    pub fn on_scroll(&mut self, up: bool, lines: usize) {
+        if let Some(selected) = self.picker {
+            let last = self.sessions.len();
+            self.picker = Some(if up {
+                selected.saturating_sub(1)
+            } else {
+                (selected + 1).min(last)
+            });
+            return;
+        }
+        self.scroll_back = if up {
+            self.scroll_back.saturating_add(lines)
+        } else {
+            self.scroll_back.saturating_sub(lines)
+        };
+    }
+
     /// Handles one key press.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
+        // Page keys are not text, so they scroll from any mode — including
+        // mid-sentence in insert.
+        match key.code {
+            KeyCode::PageUp => {
+                self.on_scroll(true, PAGE);
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.on_scroll(false, PAGE);
+                return None;
+            }
+            _ => {}
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.on_control(key.code);
         }
@@ -153,8 +194,8 @@ impl App {
         match code {
             KeyCode::Char('c') => self.quit = true,
             // Half-page scrolls; drawing clamps the overshoot.
-            KeyCode::Char('u') => self.scroll_back = self.scroll_back.saturating_add(10),
-            KeyCode::Char('d') => self.scroll_back = self.scroll_back.saturating_sub(10),
+            KeyCode::Char('u') => self.on_scroll(true, PAGE),
+            KeyCode::Char('d') => self.on_scroll(false, PAGE),
             KeyCode::Char('p') => self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
@@ -768,6 +809,48 @@ mod tests {
         app.on_key(key(KeyCode::Char('g')));
         app.on_key(key(KeyCode::Char('g')));
         assert!(app.scroll_back > 1000, "gg overshoots; drawing clamps");
+    }
+
+    #[test]
+    fn the_wheel_and_page_keys_scroll_from_any_mode() {
+        let mut app = App::new();
+
+        app.on_scroll(true, WHEEL);
+        assert_eq!(app.scroll_back, WHEEL);
+        app.on_scroll(false, WHEEL);
+        assert_eq!(app.scroll_back, 0);
+        app.on_scroll(false, WHEEL);
+        assert_eq!(app.scroll_back, 0, "scrolling down at the bottom stays put");
+
+        // Insert mode: the page keys are not text, so they still scroll.
+        typed(&mut app, "half a sentence");
+        assert_eq!(app.on_key(key(KeyCode::PageUp)), None);
+        assert_eq!(app.scroll_back, PAGE);
+        assert_eq!(app.input, "half a sentence", "and do not type themselves");
+        assert_eq!(app.mode, Mode::Insert);
+
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.scroll_back, 0);
+    }
+
+    /// A modal takes the gesture: scrolling what is behind it would move the
+    /// wrong thing.
+    #[test]
+    fn the_wheel_moves_the_picker_when_it_is_open() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session("old"), session("new")]));
+        normal(&mut app, "s");
+
+        app.on_scroll(false, WHEEL);
+        assert_eq!(app.picker, Some(1), "one row per notch, not one page");
+        app.on_scroll(false, WHEEL);
+        assert_eq!(app.picker, Some(2));
+        app.on_scroll(false, WHEEL);
+        assert_eq!(app.picker, Some(2), "and it stops at the last session");
+
+        app.on_scroll(true, WHEEL);
+        assert_eq!(app.picker, Some(1));
+        assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
     #[test]
