@@ -48,15 +48,16 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | done |
 | 5.3 | Identity file: load `data/identity.md` into system context (read-only) | bogdan | done |
 | 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | done |
+| 5.5 | systemd user unit for arcd: always-on, restart on failure, journal logging. The unit file lands in the repo; installing and enabling it on erebor is Bogdan's call, after he reads it | claude | todo |
 
 ## 6. TUI (`arc`)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 6.1 | Connect + session picker + send message + streaming render (absorbs old 6.2: "message pane, input line, session picker, nothing else") | claude | done |
-| 6.2 | TUI polish: bottom-anchored transcript, persistent wordmark, wrap indent, picker labels, markdown rendering, `--help` | claude | in review |
-| 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | in review |
-| 6.4 | TUI punch list, gathered by Bogdan while using it (see below) | claude | in review |
+| 6.2 | TUI polish: bottom-anchored transcript, persistent wordmark, wrap indent, picker labels, markdown rendering, `--help` | claude | done |
+| 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | done |
+| 6.4 | TUI punch list, gathered by Bogdan while using it (see below) | claude | done |
 
 6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; page-key scrolling; a scrollbar in the right margin; sessions ordered by last activity with a relative "x ago".
 
@@ -106,13 +107,15 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 | 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | done |
 | 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | done |
 
+Idle VRAM, settled 2026-08-13: `llama-server` holds its device allocation for the process lifetime, which is wrong for a daemon that is always up. This build has `--sleep-idle-seconds`; measured on erebor with Qwen3-8B Q4_K_M on Vulkan1, it drops 5764 MiB to 54 MiB after the idle window and takes ~1.5s to wake on the next request, with `/health` answering 200 throughout. It is a pass-through flag, so `arcd` needs no code — `data/arc.toml` now sets 300s. This is what makes 5.5 (always-on arcd) cheap enough to leave running.
+
 7.x loose ends: sidecar restart policy is deliberately absent (unexpected exit is logged loudly, turns fail until the daemon restarts); decide it when it hurts. ~~Fixture recapture~~ and ~~the live streaming check~~ both done 2026-08-13 against the Vulkan `llama-server` on the RTX 5070 (131 tok/s; nixpkgs' default `llama-cpp` is CPU-only — the dotfiles now build `llama-cpp.override { vulkanSupport = true; }`, and the sidecar needs `--device Vulkan1` to skip the iGPU).
 
 ## 8. Observability
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | — | todo |
-| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | — | todo |
+| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | claude | in progress |
+| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | claude | todo |
 
 Next session picks up here (banked 2026-08-13): 6.1 and 7.1–7.3 reviewed and done. In flight: 6.2 and 6.3 (claude). Then assign 8.x — the earlier suggestion was an implementer agent with a checkable output (a trace that opens in the Perfetto UI). Also pending, no task yet: how arcd runs long-term (currently a hand-started tmux session; a systemd user unit is the natural shape now that arcd supervises its own sidecar). Machine notes that bit us today live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
