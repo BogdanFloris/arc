@@ -79,7 +79,7 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 | 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | in review |
 | 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | in review |
 
-7.x loose ends: the `openai_stream.sse` fixture is constructed from the documented wire format, not captured — recapture from a live `llama-server` once one runs. Sidecar restart policy is deliberately absent (unexpected exit is logged loudly, turns fail until the daemon restarts); decide it when it hurts. The 6.1 live-streaming check never happened against Antigravity (rate limits) — do it against the local provider instead.
+7.x loose ends: sidecar restart policy is deliberately absent (unexpected exit is logged loudly, turns fail until the daemon restarts); decide it when it hurts. ~~Fixture recapture~~ and ~~the live streaming check~~ both done 2026-08-13 against the Vulkan `llama-server` on the RTX 5070 (131 tok/s; nixpkgs' default `llama-cpp` is CPU-only — the dotfiles now build `llama-cpp.override { vulkanSupport = true; }`, and the sidecar needs `--device Vulkan1` to skip the iGPU).
 
 ## 8. Observability
 

@@ -1,12 +1,12 @@
-data: {"id":"chatcmpl-arc1","object":"chat.completion.chunk","created":1755072000,"model":"qwen3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1786620505,"id":"chatcmpl-LrSBfDYc9NGhUxyh6SYQq551MC4C7JQ0","model":"Qwen3-8B-Q4_K_M","system_fingerprint":"b10273-a6aa6f5","object":"chat.completion.chunk"}
 
-data: {"id":"chatcmpl-arc1","object":"chat.completion.chunk","created":1755072000,"model":"qwen3-8b","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Hello"}}],"created":1786620505,"id":"chatcmpl-LrSBfDYc9NGhUxyh6SYQq551MC4C7JQ0","model":"Qwen3-8B-Q4_K_M","system_fingerprint":"b10273-a6aa6f5","object":"chat.completion.chunk"}
 
-data: {"id":"chatcmpl-arc1","object":"chat.completion.chunk","created":1755072000,"model":"qwen3-8b","choices":[{"index":0,"delta":{"content":" arc"},"finish_reason":null}]}
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" arc"}}],"created":1786620505,"id":"chatcmpl-LrSBfDYc9NGhUxyh6SYQq551MC4C7JQ0","model":"Qwen3-8B-Q4_K_M","system_fingerprint":"b10273-a6aa6f5","object":"chat.completion.chunk"}
 
-data: {"id":"chatcmpl-arc1","object":"chat.completion.chunk","created":1755072000,"model":"qwen3-8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1786620505,"id":"chatcmpl-LrSBfDYc9NGhUxyh6SYQq551MC4C7JQ0","model":"Qwen3-8B-Q4_K_M","system_fingerprint":"b10273-a6aa6f5","object":"chat.completion.chunk"}
 
-data: {"id":"chatcmpl-arc1","object":"chat.completion.chunk","created":1755072000,"model":"qwen3-8b","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}
+data: {"choices":[],"created":1786620505,"id":"chatcmpl-LrSBfDYc9NGhUxyh6SYQq551MC4C7JQ0","model":"Qwen3-8B-Q4_K_M","system_fingerprint":"b10273-a6aa6f5","object":"chat.completion.chunk","usage":{"completion_tokens":7,"prompt_tokens":17,"total_tokens":24,"prompt_tokens_details":{"cached_tokens":0}},"timings":{"cache_n":0,"prompt_n":17,"prompt_ms":523.675,"prompt_per_token_ms":30.80441176470588,"prompt_per_second":32.46288251300903,"predicted_n":7,"predicted_ms":53.42,"predicted_per_token_ms":7.631428571428572,"predicted_per_second":131.03706476974915}}
 
 data: [DONE]
 

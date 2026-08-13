@@ -15,10 +15,11 @@
 //!   `finish_reason` alone is not terminal: the usage frame follows it, so
 //!   ending there would drop the counts.
 //!
-//! The fixture in `tests/fixtures/openai_stream.sse` is constructed from that
-//! documented format, not captured live — task 7.2 note: recapture it from a
-//! running `llama-server` once the sidecar exists, the way 4.4's fixture was
-//! captured.
+//! The fixture in `tests/fixtures/openai_stream.sse` is one real completion,
+//! captured live from `llama-server` b10273 (Qwen3-8B, 2026-08-13). Two
+//! details the documentation alone would not have shown: the role-only first
+//! chunk carries `"content": null` rather than an empty string, and the
+//! usage frame brings llama.cpp's own `timings` object along.
 
 use serde::Deserialize;
 
@@ -139,15 +140,17 @@ mod tests {
     use crate::provider::stream::DeltaStream;
     use crate::provider::{CompletionDelta, Error, Usage};
 
-    /// A full completion in this dialect: role chunk, two text chunks, finish
-    /// chunk, usage frame, sentinel. Constructed from the documented format —
-    /// see the module docs for the recapture note.
+    /// One real completion, captured live: a role-only chunk with null
+    /// content, two text chunks, the finish chunk, the usage frame, the
+    /// sentinel. See the module docs.
     const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/openai_stream.sse");
 
-    /// What the fixture bills.
+    /// What the fixture bills. Completion tokens exceed the visible text:
+    /// the template's swallowed empty think block is generated and billed
+    /// like anything else.
     const FIXTURE_USAGE: Usage = Usage {
-        input_tokens: 9,
-        output_tokens: 2,
+        input_tokens: 17,
+        output_tokens: 7,
     };
 
     /// Drives a stream built from `chunks` to its end.
@@ -173,7 +176,7 @@ mod tests {
 
     fn whole_fixture() -> [CompletionDelta; 3] {
         [
-            text("hello"),
+            text("Hello"),
             text(" arc"),
             CompletionDelta::Done {
                 usage: FIXTURE_USAGE,
@@ -212,7 +215,7 @@ mod tests {
 
         let seen = ok(vec![FIXTURE[..sentinel].to_vec()]).await;
 
-        assert_eq!(seen, [text("hello"), text(" arc")]);
+        assert_eq!(seen, [text("Hello"), text(" arc")]);
     }
 
     const DONE_FRAME: &[u8] = b"data: [DONE]";
