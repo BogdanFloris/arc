@@ -163,33 +163,37 @@ impl<S, P: FrameParser> DeltaStream<S, P> {
     /// completion is not done until its last one. Token counts are the last
     /// the backend reported; zero means it never reported any, which happens
     /// only when a stream dies before its first counted frame.
+    ///
+    /// The token fields are named `counter.*` on purpose: that is what the
+    /// Perfetto layer draws as a counter track rather than as text on a
+    /// slice, so spend over a session is a graph.
     fn end(&mut self, outcome: Outcome) {
         self.finished = true;
         let usage = self.usage.unwrap_or_default();
-        let input_tokens = usage.input_tokens;
-        let output_tokens = usage.output_tokens;
+        let input = usage.input_tokens;
+        let output = usage.output_tokens;
         let provider = P::PROVIDER;
 
         self.span.in_scope(|| match outcome {
             Outcome::Done => tracing::info!(
                 provider,
                 outcome = "done",
-                input_tokens,
-                output_tokens,
+                counter.input_tokens = input,
+                counter.output_tokens = output,
                 "completion finished"
             ),
             Outcome::Cut => tracing::warn!(
                 provider,
                 outcome = "cut",
-                input_tokens,
-                output_tokens,
+                counter.input_tokens = input,
+                counter.output_tokens = output,
                 "stream ended before the model finished"
             ),
             Outcome::Failed(error) => tracing::warn!(
                 provider,
                 outcome = "error",
-                input_tokens,
-                output_tokens,
+                counter.input_tokens = input,
+                counter.output_tokens = output,
                 error = %error,
                 "stream failed"
             ),
