@@ -18,9 +18,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
 pub const PAGE: usize = 10;
 
-/// Lines one mouse-wheel notch moves.
-pub const WHEEL: usize = 3;
-
 /// What the connection task is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -138,9 +135,14 @@ impl App {
 
     /// Scrolls the transcript by `lines`, or moves the picker if it is open.
     ///
-    /// The wheel and the page keys both land here. When the picker is open it
-    /// takes the gesture: scrolling the transcript behind a modal reads as the
-    /// wrong thing moving.
+    /// Every scroll gesture lands here — `ctrl-d/u` and the page keys. When
+    /// the picker is open it takes the gesture instead: scrolling the
+    /// transcript behind a modal reads as the wrong thing moving.
+    ///
+    /// There is deliberately no mouse wheel. Reporting it means asking the
+    /// terminal for mouse motion, and a terminal that reports motion stops
+    /// doing its own text selection — which broke selecting text out of the
+    /// pane far worse than the wheel was worth.
     pub fn on_scroll(&mut self, up: bool, lines: usize) {
         if let Some(selected) = self.picker {
             let last = self.sessions.len();
@@ -836,14 +838,14 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_and_page_keys_scroll_from_any_mode() {
+    fn the_page_keys_scroll_from_any_mode() {
         let mut app = App::new();
 
-        app.on_scroll(true, WHEEL);
-        assert_eq!(app.scroll_back, WHEEL);
-        app.on_scroll(false, WHEEL);
+        app.on_scroll(true, PAGE);
+        assert_eq!(app.scroll_back, PAGE);
+        app.on_scroll(false, PAGE);
         assert_eq!(app.scroll_back, 0);
-        app.on_scroll(false, WHEEL);
+        app.on_scroll(false, PAGE);
         assert_eq!(app.scroll_back, 0, "scrolling down at the bottom stays put");
 
         // Insert mode: the page keys are not text, so they still scroll.
@@ -895,19 +897,19 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_moves_the_picker_when_it_is_open() {
+    fn scrolling_moves_the_picker_when_it_is_open() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![session("old"), session("new")]));
         normal(&mut app, "s");
 
-        app.on_scroll(false, WHEEL);
-        assert_eq!(app.picker, Some(1), "one row per notch, not one page");
-        app.on_scroll(false, WHEEL);
+        app.on_scroll(false, PAGE);
+        assert_eq!(app.picker, Some(1), "one row per gesture, not one page");
+        app.on_scroll(false, PAGE);
         assert_eq!(app.picker, Some(2));
-        app.on_scroll(false, WHEEL);
+        app.on_scroll(false, PAGE);
         assert_eq!(app.picker, Some(2), "and it stops at the last session");
 
-        app.on_scroll(true, WHEEL);
+        app.on_scroll(true, PAGE);
         assert_eq!(app.picker, Some(1));
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }

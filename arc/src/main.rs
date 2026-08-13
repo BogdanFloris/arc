@@ -15,9 +15,7 @@ use std::io::Write as _;
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
-};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
@@ -38,7 +36,7 @@ keys:
   insert mode (the default)  type; enter sends; esc leaves
   normal mode                h l 0 $ w b  i I a A  x D dd
                              j k ctrl-d ctrl-u G gg   scroll
-  any mode                   wheel, pageup/pagedown   scroll
+  any mode                   pageup / pagedown        scroll
                              s or ctrl-p  sessions    ctrl-n  new session
                              :q           quit";
 
@@ -49,17 +47,9 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     let terminal = ratatui::init();
-    // The wheel only reaches us if the terminal is told to report it. The
-    // cost is that drag-selecting text now needs Shift held, since the
-    // terminal hands us the drag instead of acting on it.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(terminal, url).await;
     ratatui::restore();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        DisableMouseCapture,
-        SetCursorStyle::DefaultUserShape
-    );
+    let _ = crossterm::execute!(std::io::stdout(), SetCursorStyle::DefaultUserShape);
     result
 }
 
@@ -96,16 +86,6 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
         let command = tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
-                Some(Ok(Event::Mouse(mouse))) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => app.on_scroll(true, crate::app::WHEEL),
-                        MouseEventKind::ScrollDown => app.on_scroll(false, crate::app::WHEEL),
-                        // Clicks and drags are the terminal's business; we
-                        // capture the wheel and want none of the rest.
-                        _ => {}
-                    }
-                    None
-                }
                 // Resizes and the rest redraw on the next pass.
                 Some(Ok(_)) => None,
                 Some(Err(error)) => return Err(error.into()),

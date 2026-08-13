@@ -54,14 +54,18 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 6.1 | Connect + session picker + send message + streaming render (absorbs old 6.2: "message pane, input line, session picker, nothing else") | claude | done |
-
 | 6.2 | TUI polish: bottom-anchored transcript, persistent wordmark, wrap indent, picker labels, markdown rendering, `--help` | claude | in review |
 | 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | in review |
 | 6.4 | TUI punch list, gathered by Bogdan while using it (see below) | claude | in review |
 
-6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; mouse-wheel and page-key scrolling; a scrollbar in the right margin; sessions ordered by last activity with a relative "x ago".
+6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; page-key scrolling; a scrollbar in the right margin; sessions ordered by last activity with a relative "x ago".
 
 Recency needed no new architecture — `messages.ts` was already projected, so last activity is a `MAX(ts)` subquery plus one additive `SessionInfo.last_at`. The daemon still answers in its stable oldest-first order (that is the order a log replays in); the client sorts, because "what did I last use" is a client's question and the wire contract in 5.4's brief says oldest first. If a second client ever wants the same order, move the sort to `Projection::sessions` and amend that brief.
+
+6.4 decisions and costs, for review:
+- **No mouse wheel — settled, do not re-add.** It was built, tried for an afternoon, and removed the same day (Bogdan's call). Answering the wheel means mouse capture, and crossterm's `EnableMouseCapture` requests five modes at once: `?1000h` press/release (all the wheel actually needs) plus `?1002h`/`?1003h` motion tracking. Once an app asks for motion the terminal stops doing its own selection, so selecting text out of the pane fell back to Shift-override, which ignores pane boundaries and grabs whole physical rows. The narrower `?1000h`+`?1006h` pair might have kept selection working, but the wheel was not worth a terminal-dependent maybe: scrolling is `j k`, `ctrl-d/u`, `G gg`, the page keys, and the scrollbar.
+- **Untagged fences are sniffed.** The local model drops the info string constantly, and leaving those blocks flat was the original complaint. Only markers belonging to one language count and a tie declines, because a wrong guess miscolours code (reads as a bug) while no guess reads as plain code. A tag that *is* present is always believed, even an unknown one.
+- Two lexer bugs came out of daily use, both fixed with tests: a one-line `"""docstring"""` (and one-line `/* */`) had only its opening marker checked, so it painted the rest of the block as one string; and plain tokens inside a highlighted block were emitted as `CODE` (aqua), colliding with the type role — they are the terminal's own foreground now, so the coloured tokens have something to read against.
 
 Scope for 6.2 (2026-08-13, from driving the app together — six items, all `arc`-only):
 1. **Bottom-anchored transcript.** Content grows up from the input rule instead of down from the top; a short turn no longer leaves ~18 rows of dead space. Once the transcript is taller than the pane, it pins to the bottom and the existing `j k` / `ctrl-d/u` / `G gg` scrolling takes over.
@@ -74,7 +78,7 @@ Scope for 6.2 (2026-08-13, from driving the app together — six items, all `arc
 Scope for 6.3 (2026-08-13):
 - Additive `wire.proto` change: a client request for a session's messages and a server frame carrying them. New oneof numbers only — nothing renumbered or repurposed (invariant 3). Lands as its own schema commit, separate from the code that uses it.
 - `arcd` answers it from the SQLite projection's `messages` table. No new subsystem, no log reads on the request path.
-- `arc` fetches on session open and renders the result before the first new delta. Decide and write down what happens when history is long (all of it vs. a tail) — the wire has no paging and Phase 1 shouldn't add one.
+- `arc` fetches on session open and renders the result before the first new delta. Decided: the daemon sends **the whole history, unpaginated**, matching `ListSessions`. One user, sessions a person could scroll, and the alternative — a tail — invents a cutoff the client would then have to explain. `FetchHistory` reserves field 2 for a paging cursor so the answer can change without a schema bump. Revisit when a real session makes the frame big enough to notice.
 
 6.2/6.3 as built (2026-08-13): picker labels needed the daemon's help, so `SessionInfo` gained a `preview` field (the first user message, from a subquery in `Projection::sessions`) rather than overloading `title`, which stays empty for Phase 2's real titles. Markdown is hand-rolled in `arc/src/markdown.rs`, not a parser crate: it has to render half-typed input on every delta, and unclosed markup has to stay literal instead of reflowing the screen when the closing `**` finally arrives. Underscores are not emphasis — `snake_case` beats `_this_` in this codebase's conversations. Loose end: the projection has no `partial` column, so a reopened session cannot mark a cut reply; `HistoryMessage` reserves field 3 for it.
 
