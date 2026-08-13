@@ -43,7 +43,7 @@ Loose ends (fold into the next touch of the relevant file, no own task): `log::E
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 5.1 | Skeleton: config, `data/` layout, tracing subscriber init, `arcd login` subcommand | claude | done |
-| 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | todo |
+| 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | done |
 | 5.3 | Identity file: load `data/identity.md` into system context (read-only) | bogdan | done |
 | 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | todo |
 
