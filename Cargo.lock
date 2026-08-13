@@ -45,6 +45,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "uuid",

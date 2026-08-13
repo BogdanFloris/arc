@@ -1,3 +1,4 @@
+pub mod client;
 pub mod log;
 pub mod projection;
 pub mod provider;
