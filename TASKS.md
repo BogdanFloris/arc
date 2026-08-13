@@ -56,6 +56,15 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | 6.1 | Connect + session list + create session + send message | — | todo |
 | 6.2 | Streaming render of model deltas | — | todo |
 
+Next session picks up here: assign 6.x and 7.x. Pending decisions: TUI library (ratatui proposed, no counter-argument raised) and whether 6.1+6.2 run as one task ("message pane, input line, session picker, nothing else"). 7.x suggested for an implementer agent — spec-transcription with a checkable output (a trace file that opens in the Perfetto UI).
+
+Client-author notes from 5.4 (fold into the 6.x brief):
+- Connect `ws://` to `config.bind` (default 127.0.0.1:8787), plain WebSocket, no auth. One `ClientFrame` per binary message, one `ServerFrame` back; text messages are refused as `bad_frame`.
+- Pick a nonzero `request_id`; every answer frame echoes it — correlate on it, not session id. `session_id = ""` creates a session; the real id arrives in `MessageAccepted`.
+- A turn is exactly: `MessageAccepted` → zero or more `Delta` → one `StreamEnd` or one `Error`. `StreamEnd.partial = true` means the reply was cut and what rendered is what got logged; tokens are 0 when the provider reported no usage.
+- Error codes `empty_message`, `empty_reply`, `provider`, `internal`: connection survives, send the next frame. `bad_frame` is terminal: the daemon closes.
+- Requests answer in order; the daemon runs one completion at a time process-wide. `ListSessions` returns id, title (empty in Phase 1), started_at — oldest first, no paging.
+
 ## 7. Observability
 
 | # | Task | Assignee | Status |
