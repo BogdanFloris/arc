@@ -35,8 +35,8 @@ use arc_core::projection::SessionSummary;
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, MessageAccepted, SendMessage, ServerFrame, SessionInfo,
-    SessionList, StreamEnd, client_frame, server_frame,
+    ClientFrame, Delta, Error as WireError, HistoryMessage, MessageAccepted, SendMessage,
+    ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -222,6 +222,9 @@ async fn request<P: Provider>(
         Some(client_frame::Msg::ListSessions(_)) => {
             list_sessions(ws, engine, frame.request_id).await
         }
+        Some(client_frame::Msg::FetchHistory(fetch)) => {
+            fetch_history(ws, engine, frame.request_id, &fetch.session_id).await
+        }
         // A frame from a newer client, or one that asked for nothing. Either
         // way this binary cannot answer it, and guessing would be worse.
         None => {
@@ -366,6 +369,33 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
     })
 }
 
+/// Answers one session's history from the projection.
+///
+/// A read, not a turn: it takes the engine lock only long enough to query, so
+/// a client opening an old session does not wait behind a completion.
+async fn fetch_history<P: Provider>(
+    ws: &mut Socket,
+    engine: &Mutex<Engine<P>>,
+    request_id: u64,
+    session_id: &str,
+) -> ControlFlow<()> {
+    let read = engine.lock().await.transcript(session_id);
+    let msg = match read {
+        Ok(messages) => server_frame::Msg::SessionHistory(SessionHistory {
+            session_id: session_id.to_owned(),
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| HistoryMessage { role, content })
+                .collect(),
+        }),
+        Err(error) => {
+            warn!(%error, session_id, "reading history failed");
+            error_frame("internal", &error)
+        }
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
 /// An `Error` frame with a stable code and a human-readable message.
 fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
     server_frame::Msg::Error(WireError {
@@ -393,6 +423,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
     match frame.msg {
         Some(client_frame::Msg::SendMessage(_)) => "send_message",
         Some(client_frame::Msg::ListSessions(_)) => "list_sessions",
+        Some(client_frame::Msg::FetchHistory(_)) => "fetch_history",
         None => "unknown",
     }
 }
@@ -403,6 +434,7 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         id: summary.id.clone(),
         title: summary.title.clone(),
         started_at: summary.started_at.map(timestamp),
+        preview: summary.preview.clone(),
     }
 }
 
@@ -439,7 +471,7 @@ mod tests {
     use arc_core::provider::{
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Usage,
     };
-    use arc_proto::v1::{ListSessions, Role};
+    use arc_proto::v1::{FetchHistory, ListSessions, Role};
     use futures::stream;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -650,6 +682,29 @@ mod tests {
         }
     }
 
+    async fn history(ws: &mut Client, request_id: u64, session_id: &str) -> Vec<HistoryMessage> {
+        send(
+            ws,
+            request_id,
+            client_frame::Msg::FetchHistory(FetchHistory {
+                session_id: session_id.to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(ws).await;
+        assert_eq!(frame.request_id, request_id);
+        match frame.msg {
+            Some(server_frame::Msg::SessionHistory(history)) => {
+                assert_eq!(
+                    history.session_id, session_id,
+                    "the answer names its session"
+                );
+                history.messages
+            }
+            other => panic!("expected SessionHistory, got {other:?}"),
+        }
+    }
+
     async fn list(ws: &mut Client, request_id: u64) -> Vec<SessionInfo> {
         send(
             ws,
@@ -736,6 +791,70 @@ mod tests {
         assert!(
             sessions[0].started_at.is_some(),
             "the projection's micros became a Timestamp"
+        );
+
+        harness.stop().await;
+    }
+
+    /// What a client needs to reopen an old session and see what was said.
+    #[tokio::test]
+    async fn history_returns_the_whole_conversation_in_order() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _, _) = turn(&mut ws, 1).await;
+        send(&mut ws, 2, say(&session_id, "again")).await;
+        turn(&mut ws, 2).await;
+
+        let messages = history(&mut ws, 3, &session_id).await;
+
+        let said: Vec<(Role, &str)> = messages
+            .iter()
+            .map(|m| {
+                (
+                    Role::try_from(m.role).expect("a known role"),
+                    m.content.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (Role::User, "hello"),
+                (Role::Assistant, "re: hello"),
+                (Role::User, "again"),
+                (Role::Assistant, "re: again"),
+            ],
+            "both turns, in the order they happened"
+        );
+
+        // A read, not a turn: the connection is good for the next request.
+        assert!(
+            history(&mut ws, 4, "no-such-session").await.is_empty(),
+            "an unknown session reads as an empty one"
+        );
+
+        harness.stop().await;
+    }
+
+    /// The picker labels rows with this, so it has to be the opening line.
+    #[tokio::test]
+    async fn listed_sessions_preview_their_first_user_message() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "what is a walking skeleton?")).await;
+        let (session_id, _, _) = turn(&mut ws, 1).await;
+        send(&mut ws, 2, say(&session_id, "a second question")).await;
+        turn(&mut ws, 2).await;
+
+        let sessions = list(&mut ws, 3).await;
+
+        assert_eq!(sessions[0].preview, "what is a walking skeleton?");
+        assert_eq!(
+            sessions[0].title, "",
+            "preview is not a title; titles wait for Phase 2"
         );
 
         harness.stop().await;
