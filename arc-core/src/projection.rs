@@ -414,6 +414,20 @@ impl Projection {
             })
             .transpose()
     }
+
+    /// The conversation history of one session: `(role, content)` pairs in
+    /// seq order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read.
+    pub fn messages(&self, session_id: &str) -> Result<Vec<(i32, String)>, Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 /// Writes the `sessions` row for a `SessionCreated`.
@@ -731,6 +745,64 @@ mod tests {
         assert_eq!(row_count(&projection, "sessions"), 1);
         assert_eq!(row_count(&projection, "messages"), 0);
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
+    }
+
+    #[test]
+    fn messages_come_back_in_seq_order() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=10 {
+            projection
+                .apply(&message_appended(seq, &format!("hello_{seq}")))
+                .expect("apply");
+        }
+
+        let conv = projection.messages("s-01").expect("messages");
+
+        assert_eq!(conv.len(), 10);
+        for (i, (role, content)) in conv.iter().enumerate() {
+            assert_eq!(*role, Role::User as i32);
+            assert_eq!(content, &format!("hello_{}", i + 1));
+        }
+    }
+
+    #[test]
+    fn an_unknown_session_and_an_empty_session_are_both_just_empty() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        assert_eq!(projection.messages("s-01").expect("messages"), []);
+
+        projection.apply(&session_created(0)).expect("apply");
+        assert_eq!(projection.messages("s-01").expect("messages"), []);
+    }
+
+    #[test]
+    fn messages_of_other_sessions_stay_out() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        // Two sessions interleaved by seq: only s-01's rows may come back.
+        for (seq, session, content) in [
+            (1, "s-01", "a"),
+            (2, "s-02", "x"),
+            (3, "s-01", "b"),
+            (4, "s-02", "y"),
+        ] {
+            let mut event = message_appended(seq, content);
+            if let Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::MessageAppended(m)),
+            })) = &mut event.payload
+            {
+                m.session_id = session.to_string();
+            }
+            projection.apply(&event).expect("apply");
+        }
+
+        let conv: Vec<String> = projection
+            .messages("s-01")
+            .expect("messages")
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(conv, ["a", "b"]);
     }
 
     #[test]
