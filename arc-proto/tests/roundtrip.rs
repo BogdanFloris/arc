@@ -85,6 +85,7 @@ fn server_frame_arms_round_trip() {
                 title: "first light".to_string(),
                 started_at: Some(ts()),
                 preview: "hello arc".to_string(),
+                last_at: Some(ts()),
             }],
         }),
         server_frame::Msg::SessionHistory(SessionHistory {

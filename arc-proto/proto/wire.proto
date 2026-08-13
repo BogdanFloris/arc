@@ -20,6 +20,11 @@ message SessionInfo {
   // stays empty until Phase 2 generates one. Empty if the session has no
   // user message yet.
   string preview = 4;
+  // When the session was last spoken in, either side. Unset for a session
+  // with no messages, where `started_at` is the only time there is. This is
+  // what a picker orders by: what you were last doing, not what you started
+  // first.
+  google.protobuf.Timestamp last_at = 5;
 }
 
 message ListSessions {}
