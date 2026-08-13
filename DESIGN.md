@@ -69,6 +69,8 @@ Sessions are pi-style: a tree, not a list. Forking a session at any message crea
 
 Branch semantics interact with memory (see §5.4): only the main line and branches explicitly marked *real* feed the consolidation pipeline. Abandoned experimental branches remain searchable in the archive but never write distilled memory.
 
+A model reply cut mid-stream is appended with `partial = true`; the log records what the user actually saw, and errors are reported to clients, never archived as messages.
+
 ## 5. Memory
 
 "Feels alive" decomposes into three subsystems with different storage, different update rules, and different retrieval paths. They are deliberately not unified.
@@ -211,4 +213,3 @@ Deferred deliberately; decide when the phase forces them:
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
 - Multi-machine story beyond backup/restore (log sync). (Post-v1.)
 - Startup recovery is a full log replay today; a checkpoint bounds it when the log grows. (When startup time or traces say so.)
-- Whether a partial model reply (stream cut before its final usage frame) is appended to the log, and marked how. (Phase 1, the daemon's session engine forces it.)

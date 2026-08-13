@@ -466,6 +466,7 @@ mod tests {
                     session_id: "s-01".to_string(),
                     role: Role::User as i32,
                     content: content.to_string(),
+                    partial: false,
                 })),
             })),
         }

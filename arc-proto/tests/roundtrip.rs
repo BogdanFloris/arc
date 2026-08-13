@@ -49,6 +49,7 @@ fn message_appended_event() -> Event {
                 session_id: "s-01".to_string(),
                 role: Role::User as i32,
                 content: "hello arc".to_string(),
+                partial: false,
             })),
         })),
     }

@@ -30,6 +30,8 @@ message MessageAppended {
   string session_id = 1;
   Role role = 2;
   string content = 3;
+  // Reply was cut before the model finished; content is what the user saw.
+  bool partial = 4;
 }
 
 message SessionEvent {
