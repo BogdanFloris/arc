@@ -539,6 +539,7 @@ async fn failure(response: reqwest::Response) -> Error {
         )),
         429 => Error::RateLimited {
             retry_after: header_advice.or_else(|| retry_delay(&body)),
+            detail: detail(&body),
         },
         _ => Error::http(status, &body),
     }
@@ -1447,7 +1448,8 @@ mod tests {
             matches!(
                 error,
                 Error::RateLimited {
-                    retry_after: Some(30)
+                    retry_after: Some(30),
+                    ..
                 }
             ),
             "{error:?}"
@@ -1478,11 +1480,19 @@ mod tests {
             matches!(
                 error,
                 Error::RateLimited {
-                    retry_after: Some(4)
+                    retry_after: Some(4),
+                    ..
                 }
             ),
             "{error:?}"
         );
+        match error {
+            Error::RateLimited { detail, .. } => assert_eq!(
+                detail, "You have exhausted your capacity on this model.",
+                "the body's message names the tripped quota"
+            ),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1490,7 +1500,13 @@ mod tests {
         let error = error_from(429, ResponseTemplate::new(429).set_body_string("slow down")).await;
 
         assert!(
-            matches!(error, Error::RateLimited { retry_after: None }),
+            matches!(
+                error,
+                Error::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
             "{error:?}"
         );
     }

@@ -191,10 +191,18 @@ pub enum Error {
 
     /// The backend is throttling. `retry_after` is its own advice, in seconds,
     /// when it gave any; `None` means back off on the caller's schedule.
-    #[error("provider rate limited{}", retry_after.map_or(String::new(), |s| format!(", retry after {s}s")))]
+    #[error(
+        "provider rate limited{}{}",
+        retry_after.map_or(String::new(), |s| format!(", retry after {s}s")),
+        if detail.is_empty() { String::new() } else { format!(": {detail}") }
+    )]
     RateLimited {
         /// Seconds the backend asked the caller to wait.
         retry_after: Option<u64>,
+        /// What the backend said about which limit tripped — a 429 body names
+        /// its quota, and "which quota" is the whole diagnosis. Empty when
+        /// the body said nothing usable.
+        detail: String,
     },
 
     /// The response did not parse: a malformed SSE frame, JSON that does not
@@ -411,17 +419,30 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_display_mentions_retry_advice_only_when_given() {
+    fn rate_limit_display_mentions_retry_advice_and_detail_only_when_given() {
         assert_eq!(
             Error::RateLimited {
-                retry_after: Some(30)
+                retry_after: Some(30),
+                detail: String::new(),
             }
             .to_string(),
             "provider rate limited, retry after 30s"
         );
         assert_eq!(
-            Error::RateLimited { retry_after: None }.to_string(),
+            Error::RateLimited {
+                retry_after: None,
+                detail: String::new(),
+            }
+            .to_string(),
             "provider rate limited"
+        );
+        assert_eq!(
+            Error::RateLimited {
+                retry_after: Some(4),
+                detail: "quota exceeded: GenerateRequestsPerMinute".to_owned(),
+            }
+            .to_string(),
+            "provider rate limited, retry after 4s: quota exceeded: GenerateRequestsPerMinute"
         );
     }
 }
