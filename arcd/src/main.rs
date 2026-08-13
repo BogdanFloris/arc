@@ -14,6 +14,7 @@ mod cli;
 mod config;
 mod daemon;
 mod dirs;
+mod identity;
 mod login;
 mod telemetry;
 

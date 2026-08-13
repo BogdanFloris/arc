@@ -25,6 +25,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::dirs::DataDirs;
+use crate::identity;
 
 /// A started daemon: everything durable is open, nothing is being served yet.
 pub struct Daemon {
@@ -43,6 +44,12 @@ pub struct Daemon {
     /// on the first completion instead.
     #[allow(dead_code, reason = "task 5.2 drives completions through this")]
     provider: Antigravity,
+
+    /// Who ARC is (`data/identity.md`), loaded once at startup. `None` runs
+    /// without an identity — supported, announced, and fixed by writing the
+    /// file and restarting.
+    #[allow(dead_code, reason = "task 5.2 passes this as the system prompt")]
+    identity: Option<String>,
 }
 
 impl Daemon {
@@ -81,6 +88,12 @@ impl Daemon {
 
         let tokens = TokenManager::new(OauthConfig::default(), dirs.tokens());
         let provider = Antigravity::new(Arc::new(tokens));
+        let identity = identity::load(dirs.identity()).context("loading the identity file")?;
+        if let Some(text) = &identity {
+            info!(chars = text.len(), "identity file loaded");
+        } else {
+            info!("no identity file, running without one");
+        }
 
         Ok(Self {
             config,
@@ -88,6 +101,7 @@ impl Daemon {
             log,
             projection,
             provider,
+            identity,
         })
     }
 

@@ -103,7 +103,6 @@ impl DataDirs {
 
     /// Identity file (task 5.3). Read-only to ARC, by §5.1.
     #[must_use]
-    #[allow(dead_code, reason = "task 5.3 loads the identity file from here")]
     pub fn identity(&self) -> &Path {
         &self.identity
     }
