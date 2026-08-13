@@ -78,6 +78,8 @@ fn inset(area: Rect) -> Rect {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = area.height as usize;
+    // The bar lives in the right margin, so the text keeps its full width and
+    // nothing reflows when a reply grows long enough to need one.
     let lines = transcript_lines(app, area.width as usize);
     // Clamp the scroll to the top of the transcript, in the state and not
     // just the view, so scrolling back down responds on the first key.
@@ -92,6 +94,38 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
     visible.extend_from_slice(&lines[start..end]);
     frame.render_widget(Paragraph::new(visible), area);
+    draw_scrollbar(frame, area, lines.len(), height, app.scroll_back);
+}
+
+/// A thumb in the right margin showing how much of the transcript is on
+/// screen and where.
+///
+/// Drawn only when there is something off screen — a bar that is always full
+/// height is furniture, not information. No track and no arrows: a run of
+/// `|` says both things at once, and the 6.1 look has no room for a rail
+/// down the side of the pane.
+fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, height: usize, scroll_back: usize) {
+    if total <= height || height == 0 {
+        return;
+    }
+
+    // At least one cell, so a very long transcript still shows a thumb.
+    let thumb = ((height * height) / total).max(1);
+    let travel = height - thumb;
+    // `scroll_back` counts up from the bottom; the thumb counts down from the
+    // top, so the fraction is inverted.
+    let from_top = total - height - scroll_back.min(total - height);
+    let top = (from_top * travel) / (total - height);
+
+    // The first column of the right margin: past the text, never over it, so
+    // the wrap width is the same whether a bar is showing or not.
+    let x = area.x + area.width;
+    for row in 0..thumb {
+        let y = area.y + u16::try_from(top + row).unwrap_or(u16::MAX);
+        if y < area.y + area.height {
+            frame.render_widget(Line::styled("|", theme::DIM), Rect::new(x, y, 1, 1));
+        }
+    }
 }
 
 /// The whole transcript as wrapped, styled lines.
@@ -260,6 +294,9 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     };
     frame.render_widget(Clear, area);
 
+    // One clock read for the whole list, so two rows a second apart never
+    // disagree about what "now" was.
+    let now = chrono::Utc::now();
     let mut lines = vec![Line::styled(" sessions", theme::DIM), Line::default()];
     let visible = (height as usize).saturating_sub(3);
     let start = selected.saturating_sub(visible.saturating_sub(1));
@@ -277,7 +314,10 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
             // right-hand edge instead of a ragged one.
             Some(session) => vec![
                 Span::styled(format!("{prefix}{:<room$}", label(session, room)), style),
-                Span::styled(format!("  {}", started_at(session)), theme::DIM),
+                Span::styled(
+                    format!("  {:>TIME_WIDTH$}", last_active(session, now)),
+                    theme::DIM,
+                ),
             ],
         };
         lines.push(Line::from(spans));
@@ -285,8 +325,8 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Columns `started_at` renders into: `08-13 18:22`.
-const TIME_WIDTH: usize = 11;
+/// Columns [`last_active`] renders into: `just now`, `3h ago`, `08-13`.
+const TIME_WIDTH: usize = 8;
 
 /// What a session is called in the picker: its opening line, elided to fit.
 ///
@@ -312,21 +352,31 @@ fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// `08-13 18:22` — the day and time, in the local zone. No year: a picker is
-/// for finding what you were just doing.
-fn started_at(session: &arc_proto::v1::SessionInfo) -> String {
-    session
-        .started_at
+/// How long ago the session was last spoken in: `just now`, `12m ago`,
+/// `3h ago`, `2d ago`, and a date once "ago" stops meaning anything.
+///
+/// Relative, because a picker answers "what was I just doing" — and the
+/// answer to that is never a wall-clock time you have to subtract from now.
+fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Some(at) = session
+        .last_at
         .as_ref()
+        .or(session.started_at.as_ref())
         .and_then(|ts| {
             chrono::DateTime::from_timestamp(ts.seconds, u32::try_from(ts.nanos).unwrap_or(0))
         })
-        .map_or_else(
-            || " ".repeat(TIME_WIDTH),
-            |utc| {
-                utc.with_timezone(&chrono::Local)
-                    .format("%m-%d %H:%M")
-                    .to_string()
-            },
-        )
+    else {
+        return String::new();
+    };
+
+    let seconds = (now - at).num_seconds();
+    match seconds {
+        // A clock that disagrees with the daemon's should not print "-4m ago".
+        ..60 => "just now".to_owned(),
+        60..3_600 => format!("{}m ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        86_400..604_800 => format!("{}d ago", seconds / 86_400),
+        // Past a week "ago" stops being a unit anyone reads; give the date.
+        _ => at.with_timezone(&chrono::Local).format("%m-%d").to_string(),
+    }
 }

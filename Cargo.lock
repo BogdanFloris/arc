@@ -51,6 +51,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "prost-types",
  "ratatui",
  "textwrap",
  "tokio",
