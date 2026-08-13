@@ -3,6 +3,7 @@ syntax = "proto3";
 package arc.v1;
 
 import "google/protobuf/timestamp.proto";
+import "events.proto";
 
 message SendMessage {
   string session_id = 1;
@@ -14,15 +15,29 @@ message SessionInfo {
   string id = 1;
   string title = 2;
   google.protobuf.Timestamp started_at = 3;
+  // The session's first user message, verbatim and untruncated — a stand-in
+  // label so a picker has something to show. Distinct from `title`, which
+  // stays empty until Phase 2 generates one. Empty if the session has no
+  // user message yet.
+  string preview = 4;
 }
 
 message ListSessions {}
+
+// Ask for a session's messages. Phase 1 answers with the whole history:
+// unpaginated, like ListSessions. Paging is a wire question (DESIGN.md §7)
+// and gets answered when a real session makes it one.
+message FetchHistory {
+  string session_id = 1;
+  reserved 2; // a paging cursor, when it is needed
+}
 
 message ClientFrame {
   uint64 request_id = 1; // client-chosen, echoed back
   oneof msg {
     SendMessage send_message = 11;
     ListSessions list_sessions = 12;
+    FetchHistory fetch_history = 13;
   }
 }
 
@@ -52,6 +67,21 @@ message SessionList {
   repeated SessionInfo sessions = 1;
 }
 
+// One past message, as the projection has it.
+message HistoryMessage {
+  Role role = 1;
+  string content = 2;
+  // 3 reserved for `partial`: the log carries it on MessageAppended, but the
+  // SQLite projection has no column for it yet, so a reopened session cannot
+  // yet tell a cut reply from a whole one.
+  reserved 3;
+}
+
+message SessionHistory {
+  string session_id = 1;
+  repeated HistoryMessage messages = 2;
+}
+
 message ServerFrame {
   uint64 request_id = 1; // 0 = unsolicited
   oneof msg {
@@ -60,5 +90,6 @@ message ServerFrame {
     Delta delta = 12;
     StreamEnd stream_end = 13;
     Error error = 14;
+    SessionHistory session_history = 15;
   }
 }

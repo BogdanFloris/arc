@@ -2,9 +2,9 @@
 //! forward compatibility with additive schema changes, and proto3 defaults.
 
 use arc_proto::v1::{
-    ClientFrame, Delta, Error, Event, MessageAccepted, MessageAppended, Role, SendMessage,
-    ServerFrame, SessionCreated, SessionEvent, SessionInfo, SessionList, Source, StreamEnd,
-    client_frame, event, server_frame, session_event,
+    ClientFrame, Delta, Error, Event, HistoryMessage, MessageAccepted, MessageAppended, Role,
+    SendMessage, ServerFrame, SessionCreated, SessionEvent, SessionHistory, SessionInfo,
+    SessionList, Source, StreamEnd, client_frame, event, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -84,7 +84,21 @@ fn server_frame_arms_round_trip() {
                 id: "s-01".to_string(),
                 title: "first light".to_string(),
                 started_at: Some(ts()),
+                preview: "hello arc".to_string(),
             }],
+        }),
+        server_frame::Msg::SessionHistory(SessionHistory {
+            session_id: "s-01".to_string(),
+            messages: vec![
+                HistoryMessage {
+                    role: Role::User as i32,
+                    content: "hello arc".to_string(),
+                },
+                HistoryMessage {
+                    role: Role::Assistant as i32,
+                    content: "hello back".to_string(),
+                },
+            ],
         }),
         server_frame::Msg::MessageAccepted(MessageAccepted {
             session_id: "s-01".to_string(),
