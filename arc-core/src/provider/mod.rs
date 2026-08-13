@@ -30,7 +30,9 @@
 
 pub mod antigravity;
 pub mod oauth;
+pub mod openai;
 pub mod sse;
+pub(crate) mod stream;
 
 use std::future::Future;
 use std::pin::Pin;
