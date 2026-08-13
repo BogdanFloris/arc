@@ -5,6 +5,8 @@ fn main() -> std::io::Result<()> {
         "proto/events.proto",
         "proto/memory.proto",
         "proto/wire.proto",
+        // Not ours: a subset of Perfetto's schema, in its own package.
+        "proto/perfetto.proto",
     ];
 
     for proto in protos {

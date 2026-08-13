@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+// A hand-trimmed subset of Perfetto's `perfetto_trace.proto`, carrying only
+// what ARC emits: track descriptors, track events (slices, instants,
+// counters), and their debug annotations.
+//
+// This file is NOT ours, and the invariants in CLAUDE.md read differently
+// here:
+//
+//   - Field numbers are Perfetto's, not ours. They must match upstream
+//     exactly or the trace does not open. Never renumber to tidy something.
+//   - `arc.v1`'s additive rule does not apply: this schema follows upstream.
+//     Growing it means copying more fields down from perfetto_trace.proto,
+//     with their numbers.
+//   - Nothing here is ever written to the event log. Traces are disposable
+//     (DESIGN.md §10 excludes `data/traces/` from backups), so a subset that
+//     drops fields costs nothing but detail in the UI.
+//
+// Upstream: perfetto/protos/perfetto/trace/perfetto_trace.proto. The subset
+// is deliberately small — a reader should be able to check every number here
+// against upstream in one sitting.
+package perfetto.protos;
+
+// The file format: a stream of packets, concatenated. Appending a serialized
+// `Trace` to another serialized `Trace` yields a valid `Trace`, which is what
+// lets the writer stream packets out as they happen.
+message Trace {
+  repeated TracePacket packet = 1;
+}
+
+message TracePacket {
+  optional uint64 timestamp = 8;
+  // Which clock `timestamp` is in — a `BuiltinClock`. ARC uses REALTIME (1),
+  // nanoseconds since the Unix epoch, so a trace lines up with the log's own
+  // timestamps without a clock snapshot to correlate them.
+  optional uint32 timestamp_clock_id = 58;
+
+  TrackEvent track_event = 11;
+  TrackDescriptor track_descriptor = 60;
+
+  // Packets from one writer, in order. Perfetto requires this on every packet
+  // carrying a `TrackEvent`.
+  optional uint32 trusted_packet_sequence_id = 10;
+}
+
+// Perfetto's `BuiltinClock`. Only the values ARC uses are copied down.
+enum BuiltinClock {
+  BUILTIN_CLOCK_UNKNOWN = 0;
+  BUILTIN_CLOCK_REALTIME = 1;
+  BUILTIN_CLOCK_MONOTONIC = 3;
+  BUILTIN_CLOCK_BOOTTIME = 6;
+}
+
+// Declares a track: a row in the UI. `parent_uuid` builds the tree, so a
+// session's spans nest under the session and the session nests under the
+// process.
+message TrackDescriptor {
+  optional uint64 uuid = 1;
+  // Upstream this is a oneof with `static_name = 10`; a plain field encodes
+  // identically and we only ever set the dynamic one.
+  string name = 2;
+  ProcessDescriptor process = 3;
+  // 4 is `thread`, upstream. ARC's work is async and does not sit still on a
+  // thread, so it tracks spans, not threads.
+  optional uint64 parent_uuid = 5;
+  CounterDescriptor counter = 8;
+}
+
+message ProcessDescriptor {
+  optional int32 pid = 1;
+  string process_name = 6;
+}
+
+message CounterDescriptor {
+  enum Unit {
+    UNIT_UNSPECIFIED = 0;
+    UNIT_TIME_NS = 1;
+    UNIT_COUNT = 2;
+    UNIT_SIZE_BYTES = 3;
+  }
+  Unit unit = 3;
+  string unit_name = 6;
+  // Whether each sample is a delta on the last one. ARC's counters are
+  // absolute values, so this stays false.
+  optional bool is_incremental = 5;
+}
+
+message TrackEvent {
+  Type type = 9;
+  // Upstream this is a oneof with the interned `name_iid = 10`. ARC writes
+  // names out in full: span names are short and few, and interning is a
+  // second table to get wrong.
+  string name = 23;
+  optional uint64 track_uuid = 11;
+  repeated string categories = 22;
+  repeated DebugAnnotation debug_annotations = 4;
+  // Upstream these are a oneof. Only one is ever set.
+  optional int64 counter_value = 30;
+  optional double double_counter_value = 44;
+
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_SLICE_BEGIN = 1;
+    TYPE_SLICE_END = 2;
+    TYPE_INSTANT = 3;
+    TYPE_COUNTER = 4;
+  }
+}
+
+// A key/value pair shown in the UI when a slice is selected. Upstream the
+// name and the value are each a oneof; plain fields encode the same.
+message DebugAnnotation {
+  string name = 10;
+  optional bool bool_value = 2;
+  optional uint64 uint_value = 3;
+  optional int64 int_value = 4;
+  optional double double_value = 5;
+  string string_value = 6;
+}
