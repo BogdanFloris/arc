@@ -23,7 +23,7 @@ Non-goals for v1: multi-user support, cloud hosting, plugin sandboxing, and any 
 
 Cargo workspace with five crates:
 
-- `arc-proto` — all protobuf schemas (`events.proto`, `memory.proto`, `wire.proto`, package `arc.v1`) and generated types via prost. The single schema authority: the event log on disk and the WebSocket wire protocol use the same generated types. No other crate defines serialized formats.
+- `arc-proto` — all protobuf schemas (`events.proto`, `memory.proto`, `wire.proto`, package `arc.v1`) and generated types via prost. The single schema authority: the event log on disk and the WebSocket wire protocol use the same generated types. No other crate defines serialized formats. One schema there is not ours (added 2026-08-13): `perfetto.proto` is a hand-trimmed subset of Perfetto's own, in its own `perfetto.protos` package. Its field numbers are upstream's and must match them exactly, so §3's additive rules do not govern it; nothing in it is ever written to the log.
 - `arc-core` — shared library: event log reader/writer, projections (SQLite index, memory state), provider abstraction, memory tools, tracing integration. All logic lives here so the daemon stays a thin composition layer and logic is testable without a running daemon.
 - `arcd` — the daemon binary. Owns the event log, runs projections, serves the WebSocket, holds provider credentials, runs the consolidation pipeline.
 - `arc` — the TUI client.
@@ -154,7 +154,7 @@ trait Provider {
 
 v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is preferred over API keys for cost. For Google, Phase 1 authenticates with the Antigravity (Code Assist) OAuth flow using the community-documented public client against `cloudcode-pa.googleapis.com` — a known ToS gray area for third-party harnesses, accepted deliberately for personal use (decided 2026-08; Google has reportedly blocked accounts of abusive plugins, so revisit if that risk materializes). The auth layer keeps an API-key backend a config change, not a redesign, if this path closes.
 
-Amended 2026-08-13: the Antigravity risk materialized as hidden short-term rate limits on the third-party client surface (429 `RESOURCE_EXHAUSTED` with quota showing available — endemic across community harnesses, no known workaround). Phase 1's default provider is therefore local: a llama.cpp `llama-server` sidecar, supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions` over HTTP + SSE, no auth). The same provider implementation covers vLLM or any OpenAI-compatible server by config. Antigravity remains available behind config for when its limits allow; it is no longer relied on.
+Amended 2026-08-13: the Antigravity risk materialized as hidden short-term rate limits on the third-party client surface (429 `RESOURCE_EXHAUSTED` with quota showing available — endemic across community harnesses, no known workaround). Phase 1's default provider is therefore local: a llama.cpp `llama-server` sidecar, supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions` over HTTP + SSE, no auth). The same provider implementation covers vLLM or any OpenAI-compatible server by config. Antigravity remains available behind config for when its limits allow; it is no longer relied on. The sidecar is configured to release its device memory after an idle window (`--sleep-idle-seconds`), so an always-on daemon costs tens of MiB of VRAM between turns instead of the model's several GiB, and pays about a second and a half to wake on the next one — that is what makes a local default compatible with a machine the user also uses for other things.
 
 Provider choice is per-completion: a global default, optionally overridden per request. Sessions don't own a provider; the log records what actually ran. Tool-calling and system-prompt differences are normalized in `arc-core`, not leaked to clients. Providers are hot-swappable mid-session — by a voice request, or by the agent itself deciding to use a cheap model for a subtask.
 
@@ -183,8 +183,9 @@ Physical devices integrate as MCP servers, never as bespoke daemon code: an ESP3
 
 No robotics code exists in this repo until Phase 5.
 
-## 10. Security and backup
+## 10. Security, backup, and running
 
+- "Always-on" (§1) means a systemd user unit (`arcd/arcd.service`): started with the machine, restarted on failure, logging to the journal. `SIGTERM` is a clean stop — `arcd` handles it, and the llama.cpp sidecar dies with it either way, since systemd kills the whole control group. Nothing is left holding the GPU.
 - Runtime state lives under `data/` (log, index, identity, traces).
 - Backup: rustic, encrypted at the repository level, covering `data/log/`, `data/identity.md`, and snapshots. `data/index.db` and `data/traces/` are excluded — both are rebuildable/disposable.
 - Provider credentials live in the OS keychain or an encrypted secrets file, never in the log and never in backups. Phase 1 simplification: OAuth tokens sit in a plaintext file under `data/secrets/` with 0600 permissions, excluded from backups; keychain integration comes later.
