@@ -6,7 +6,7 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 
 Loose ends (fold into the next touch of the relevant file, no own task): `log::Error::Io`'s field doc says "segment" but the variant also carries directory paths (from `sync_parent_dir`, `discover_segments`).
 
-Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 3): `Delta`/`StreamEnd.session_id` are redundant given `request_id` correlation; no explicit "session was created" signal; `request_id = 0` overloaded (unsolicited vs undecodable-frame errors); `Error` doesn't say whether the connection survives (clients know `bad_frame` is terminal out-of-band); text WS messages are refused as `bad_frame` (5.4's call, unspecified in the schema comments). Added by 6.1: no session-history fetch — a client opening an old session renders an empty transcript (new messages only); accepted for Phase 1.
+Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 3): `Delta`/`StreamEnd.session_id` are redundant given `request_id` correlation; no explicit "session was created" signal; `request_id = 0` overloaded (unsolicited vs undecodable-frame errors); `Error` doesn't say whether the connection survives (clients know `bad_frame` is terminal out-of-band); text WS messages are refused as `bad_frame` (5.4's call, unspecified in the schema comments). Added by 6.1: no session-history fetch — a client opening an old session renders an empty transcript (new messages only); accepted for Phase 1. Added after the Antigravity 429s: the wire's `provider` error code is too coarse to tell a client "rate limited, retry in Ns" apart from a hard provider failure, and no layer owns a retry policy.
 
 ## 1. Schemas (`arc-proto`)
 
@@ -69,9 +69,19 @@ Client-author notes from 5.4 (the 6.1 brief):
 - Error codes `empty_message`, `empty_reply`, `provider`, `internal`: connection survives, send the next frame. `bad_frame` is terminal: the daemon closes.
 - Requests answer in order; the daemon runs one completion at a time process-wide. `ListSessions` returns id, title (empty in Phase 1), started_at — oldest first, no paging.
 
-## 7. Observability
+## 7. Local provider (llama.cpp)
+
+Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as a daily driver (DESIGN.md §6 amendment). Local is the new default; Antigravity stays behind config. Test model: Qwen3-8B Q4_K_M GGUF (~5.5GB VRAM — fits the RTX 5070 with headroom; swap is a config line). arcd owns the sidecar process (Bogdan's call, over a systemd unit).
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 7.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | — | todo |
-| 7.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | — | todo |
+| 7.1 | OpenAI-compat provider in `arc-core`: `/v1/chat/completions` request building + SSE stream → `CompletionDelta`, fixture-based parser tests (reuse the 4.4 `FrameDecoder`) | claude | todo |
+| 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | todo |
+| 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | todo |
+
+## 8. Observability
+
+| # | Task | Assignee | Status |
+|---|------|----------|--------|
+| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | — | todo |
+| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | — | todo |

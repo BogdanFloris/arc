@@ -152,7 +152,9 @@ trait Provider {
 }
 ```
 
-v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is preferred over API keys for cost. For Google, Phase 1 authenticates with the Antigravity (Code Assist) OAuth flow using the community-documented public client against `cloudcode-pa.googleapis.com` — a known ToS gray area for third-party harnesses, accepted deliberately for personal use (decided 2026-08; Google has reportedly blocked accounts of abusive plugins, so revisit if that risk materializes). The auth layer keeps an API-key backend a config change, not a redesign, if this path closes. Local models (an OpenAI-compatible endpoint pointed at llama.cpp/vLLM) are a planned third implementation.
+v1 ships Anthropic (Claude) and Google (Gemini) implementations over plain HTTP + SSE (`reqwest` + rustls); no vendor SDKs. Consumer-subscription OAuth is preferred over API keys for cost. For Google, Phase 1 authenticates with the Antigravity (Code Assist) OAuth flow using the community-documented public client against `cloudcode-pa.googleapis.com` — a known ToS gray area for third-party harnesses, accepted deliberately for personal use (decided 2026-08; Google has reportedly blocked accounts of abusive plugins, so revisit if that risk materializes). The auth layer keeps an API-key backend a config change, not a redesign, if this path closes.
+
+Amended 2026-08-13: the Antigravity risk materialized as hidden short-term rate limits on the third-party client surface (429 `RESOURCE_EXHAUSTED` with quota showing available — endemic across community harnesses, no known workaround). Phase 1's default provider is therefore local: a llama.cpp `llama-server` sidecar, supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions` over HTTP + SSE, no auth). The same provider implementation covers vLLM or any OpenAI-compatible server by config. Antigravity remains available behind config for when its limits allow; it is no longer relied on.
 
 Provider choice is per-completion: a global default, optionally overridden per request. Sessions don't own a provider; the log records what actually ran. Tool-calling and system-prompt differences are normalized in `arc-core`, not leaked to clients. Providers are hot-swappable mid-session — by a voice request, or by the agent itself deciding to use a cheap model for a subtask.
 
@@ -194,7 +196,7 @@ Each phase ends in something used daily. No phase begins until the previous one 
 
 **Phase 0 — Scaffold.** *Done.* Workspace, empty crates, empty schemas, build/test/fmt/lint targets.
 
-**Phase 1 — Walking skeleton.** `arcd` with one provider (Gemini via Auth because it's cheaper to test with), linear sessions only, event log with `SessionEvent`, SQLite projection, the TUI with streaming, identity file loaded into context, Perfetto spans on LLM calls. Memory is *only* the identity file. Exit criterion: ARC replaces a chat app for daily use.
+**Phase 1 — Walking skeleton.** `arcd` with a default local provider (llama.cpp sidecar; Antigravity/Gemini behind config after its rate limits proved unreliable — amended 2026-08-13), linear sessions only, event log with `SessionEvent`, SQLite projection, the TUI with streaming, identity file loaded into context, Perfetto spans on LLM calls. Memory is *only* the identity file. Exit criterion: ARC replaces a chat app for daily use.
 
 **Phase 2 — Memory.** `MemoryEvent`, distilled records + always-loaded index, the five memory/archive tools, FTS5 over messages, explicit `memory_write` plus end-of-session consolidation, `arcd memory-replay` with a versioned consolidation prompt, the weekly review flow in the TUI, Perfetto spans on all memory operations. Exit criterion: "what do you know about X" and "what did we say about X" both work on real history.
 
