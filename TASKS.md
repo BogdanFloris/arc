@@ -59,7 +59,9 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | in review |
 | 6.4 | TUI punch list, gathered by Bogdan while using it (see below) | claude | in review |
 
-6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; mouse-wheel and page-key scrolling.
+6.4 is a running list — Bogdan adds items as daily use turns them up, and they land in small batches rather than waiting for a task boundary. Done so far (2026-08-13): one blank row between the last message and the status rule; syntax highlighting in fenced code blocks; mouse-wheel and page-key scrolling; a scrollbar in the right margin; sessions ordered by last activity with a relative "x ago".
+
+Recency needed no new architecture — `messages.ts` was already projected, so last activity is a `MAX(ts)` subquery plus one additive `SessionInfo.last_at`. The daemon still answers in its stable oldest-first order (that is the order a log replays in); the client sorts, because "what did I last use" is a client's question and the wire contract in 5.4's brief says oldest first. If a second client ever wants the same order, move the sort to `Projection::sessions` and amend that brief.
 
 Scope for 6.2 (2026-08-13, from driving the app together — six items, all `arc`-only):
 1. **Bottom-anchored transcript.** Content grows up from the input rule instead of down from the top; a short turn no longer leaves ~18 rows of dead space. Once the transcript is taller than the pane, it pins to the bottom and the existing `j k` / `ctrl-d/u` / `G gg` scrolling takes over.

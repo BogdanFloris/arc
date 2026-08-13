@@ -11,6 +11,7 @@ arc-proto.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
 futures.workspace = true
+prost-types.workspace = true
 ratatui.workspace = true
 textwrap.workspace = true
 tokio.workspace = true

@@ -151,6 +151,10 @@ pub struct SessionSummary {
     /// in it yet. A label for pickers — not a title, which stays empty until
     /// something generates one.
     pub preview: String,
+    /// When the session was last spoken in, either side, or `None` if nothing
+    /// has been said in it. What recency means for a session: `started_at` is
+    /// when it was opened, which is not when you last used it.
+    pub last_at: Option<i64>,
 }
 
 /// What a [`replay`] pass did: how many events it applied and how many it
@@ -452,14 +456,14 @@ impl Projection {
     ///
     /// [`Error::Sqlite`] if the index cannot be read.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
-        // The preview subquery rides along rather than costing a query per
-        // session: `messages_by_session` makes each one an index seek to the
-        // first matching row.
+        // The subqueries ride along rather than costing a query per session:
+        // `messages_by_session` makes each one an index seek.
         let mut stmt = self.conn.prepare(
             "SELECT s.id, coalesce(s.title, ''), s.started_at,
                     coalesce((SELECT m.content FROM messages m
                               WHERE m.session_id = s.id AND m.role = ?1
-                              ORDER BY m.seq LIMIT 1), '')
+                              ORDER BY m.seq LIMIT 1), ''),
+                    (SELECT MAX(m.ts) FROM messages m WHERE m.session_id = s.id)
              FROM sessions s ORDER BY s.started_at, s.id",
         )?;
         let rows = stmt.query_map([Role::User as i32], |row| {
@@ -468,6 +472,7 @@ impl Projection {
                 title: row.get(1)?,
                 started_at: row.get(2)?,
                 preview: row.get(3)?,
+                last_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -873,6 +878,7 @@ mod tests {
                 title: "also second".to_string(),
                 started_at: Some(200_000_000),
                 preview: String::new(),
+                last_at: None,
             }
         );
         assert_eq!(sessions[0].started_at, None);
@@ -909,6 +915,38 @@ mod tests {
         assert_eq!(
             projection.sessions().expect("sessions")[0].preview,
             "what is a walking skeleton?"
+        );
+    }
+
+    /// Recency is the last message, not the first: a session opened days ago
+    /// and spoken in a minute ago is a recent session.
+    #[test]
+    fn a_session_reports_when_it_was_last_spoken_in() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].last_at,
+            None,
+            "a session nobody has spoken in has no last message"
+        );
+
+        // `message_appended` stamps every event with the same fixed clock, so
+        // move the second one forward by hand to make the MAX meaningful.
+        projection
+            .apply(&message_appended(1, "first"))
+            .expect("apply");
+        let mut later = message_appended(2, "second");
+        later.ts = Some(Timestamp {
+            seconds: 1_700_000_600,
+            nanos: 0,
+        });
+        projection.apply(&later).expect("apply");
+
+        let listed = &projection.sessions().expect("sessions")[0];
+        assert_eq!(listed.last_at, Some(1_700_000_600_000_000));
+        assert_ne!(
+            listed.last_at, listed.started_at,
+            "when it was opened is not when it was last used"
         );
     }
 

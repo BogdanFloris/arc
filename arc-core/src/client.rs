@@ -417,6 +417,7 @@ mod tests {
     async fn list_sessions_round_trips() {
         let session = SessionInfo {
             preview: "hello arc".to_owned(),
+            last_at: None,
             id: "s-1".to_owned(),
             title: String::new(),
             started_at: Some(Timestamp {

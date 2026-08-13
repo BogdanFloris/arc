@@ -351,10 +351,24 @@ impl App {
 
     /// The session behind picker row `row`, `None` for the "new session" row.
     ///
-    /// The picker shows sessions newest first; `sessions` is oldest first.
+    /// Rows are ordered by [`Self::by_recency`].
     pub fn picker_session(&self, row: usize) -> Option<&SessionInfo> {
-        row.checked_sub(1)
-            .and_then(|i| self.sessions.iter().rev().nth(i))
+        let order = self.by_recency();
+        row.checked_sub(1).and_then(|i| order.get(i).copied())
+    }
+
+    /// Sessions as the picker shows them: last spoken in first.
+    ///
+    /// The daemon answers in a stable order — oldest first, by when each was
+    /// created — because that is the order a log replays in. What you want to
+    /// reopen is what you were last doing, which is a different question, so
+    /// the client asks it here. Sessions with nothing said in them fall back
+    /// to when they started, and ties break on id so the list never shuffles
+    /// between draws.
+    pub fn by_recency(&self) -> Vec<&SessionInfo> {
+        let mut order: Vec<&SessionInfo> = self.sessions.iter().collect();
+        order.sort_by(|a, b| activity(b).cmp(&activity(a)).then_with(|| a.id.cmp(&b.id)));
+        order
     }
 
     /// Switches the view to `session_id` (`None` = a fresh one), asking the
@@ -529,6 +543,15 @@ impl App {
     }
 }
 
+/// When a session was last touched, for ordering: its last message, or when
+/// it started if nothing has been said in it.
+fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
+    session
+        .last_at
+        .or(session.started_at)
+        .map(|ts| (ts.seconds, ts.nanos))
+}
+
 /// One past message as a transcript block.
 ///
 /// Roles this build has no rendering for — a system message, or a value from
@@ -580,6 +603,7 @@ mod tests {
             title: String::new(),
             started_at: None,
             preview: String::new(),
+            last_at: None,
         }
     }
 
@@ -835,6 +859,41 @@ mod tests {
 
     /// A modal takes the gesture: scrolling what is behind it would move the
     /// wrong thing.
+    /// What you reopen is what you were last doing, which is not what you
+    /// started most recently.
+    #[test]
+    fn the_picker_orders_sessions_by_last_activity() {
+        fn at(id: &str, started: i64, last: Option<i64>) -> SessionInfo {
+            SessionInfo {
+                id: id.to_owned(),
+                title: String::new(),
+                preview: String::new(),
+                started_at: Some(prost_types::Timestamp {
+                    seconds: started,
+                    nanos: 0,
+                }),
+                last_at: last.map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
+            }
+        }
+
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            // Opened first, but spoken in most recently.
+            at("old-but-active", 100, Some(900)),
+            at("newer-but-stale", 500, Some(600)),
+            // Never spoken in: falls back to when it started.
+            at("empty", 700, None),
+        ]));
+
+        let order: Vec<&str> = app.by_recency().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, ["old-but-active", "empty", "newer-but-stale"]);
+        assert_eq!(
+            app.picker_session(1).map(|s| s.id.as_str()),
+            Some("old-but-active"),
+            "row 1 is the session you were last in"
+        );
+    }
+
     #[test]
     fn the_wheel_moves_the_picker_when_it_is_open() {
         let mut app = App::new();

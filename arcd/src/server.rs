@@ -435,6 +435,7 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         title: summary.title.clone(),
         started_at: summary.started_at.map(timestamp),
         preview: summary.preview.clone(),
+        last_at: summary.last_at.map(timestamp),
     }
 }
 
