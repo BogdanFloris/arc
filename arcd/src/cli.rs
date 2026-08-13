@@ -35,7 +35,7 @@ pub enum Parsed {
 }
 
 /// Config file used when `--config` is absent.
-pub const DEFAULT_CONFIG: &str = "arc.toml";
+pub const DEFAULT_CONFIG: &str = "data/arc.toml";
 
 /// Printed on `--help`, and on stderr for anything unparseable.
 pub const USAGE: &str = "\
@@ -46,7 +46,7 @@ commands:
   login   sign in to the provider and write the token file
 
 options:
-  --config <path>   config file (default: arc.toml; a missing file means defaults)
+  --config <path>   config file (default: data/arc.toml; a missing file means defaults)
   -h, --help        print this message";
 
 /// Parses `args`, argv[0] included.
@@ -112,7 +112,7 @@ mod tests {
     fn no_arguments_runs_the_daemon_with_the_default_config() {
         let cli = ok(&["arcd"]);
         assert_eq!(cli.command, Command::Run);
-        assert_eq!(cli.config, PathBuf::from("arc.toml"));
+        assert_eq!(cli.config, PathBuf::from("data/arc.toml"));
     }
 
     #[test]
