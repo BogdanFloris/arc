@@ -16,6 +16,7 @@ mod daemon;
 mod dirs;
 mod identity;
 mod login;
+mod server;
 mod telemetry;
 
 use std::process::ExitCode;

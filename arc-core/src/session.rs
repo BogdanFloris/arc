@@ -35,7 +35,7 @@ use prost_types::Timestamp;
 use tokio::sync::mpsc;
 
 use crate::log::{self, Log};
-use crate::projection::{self, Projection};
+use crate::projection::{self, Projection, SessionSummary};
 use crate::provider::{self, CompletionDelta, CompletionRequest, Message, Provider, Usage};
 
 /// The conversation loop, generic over the model backend so tests drive it
@@ -260,6 +260,18 @@ impl<P: Provider> Engine<P> {
                 Err(error.into())
             }
         }
+    }
+
+    /// Every session, oldest first (see [`Projection::sessions`]).
+    ///
+    /// The engine is the façade over durable state: callers above it — the
+    /// daemon's socket layer — never reach past it to the log or the index.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Projection`] if the index cannot be read.
+    pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
+        Ok(self.projection.sessions()?)
     }
 
     /// Appends one event to the log and applies it to the index, as a pair.
@@ -556,6 +568,36 @@ mod tests {
             ],
             "history in order, current message last, nothing duplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_lists_what_send_message_created() {
+        let provider = MockProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine(&provider, &dir);
+        assert_eq!(engine.sessions().expect("sessions"), []);
+
+        let (tx, _rx) = channel();
+        let first = engine
+            .send_message(None, "a", tx)
+            .await
+            .expect("first send");
+        let (tx, _rx) = channel();
+        let second = engine
+            .send_message(None, "b", tx)
+            .await
+            .expect("second send");
+
+        let listed = engine.sessions().expect("sessions");
+        // Both were created inside the same second, so their relative order is
+        // whatever the tie-break says; membership is what this asserts.
+        let mut ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut expected = vec![first.session_id.as_str(), second.session_id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert!(listed.iter().all(|s| s.title.is_empty()));
+        assert!(listed.iter().all(|s| s.started_at.is_some()));
     }
 
     #[tokio::test]

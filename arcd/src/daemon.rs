@@ -1,9 +1,9 @@
 //! `arcd run` — startup composition and lifecycle.
 //!
-//! [`Daemon::start`] is the whole of the daemon's wiring: open the log,
-//! catch the index up to it, build the provider, and hand back a value that
-//! owns all of it. [`Daemon::serve`] is the lifecycle: announce readiness, wait
-//! for a shutdown signal, stop.
+//! [`Daemon::start`] is the whole of the daemon's wiring: open the log, catch
+//! the index up to it, build the provider, and hand back the session engine
+//! over all three. [`Daemon::serve`] is the lifecycle: bind the socket,
+//! announce readiness, serve until a shutdown signal, stop.
 //!
 //! Nothing here decides anything — every rule lives in `arc-core` (DESIGN.md
 //! §2). What this file owns is the order things happen in, and the property
@@ -20,36 +20,30 @@ use arc_core::log::Log;
 use arc_core::projection::{self, Projection};
 use arc_core::provider::antigravity::Antigravity;
 use arc_core::provider::oauth::{OauthConfig, TokenManager};
+use arc_core::session::Engine;
 use std::sync::Arc;
-use tracing::info;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::dirs::DataDirs;
 use crate::identity;
+use crate::server;
 
 /// A started daemon: everything durable is open, nothing is being served yet.
 pub struct Daemon {
     config: Config,
     dirs: DataDirs,
 
-    /// The event log. `mut` from 5.2 on — every durable change is an append.
-    log: Log,
-
-    /// The `SQLite` index, replayed up to the log's head.
-    #[allow(dead_code, reason = "task 5.2 reads sessions and messages from here")]
-    projection: Projection,
-
-    /// The provider. Constructed without a network call: auth is lazy, so the
-    /// daemon starts on a machine with no connectivity and fails, if it must,
-    /// on the first completion instead.
-    #[allow(dead_code, reason = "task 5.2 drives completions through this")]
-    provider: Antigravity,
-
-    /// Who ARC is (`data/identity.md`), loaded once at startup. `None` runs
-    /// without an identity — supported, announced, and fixed by writing the
-    /// file and restarting.
-    #[allow(dead_code, reason = "task 5.2 passes this as the system prompt")]
-    identity: Option<String>,
+    /// The session engine, holding the log, the index, the provider, and the
+    /// identity file.
+    ///
+    /// The mutex serializes completions daemon-wide: `send_message` takes
+    /// `&mut Engine`, so one turn runs at a time and everything else waits.
+    /// That is Phase 1's single-user reality (DESIGN.md §1), stated once here
+    /// rather than worked around in the server.
+    engine: Arc<Mutex<Engine<Antigravity>>>,
 }
 
 impl Daemon {
@@ -95,39 +89,59 @@ impl Daemon {
             info!("no identity file, running without one");
         }
 
+        let engine = Engine::new(
+            log,
+            projection,
+            Arc::new(provider),
+            config.model.as_str(),
+            identity,
+        );
+
         Ok(Self {
             config,
             dirs,
-            log,
-            projection,
-            provider,
-            identity,
+            engine: Arc::new(Mutex::new(engine)),
         })
     }
 
-    /// Announces readiness and runs until a shutdown signal.
+    /// Binds the socket, announces readiness, and serves until a shutdown
+    /// signal.
     ///
     /// # Errors
     ///
-    /// If the signal handler cannot be installed.
+    /// If `bind` is already taken or cannot be bound. Nothing has been served
+    /// at that point, so it comes straight back out like any startup failure.
     pub async fn serve(self) -> Result<()> {
-        // 5.4 plugs in here: bind `config.bind` and serve `wire.proto`, with
-        // 5.2's session engine behind it and 5.3's identity file in its
-        // context. Until then the daemon holds its state open and waits.
+        let listener = TcpListener::bind(self.config.bind)
+            .await
+            .with_context(|| format!("binding {}", self.config.bind))?;
+        // Port 0 in the config is a real answer, so report what was bound
+        // rather than what was asked for.
+        let bound = listener.local_addr().unwrap_or(self.config.bind);
+
         info!(
             model = self.config.model,
-            bind = %self.config.bind,
+            bind = %bound,
             data_dir = %self.dirs.root().display(),
-            next_seq = self.log.next_seq(),
             version = env!("CARGO_PKG_VERSION"),
             "arcd ready"
         );
 
-        tokio::signal::ctrl_c()
-            .await
-            .context("waiting for the shutdown signal")?;
+        server::serve(listener, self.engine, shutdown()).await;
 
-        info!("shutting down");
+        info!("stopped");
         Ok(())
+    }
+}
+
+/// Resolves when the daemon should stop.
+///
+/// A signal handler that cannot be installed counts as a stop: a daemon no one
+/// can shut down is worse than one that refuses to run, and it fails loudly at
+/// startup rather than quietly at the end.
+async fn shutdown() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => info!("shutdown signal received"),
+        Err(error) => error!(%error, "the shutdown signal handler failed; stopping"),
     }
 }

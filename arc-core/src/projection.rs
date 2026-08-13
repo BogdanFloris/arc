@@ -131,6 +131,24 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// One row of [`Projection::sessions`]: what a client needs to list a session
+/// before opening it.
+///
+/// `started_at` stays in the projection's own unit — microseconds since the
+/// Unix epoch — because that is what the column holds. Callers that speak
+/// protobuf convert at their boundary; nothing in this layer does clock
+/// formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// Session id, as `SessionCreated` set it.
+    pub id: String,
+    /// Session title. Empty until something names the session.
+    pub title: String,
+    /// When the session was created, or `None` if its event carried no
+    /// timestamp.
+    pub started_at: Option<i64>,
+}
+
 /// What a [`replay`] pass did: how many events it applied and how many it
 /// skipped as already projected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +433,34 @@ impl Projection {
             .transpose()
     }
 
+    /// Every session in the index, oldest first.
+    ///
+    /// Ordered by `started_at`, then by `id` to break ties — two sessions
+    /// created inside the same microsecond still come back in a fixed order,
+    /// so the list a client renders does not shuffle between calls. A session
+    /// whose event carried no timestamp sorts first, where `SQLite` puts NULL.
+    ///
+    /// The whole table, unpaginated: Phase 1 has one user and a session count
+    /// a person could scroll. Paging is a wire-protocol question (DESIGN.md
+    /// §7) and gets answered when the number of sessions makes it one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read.
+    pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, coalesce(title, ''), started_at FROM sessions ORDER BY started_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                started_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The conversation history of one session: `(role, content)` pairs in
     /// seq order.
     ///
@@ -518,7 +564,7 @@ mod tests {
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
-    use super::{Error, Projection, ReplayError, ReplayStats, replay};
+    use super::{Error, Projection, ReplayError, ReplayStats, SessionSummary, replay};
     use crate::log::{Log, LogReader, discover_segments};
 
     /// 2023-11-14T22:13:20.123456789Z, chosen so the nanos truncate visibly.
@@ -764,6 +810,72 @@ mod tests {
             assert_eq!(*role, Role::User as i32);
             assert_eq!(content, &format!("hello_{}", i + 1));
         }
+    }
+
+    /// A `SessionCreated` with its own id, title, and creation second.
+    fn session_created_as(seq: u64, id: &str, title: &str, at: Option<i64>) -> Event {
+        Event {
+            seq,
+            ts: at.map(|seconds| Timestamp { seconds, nanos: 0 }),
+            source: Source::User as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionCreated(SessionCreated {
+                    session_id: id.to_string(),
+                    title: title.to_string(),
+                    provider: "gemini".to_string(),
+                    model: "gemini-3-pro".to_string(),
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn sessions_are_ordered_by_start_then_id() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        assert_eq!(projection.sessions().expect("sessions"), []);
+
+        // Applied in neither id order nor time order, and two share a start.
+        for (seq, id, title, at) in [
+            (0, "s-c", "third", Some(300)),
+            (1, "s-b", "second", Some(200)),
+            (2, "s-a", "also second", Some(200)),
+            (3, "s-none", "no clock", None),
+        ] {
+            projection
+                .apply(&session_created_as(seq, id, title, at))
+                .expect("apply");
+        }
+
+        let sessions = projection.sessions().expect("sessions");
+
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["s-none", "s-a", "s-b", "s-c"],
+            "no timestamp first, then by start, ties broken by id"
+        );
+        assert_eq!(
+            sessions[1],
+            SessionSummary {
+                id: "s-a".to_string(),
+                title: "also second".to_string(),
+                started_at: Some(200_000_000),
+            }
+        );
+        assert_eq!(sessions[0].started_at, None);
+    }
+
+    #[test]
+    fn a_session_with_no_title_lists_with_an_empty_one() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(1)))
+            .expect("apply");
+
+        let sessions = projection.sessions().expect("sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "");
     }
 
     #[test]
