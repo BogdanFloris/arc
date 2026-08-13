@@ -87,3 +87,5 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 |---|------|----------|--------|
 | 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | — | todo |
 | 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | — | todo |
+
+Next session picks up here (banked 2026-08-13): Bogdan reviews 6.1 and 7.1–7.3 (all "in review", claude-implemented); then assign 8.x — the earlier suggestion was an implementer agent with a checkable output (a trace that opens in the Perfetto UI). Also pending, no task yet: how arcd runs long-term (currently a hand-started tmux session; a systemd user unit is the natural shape now that arcd supervises its own sidecar). Machine notes that bit us today live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
