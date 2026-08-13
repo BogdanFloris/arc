@@ -35,12 +35,24 @@ message TracePacket {
   // timestamps without a clock snapshot to correlate them.
   optional uint32 timestamp_clock_id = 58;
 
+  ClockSnapshot clock_snapshot = 6;
   TrackEvent track_event = 11;
   TrackDescriptor track_descriptor = 60;
 
   // Packets from one writer, in order. Perfetto requires this on every packet
   // carrying a `TrackEvent`.
   optional uint32 trusted_packet_sequence_id = 10;
+}
+
+// Declares which clock a trace's timestamps are in. Without one, Perfetto
+// assumes BOOTTIME and drops every packet it cannot convert.
+message ClockSnapshot {
+  message Clock {
+    optional uint32 clock_id = 1;
+    optional uint64 timestamp = 2;
+  }
+  repeated Clock clocks = 1;
+  BuiltinClock primary_trace_clock = 2;
 }
 
 // Perfetto's `BuiltinClock`. Only the values ARC uses are copied down.
