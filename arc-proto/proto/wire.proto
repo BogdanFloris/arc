@@ -39,6 +39,8 @@ message StreamEnd {
   string session_id = 1;
   uint32 input_tokens = 2;
   uint32 output_tokens = 3;
+  // Reply was cut before the model finished; the deltas are what the user saw.
+  bool partial = 4;
 }
 
 message Error {

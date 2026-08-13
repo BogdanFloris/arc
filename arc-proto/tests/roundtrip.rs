@@ -97,6 +97,7 @@ fn server_frame_arms_round_trip() {
             session_id: "s-01".to_string(),
             input_tokens: 128,
             output_tokens: 64,
+            partial: true,
         }),
         server_frame::Msg::Error(Error {
             code: "provider_unavailable".to_string(),
