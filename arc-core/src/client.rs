@@ -10,7 +10,8 @@
 //! over the wire, safe to drop and reconnect.
 
 use arc_proto::v1::{
-    ClientFrame, ListSessions, SendMessage, ServerFrame, SessionInfo, client_frame, server_frame,
+    ClientFrame, FetchHistory, HistoryMessage, ListSessions, SendMessage, ServerFrame, SessionInfo,
+    client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -119,6 +120,33 @@ impl Client {
                 msg: error.msg,
             }),
             other => Err(unexpected("SessionList", &other)),
+        }
+    }
+
+    /// Asks the daemon for one session's messages, oldest first.
+    ///
+    /// The whole history, unpaginated — see `FetchHistory` in `wire.proto`.
+    /// An unknown session id is not an error: it answers with no messages,
+    /// the same as a session nobody has spoken in.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Server`] if the daemon refused the request; any other variant
+    /// means the connection is unusable.
+    #[tracing::instrument(name = "client.fetch_history", skip_all, fields(session_id))]
+    pub async fn fetch_history(&mut self, session_id: &str) -> Result<Vec<HistoryMessage>, Error> {
+        let id = self
+            .send(client_frame::Msg::FetchHistory(FetchHistory {
+                session_id: session_id.to_owned(),
+            }))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::SessionHistory(history) => Ok(history.messages),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("SessionHistory", &other)),
         }
     }
 
@@ -251,7 +279,7 @@ impl Turn<'_> {
                     msg: error.msg,
                 }
             }
-            other @ server_frame::Msg::SessionList(_) => {
+            other @ (server_frame::Msg::SessionList(_) | server_frame::Msg::SessionHistory(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
         };
@@ -267,6 +295,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::Delta(_) => "Delta",
         server_frame::Msg::StreamEnd(_) => "StreamEnd",
         server_frame::Msg::Error(_) => "Error",
+        server_frame::Msg::SessionHistory(_) => "SessionHistory",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))
 }
@@ -387,6 +416,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_round_trips() {
         let session = SessionInfo {
+            preview: "hello arc".to_owned(),
             id: "s-1".to_owned(),
             title: String::new(),
             started_at: Some(Timestamp {

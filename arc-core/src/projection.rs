@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use arc_proto::v1::{Event, MessageAppended, SessionCreated, event, session_event};
+use arc_proto::v1::{Event, MessageAppended, Role, SessionCreated, event, session_event};
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
@@ -147,6 +147,10 @@ pub struct SessionSummary {
     /// When the session was created, or `None` if its event carried no
     /// timestamp.
     pub started_at: Option<i64>,
+    /// The session's first user message, verbatim. Empty if nobody has spoken
+    /// in it yet. A label for pickers — not a title, which stays empty until
+    /// something generates one.
+    pub preview: String,
 }
 
 /// What a [`replay`] pass did: how many events it applied and how many it
@@ -448,14 +452,22 @@ impl Projection {
     ///
     /// [`Error::Sqlite`] if the index cannot be read.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
+        // The preview subquery rides along rather than costing a query per
+        // session: `messages_by_session` makes each one an index seek to the
+        // first matching row.
         let mut stmt = self.conn.prepare(
-            "SELECT id, coalesce(title, ''), started_at FROM sessions ORDER BY started_at, id",
+            "SELECT s.id, coalesce(s.title, ''), s.started_at,
+                    coalesce((SELECT m.content FROM messages m
+                              WHERE m.session_id = s.id AND m.role = ?1
+                              ORDER BY m.seq LIMIT 1), '')
+             FROM sessions s ORDER BY s.started_at, s.id",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([Role::User as i32], |row| {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 started_at: row.get(2)?,
+                preview: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -860,9 +872,44 @@ mod tests {
                 id: "s-a".to_string(),
                 title: "also second".to_string(),
                 started_at: Some(200_000_000),
+                preview: String::new(),
             }
         );
         assert_eq!(sessions[0].started_at, None);
+    }
+
+    /// The picker labels sessions by their opening line, so the preview must
+    /// be the *first user* message — not the first message (which can be the
+    /// model, healing a torn turn) and not the last.
+    #[test]
+    fn a_session_previews_its_first_user_message() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].preview,
+            "",
+            "a session nobody has spoken in has no preview"
+        );
+
+        let mut reply = message_appended(1, "a stray model line");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(appended)),
+        })) = &mut reply.payload
+        {
+            appended.role = Role::Assistant as i32;
+        }
+        projection.apply(&reply).expect("apply");
+        projection
+            .apply(&message_appended(2, "what is a walking skeleton?"))
+            .expect("apply");
+        projection
+            .apply(&message_appended(3, "and a second question"))
+            .expect("apply");
+
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].preview,
+            "what is a walking skeleton?"
+        );
     }
 
     #[test]

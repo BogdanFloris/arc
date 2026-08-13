@@ -274,6 +274,24 @@ impl<P: Provider> Engine<P> {
         Ok(self.projection.sessions()?)
     }
 
+    /// One session's messages as a client renders them, oldest first, as
+    /// `(role, content)` pairs.
+    ///
+    /// Unlike the private `history`, this keeps every role verbatim: a client
+    /// showing a transcript should not silently drop a message the provider
+    /// vocabulary happens not to cover.
+    ///
+    /// An unknown id reads as a session with nothing in it — the projection
+    /// has no row to distinguish "never existed" from "never spoken in", and
+    /// the difference does not change what a client renders.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Projection`] if the index cannot be read.
+    pub fn transcript(&self, session_id: &str) -> Result<Vec<(i32, String)>, Error> {
+        Ok(self.projection.messages(session_id)?)
+    }
+
     /// Appends one event to the log and applies it to the index, as a pair.
     ///
     /// The log stamps the seq; the same event, seq included, then goes into
