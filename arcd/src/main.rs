@@ -15,6 +15,7 @@ mod config;
 mod daemon;
 mod dirs;
 mod identity;
+mod llama;
 mod login;
 mod server;
 mod telemetry;
@@ -25,7 +26,6 @@ use anyhow::Result;
 
 use crate::cli::{Cli, Command, Parsed};
 use crate::config::Config;
-use crate::daemon::Daemon;
 use crate::dirs::DataDirs;
 
 /// Usage error.
@@ -66,7 +66,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
     let dirs = DataDirs::new(&config.data_dir);
     match cli.command {
-        Command::Run => Daemon::start(config, dirs)?.serve().await,
+        Command::Run => daemon::run(config, dirs).await,
         Command::Login => login::run(&dirs).await,
     }
 }

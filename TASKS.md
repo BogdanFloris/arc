@@ -75,9 +75,11 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 7.1 | OpenAI-compat provider in `arc-core`: `/v1/chat/completions` request building + SSE stream → `CompletionDelta`, fixture-based parser tests (reuse the 4.4 `FrameDecoder`) | claude | todo |
-| 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | todo |
-| 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | todo |
+| 7.1 | OpenAI-compat provider in `arc-core`: `/v1/chat/completions` request building + SSE stream → `CompletionDelta`, fixture-based parser tests (reuse the 4.4 `FrameDecoder`) | claude | in review |
+| 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | in review |
+| 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | in review |
+
+7.x loose ends: the `openai_stream.sse` fixture is constructed from the documented wire format, not captured — recapture from a live `llama-server` once one runs. Sidecar restart policy is deliberately absent (unexpected exit is logged loudly, turns fail until the daemon restarts); decide it when it hurts. The 6.1 live-streaming check never happened against Antigravity (rate limits) — do it against the local provider instead.
 
 ## 8. Observability
 

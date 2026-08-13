@@ -18,21 +18,62 @@
 use anyhow::{Context as _, Result};
 use arc_core::log::Log;
 use arc_core::projection::{self, Projection};
+use arc_core::provider::Provider;
 use arc_core::provider::antigravity::Antigravity;
 use arc_core::provider::oauth::{OauthConfig, TokenManager};
+use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use crate::config::Config;
+use crate::config::{Config, ProviderChoice};
 use crate::dirs::DataDirs;
 use crate::identity;
+use crate::llama::Sidecar;
 use crate::server;
 
+/// Builds the configured provider, then runs the daemon over it.
+///
+/// This match is the one place `provider = "..."` becomes a type. The daemon
+/// stays generic over [`Provider`] below it; the trait's dyn-compatibility
+/// question (see `arc-core::provider`) stays open, because a per-daemon
+/// choice needs only this dispatch — per-completion choice is Phase 3's
+/// problem.
+///
+/// For the local provider, the sidecar starts before the log is touched —
+/// the daemon's slowest dependency goes first — and is killed after the
+/// server stops, whatever way it stops.
+///
+/// # Errors
+///
+/// Whatever [`Sidecar::start`], [`Daemon::start`], or [`Daemon::serve`]
+/// refused on.
+pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
+    match config.provider {
+        ProviderChoice::Local => {
+            let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
+            let provider = OpenAiCompat::new(sidecar.endpoint());
+            let served = match Daemon::start(config, dirs, provider) {
+                Ok(daemon) => daemon.serve().await,
+                Err(error) => Err(error),
+            };
+            // Both arms end here: a daemon that failed to start must not
+            // leave a model server holding the GPU.
+            sidecar.stop().await;
+            served
+        }
+        ProviderChoice::Antigravity => {
+            let tokens = TokenManager::new(OauthConfig::default(), dirs.tokens());
+            let provider = Antigravity::new(Arc::new(tokens));
+            Daemon::start(config, dirs, provider)?.serve().await
+        }
+    }
+}
+
 /// A started daemon: everything durable is open, nothing is being served yet.
-pub struct Daemon {
+pub struct Daemon<P: Provider> {
     config: Config,
     dirs: DataDirs,
 
@@ -43,10 +84,10 @@ pub struct Daemon {
     /// `&mut Engine`, so one turn runs at a time and everything else waits.
     /// That is Phase 1's single-user reality (DESIGN.md §1), stated once here
     /// rather than worked around in the server.
-    engine: Arc<Mutex<Engine<Antigravity>>>,
+    engine: Arc<Mutex<Engine<P>>>,
 }
 
-impl Daemon {
+impl<P: Provider + 'static> Daemon<P> {
     /// Opens everything the daemon needs, in dependency order.
     ///
     /// # Errors
@@ -55,7 +96,7 @@ impl Daemon {
     /// recovered, or the index cannot be opened or replayed. All of these mean
     /// durable state is not in a known condition, which is a refusal to start.
     #[tracing::instrument(name = "daemon.start", skip_all, fields(data_dir = %dirs.root().display()))]
-    pub fn start(config: Config, dirs: DataDirs) -> Result<Self> {
+    pub fn start(config: Config, dirs: DataDirs, provider: P) -> Result<Self> {
         dirs.create()
             .with_context(|| format!("preparing {}", dirs.root().display()))?;
 
@@ -80,8 +121,6 @@ impl Daemon {
             "index caught up with the log"
         );
 
-        let tokens = TokenManager::new(OauthConfig::default(), dirs.tokens());
-        let provider = Antigravity::new(Arc::new(tokens));
         let identity = identity::load(dirs.identity()).context("loading the identity file")?;
         if let Some(text) = &identity {
             info!(chars = text.len(), "identity file loaded");
@@ -93,7 +132,7 @@ impl Daemon {
             log,
             projection,
             Arc::new(provider),
-            config.model.as_str(),
+            config.model(),
             identity,
         );
 
@@ -120,7 +159,8 @@ impl Daemon {
         let bound = listener.local_addr().unwrap_or(self.config.bind);
 
         info!(
-            model = self.config.model,
+            model = self.config.model(),
+            provider = ?self.config.provider,
             bind = %bound,
             data_dir = %self.dirs.root().display(),
             version = env!("CARGO_PKG_VERSION"),

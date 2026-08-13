@@ -110,6 +110,7 @@ dependencies = [
  "futures",
  "prost",
  "prost-types",
+ "reqwest",
  "serde",
  "tempfile",
  "tokio",
