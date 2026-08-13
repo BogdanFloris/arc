@@ -25,6 +25,7 @@ use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
@@ -174,14 +175,29 @@ impl<P: Provider + 'static> Daemon<P> {
     }
 }
 
-/// Resolves when the daemon should stop.
+/// Resolves when the daemon should stop: Ctrl-C, or `SIGTERM`.
+///
+/// `SIGTERM` is what a service manager sends, and it is not optional here —
+/// dying on the default handler skips the shutdown path, and the llama-server
+/// sidecar is orphaned holding the model's several GiB of VRAM.
 ///
 /// A signal handler that cannot be installed counts as a stop: a daemon no one
 /// can shut down is worse than one that refuses to run, and it fails loudly at
 /// startup rather than quietly at the end.
 async fn shutdown() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => info!("shutdown signal received"),
-        Err(error) => error!(%error, "the shutdown signal handler failed; stopping"),
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            error!(%error, "the SIGTERM handler could not be installed; stopping");
+            return;
+        }
+    };
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => match result {
+            Ok(()) => info!("interrupted"),
+            Err(error) => error!(%error, "the shutdown signal handler failed; stopping"),
+        },
+        _ = terminate.recv() => info!("terminated"),
     }
 }
