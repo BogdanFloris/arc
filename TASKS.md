@@ -6,6 +6,8 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 
 Loose ends (fold into the next touch of the relevant file, no own task): `log::Error::Io`'s field doc says "segment" but the variant also carries directory paths (from `sync_parent_dir`, `discover_segments`).
 
+Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 3): `Delta`/`StreamEnd.session_id` are redundant given `request_id` correlation; no explicit "session was created" signal; `request_id = 0` overloaded (unsolicited vs undecodable-frame errors); `Error` doesn't say whether the connection survives (clients know `bad_frame` is terminal out-of-band); text WS messages are refused as `bad_frame` (5.4's call, unspecified in the schema comments).
+
 ## 1. Schemas (`arc-proto`)
 
 | # | Task | Assignee | Status |
@@ -45,7 +47,7 @@ Loose ends (fold into the next touch of the relevant file, no own task): `log::E
 | 5.1 | Skeleton: config, `data/` layout, tracing subscriber init, `arcd login` subcommand | claude | done |
 | 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | done |
 | 5.3 | Identity file: load `data/identity.md` into system context (read-only) | bogdan | done |
-| 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | todo |
+| 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | done |
 
 ## 6. TUI (`arc`)
 
