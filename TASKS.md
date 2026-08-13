@@ -1,5 +1,7 @@
 # TASKS — Phase 1 walking skeleton
 
+**Phase 1 closed 2026-08-13.** All 26 tasks built and reviewed; the exit criterion was called met on real use — simple questions go to ARC daily instead of to a chat app. Not a full replacement (no tools, and an 8B local model does no coding), and neither gap belonged to this phase. This file stays as the record; Phase 2 gets its own list.
+
 Working agreement: Bogdan assigns each task (`bogdan` or `claude`). The implementer's work is reviewed by the other. Statuses: `todo` → `in progress` → `in review` → `done`.
 
 Tasks are ordered by dependency; anything at the same number can go in parallel.
