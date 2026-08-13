@@ -43,6 +43,7 @@ async fn handle(
 ) -> Option<Client> {
     let result = match command {
         Command::List => list(&mut client, events).await,
+        Command::History { session_id } => history(&mut client, &session_id, events).await,
         Command::Send {
             session_id,
             content,
@@ -63,6 +64,31 @@ async fn list(client: &mut Client, events: &mpsc::UnboundedSender<NetEvent>) -> 
     match client.list_sessions().await {
         Ok(sessions) => {
             let _ = events.send(NetEvent::Sessions(sessions));
+            Ok(())
+        }
+        // The daemon said no to this request; the connection is fine.
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn history(
+    client: &mut Client,
+    session_id: &str,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.fetch_history(session_id).await {
+        Ok(messages) => {
+            let _ = events.send(NetEvent::History {
+                session_id: session_id.to_owned(),
+                messages: messages
+                    .into_iter()
+                    .map(|message| (message.role, message.content))
+                    .collect(),
+            });
             Ok(())
         }
         // The daemon said no to this request; the connection is fine.

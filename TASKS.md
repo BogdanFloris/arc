@@ -6,7 +6,7 @@ Tasks are ordered by dependency; anything at the same number can go in parallel.
 
 Loose ends (fold into the next touch of the relevant file, no own task): `log::Error::Io`'s field doc says "segment" but the variant also carries directory paths (from `sync_parent_dir`, `discover_segments`).
 
-Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 3): `Delta`/`StreamEnd.session_id` are redundant given `request_id` correlation; no explicit "session was created" signal; `request_id = 0` overloaded (unsolicited vs undecodable-frame errors); `Error` doesn't say whether the connection survives (clients know `bad_frame` is terminal out-of-band); text WS messages are refused as `bad_frame` (5.4's call, unspecified in the schema comments). Added by 6.1: no session-history fetch — a client opening an old session renders an empty transcript (new messages only); accepted for Phase 1. Added after the Antigravity 429s: the wire's `provider` error code is too coarse to tell a client "rate limited, retry in Ns" apart from a hard provider failure, and no layer owns a retry policy.
+Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 3): `Delta`/`StreamEnd.session_id` are redundant given `request_id` correlation; no explicit "session was created" signal; `request_id = 0` overloaded (unsolicited vs undecodable-frame errors); `Error` doesn't say whether the connection survives (clients know `bad_frame` is terminal out-of-band); text WS messages are refused as `bad_frame` (5.4's call, unspecified in the schema comments). ~~Added by 6.1: no session-history fetch — a client opening an old session renders an empty transcript (new messages only); accepted for Phase 1.~~ (retired: 6.3 adds the frame — Phase 1's exit criterion needs it.) Added after the Antigravity 429s: the wire's `provider` error code is too coarse to tell a client "rate limited, retry in Ns" apart from a hard provider failure, and no layer owns a retry policy.
 
 ## 1. Schemas (`arc-proto`)
 
@@ -53,7 +53,25 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 6.1 | Connect + session picker + send message + streaming render (absorbs old 6.2: "message pane, input line, session picker, nothing else") | claude | in review |
+| 6.1 | Connect + session picker + send message + streaming render (absorbs old 6.2: "message pane, input line, session picker, nothing else") | claude | done |
+
+| 6.2 | TUI polish: bottom-anchored transcript, persistent wordmark, wrap indent, picker labels, markdown rendering, `--help` | claude | in review |
+| 6.3 | Session history over the wire: fetch on session open so the picker lands in a full transcript | claude | in review |
+
+Scope for 6.2 (2026-08-13, from driving the app together — six items, all `arc`-only):
+1. **Bottom-anchored transcript.** Content grows up from the input rule instead of down from the top; a short turn no longer leaves ~18 rows of dead space. Once the transcript is taller than the pane, it pins to the bottom and the existing `j k` / `ctrl-d/u` / `G gg` scrolling takes over.
+2. **Persistent wordmark.** The ASCII `arc` wordmark stays at the top of the pane always, not just on the empty state (reverses the 6.1 "empty state only" call — Bogdan likes it there). The transcript scrolls under it; the wordmark does not scroll away.
+3. **Wrap indent.** Continuation lines of a wrapped message indent past the speaker-label column, so a long paragraph is never mistaken for a new turn.
+4. **Picker labels.** Sessions list as their first user message (elided to fit) instead of `2026-08-13 18:22  398f1cde`. `title` stays empty in Phase 1 — this is a read of the projection at the client, not title generation, which is Phase 2.
+5. **Markdown rendering.** Bold, italic, inline code, fenced code blocks, bullet/numbered lists, ATX headings, blockquotes, horizontal rules. Styled through `theme.rs` semantic roles only — terminal palette indices, never RGB, per the 6.1 decision — so it reads as gruvbox in Bogdan's terminal and stays correct in any other. Headings get weight/color, not box-drawing.
+6. **`arc --help`.** Prints the usage string and exits 0. Today it returns an `anyhow::Error`, so the first thing anyone types produces a 30-frame backtrace.
+
+Scope for 6.3 (2026-08-13):
+- Additive `wire.proto` change: a client request for a session's messages and a server frame carrying them. New oneof numbers only — nothing renumbered or repurposed (invariant 3). Lands as its own schema commit, separate from the code that uses it.
+- `arcd` answers it from the SQLite projection's `messages` table. No new subsystem, no log reads on the request path.
+- `arc` fetches on session open and renders the result before the first new delta. Decide and write down what happens when history is long (all of it vs. a tail) — the wire has no paging and Phase 1 shouldn't add one.
+
+6.2/6.3 as built (2026-08-13): picker labels needed the daemon's help, so `SessionInfo` gained a `preview` field (the first user message, from a subquery in `Projection::sessions`) rather than overloading `title`, which stays empty for Phase 2's real titles. Markdown is hand-rolled in `arc/src/markdown.rs`, not a parser crate: it has to render half-typed input on every delta, and unclosed markup has to stay literal instead of reflowing the screen when the closing `**` finally arrives. Underscores are not emphasis — `snake_case` beats `_this_` in this codebase's conversations. Loose end: the projection has no `partial` column, so a reopened session cannot mark a cut reply; `HistoryMessage` reserves field 3 for it.
 
 Decisions for 6.1 (2026-08-13):
 - ratatui + crossterm. The wire client (connect, frame correlation, turn events) lives in `arc-core` so it is testable without a terminal and reusable by `arc-voice`; the `arc` binary is rendering and key handling only.
@@ -75,9 +93,9 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 7.1 | OpenAI-compat provider in `arc-core`: `/v1/chat/completions` request building + SSE stream → `CompletionDelta`, fixture-based parser tests (reuse the 4.4 `FrameDecoder`) | claude | in review |
-| 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | in review |
-| 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | in review |
+| 7.1 | OpenAI-compat provider in `arc-core`: `/v1/chat/completions` request building + SSE stream → `CompletionDelta`, fixture-based parser tests (reuse the 4.4 `FrameDecoder`) | claude | done |
+| 7.2 | Sidecar supervision in `arcd`: spawn `llama-server`, wait for ready, clean shutdown with the daemon; config for binary path, model path, port | claude | done |
+| 7.3 | Provider selection in config: `provider = "local" (default) \| "antigravity"`, endpoint/model per provider; daemon wires the chosen one | claude | done |
 
 7.x loose ends: sidecar restart policy is deliberately absent (unexpected exit is logged loudly, turns fail until the daemon restarts); decide it when it hurts. ~~Fixture recapture~~ and ~~the live streaming check~~ both done 2026-08-13 against the Vulkan `llama-server` on the RTX 5070 (131 tok/s; nixpkgs' default `llama-cpp` is CPU-only — the dotfiles now build `llama-cpp.override { vulkanSupport = true; }`, and the sidecar needs `--device Vulkan1` to skip the iGPU).
 
@@ -88,4 +106,4 @@ Decided 2026-08-13 after Antigravity's hidden rate limits made it unreliable as 
 | 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | — | todo |
 | 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | — | todo |
 
-Next session picks up here (banked 2026-08-13): Bogdan reviews 6.1 and 7.1–7.3 (all "in review", claude-implemented); then assign 8.x — the earlier suggestion was an implementer agent with a checkable output (a trace that opens in the Perfetto UI). Also pending, no task yet: how arcd runs long-term (currently a hand-started tmux session; a systemd user unit is the natural shape now that arcd supervises its own sidecar). Machine notes that bit us today live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
+Next session picks up here (banked 2026-08-13): 6.1 and 7.1–7.3 reviewed and done. In flight: 6.2 and 6.3 (claude). Then assign 8.x — the earlier suggestion was an implementer agent with a checkable output (a trace that opens in the Perfetto UI). Also pending, no task yet: how arcd runs long-term (currently a hand-started tmux session; a systemd user unit is the natural shape now that arcd supervises its own sidecar). Machine notes that bit us today live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.

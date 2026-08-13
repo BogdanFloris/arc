@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 
-use arc_proto::v1::SessionInfo;
+use arc_proto::v1::{Role, SessionInfo};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What the connection task is asked to do.
@@ -20,6 +20,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Command {
     /// Ask the daemon for its sessions.
     List,
+    /// Ask the daemon for one session's past messages.
+    History { session_id: String },
     /// Send one user message; `None` starts a new session.
     Send {
         session_id: Option<String>,
@@ -32,6 +34,11 @@ pub enum Command {
 pub enum NetEvent {
     /// The daemon answered `ListSessions`.
     Sessions(Vec<SessionInfo>),
+    /// The daemon answered `FetchHistory` for `session_id`.
+    History {
+        session_id: String,
+        messages: Vec<(i32, String)>,
+    },
     /// The daemon accepted the message and named the session.
     Accepted { session_id: String },
     /// A piece of the model's reply.
@@ -129,8 +136,7 @@ impl App {
             return self.on_control(key.code);
         }
         if self.picker.is_some() {
-            self.on_picker_key(key.code);
-            return None;
+            return self.on_picker_key(key.code);
         }
         match self.mode {
             Mode::Insert => self.on_insert(key.code),
@@ -150,7 +156,9 @@ impl App {
             KeyCode::Char('u') => self.scroll_back = self.scroll_back.saturating_add(10),
             KeyCode::Char('d') => self.scroll_back = self.scroll_back.saturating_sub(10),
             KeyCode::Char('p') => self.open_picker(),
-            KeyCode::Char('n') if self.status != Status::Streaming => self.start_session(None),
+            KeyCode::Char('n') if self.status != Status::Streaming => {
+                return self.start_session(None);
+            }
             _ => {}
         }
         None
@@ -271,7 +279,7 @@ impl App {
     }
 
     /// Keys while the picker is open.
-    fn on_picker_key(&mut self, code: KeyCode) {
+    fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
         let selected = self.picker.expect("picker is open");
         let last = self.sessions.len(); // rows: 0 = new, 1..=len = sessions
         match code {
@@ -285,10 +293,11 @@ impl App {
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
                 self.picker = None;
-                self.start_session(chosen);
+                return self.start_session(chosen);
             }
             _ => {}
         }
+        None
     }
 
     /// Opens the picker — not mid-stream: the in-flight turn would keep
@@ -307,19 +316,18 @@ impl App {
             .and_then(|i| self.sessions.iter().rev().nth(i))
     }
 
-    /// Switches the view to `session_id` (`None` = a fresh one).
-    fn start_session(&mut self, session_id: Option<String>) {
-        let existing = session_id.is_some();
-        self.session_id = session_id;
+    /// Switches the view to `session_id` (`None` = a fresh one), asking the
+    /// daemon for its history if it has any.
+    fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
+        self.session_id.clone_from(&session_id);
         self.transcript.clear();
         self.scroll_back = 0;
         self.last_error = None;
-        if existing {
-            // The wire has no history fetch in Phase 1; say so instead of
-            // presenting an old session as empty.
-            self.transcript
-                .push(Block::Note("earlier history not shown".to_owned()));
-        }
+        let session_id = session_id?;
+        // Say the transcript is on its way rather than showing an old session
+        // as empty; the answer replaces this note wholesale.
+        self.transcript.push(Block::Note("loading".to_owned()));
+        Some(Command::History { session_id })
     }
 
     /// Enter on the input line, either mode.
@@ -354,6 +362,18 @@ impl App {
         match event {
             NetEvent::Sessions(sessions) => {
                 self.sessions = sessions;
+                None
+            }
+            NetEvent::History {
+                session_id,
+                messages,
+            } => {
+                // Switching sessions twice in a row leaves an answer for the
+                // one we left in flight; it must not land in this transcript.
+                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                    self.transcript = messages.into_iter().filter_map(history_block).collect();
+                    self.scroll_back = 0;
+                }
                 None
             }
             NetEvent::Accepted { session_id } => {
@@ -468,6 +488,25 @@ impl App {
     }
 }
 
+/// One past message as a transcript block.
+///
+/// Roles this build has no rendering for — a system message, or a value from
+/// a newer schema — are dropped rather than guessed at: the daemon never puts
+/// them in a session's history today, and inventing a speaker label for one
+/// would be worse than its absence.
+fn history_block((role, content): (i32, String)) -> Option<Block> {
+    match Role::try_from(role) {
+        Ok(Role::User) => Some(Block::You(content)),
+        Ok(Role::Assistant) => Some(Block::Arc {
+            text: content,
+            // The projection carries no `partial` column, so a cut reply
+            // reopens without its `-- cut --` marker. See `wire.proto`.
+            partial: false,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +538,7 @@ mod tests {
             id: id.to_owned(),
             title: String::new(),
             started_at: None,
+            preview: String::new(),
         }
     }
 
@@ -754,14 +794,70 @@ mod tests {
         assert_eq!(app.picker_session(2).map(|s| s.id.as_str()), Some("old"));
 
         app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Enter));
+        let fetch = app.on_key(key(KeyCode::Enter));
 
         assert_eq!(app.picker, None);
         assert_eq!(app.session_id.as_deref(), Some("new"));
         assert_eq!(
+            fetch,
+            Some(Command::History {
+                session_id: "new".to_owned()
+            }),
+            "opening a session asks for its transcript"
+        );
+        assert_eq!(
             app.transcript,
-            [Block::Note("earlier history not shown".to_owned())],
-            "an old session is honest about its missing history"
+            [Block::Note("loading".to_owned())],
+            "until the answer lands, the wait is visible"
+        );
+    }
+
+    #[test]
+    fn history_replaces_the_loading_note_with_the_transcript() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session("old")]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Enter));
+
+        app.on_net(NetEvent::History {
+            session_id: "old".to_owned(),
+            messages: vec![
+                (Role::User as i32, "what is a walking skeleton?".to_owned()),
+                (Role::Assistant as i32, "a thin end-to-end slice".to_owned()),
+                (Role::System as i32, "the identity file".to_owned()),
+            ],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("what is a walking skeleton?".to_owned()),
+                Block::Arc {
+                    text: "a thin end-to-end slice".to_owned(),
+                    partial: false
+                }
+            ],
+            "user and model render; a system message has no speaker to be"
+        );
+    }
+
+    /// Switching twice leaves the first answer in flight behind the second.
+    #[test]
+    fn history_for_a_session_already_left_is_dropped() {
+        let mut app = App::new();
+        app.session_id = Some("second".to_owned());
+        app.transcript = vec![Block::Note("loading".to_owned())];
+
+        app.on_net(NetEvent::History {
+            session_id: "first".to_owned(),
+            messages: vec![(Role::User as i32, "stale".to_owned())],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [Block::Note("loading".to_owned())],
+            "the transcript we are actually waiting on is untouched"
         );
     }
 

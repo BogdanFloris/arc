@@ -25,3 +25,27 @@ pub const PLAIN: Style = Style::new();
 pub const CUT: Style = Style::new()
     .fg(Color::DarkGray)
     .add_modifier(Modifier::ITALIC);
+
+/// A markdown heading. The accent again, with weight — headings are structure,
+/// and structure in this UI is orange.
+pub const HEADING: Style = Style::new()
+    .fg(Color::Indexed(208))
+    .add_modifier(Modifier::BOLD);
+
+/// Code, inline and fenced. Cyan is the ANSI slot gruvbox paints aqua, which
+/// is what its editor themes already use for literals.
+pub const CODE: Style = Style::new().fg(Color::Cyan);
+
+/// Blockquoted text and its gutter.
+pub const QUOTE: Style = Style::new()
+    .fg(Color::DarkGray)
+    .add_modifier(Modifier::ITALIC);
+
+/// `**bold**` — weight only, so the terminal's foreground still decides color.
+pub const STRONG: Style = Style::new().add_modifier(Modifier::BOLD);
+
+/// `*italic*`.
+pub const EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
+
+/// List bullets and ordinals, so the text outranks its marker.
+pub const MARKER: Style = Style::new().fg(Color::DarkGray);

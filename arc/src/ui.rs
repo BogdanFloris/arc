@@ -8,13 +8,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{App, Block, Mode, Status};
-use crate::theme;
+use crate::{markdown, theme};
 
 /// Left and right breathing room, in cells.
 const MARGIN: u16 = 2;
 
-/// The wordmark, shown on an empty transcript and nowhere else.
-const WORDMARK: [&str; 4] = [
+/// How far a wrapped line sits in from the first line of its paragraph.
+/// Matches the markdown renderer's own continuation indent.
+const CONTINUATION: &str = "  ";
+
+/// The wordmark: always at the top of the pane, transcript or no transcript.
+const WORDMARK: [&str; WORDMARK_ROWS as usize] = [
     r"  __ _ _ __ ___ ",
     r" / _` | '__/ __|",
     r"| (_| | | | (__ ",
@@ -22,6 +26,16 @@ const WORDMARK: [&str; 4] = [
 ];
 
 const TAGLINE: &str = "autonomous robotic core";
+
+/// Rows the masthead takes: the wordmark plus one blank under it.
+const MASTHEAD: u16 = WORDMARK_ROWS + 1;
+
+/// [`WORDMARK`]'s row count, as a `u16` for layout without a cast.
+const WORDMARK_ROWS: u16 = 4;
+
+/// Below this many rows the masthead is dropped — on a short pane the
+/// transcript needs the space more than the branding does.
+const MASTHEAD_FLOOR: u16 = 12;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [transcript, rule, input] = Layout::vertical([
@@ -31,7 +45,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    draw_transcript(frame, inset(transcript), app);
+    let body = if transcript.height >= MASTHEAD_FLOOR {
+        let [masthead, rest] =
+            Layout::vertical([Constraint::Length(MASTHEAD), Constraint::Fill(1)]).areas(transcript);
+        draw_masthead(frame, inset(masthead), app);
+        rest
+    } else {
+        transcript
+    };
+
+    draw_transcript(frame, inset(body), app);
     draw_rule(frame, rule, app);
     draw_input(frame, inset(input), app);
     if let Some(selected) = app.picker {
@@ -49,20 +72,20 @@ fn inset(area: Rect) -> Rect {
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
-    if app.transcript.is_empty() {
-        draw_wordmark(frame, area);
-        return;
-    }
-
+    let height = area.height as usize;
     let lines = transcript_lines(app, area.width as usize);
     // Clamp the scroll to the top of the transcript, in the state and not
     // just the view, so scrolling back down responds on the first key.
-    let max_back = lines.len().saturating_sub(area.height as usize);
+    let max_back = lines.len().saturating_sub(height);
     app.scroll_back = app.scroll_back.min(max_back);
 
     let end = lines.len() - app.scroll_back;
-    let start = end.saturating_sub(area.height as usize);
-    let visible: Vec<Line> = lines[start..end].to_vec();
+    let start = end.saturating_sub(height);
+    // Anchored to the bottom: a short exchange sits just above the input
+    // line, where the eye already is, instead of stranded at the top under a
+    // screen of blank rows.
+    let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
+    visible.extend_from_slice(&lines[start..end]);
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -77,6 +100,8 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         match block {
             Block::You(text) => {
                 out.push(Line::styled("you", theme::DIM));
+                // What the user typed is shown as typed: markdown in the
+                // input is text they wrote, not a document to re-render.
                 push_wrapped(&mut out, text, width, theme::PLAIN);
             }
             Block::Arc { text, partial } => {
@@ -89,7 +114,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 } else {
                     text.clone()
                 };
-                push_wrapped(&mut out, &text, width, theme::PLAIN);
+                out.extend(markdown::render(&text, width, theme::PLAIN));
                 if *partial {
                     out.push(Line::styled("-- cut --", theme::CUT));
                 }
@@ -107,34 +132,46 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Wraps `text` to `width`, one styled [`Line`] per wrapped line.
+///
+/// Continuation lines sit in two columns, so a paragraph that ran on is never
+/// mistaken for the start of a new one — the speaker labels are the only
+/// thing at column zero.
 fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let options = textwrap::Options::new(width.max(2)).subsequent_indent(CONTINUATION);
     for paragraph in text.split('\n') {
         if paragraph.is_empty() {
             out.push(Line::default());
             continue;
         }
-        for line in textwrap::wrap(paragraph, width.max(1)) {
+        for line in textwrap::wrap(paragraph, options.clone()) {
             out.push(Line::styled(line.into_owned(), style));
         }
     }
 }
 
-fn draw_wordmark(frame: &mut Frame, area: Rect) {
-    let mut lines: Vec<Line> = WORDMARK
+/// The wordmark at the top of the pane, with the tagline beside it while the
+/// transcript is still empty.
+///
+/// It stays put once messages arrive: the transcript scrolls underneath it,
+/// never over it.
+fn draw_masthead(frame: &mut Frame, area: Rect, app: &App) {
+    let tagline = app.transcript.is_empty();
+    let lines: Vec<Line> = WORDMARK
         .iter()
-        .map(|row| Line::styled(*row, theme::ACCENT))
+        .enumerate()
+        .map(|(row, art)| {
+            // On the wordmark's last row, so the two read as one mark.
+            if tagline && row + 1 == WORDMARK.len() {
+                Line::from(vec![
+                    Span::styled(*art, theme::ACCENT),
+                    Span::styled(format!("  {TAGLINE}"), theme::DIM),
+                ])
+            } else {
+                Line::styled(*art, theme::ACCENT)
+            }
+        })
         .collect();
-    lines.push(Line::default());
-    lines.push(Line::styled(TAGLINE, theme::DIM));
-
-    let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let top = area.height.saturating_sub(count) / 2;
-    let centered = Rect {
-        y: area.y + top,
-        height: area.height.saturating_sub(top),
-        ..area
-    };
-    frame.render_widget(Paragraph::new(lines), centered);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The status rule: dashes across the width, the mode at the left edge,
@@ -206,7 +243,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 /// The session picker: a cleared rectangle over the transcript, no border.
 fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     let rows = app.sessions.len() + 1;
-    let width = 44.min(full.width.saturating_sub(4));
+    let width = 64.min(full.width.saturating_sub(4));
     let height = u16::try_from(rows + 3)
         .unwrap_or(u16::MAX)
         .min(full.height.saturating_sub(2));
@@ -221,37 +258,70 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     let mut lines = vec![Line::styled(" sessions", theme::DIM), Line::default()];
     let visible = (height as usize).saturating_sub(3);
     let start = selected.saturating_sub(visible.saturating_sub(1));
+    // Room for the row prefix, the time, and the two spaces between.
+    let room = (width as usize).saturating_sub(TIME_WIDTH + 5);
     for row in start..rows.min(start + visible) {
-        let label = match app.picker_session(row) {
-            None => "new session".to_owned(),
-            Some(session) => session_label(session),
-        };
         let (prefix, style) = if row == selected {
             (" > ", theme::ACCENT)
         } else {
             ("   ", theme::DIM)
         };
-        lines.push(Line::styled(format!("{prefix}{label}"), style));
+        let spans = match app.picker_session(row) {
+            None => vec![Span::styled(format!("{prefix}new session"), style)],
+            // The label is padded to a fixed column so the times form a clean
+            // right-hand edge instead of a ragged one.
+            Some(session) => vec![
+                Span::styled(format!("{prefix}{:<room$}", label(session, room)), style),
+                Span::styled(format!("  {}", started_at(session)), theme::DIM),
+            ],
+        };
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// `2026-08-13 10:58  a1b2c3d4` — when it started, and enough id to grep.
-fn session_label(session: &arc_proto::v1::SessionInfo) -> String {
-    let started = session
+/// Columns `started_at` renders into: `08-13 18:22`.
+const TIME_WIDTH: usize = 11;
+
+/// What a session is called in the picker: its opening line, elided to fit.
+///
+/// Falls back to a slice of the id — a session can exist with nothing said in
+/// it (the daemon names it before the first message lands), and an unlabelled
+/// row is still one a person can pick.
+fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
+    let text = if session.title.is_empty() {
+        &session.preview
+    } else {
+        &session.title
+    };
+    // Newlines would break the row; take the first line and let the ellipsis
+    // stand for the rest.
+    let first = text.lines().next().unwrap_or_default().trim();
+    if first.is_empty() {
+        return session.id.chars().take(8).collect();
+    }
+    if first.chars().count() <= room {
+        return first.to_owned();
+    }
+    let cut: String = first.chars().take(room.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// `08-13 18:22` — the day and time, in the local zone. No year: a picker is
+/// for finding what you were just doing.
+fn started_at(session: &arc_proto::v1::SessionInfo) -> String {
+    session
         .started_at
         .as_ref()
         .and_then(|ts| {
             chrono::DateTime::from_timestamp(ts.seconds, u32::try_from(ts.nanos).unwrap_or(0))
         })
         .map_or_else(
-            || "????-??-?? ??:??".to_owned(),
+            || " ".repeat(TIME_WIDTH),
             |utc| {
                 utc.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M")
+                    .format("%m-%d %H:%M")
                     .to_string()
             },
-        );
-    let id: String = session.id.chars().take(8).collect();
-    format!("{started}  {id}")
+        )
 }

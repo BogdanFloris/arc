@@ -5,6 +5,7 @@
 //! The loop below just moves events between the three and draws.
 
 mod app;
+mod markdown;
 mod net;
 mod theme;
 mod ui;
@@ -23,9 +24,26 @@ use crate::app::{App, Command, Mode};
 /// bind).
 const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
 
+const USAGE: &str = "\
+usage: arc [--addr ws://host:port]
+
+options:
+  --addr <url>   daemon to connect to (default: ws://127.0.0.1:8787)
+  -h, --help     print this message
+
+keys:
+  insert mode (the default)  type; enter sends; esc leaves
+  normal mode                h l 0 $ w b  i I a A  x D dd
+                             j k ctrl-d ctrl-u G gg   scroll
+                             s or ctrl-p  sessions    ctrl-n  new session
+                             :q           quit";
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let url = url_from_args()?;
+    let Some(url) = url_from_args()? else {
+        println!("{USAGE}");
+        return Ok(());
+    };
     let terminal = ratatui::init();
     let result = run(terminal, url).await;
     ratatui::restore();
@@ -34,12 +52,16 @@ async fn main() -> Result<()> {
 }
 
 /// `arc [--addr ws://host:port]` — anything else is refused, not guessed at.
-fn url_from_args() -> Result<String> {
+///
+/// `Ok(None)` means the args asked for help: print it and exit 0, because a
+/// backtrace is not an answer to `--help`.
+fn url_from_args() -> Result<Option<String>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [] => Ok(DEFAULT_URL.to_owned()),
-        [flag, url] if flag == "--addr" => Ok(url.clone()),
-        _ => anyhow::bail!("usage: arc [--addr ws://host:port]"),
+        [] => Ok(Some(DEFAULT_URL.to_owned())),
+        [flag] if flag == "-h" || flag == "--help" => Ok(None),
+        [flag, url] if flag == "--addr" => Ok(Some(url.clone())),
+        _ => anyhow::bail!("{USAGE}"),
     }
 }
 
