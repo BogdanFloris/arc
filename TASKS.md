@@ -48,7 +48,7 @@ Wire-protocol friction, noted by 5.4 for the next `wire.proto` evolution (Phase 
 | 5.2 | Session engine: create session / append user message → drive provider → append model message, all via log events | bogdan | done |
 | 5.3 | Identity file: load `data/identity.md` into system context (read-only) | bogdan | done |
 | 5.4 | WebSocket server on localhost speaking `wire.proto`, streaming deltas to the client | claude | done |
-| 5.5 | systemd user unit for arcd: always-on, restart on failure, journal logging. The unit file lands in the repo; installing and enabling it on erebor is Bogdan's call, after he reads it | claude | in review |
+| 5.5 | systemd user unit for arcd: always-on, restart on failure, journal logging. The unit file lands in the repo; installing and enabling it on erebor is Bogdan's call, after he reads it | claude | done |
 
 ## 6. TUI (`arc`)
 
@@ -115,8 +115,8 @@ Idle VRAM, settled 2026-08-13: `llama-server` holds its device allocation for th
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | claude | in review |
-| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | claude | in review |
+| 8.1 | Perfetto `TracePacket` output from `tracing` spans, written to `data/traces/` | claude | done |
+| 8.2 | Spans + token counters on LLM calls (lands with 4.x/5.2, verified in Perfetto UI) | claude | done |
 
 8.x as built (2026-08-13). The subset of Perfetto's schema ARC emits is vendored in `arc-proto/proto/perfetto.proto` — third-party field numbers, each checked against upstream, and the header says how the schema invariants read differently there. The layer is `arc-core/src/trace/`; `arcd` layers it beside the stderr one over the same filter.
 
@@ -133,4 +133,6 @@ Cost of leaving it on, measured 2026-08-13 (100k synthetic turns, release build)
 
 Found while shutting the daemon down for that test, fixed in the same batch: arcd only handled Ctrl-C, so a `SIGTERM` — what any service manager sends — killed it before the shutdown path ran and orphaned llama-server holding 5.7 GiB of VRAM. It now stops on both.
 
-Next session picks up here (banked 2026-08-13, second batch): 6.2–6.4 reviewed and done, and every Phase 1 task is now built. In review: 8.1, 8.2, 5.5 (claude). What is left before Phase 1 can be called finished is not code — it is Bogdan opening a trace in the Perfetto UI, deciding whether to enable the systemd unit, and then daily use answering the exit criterion. Machine notes that bit us live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
+Next session picks up here (banked 2026-08-13, second batch): all 26 Phase 1 tasks are built and reviewed. Nothing is in flight. What is left is not code — it is daily use answering the exit criterion ("ARC replaces a chat app"), which is also what Phase 2's memory design is supposed to be built from. When it holds up, mark Phase 1 done in DESIGN.md §11 and open Phase 2. The unit is installed but not enabled (`systemctl --user enable --now arcd`), and the release binary it points at is built.
+
+Open on purpose, none of them Phase 1's problem: the wire friction banked above for Phase 3; no `partial` column in the projection, so a reopened session cannot show a cut reply (`HistoryMessage` field 3 is reserved); no sidecar restart policy; no retention on `data/traces/`; `log::Error::Io`'s field doc. Machine notes that bit us live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
