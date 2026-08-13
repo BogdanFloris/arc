@@ -1,0 +1,49 @@
+# A systemd *user* unit for arcd, so the daemon is up whenever the machine is
+# and the TUI has something to connect to at any hour. Phase 1's exit criterion
+# is daily use, and hand-starting a tmux session is the thing that stops that.
+#
+# Install (from the repo root):
+#
+#     cargo build --release
+#     just install-service      # copies this to ~/.config/systemd/user/
+#     systemctl --user enable --now arcd
+#     journalctl --user -u arcd -f
+#
+# On a NixOS box the declarative equivalent belongs in the host's dotfiles
+# (`systemd.user.services.arcd`); this file is the reference for what it says.
+#
+# Two things worth knowing:
+#
+#   - systemd kills the whole control group on stop, so the llama-server
+#     sidecar goes with the daemon. Nothing is left holding the GPU.
+#   - the sidecar releases its VRAM on its own after `--sleep-idle-seconds`
+#     (arc.toml), so an always-on arcd costs ~50 MiB of VRAM while idle
+#     rather than the model's full ~5.7 GiB.
+
+[Unit]
+Description=ARC daemon
+Documentation=file:%h/arc/DESIGN.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/arc
+# Relative paths in the config (data/, the model file) resolve against
+# WorkingDirectory, so this is the same arcd you get from a shell.
+ExecStart=%h/arc/target/release/arcd --config %h/arc/data/arc.toml run
+Environment=RUST_LOG=info,arc_core=debug
+
+# The daemon exiting is a bug, not a state to sit in: bring it back, slowly
+# enough that a crash loop is visible in the journal rather than hidden by it.
+# This is the daemon only — a sidecar that dies mid-run is still left dead and
+# loud on purpose (TASKS.md, 7.x).
+Restart=on-failure
+RestartSec=5s
+
+# Everything arcd writes goes to the journal, including llama-server's own
+# output, which arcd inherits rather than swallows.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

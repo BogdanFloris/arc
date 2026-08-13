@@ -18,6 +18,14 @@ lint:
 check:
     cargo check --workspace
 
+# Install the systemd user unit. Enabling it is a separate, deliberate step:
+# `systemctl --user enable --now arcd`.
+install-service:
+    mkdir -p ~/.config/systemd/user
+    cp arcd/arcd.service ~/.config/systemd/user/arcd.service
+    systemctl --user daemon-reload
+    @echo "installed. enable with: systemctl --user enable --now arcd"
+
 # Download the default local model (Qwen3-8B Q4_K_M GGUF, ~5GB) to where the
 # default config expects it. Resumes a partial download.
 model:
