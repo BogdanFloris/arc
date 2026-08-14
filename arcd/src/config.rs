@@ -2,8 +2,8 @@
 //!
 //! ```toml
 //! data_dir = "data"
-//! provider = "local"           # or "antigravity"
-//! model    = "qwen3-8b"        # default: per provider, see [`Config::model`]
+//! provider = "local"           # the only choice today
+//! model    = "qwen3-8b"        # default: the model file's stem, see [`Config::model`]
 //! bind     = "127.0.0.1:8787"
 //!
 //! [llama]                      # the local sidecar, when provider = "local"
@@ -42,9 +42,8 @@ pub struct Config {
     /// working directory, which for a hand-started daemon is the repo root.
     pub data_dir: PathBuf,
 
-    /// Which backend answers completions. Local by default: Antigravity's
-    /// hidden rate limits made it unreliable as a daily driver (DESIGN.md §6,
-    /// amendment 2026-08-13).
+    /// Which backend answers completions. Only `local` for now; the enum
+    /// stays so the next provider is a new variant, not a new config shape.
     pub provider: ProviderChoice,
 
     /// Model name for completions. `None` resolves per provider — see
@@ -132,10 +131,9 @@ impl Config {
     /// The model name completions run as: what the engine records in the log
     /// and what goes in the request.
     ///
-    /// Unset, it resolves per provider: Antigravity gets its default model
-    /// id; local gets the model file's stem, so the log names the weights
-    /// that actually answered (`llama-server` serves one model and ignores
-    /// the name, but the log should not).
+    /// Unset, it resolves to the model file's stem, so the log names the
+    /// weights that actually answered (`llama-server` serves one model and
+    /// ignores the name, but the log should not).
     #[must_use]
     pub fn model(&self) -> String {
         if let Some(model) = &self.model {

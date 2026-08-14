@@ -3,10 +3,8 @@
 //!
 //! [`sse`](crate::provider::sse) turns bytes into `data:` payloads without
 //! knowing what one says; a [`FrameParser`] reads what one says without
-//! knowing how it arrived; [`DeltaStream`] is the join. Extracted from the
-//! Antigravity implementation when the OpenAI-compatible provider needed the
-//! same machine (task 7.1): backends differ in frame dialect, never in how a
-//! stream is driven, cut, or fused.
+//! knowing how it arrived; [`DeltaStream`] is the join. Backends differ in
+//! frame dialect, never in how a stream is driven, cut, or fused.
 //!
 //! # Where a stream can stop
 //!

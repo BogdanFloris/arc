@@ -173,8 +173,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
         // request type would not know it did: `CompletionRequest::system` is
         // the one place a system prompt lives, and letting a second spelling
         // through would leave the log and the prompt disagreeing about what
-        // was sent. Same refusal as the Antigravity backend, for the same
-        // reason.
+        // was sent.
         Role::System => {
             return Err(Error::InvalidRequest(
                 "system prompts go in CompletionRequest::system, not the history".to_owned(),

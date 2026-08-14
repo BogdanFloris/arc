@@ -26,14 +26,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 serde_json = "1"
 toml = "0.9"
-base64 = "0.22"
-sha2 = "0.10"
-getrandom = "0.4"
 wiremock = "0.6"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-tungstenite = "0.30"
