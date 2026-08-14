@@ -18,8 +18,6 @@ pub struct DataDirs {
     log: PathBuf,
     /// `data/secrets/` — 0700, provider credentials, never backed up.
     secrets: PathBuf,
-    /// `data/secrets/google_oauth.json` — the OAuth token file.
-    tokens: PathBuf,
     /// `data/index.db` — the `SQLite` projection. Disposable.
     index: PathBuf,
     /// `data/traces/` — Perfetto traces. Disposable.
@@ -36,7 +34,6 @@ impl DataDirs {
         Self {
             log: root.join("log"),
             secrets: root.join("secrets"),
-            tokens: root.join("secrets").join("google_oauth.json"),
             index: root.join("index.db"),
             traces: root.join("traces"),
             identity: root.join("identity.md"),
@@ -82,12 +79,6 @@ impl DataDirs {
         &self.log
     }
 
-    /// OAuth token file, for `TokenManager` and `arcd login`.
-    #[must_use]
-    pub fn tokens(&self) -> &Path {
-        &self.tokens
-    }
-
     /// `SQLite` index, for [`arc_core::projection::Projection::open`].
     #[must_use]
     pub fn index(&self) -> &Path {
@@ -117,10 +108,6 @@ mod tests {
         let dirs = DataDirs::new("/srv/arc");
         assert_eq!(dirs.root(), Path::new("/srv/arc"));
         assert_eq!(dirs.log(), Path::new("/srv/arc/log"));
-        assert_eq!(
-            dirs.tokens(),
-            Path::new("/srv/arc/secrets/google_oauth.json")
-        );
         assert_eq!(dirs.index(), Path::new("/srv/arc/index.db"));
         assert_eq!(dirs.traces(), Path::new("/srv/arc/traces"));
         assert_eq!(dirs.identity(), Path::new("/srv/arc/identity.md"));
@@ -136,21 +123,9 @@ mod tests {
 
         assert!(dirs.log().is_dir());
         assert!(dirs.traces().is_dir());
-        assert!(dirs.tokens().parent().expect("secrets dir").is_dir());
         // Neither is created: the index is made by the projection, the
         // identity file by a human.
         assert!(!dirs.index().exists());
         assert!(!dirs.identity().exists());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let secrets = dirs.tokens().parent().expect("secrets dir");
-            let mode = std::fs::metadata(secrets)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o700, "secrets/ must be owner-only");
-        }
     }
 }

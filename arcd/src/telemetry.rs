@@ -17,9 +17,6 @@ const DEFAULT_FILTER: &str = "info,arc_core=debug";
 
 /// Installs the global subscriber, and says where the trace is being written.
 ///
-/// stderr, not stdout: `arcd login` prints a URL the user has to act on, and
-/// log lines must not be interleaved into it.
-///
 /// # Errors
 ///
 /// If a subscriber is already installed, `RUST_LOG` is not a valid filter — a

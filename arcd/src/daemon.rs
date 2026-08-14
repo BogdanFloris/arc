@@ -19,8 +19,6 @@ use anyhow::{Context as _, Result};
 use arc_core::log::Log;
 use arc_core::projection::{self, Projection};
 use arc_core::provider::Provider;
-use arc_core::provider::antigravity::Antigravity;
-use arc_core::provider::oauth::{OauthConfig, TokenManager};
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use std::sync::Arc;
@@ -64,11 +62,6 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
             // leave a model server holding the GPU.
             sidecar.stop().await;
             served
-        }
-        ProviderChoice::Antigravity => {
-            let tokens = TokenManager::new(OauthConfig::default(), dirs.tokens());
-            let provider = Antigravity::new(Arc::new(tokens));
-            Daemon::start(config, dirs, provider)?.serve().await
         }
     }
 }

@@ -5,7 +5,7 @@
 //! lifecycle. It owns no rules about logs, projections, or providers.
 //!
 //! ```text
-//! arcd [run|login] [--config <path>]
+//! arcd run [--config <path>]
 //! ```
 //!
 //! Exit codes: 0 fine, 1 something failed, 2 the command line did not parse.
@@ -16,7 +16,6 @@ mod daemon;
 mod dirs;
 mod identity;
 mod llama;
-mod login;
 mod server;
 mod telemetry;
 
@@ -70,6 +69,5 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Run => daemon::run(config, dirs).await,
-        Command::Login => login::run(&dirs).await,
     }
 }

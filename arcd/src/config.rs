@@ -22,9 +22,6 @@ use serde::{Deserialize, Serialize};
 /// Directory all runtime state hangs off (DESIGN.md §10).
 const DEFAULT_DATA_DIR: &str = "data";
 
-/// Model used for Antigravity when the config names none.
-const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.6-flash";
-
 /// Localhost, per DESIGN.md §7: the socket never leaves the machine
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
@@ -68,8 +65,6 @@ pub struct Config {
 pub enum ProviderChoice {
     /// The llama.cpp sidecar, spoken to as an OpenAI-compatible endpoint.
     Local,
-    /// Google via the Antigravity OAuth flow. Kept for when its limits allow.
-    Antigravity,
 }
 
 /// The `llama-server` sidecar `arcd` supervises.
@@ -147,7 +142,6 @@ impl Config {
             return model.clone();
         }
         match self.provider {
-            ProviderChoice::Antigravity => DEFAULT_ANTIGRAVITY_MODEL.to_owned(),
             ProviderChoice::Local => self.llama.model_file.file_stem().map_or_else(
                 || "local".to_owned(),
                 |stem| stem.to_string_lossy().into_owned(),
@@ -191,27 +185,11 @@ mod tests {
     }
 
     #[test]
-    fn the_model_resolves_per_provider() {
-        let mut config = Config::default();
-        assert_eq!(
-            config.model(),
-            "Qwen3-8B-Q4_K_M",
-            "the file stem, by default"
-        );
-
-        config.provider = ProviderChoice::Antigravity;
-        assert_eq!(config.model(), "gemini-3.6-flash");
-
-        config.model = Some("gemini-3.1-pro".to_owned());
-        assert_eq!(config.model(), "gemini-3.1-pro", "an explicit name wins");
-    }
-
-    #[test]
     fn every_field_round_trips() {
         let config = Config {
             data_dir: PathBuf::from("/srv/arc"),
-            provider: ProviderChoice::Antigravity,
-            model: Some("gemini-3.1-pro".to_owned()),
+            provider: ProviderChoice::Local,
+            model: Some("qwen".to_owned()),
             bind: "127.0.0.1:9000".parse().expect("valid address"),
             llama: super::LlamaConfig {
                 server: PathBuf::from("/opt/llama/llama-server"),

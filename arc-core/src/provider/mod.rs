@@ -28,8 +28,6 @@
 //! [`CompletionDelta`] grows a variant when that work starts. Leaving the
 //! types out now means no half-designed tool-call vocabulary to migrate off.
 
-pub mod antigravity;
-pub mod oauth;
 pub mod openai;
 pub mod sse;
 pub(crate) mod stream;

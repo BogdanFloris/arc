@@ -12,8 +12,6 @@ use std::path::PathBuf;
 pub enum Command {
     /// Run the daemon. The default when no subcommand is given.
     Run,
-    /// Run the OAuth flow and write the token file.
-    Login,
 }
 
 /// A parsed command line.
@@ -39,11 +37,10 @@ pub const DEFAULT_CONFIG: &str = "data/arc.toml";
 
 /// Printed on `--help`, and on stderr for anything unparseable.
 pub const USAGE: &str = "\
-usage: arcd [run|login] [--config <path>]
+usage: arcd run [--config <path>]
 
 commands:
   run     start the daemon (default)
-  login   sign in to the provider and write the token file
 
 options:
   --config <path>   config file (default: data/arc.toml; a missing file means defaults)
@@ -78,7 +75,6 @@ where
                 }
             }
             Some("run") if command.is_none() => command = Some(Command::Run),
-            Some("login") if command.is_none() => command = Some(Command::Login),
             _ => {
                 let shown = arg.to_string_lossy().into_owned();
                 return Err(if command.is_some() {
@@ -117,11 +113,6 @@ mod tests {
 
     #[test]
     fn subcommands_and_the_config_flag_parse_in_either_order() {
-        assert_eq!(ok(&["arcd", "login"]).command, Command::Login);
-        assert_eq!(
-            ok(&["arcd", "login", "--config", "/etc/arc.toml"]).config,
-            PathBuf::from("/etc/arc.toml")
-        );
         assert_eq!(
             ok(&["arcd", "--config", "/etc/arc.toml", "run"]).command,
             Command::Run
@@ -139,7 +130,6 @@ mod tests {
         for args in [
             vec!["arcd", "serve"],
             vec!["arcd", "--verbose"],
-            vec!["arcd", "run", "login"],
             vec!["arcd", "run", "extra"],
             vec!["arcd", "--config"],
         ] {
