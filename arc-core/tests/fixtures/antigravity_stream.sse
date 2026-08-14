@@ -1,4 +1,0 @@
-data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"text": "hello arc"}]}}],"usageMetadata": {"promptTokenCount": 11,"candidatesTokenCount": 2,"totalTokenCount": 86,"thoughtsTokenCount": 73},"modelVersion": "gemini-3-flash","responseId": "test-response-id"},"traceId": "test-trace-id","metadata": {}}
-
-data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thoughtSignature": "test-thought-signature","text": ""}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 11,"candidatesTokenCount": 2,"totalTokenCount": 86,"thoughtsTokenCount": 73},"modelVersion": "gemini-3-flash","responseId": "test-response-id"},"traceId": "test-trace-id","metadata": {}}
-
