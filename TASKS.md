@@ -12,12 +12,13 @@ Decisions banked 2026-08-14, before task-cutting:
 - **Consolidation model: the same local model.** The sidecar serves exactly one; "a cheap model pass" means the model we have until routing exists.
 - **Tool activity is visible in the TUI.** Additive wire frames, rendered in the transcript. Watching memory work is how it gets tuned; invisible tools cannot be reviewed.
 - **Routing is later, deliberately.** The ambition — match a Claude Code 100-style tier with our own router picking the best model per request across local + OpenRouter — is banked in DESIGN.md §12, gated on usage data Phase 2 will generate. Nothing in this phase may assume more than one provider.
+- **Reasoning is streamed, never durable** (decided 2026-08-14, from the 1.1 verdict). It reaches the TUI live — that ends Phase 1's silent dead air while the model thinks — but it is scratch work, not what the log's "what the user saw" rule protects, so no event carries it. Where this lands: 3.1 gives `CompletionDelta` a reasoning variant, 2.4 a wire frame so 4.4 can render it dim, and 2.1's sketch reserves a proto field number so "durable after all" stays a schema addition, not a migration.
 
 ## 1. Spike (before schemas harden)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 1.1 | Tool-calling spike against `llama-server`: tools on (`--jinja`), one toy tool, capture SSE fixtures of Qwen3-8B tool calls. Output is fixtures plus a written verdict — the delta dialect for 3.x's parser, and whether 8B/Q4 calls tools reliably enough to build on. No production code | claude | in review |
+| 1.1 | Tool-calling spike against `llama-server`: tools on (`--jinja`), one toy tool, capture SSE fixtures of Qwen3-8B tool calls. Output is fixtures plus a written verdict — the delta dialect for 3.x's parser, and whether 8B/Q4 calls tools reliably enough to build on. No production code | claude | done |
 
 If the verdict is "shaky", the fallback is a bigger model as a config line, decided before section 3 starts — not a redesign.
 
