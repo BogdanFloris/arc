@@ -215,7 +215,8 @@ Each phase ends in something used daily. No phase begins until the previous one 
 
 Deferred deliberately; decide when the phase forces them:
 
-- Consolidation triggering: idle-timeout vs explicit session close vs continuous. (Phase 2, from traces.)
+- Consolidation triggering: idle-timeout vs explicit session close vs continuous. (Phase 2, from traces. v1 placeholder decided 2026-08-14: a configurable idle timeout, so the pass has something to hang on — the question stays open; traces judge it.)
+- Model routing. The ambition is a router of our own — pick the best model per request across local + hosted (OpenRouter), aiming at what a Claude Code 100-style tier delivers. §6's per-completion provider choice is the seam it plugs into. Deliberately not now: a router needs to know what usage looks like, and Phase 2 is what generates that data. (Post-Phase 2, from usage.)
 - Tool-call events. `MessageAppended` carries flat text and cannot represent tool calls, tool results, or structured content. Before Phase 2 lands FTS and any further messages-table shape, sketch the event vocabulary for tool use — likely first-class events (e.g. tool call issued, tool result recorded) rather than fields bolted onto `MessageAppended` — so the projection schema is designed for structured turns from the start instead of prose-only plus a later schema bump. Evolution stays additive per §3 rule 3. Prior art worth an hour: DeepSeek Harness's persistence event catalog (turn/start/turn/end, tool call/result as first-class events, and its `TOOL_OUTCOME_UNKNOWN` resume contract for a durable call with no durable result). (Phase 2, before the projection hardens.)
 - Whether identity edits ever move into the event log. (Revisit if hand-editing becomes a bottleneck.)
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
