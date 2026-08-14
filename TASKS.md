@@ -138,3 +138,15 @@ Found while shutting the daemon down for that test, fixed in the same batch: arc
 Next session picks up here (banked 2026-08-13, second batch): all 26 Phase 1 tasks are built and reviewed. Nothing is in flight. What is left is not code — it is daily use answering the exit criterion ("ARC replaces a chat app"), which is also what Phase 2's memory design is supposed to be built from. When it holds up, mark Phase 1 done in DESIGN.md §11 and open Phase 2. The unit is installed but not enabled (`systemctl --user enable --now arcd`), and the release binary it points at is built.
 
 Open on purpose, none of them Phase 1's problem: the wire friction banked above for Phase 3; no `partial` column in the projection, so a reopened session cannot show a cut reply (`HistoryMessage` field 3 is reserved); no sidecar restart policy; no retention on `data/traces/`; `log::Error::Io`'s field doc. Machine notes that bit us live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.
+
+## Phase 2 — seed
+
+The full Phase 2 list is still to be cut. Banked so it isn't lost when it is:
+
+| # | Task | Assignee | Status |
+|---|------|----------|--------|
+| P2.0 | Sketch tool-call event vocabulary (DESIGN.md §12) before touching projection schema or FTS | — | todo |
+
+## Later / gated on traces
+
+- Batched log appends with flush checkpoint — only with trace evidence that fsync-per-append is a real cost (DESIGN.md §3, durability policy).

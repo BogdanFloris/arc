@@ -61,6 +61,8 @@ Rules that make the model work:
 2. **All state is a projection.** The SQLite index, the current distilled-memory state, and session trees are all deterministic replays of the log. Any projection can be deleted and rebuilt at any time.
 3. **Schema evolution is additive.** Fields are never renumbered or repurposed; old events must always decode. Forward compatibility (new events on an old binary) has one deliberate boundary: a new *kind* inside an existing payload arm is skipped safely during replay, but a new top-level `Event.payload` arm decodes as empty on an older binary and reads as corruption — replaying a log requires a binary at least as new as its newest payload arm. Acceptable for a single-user system whose writer and reader ship together; revisit if that stops being true.
 
+Durability policy: v1 fsyncs every append — durability beats throughput, and batching is an optimization that needs trace data to justify it. The expected trigger is Phase 2/3, when tool loops turn one user turn into many events. When traces justify it, the shape to evaluate is a small fixed coalescing window (~200ms) draining to one fsync per batch, with an explicit flush checkpoint before a turn is claimed complete (cf. DeepSeek Harness's bounded write batching). Any batching change must preserve the writer's existing contract: seq stamped internally, a written-but-unfsynced record still consumes its seq, failed writer is rebuilt, never retried.
+
 Consequences: backup is "back up the log segments" (rustic handles append-only files efficiently), transfer to a new machine is "copy log + identity file, replay," and there is no live-database backup problem because SQLite is disposable.
 
 ## 4. Sessions
@@ -212,6 +214,7 @@ Each phase ends in something used daily. No phase begins until the previous one 
 Deferred deliberately; decide when the phase forces them:
 
 - Consolidation triggering: idle-timeout vs explicit session close vs continuous. (Phase 2, from traces.)
+- Tool-call events. `MessageAppended` carries flat text and cannot represent tool calls, tool results, or structured content. Before Phase 2 lands FTS and any further messages-table shape, sketch the event vocabulary for tool use — likely first-class events (e.g. tool call issued, tool result recorded) rather than fields bolted onto `MessageAppended` — so the projection schema is designed for structured turns from the start instead of prose-only plus a later schema bump. Evolution stays additive per §3 rule 3. Prior art worth an hour: DeepSeek Harness's persistence event catalog (turn/start/turn/end, tool call/result as first-class events, and its `TOOL_OUTCOME_UNKNOWN` resume contract for a durable call with no durable result). (Phase 2, before the projection hardens.)
 - Whether identity edits ever move into the event log. (Revisit if hand-editing becomes a bottleneck.)
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
 - Multi-machine story beyond backup/restore (log sync). (Post-v1.)
