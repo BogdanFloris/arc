@@ -59,8 +59,8 @@ Each schema change is its own commit, separate from code that uses it (invariant
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 2.1 | Sketch the tool-call event vocabulary (the question banked in DESIGN.md §12): likely new kinds inside `SessionEvent` — a new top-level payload arm is a replay hazard per §3 rule 3, a new kind inside an arm is skipped safely. Includes the resume contract for a durable call with no durable result (prior art: DeepSeek Harness's `TOOL_OUTCOME_UNKNOWN`). Lands as a DESIGN.md amendment first, proto after | claude | todo |
-| 2.2 | `events.proto`: tool call / tool result events per the 2.1 sketch | bogdan | todo |
+| 2.1 | Sketch the tool-call event vocabulary (the question banked in DESIGN.md §12): likely new kinds inside `SessionEvent` — a new top-level payload arm is a replay hazard per §3 rule 3, a new kind inside an arm is skipped safely. Includes the resume contract for a durable call with no durable result (prior art: DeepSeek Harness's `TOOL_OUTCOME_UNKNOWN`). Lands as a DESIGN.md amendment first, proto after | claude | in review |
+| 2.2 | `events.proto`: tool call / tool result events per the 2.1 sketch (DESIGN.md §3.1) | bogdan | todo |
 | 2.3 | `events.proto`: `MemoryEvent` + `MemoryRecord` (§5.2) — created / updated / superseded / deleted | — | todo |
 | 2.4 | `wire.proto`: tool-activity frames so a client can render what a turn is doing. Additive oneof numbers only; the Phase 3 wire-friction list in `TASKS-phase1.md` stays banked, this does not open it | — | todo |
 

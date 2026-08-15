@@ -65,6 +65,81 @@ Durability policy: v1 fsyncs every append — durability beats throughput, and b
 
 Consequences: backup is "back up the log segments" (rustic handles append-only files efficiently), transfer to a new machine is "copy log + identity file, replay," and there is no live-database backup problem because SQLite is disposable.
 
+### 3.1 Tool-call events
+
+Tool use appends first-class events inside `SessionEvent`: `ToolCallIssued` and `ToolResultRecorded`. Not fields bolted onto `MessageAppended`, whose `content` is the prose the user saw and is what §5.3's FTS indexes — a sometimes-empty `content` beside a repeated calls field would make every existing reader learn a new shape. Not a new top-level `Event.payload` arm either: §3 rule 3 makes that a replay hazard, while a new kind inside an existing arm is skipped safely by an older binary. That skip-safety is the whole reason the vocabulary lives here. Sketches below carry no field numbers; 2.2 owns numbering.
+
+**The event set.** One turn — reasoning, two parallel calls, their results, final text — appends exactly this:
+
+```
+user asks                    MessageAppended{USER, content, turn_id=T}
+model reasons                — nothing durable
+step 0 text, if any          MessageAppended{ASSISTANT, content, turn_id=T}
+step 0 call index 0          ToolCallIssued{T, call_id=a, index=0, name, arguments_json}
+step 0 call index 1          ToolCallIssued{T, call_id=b, index=1, name, arguments_json}
+                             → both tools dispatch, b finishes first
+                             ToolResultRecorded{T, call_id=b, OK, content}
+                             ToolResultRecorded{T, call_id=a, OK, content}
+step 1 final text            MessageAppended{ASSISTANT, content, partial=false, turn_id=T}
+```
+
+Reasoning appends nothing: streamed, never durable (banked 2026-08-14). A step that only calls tools appends no `MessageAppended` at all — the call events are the assistant's utterance for that step, and 1.1 found text and calls mutually exclusive in all 71 captures, so this is the ordinary case, not the exotic one. Results append in completion order, not index order, because the log records what happened when; the provider transcript sorts them by the index of the call each one closes. `Event.source` is `MODEL` on a call (the model asked for it) and `SYSTEM` on a result (arcd ran it).
+
+**Turn boundaries are an id, not events.** No `TurnStarted`/`TurnEnded`. A `turn_id`, minted when a user message opens a turn and carried by every event that turn produces, does the grouping turn events would do, without two extra fsyncs per turn and without a second source of truth about whether a turn finished that can disagree with the messages. `MessageAppended` gains `turn_id` as a new field; Phase 1 events decode with it empty, and a projection reads empty as "one message, one turn," which is exactly true of a log with no tools in it. Grouping *within* a turn is by seq order — an assistant text message plus the calls that follow it with no result in between is one assistant step — and that rule is only sound because events are filtered by `turn_id` first. The raw log interleaves sessions and payload arms, so adjacency in it means nothing.
+
+**Per-call identity.** A call is named by `call_id`, the provider's own id recorded verbatim, and ordered by `index`, the provider's index within its step, dense from 0 (1.1: parallel calls are real, and a parser keyed on anything but `index` silently merges them). `index` restarts at 0 each step; `call_id` is the unique key, scoped to the session. If a provider gives no id, arcd mints one; if an incoming id collides with a call still open in that session, arcd mints a replacement. Either way the log records the id that was used, replay reads it rather than regenerating it, and the transcript arcd rebuilds uses the same string throughout, so the provider never sees a mismatch. A result names its call by `call_id` and nothing else — no denormalized tool name, because a second copy of a fact is a second thing that can be wrong, and the projection joins once. The dialect's `type: "function"` is not recorded: it has exactly one value, and a second one arrives as a new field, not a new string.
+
+```proto
+message ToolCallIssued {
+  string session_id;
+  string turn_id;
+  string call_id;
+  uint32 index;
+  string name;
+  string arguments_json;  // complete object, verbatim as sent to the tool
+}
+
+message ToolResultRecorded {
+  string session_id;
+  string turn_id;
+  string call_id;
+  ToolOutcome outcome;
+  string content;         // what the model is shown, verbatim
+  bool truncated;
+}
+
+enum ToolOutcome {        // UNSPECIFIED stays 0 and is never written
+  TOOL_OUTCOME_UNSPECIFIED;
+  TOOL_OUTCOME_OK;
+  TOOL_OUTCOME_ERROR;
+  TOOL_OUTCOME_UNKNOWN;
+}
+```
+
+**Write order and the resume contract.** `ToolCallIssued` is appended and fsynced before its tool is dispatched, and the whole batch of a step's calls is durable before any of them runs. That write-ahead is what makes the log's silence meaningful: nothing ran that is not on disk. It also creates the only case that matters here — a durable call with no durable result. A replayer concludes exactly one thing from it: **the outcome is unknown.** Not failed. The tool may never have started, may have run and had its effect and died before its result was appended, or may have had its result torn by the crash and dropped by recovery; the bytes cannot tell these apart, and a tool that moved an actuator (§9) has moved it either way. So the call must never be silently re-dispatched, and it must never be silently dropped. Detection is cheap: replay carries a set of open `call_id`s, removes each on its result, and whatever remains at the end of the log is orphaned.
+
+Only arcd, at startup, may act on an orphan, and only before it dispatches anything for that session. An in-flight call in a live daemon is byte-identical on disk to an abandoned one, so "orphaned" is not a property of the log alone — it is a property of the log plus the fact that nobody is running. That is why the repair is an appended event rather than something each reader synthesizes: `arcd rebuild`, `memory-replay`, and the projection all read an orphan as unknown-outcome and append nothing. At startup, arcd appends for each orphan a `ToolResultRecorded{outcome: UNKNOWN, content: a fixed sentence saying the daemon restarted before the result was recorded and the call may or may not have run}`, `Event.source = SYSTEM`. This closes the call durably, so the next replay is clean and every `tool_call_id` in the reconstructed transcript has a tool message answering it. The closer lands at the log tail, possibly hours after the call it closes — which is the second reason correlation is by `call_id` and not by adjacency. arcd does not then re-drive the model: a restarted daemon resuming a turn the user walked away from is a surprise, and the cost of not doing it is that the user types "continue." The turn resumes on the next user message, which follows a tool result perfectly well. This is 4.3's contract, in full.
+
+**Tool errors are results, not wire errors.** A tool that fails — bad arguments, missing file, timeout, no such tool, denied — produces `ToolResultRecorded{outcome: ERROR}` with the error text the model should see, and the loop continues. §4's "errors are reported to clients, never archived" governs ARC failing to do its job: provider unreachable, malformed frame, log write failed. The boundary is one line: **if the model is going to see it, it is durable; if only the user sees it, it is a wire `Error`.** A tool error changes the conversation and the model must reason about it; a provider outage changes nothing and the fix is to ask again. The corollary bites in the right direction too — if the log append itself fails, nothing durable happened, the turn is abandoned, and the client gets an `Error`. Readers must treat an unrecognized `ToolOutcome` as UNKNOWN, not as ERROR: unknown is the value with the conservative behaviour attached.
+
+**The partial rule does not extend.** `partial` stays on `MessageAppended` and stays about text. A call is appended only once its arguments are complete — 3.2 accumulates fragments by index and the JSON is valid only concatenated — so a half-streamed call is never appended and there is nothing to mark. A result is produced whole by the tool. What marks a turn cut mid-loop is the orphaned call itself, closed as above. Two mechanisms because two different failures: cut text loses only what the user did not see, while a cut loop may have left an effect in the world, and only the second needs UNKNOWN to say so.
+
+**Size.** §3's 16 MiB record cap covers tool results, but it is the backstop, not the policy. The tool registry (4.1) truncates before the event is built, to a configurable `max_tool_result_bytes` far below the cap — 32 KiB to start, because the real constraint is an 8k-context model, not the disk. Truncation sets `truncated` and leaves an explicit marker in the content. It is lossy and deliberate: nothing else stores the full result, and that is the same rule `partial` already encodes — the log keeps what was actually seen. Enforcement belongs to the registry because it knows the tool and can cut meaningfully; a log-layer refusal would leave the loop holding a result it cannot record and force it to invent the same truncation later with less context. An event that still exceeds 16 MiB is a registry bug, and the log's refusal is the assertion that catches it.
+
+**Secrets.** Invariant 5 holds at the tool boundary: a tool result entering the log must contain no secret, and **the tool that produces it owns that** — not the log writer, which cannot tell, and not a regex scrubber, which is a false promise. A tool that touches credentials returns a reference, never a value. Arguments are covered by the same contract from the other side: the model can only echo what it was given, and credentials never enter model context (§10 — they live in the keychain or `data/secrets/`, and the provider layer injects auth into headers, never into prompt text). The contract is airtight only for tools that cannot read their own environment; Phase 2 has none.
+
+**Reserved, not built.** Reserve one number in the `SessionEvent.event` oneof for a future reasoning event. Reasoning is streamed-only by decision, and this keeps "durable after all" a schema addition rather than a migration — same move as `SessionCreated`'s reserved fork fields. Reserving a oneof number beats reserving a field on `MessageAppended`, because a call-only step has no `MessageAppended` to hang reasoning on. Three field-level reserves are worth taking while the messages are new: on `ToolCallIssued`, a tool *source* (an MCP server id — §9's devices are MCP servers, and two servers can both offer `read`) and the model that issued the call (§6 makes provider choice per-completion, and today only `SessionCreated` records what ran); on `ToolResultRecorded`, a structured-content field, since `content` is a string and an image or binary result needs its own. Not reserved: call duration. Latency is trace material (§8), and putting it in the log would make every replay assert timing it cannot reproduce.
+
+**What the projection will need.** 5.1's messages shape stops being `(role, content)` rows: it needs tool calls and results as their own rows (or a sibling table) keyed by `call_id`, `turn_id` on every row so a reopened session can rebuild both the display and a valid provider transcript, the tool name and outcome as columns so "when did you last write a memory record" is a query, and the reserved `partial` and new `truncated` flags so a cut reply and a cut result are distinguishable from whole ones. FTS should index tool result content, but tagged by row kind and excluded from `sessions_search`'s default: a 30 KB directory listing the model read would otherwise outrank the sentence the user wrote. Arguments are not indexed — they are small JSON, and the call is already findable by name.
+
+**Prior art (DeepSeek Harness, session persistence).** Taken: the write-ahead checkpoint — "a recorded top-level call before tool dispatch" is exactly our durability point. Taken: closing an unanswered call with a synthetic result so the resumed transcript stays valid, except that theirs injects a risk-classified *error* and ours records UNKNOWN, because unknown is the honest classification and the one that forbids silent retry. Rejected: `turn/start` and `turn/end` events — `turn_id` over a gapless seq gives the same grouping without two fsyncs a turn. Rejected: persisting `assistant/chunk` delta runs — the log stores what the user saw, not how it arrived. Rejected: a generated catalog of string event types with an `ignorable` escape hatch — proto oneof numbers plus §3 rule 3 already give skip-safety, and string types would put a second schema authority outside `arc-proto`.
+
+Open, and deliberately left to the task that hits them:
+
+- open: whether an UNKNOWN call may ever be re-dispatched automatically for a tool that declares itself idempotent. 4.1's registry trait has no idempotence declaration; if one lands, this contract gains a branch.
+- open: the FTS default for tool-result rows is 5.1/5.2's call to confirm against real queries; the sketch only insists the rows be tagged so the choice stays a query change, not a re-projection.
+- open: the redaction policy for a tool that can incidentally capture its environment (a shell tool, a device tool that echoes config). None exists in Phase 2; the first one that does decides it, and it is a tool-side policy either way.
+
 ## 4. Sessions
 
 Sessions are pi-style: a tree, not a list. Forking a session at any message creates a child session with a `parent_session` and `fork_point`; the tree structure is just parent pointers in the projection. Clients render the tree; the daemon only stores it.
@@ -217,7 +292,7 @@ Deferred deliberately; decide when the phase forces them:
 
 - Consolidation triggering: idle-timeout vs explicit session close vs continuous. (Phase 2, from traces. v1 placeholder decided 2026-08-14: a configurable idle timeout, so the pass has something to hang on — the question stays open; traces judge it.)
 - Model routing. The ambition is a router of our own — pick the best model per request across local + hosted (OpenRouter), aiming at what a Claude Code 100-style tier delivers. §6's per-completion provider choice is the seam it plugs into. Deliberately not now: a router needs to know what usage looks like, and Phase 2 is what generates that data. (Post-Phase 2, from usage.)
-- Tool-call events. `MessageAppended` carries flat text and cannot represent tool calls, tool results, or structured content. Before Phase 2 lands FTS and any further messages-table shape, sketch the event vocabulary for tool use — likely first-class events (e.g. tool call issued, tool result recorded) rather than fields bolted onto `MessageAppended` — so the projection schema is designed for structured turns from the start instead of prose-only plus a later schema bump. Evolution stays additive per §3 rule 3. Prior art worth an hour: DeepSeek Harness's persistence event catalog (turn/start/turn/end, tool call/result as first-class events, and its `TOOL_OUTCOME_UNKNOWN` resume contract for a durable call with no durable result). (Phase 2, before the projection hardens.)
+- Tool-call events. Answered 2026-08-15 in §3.1: `ToolCallIssued` and `ToolResultRecorded` as kinds inside `SessionEvent`, a `turn_id` instead of turn events, and a write-ahead resume contract that closes an unanswered call as UNKNOWN. The three questions §3.1 leaves open are scoped to the tasks that hit them and listed there.
 - Whether identity edits ever move into the event log. (Revisit if hand-editing becomes a bottleneck.)
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
 - Multi-machine story beyond backup/restore (log sync). (Post-v1.)
