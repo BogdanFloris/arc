@@ -4,11 +4,11 @@ A personal AI assistant built as an always-on Rust daemon (`arcd`) with thin cli
 
 ![The arc TUI](docs/arc-tui.png)
 
-It is one person's daily driver, built in the open. No stability promises, no releases, no multi-user story. `DESIGN.md` is the architectural authority and the honest account of what exists; `TASKS.md` is what's being built now.
+It is one person's daily driver, built in the open. No stability promises, no releases, no multi-user story. [docs/DESIGN.md](docs/DESIGN.md) is the architectural authority and the honest account of what exists; [docs/TASKS.md](docs/TASKS.md) is what's being built now.
 
 Four priorities, in order: **durability** (one append-only log, everything else rebuildable), **observability** (every LLM call, tool call, and memory write shows up in a Perfetto trace), **speed** (no GC, protobuf on disk and on the wire), **independence** (plain HTTP + SSE behind one provider trait, never vendor SDKs).
 
-**Status:** Phase 1 (walking skeleton) is done and in daily use — local model, linear sessions, streaming TUI. Phase 2 (memory + tool calling) is in progress. Phases are in DESIGN.md §11.
+**Status:** Phase 1 (walking skeleton) is done and in daily use — local model, linear sessions, streaming TUI. Phase 2 (memory + tool calling) is in progress. Phases are in [DESIGN.md §11](docs/DESIGN.md).
 
 ## Running it
 

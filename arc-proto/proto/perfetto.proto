@@ -4,7 +4,7 @@ syntax = "proto3";
 // what ARC emits: track descriptors, track events (slices, instants,
 // counters), and their debug annotations.
 //
-// This file is NOT ours, and the invariants in CLAUDE.md read differently
+// This file is NOT ours, and the invariants in AGENTS.md read differently
 // here:
 //
 //   - Field numbers are Perfetto's, not ours. They must match upstream

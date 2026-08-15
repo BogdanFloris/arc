@@ -22,7 +22,7 @@
 
 [Unit]
 Description=ARC daemon
-Documentation=file:%h/arc/DESIGN.md
+Documentation=file:%h/arc/docs/DESIGN.md
 After=network.target
 
 [Service]
