@@ -4,7 +4,8 @@
 use arc_proto::v1::{
     ClientFrame, Delta, Error, Event, HistoryMessage, MessageAccepted, MessageAppended, Role,
     SendMessage, ServerFrame, SessionCreated, SessionEvent, SessionHistory, SessionInfo,
-    SessionList, Source, StreamEnd, client_frame, event, server_frame, session_event,
+    SessionList, Source, StreamEnd, ToolCallIssued, ToolOutcome, ToolResultRecorded, client_frame,
+    event, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -50,7 +51,46 @@ fn message_appended_event() -> Event {
                 role: Role::User as i32,
                 content: "hello arc".to_string(),
                 partial: false,
+                turn_id: "t-01".to_string(),
             })),
+        })),
+    }
+}
+
+fn tool_call_issued_event() -> Event {
+    Event {
+        seq: 3,
+        ts: Some(ts()),
+        source: Source::Model as i32,
+        payload: Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::ToolCallIssued(ToolCallIssued {
+                session_id: "s-01".to_string(),
+                turn_id: "t-01".to_string(),
+                call_id: "call-aa".to_string(),
+                index: 1,
+                name: "memory_search".to_string(),
+                arguments_json: r#"{"query":"hello"}"#.to_string(),
+            })),
+        })),
+    }
+}
+
+fn tool_result_recorded_event() -> Event {
+    Event {
+        seq: 4,
+        ts: Some(ts()),
+        source: Source::System as i32,
+        payload: Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::ToolResultRecorded(
+                ToolResultRecorded {
+                    session_id: "s-01".to_string(),
+                    turn_id: "t-01".to_string(),
+                    call_id: "call-aa".to_string(),
+                    outcome: ToolOutcome::Ok as i32,
+                    content: "one record".to_string(),
+                    truncated: true,
+                },
+            )),
         })),
     }
 }
@@ -63,6 +103,16 @@ fn event_session_created_round_trips() {
 #[test]
 fn event_message_appended_round_trips() {
     round_trip(&message_appended_event());
+}
+
+#[test]
+fn event_tool_call_issued_round_trips() {
+    round_trip(&tool_call_issued_event());
+}
+
+#[test]
+fn event_tool_result_recorded_round_trips() {
+    round_trip(&tool_result_recorded_event());
 }
 
 #[test]

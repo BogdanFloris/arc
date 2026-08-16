@@ -174,6 +174,7 @@ mod tests {
                     role: Role::User as i32,
                     content: content.to_string(),
                     partial: false,
+                    turn_id: String::new(),
                 })),
             })),
         }

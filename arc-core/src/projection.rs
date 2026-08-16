@@ -398,6 +398,15 @@ impl Projection {
                     span.record("kind", "message_appended");
                     insert_message(&tx, event, appended)?;
                 }
+                // Skipped deliberately, not lost: the projection is disposable,
+                // and the messages shape that holds tool rows lands with the
+                // archive tier, which re-projects.
+                Some(session_event::Event::ToolCallIssued(_)) => {
+                    span.record("kind", "tool_call_issued");
+                }
+                Some(session_event::Event::ToolResultRecorded(_)) => {
+                    span.record("kind", "tool_result_recorded");
+                }
                 None => {
                     span.record("kind", "unknown");
                     tracing::warn!(
@@ -623,6 +632,7 @@ mod tests {
                     role: Role::User as i32,
                     content: content.to_string(),
                     partial: false,
+                    turn_id: String::new(),
                 })),
             })),
         }

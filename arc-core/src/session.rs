@@ -183,6 +183,7 @@ impl<P: Provider> Engine<P> {
                 role: Role::User as i32,
                 content: content.to_owned(),
                 partial: false,
+                turn_id: String::new(),
             }),
         )?;
 
@@ -321,6 +322,7 @@ impl<P: Provider> Engine<P> {
                 role: Role::Assistant as i32,
                 content: text.to_owned(),
                 partial,
+                turn_id: String::new(),
             }),
         )
     }
@@ -483,9 +485,7 @@ mod tests {
     fn appended(event: &session_event::Event) -> &arc_proto::v1::MessageAppended {
         match event {
             session_event::Event::MessageAppended(m) => m,
-            other @ session_event::Event::SessionCreated(_) => {
-                panic!("expected a message, got {other:?}")
-            }
+            other => panic!("expected a message, got {other:?}"),
         }
     }
 
@@ -758,6 +758,7 @@ mod tests {
                     role: 99,
                     content: "from the future".to_owned(),
                     partial: false,
+                    turn_id: String::new(),
                 }),
             )
             .expect("record");
