@@ -33,7 +33,7 @@ use futures::Stream;
 use tracing::Span;
 
 use crate::provider::sse::FrameDecoder;
-use crate::provider::{CompletionDelta, CompletionStream, Error, Usage};
+use crate::provider::{CompletionDelta, CompletionStream, Error, Stop, Usage};
 
 /// What one frame means for the stream.
 pub(crate) struct Deltas {
@@ -43,8 +43,8 @@ pub(crate) struct Deltas {
     /// Counts this frame reported, if it reported any.
     pub usage: Option<Usage>,
 
-    /// Whether this frame ends the reply.
-    pub finished: bool,
+    /// Set when this frame ends the reply, to why the model stopped.
+    pub finished: Option<Stop>,
 }
 
 /// A backend's frame dialect: what one `data:` payload says.
@@ -145,9 +145,10 @@ impl<S, P: FrameParser> DeltaStream<S, P> {
             for text in decoded.text {
                 self.pending.push_back(CompletionDelta::Text(text));
             }
-            if decoded.finished {
+            if let Some(stop) = decoded.finished {
                 self.pending.push_back(CompletionDelta::Done {
                     usage: self.usage.unwrap_or_default(),
+                    stop,
                 });
             }
         }

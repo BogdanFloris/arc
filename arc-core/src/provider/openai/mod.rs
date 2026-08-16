@@ -136,6 +136,14 @@ struct WireMessage<'a> {
 impl<'a> Payload<'a> {
     /// Expresses `request` on the wire, or says why it cannot be.
     fn new(request: &'a CompletionRequest) -> Result<Self, Error> {
+        // Refused rather than dropped, per `CompletionRequest::tools`. 3.2
+        // serializes them and this goes away.
+        if !request.tools.is_empty() {
+            return Err(Error::InvalidRequest(
+                "this provider cannot send tool definitions yet".to_owned(),
+            ));
+        }
+
         // The system prompt is the first message — that is where this dialect
         // puts it, and the only place a `system` role is produced.
         let system = request
@@ -166,7 +174,15 @@ impl<'a> Payload<'a> {
 
 /// One history turn on the wire.
 fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
-    let role = match message.role {
+    // Tool calls and their results have a wire shape this payload has no field
+    // for; 3.2 gives them one.
+    let Message::Text { role, content } = message else {
+        return Err(Error::InvalidRequest(
+            "this provider cannot send tool calls or tool results yet".to_owned(),
+        ));
+    };
+
+    let role = match role {
         Role::User => "user",
         Role::Assistant => "assistant",
         // The dialect would accept a system message mid-history, but the
@@ -185,10 +201,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
             ));
         }
     };
-    Ok(WireMessage {
-        role,
-        content: &message.content,
-    })
+    Ok(WireMessage { role, content })
 }
 
 /// Classifies a rejection per the error contract in [`Provider::complete`].
@@ -244,7 +257,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
-    use crate::provider::{CompletionDelta, Usage};
+    use crate::provider::{CompletionDelta, Stop, Usage};
 
     fn request(system: Option<&str>, turns: &[(Role, &str)]) -> CompletionRequest {
         CompletionRequest {
@@ -252,11 +265,12 @@ mod tests {
             system: system.map(str::to_owned),
             messages: turns
                 .iter()
-                .map(|(role, content)| Message {
+                .map(|(role, content)| Message::Text {
                     role: *role,
                     content: (*content).to_owned(),
                 })
                 .collect(),
+            tools: Vec::new(),
         }
     }
 
@@ -316,7 +330,8 @@ mod tests {
                     usage: Usage {
                         input_tokens: 7,
                         output_tokens: 3
-                    }
+                    },
+                    stop: Stop::EndTurn,
                 },
             ]
         );

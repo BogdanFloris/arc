@@ -24,7 +24,7 @@
 use serde::Deserialize;
 
 use crate::provider::stream::{Deltas, FrameParser};
-use crate::provider::{Error, Usage};
+use crate::provider::{Error, Stop, Usage};
 
 /// The terminal sentinel, sent instead of JSON.
 const DONE: &str = "[DONE]";
@@ -50,7 +50,10 @@ impl FrameParser for Parser {
             return Ok(Deltas {
                 text: Vec::new(),
                 usage: None,
-                finished: true,
+                // Every stream this dialect can currently produce ends a turn:
+                // tool calls, and the `finish_reason` that closes them, arrive
+                // with 3.2.
+                finished: Some(Stop::EndTurn),
             });
         }
 
@@ -79,7 +82,7 @@ impl FrameParser for Parser {
                 .filter(|content| !content.is_empty())
                 .collect(),
             usage: usage.as_ref().map(UsageJson::usage),
-            finished: false,
+            finished: None,
         })
     }
 }
@@ -138,7 +141,7 @@ mod tests {
 
     use super::Parser;
     use crate::provider::stream::DeltaStream;
-    use crate::provider::{CompletionDelta, Error, Usage};
+    use crate::provider::{CompletionDelta, Error, Stop, Usage};
 
     /// One real completion, captured live: a role-only chunk with null
     /// content, two text chunks, the finish chunk, the usage frame, the
@@ -180,6 +183,7 @@ mod tests {
             text(" arc"),
             CompletionDelta::Done {
                 usage: FIXTURE_USAGE,
+                stop: Stop::EndTurn,
             },
         ]
     }
@@ -234,7 +238,8 @@ mod tests {
             [
                 text("hi"),
                 CompletionDelta::Done {
-                    usage: Usage::default()
+                    usage: Usage::default(),
+                    stop: Stop::EndTurn,
                 },
             ]
         );
@@ -278,7 +283,8 @@ mod tests {
         assert_eq!(
             ok(vec![body.as_bytes().to_vec()]).await,
             [CompletionDelta::Done {
-                usage: Usage::default()
+                usage: Usage::default(),
+                stop: Stop::EndTurn,
             }]
         );
     }

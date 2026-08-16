@@ -200,6 +200,8 @@ impl<P: Provider> Engine<P> {
             model: self.model.clone(),
             system: self.system.clone(),
             messages: self.history(&session_id)?,
+            // The loop that offers tools is 4.2's.
+            tools: Vec::new(),
         };
 
         let mut stream = self.provider.complete(request).await?;
@@ -211,9 +213,12 @@ impl<P: Provider> Engine<P> {
                     text.push_str(&chunk);
                     let _ = events.send(EngineEvent::Delta(chunk)).await;
                 }
+                // Reasoning and tool calls are 4.2's to act on; this loop
+                // still only knows how to say text.
+                Some(Ok(CompletionDelta::Reasoning(_) | CompletionDelta::ToolCall(_))) => {}
                 // The stream contract says `Done` is the last item; trusting
                 // it saves a poll that could only return `None`.
-                Some(Ok(CompletionDelta::Done { usage: done })) => {
+                Some(Ok(CompletionDelta::Done { usage: done, .. })) => {
                     usage = Some(done);
                     break Ending::Done;
                 }
@@ -337,7 +342,7 @@ impl<P: Provider> Engine<P> {
         let mut messages = Vec::new();
         for (role, content) in self.projection.messages(session_id)? {
             if let Ok(mapped @ (Role::User | Role::Assistant)) = Role::try_from(role) {
-                messages.push(Message {
+                messages.push(Message::Text {
                     role: mapped,
                     content,
                 });
@@ -384,8 +389,8 @@ mod tests {
     use crate::log::{Log, LogReader, discover_segments};
     use crate::projection::Projection;
     use crate::provider::{
-        CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Provider,
-        Usage,
+        CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
+        Provider, Stop, Usage,
     };
 
     /// A scripted provider: each `complete` call captures its request and
@@ -438,8 +443,20 @@ mod tests {
     fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
         vec![
             Ok(CompletionDelta::Text(text.to_owned())),
-            Ok(CompletionDelta::Done { usage: usage() }),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
         ]
+    }
+
+    /// The role and text of a history message. Everything this engine sends is
+    /// text; a tool message here is a bug in the test.
+    fn turn(message: &Message) -> (Role, &str) {
+        match message {
+            Message::Text { role, content } => (*role, content.as_str()),
+            other => panic!("expected a text message, got {other:?}"),
+        }
     }
 
     /// An engine over a fresh log and in-memory index.
@@ -575,11 +592,7 @@ mod tests {
 
         let requests = provider.requests();
         assert_eq!(requests[1].system.as_deref(), Some("be terse"));
-        let turns: Vec<(Role, &str)> = requests[1]
-            .messages
-            .iter()
-            .map(|m| (m.role, m.content.as_str()))
-            .collect();
+        let turns: Vec<(Role, &str)> = requests[1].messages.iter().map(turn).collect();
         assert_eq!(
             turns,
             [
@@ -773,11 +786,7 @@ mod tests {
             .expect("send");
 
         let requests = provider.requests();
-        let turns: Vec<&str> = requests[0]
-            .messages
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect();
+        let turns: Vec<&str> = requests[0].messages.iter().map(|m| turn(m).1).collect();
         assert_eq!(turns, ["hi"], "the unmappable message stayed out");
     }
 }

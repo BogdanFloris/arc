@@ -470,7 +470,8 @@ mod tests {
     use arc_core::log::Log;
     use arc_core::projection::Projection;
     use arc_core::provider::{
-        CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Usage,
+        CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
+        Stop, Usage,
     };
     use arc_proto::v1::{FetchHistory, ListSessions, Role};
     use futures::stream;
@@ -537,11 +538,20 @@ mod tests {
                         .messages
                         .iter()
                         .rev()
-                        .find(|m| m.role == Role::User)
-                        .map_or(String::new(), |m| m.content.clone());
+                        .find_map(|m| match m {
+                            Message::Text {
+                                role: Role::User,
+                                content,
+                            } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
                     vec![
                         Ok(CompletionDelta::Text(format!("re: {last}"))),
-                        Ok(CompletionDelta::Done { usage: usage() }),
+                        Ok(CompletionDelta::Done {
+                            usage: usage(),
+                            stop: Stop::EndTurn,
+                        }),
                     ]
                 }
                 Script::Canned(calls) => calls.pop_front().expect("script exhausted"),
@@ -761,7 +771,10 @@ mod tests {
         let turns: Vec<(Role, &str)> = requests[1]
             .messages
             .iter()
-            .map(|m| (m.role, m.content.as_str()))
+            .map(|m| match m {
+                Message::Text { role, content } => (*role, content.as_str()),
+                other => panic!("expected a text message, got {other:?}"),
+            })
             .collect();
         assert_eq!(
             turns,
