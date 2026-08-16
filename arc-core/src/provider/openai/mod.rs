@@ -10,6 +10,10 @@
 //! Wire details come from the `OpenAI` streaming chat-completions format as
 //! llama.cpp's server implements it (its `tools/server` README documents the
 //! endpoint as OpenAI-compatible, `stream_options.include_usage` included).
+//! Tools ride the same dialect: a `tools` array on the request, `tool_calls`
+//! on the assistant turn that asked, and a `role: "tool"` message answering by
+//! `tool_call_id` — the round trip the 1.1 spike drove end to end. What comes
+//! back is [`stream`]'s to read.
 
 mod stream;
 
@@ -17,7 +21,8 @@ use reqwest::header::ACCEPT;
 use serde::Serialize;
 
 use crate::provider::{
-    CompletionRequest, CompletionStream, Error, Message, Provider, stream as delta_stream,
+    CompletionRequest, CompletionStream, Error, Message, Provider, ToolDefinition,
+    stream as delta_stream,
 };
 use arc_proto::v1::Role;
 
@@ -104,7 +109,7 @@ impl Provider for OpenAiCompat {
         }
         Ok(delta_stream::deltas(
             response,
-            stream::Parser,
+            stream::Parser::default(),
             tracing::Span::current(),
         ))
     }
@@ -119,6 +124,11 @@ struct Payload<'a> {
     /// Asks for the final usage chunk. llama.cpp honors it; a server that
     /// ignores it degrades to zero counts, not to a broken stream.
     stream_options: StreamOptions,
+    /// Omitted rather than sent empty: a plain conversation should look to the
+    /// server exactly like a Phase 1 one, and a `tools` key can cost prompt
+    /// tokens in the chat template that renders it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool<'a>>,
 }
 
 #[derive(Serialize)]
@@ -127,30 +137,82 @@ struct StreamOptions {
 }
 
 /// One turn as the wire spells it.
+///
+/// Untagged, with `role` spelled out per variant: the three shapes agree on
+/// nothing but that field, and two of them fix its value.
 #[derive(Serialize)]
-struct WireMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+#[serde(untagged)]
+enum WireMessage<'a> {
+    /// Prose from one participant.
+    Text {
+        role: &'static str,
+        content: &'a str,
+    },
+
+    /// An assistant step that asked for tools. No `content` key at all: the
+    /// dialect makes it optional when `tool_calls` is present, and an empty
+    /// string is a turn that said something empty rather than a turn that
+    /// said nothing.
+    ToolCalls {
+        role: &'static str,
+        tool_calls: Vec<WireToolCall<'a>>,
+    },
+
+    /// What a tool answered, named to the call that asked.
+    ToolResult {
+        role: &'static str,
+        tool_call_id: &'a str,
+        content: &'a str,
+    },
 }
+
+/// One call in an assistant turn's history. No `index`: position in the list
+/// carries it back, and the wire has no field for it on the way in.
+#[derive(Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireCalledFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct WireCalledFunction<'a> {
+    name: &'a str,
+    /// The arguments object, serialized — a JSON string holding JSON, which is
+    /// how this dialect spells it in both directions.
+    arguments: &'a str,
+}
+
+/// One tool on offer.
+#[derive(Serialize)]
+struct WireTool<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct WireFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    /// The caller's JSON Schema, passed through unread.
+    parameters: &'a serde_json::Value,
+}
+
+/// The one `type` this dialect has for a tool or a call.
+const FUNCTION: &str = "function";
 
 impl<'a> Payload<'a> {
     /// Expresses `request` on the wire, or says why it cannot be.
     fn new(request: &'a CompletionRequest) -> Result<Self, Error> {
-        // Refused rather than dropped, per `CompletionRequest::tools`. 3.2
-        // serializes them and this goes away.
-        if !request.tools.is_empty() {
-            return Err(Error::InvalidRequest(
-                "this provider cannot send tool definitions yet".to_owned(),
-            ));
-        }
-
         // The system prompt is the first message — that is where this dialect
         // puts it, and the only place a `system` role is produced.
         let system = request
             .system
             .as_deref()
             .filter(|system| !system.trim().is_empty())
-            .map(|content| WireMessage {
+            .map(|content| WireMessage::Text {
                 role: "system",
                 content,
             });
@@ -168,18 +230,50 @@ impl<'a> Payload<'a> {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            tools: request.tools.iter().map(wire_tool).collect(),
         })
+    }
+}
+
+/// One tool on offer, on the wire.
+fn wire_tool(tool: &ToolDefinition) -> WireTool<'_> {
+    WireTool {
+        kind: FUNCTION,
+        function: WireFunction {
+            name: &tool.name,
+            description: &tool.description,
+            parameters: &tool.parameters,
+        },
     }
 }
 
 /// One history turn on the wire.
 fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
-    // Tool calls and their results have a wire shape this payload has no field
-    // for; 3.2 gives them one.
-    let Message::Text { role, content } = message else {
-        return Err(Error::InvalidRequest(
-            "this provider cannot send tool calls or tool results yet".to_owned(),
-        ));
+    let (role, content) = match message {
+        Message::Text { role, content } => (role, content),
+        Message::ToolCalls(calls) => {
+            return Ok(WireMessage::ToolCalls {
+                role: "assistant",
+                tool_calls: calls
+                    .iter()
+                    .map(|call| WireToolCall {
+                        id: &call.id,
+                        kind: FUNCTION,
+                        function: WireCalledFunction {
+                            name: &call.name,
+                            arguments: &call.arguments,
+                        },
+                    })
+                    .collect(),
+            });
+        }
+        Message::ToolResult { call_id, content } => {
+            return Ok(WireMessage::ToolResult {
+                role: "tool",
+                tool_call_id: call_id,
+                content,
+            });
+        }
     };
 
     let role = match role {
@@ -201,7 +295,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
             ));
         }
     };
-    Ok(WireMessage { role, content })
+    Ok(WireMessage::Text { role, content })
 }
 
 /// Classifies a rejection per the error contract in [`Provider::complete`].
@@ -257,7 +351,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
-    use crate::provider::{CompletionDelta, Stop, Usage};
+    use crate::provider::{CompletionDelta, Stop, ToolCall, Usage};
 
     fn request(system: Option<&str>, turns: &[(Role, &str)]) -> CompletionRequest {
         CompletionRequest {
@@ -360,6 +454,91 @@ mod tests {
                 {"role": "system", "content": "be terse"},
                 {"role": "user", "content": "one"},
                 {"role": "assistant", "content": "re: one"},
+            ])
+        );
+    }
+
+    /// A conversation with no tools looks exactly like a Phase 1 one.
+    #[tokio::test]
+    async fn a_request_without_tools_has_no_tools_key() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body.get("tools"), None, "{body}");
+    }
+
+    #[tokio::test]
+    async fn tools_are_offered_in_the_dialects_shape() {
+        let mut req = request(None, &[(Role::User, "what do you know about arc?")]);
+        req.tools = vec![ToolDefinition {
+            name: "memory_search".to_owned(),
+            description: "Search durable memory".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }),
+        }];
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search durable memory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }])
+        );
+    }
+
+    /// The transcript a tool loop rebuilds after a result: the assistant step
+    /// that asked, then the answer naming the same `call_id`.
+    #[tokio::test]
+    async fn tool_calls_and_their_results_go_back_as_history() {
+        let mut req = request(None, &[(Role::User, "what time is it?")]);
+        req.messages.push(Message::ToolCalls(vec![ToolCall {
+            id: "VB3c1GM6".to_owned(),
+            index: 0,
+            name: "get_time".to_owned(),
+            arguments: "{}".to_owned(),
+        }]));
+        req.messages.push(Message::ToolResult {
+            call_id: "VB3c1GM6".to_owned(),
+            content: "2026-08-14T09:12:00Z".to_owned(),
+        });
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": "what time is it?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "VB3c1GM6",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "VB3c1GM6",
+                    "content": "2026-08-14T09:12:00Z",
+                },
             ])
         );
     }

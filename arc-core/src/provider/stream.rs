@@ -37,8 +37,10 @@ use crate::provider::{CompletionDelta, CompletionStream, Error, Stop, Usage};
 
 /// What one frame means for the stream.
 pub(crate) struct Deltas {
-    /// Non-empty text chunks, in the order the frame carried them.
-    pub text: Vec<String>,
+    /// What the frame adds to the reply, in the order it carried it. Never a
+    /// [`CompletionDelta::Done`]: that one is this module's to append, from
+    /// `finished` and the counts it has been keeping.
+    pub items: Vec<CompletionDelta>,
 
     /// Counts this frame reported, if it reported any.
     pub usage: Option<Usage>,
@@ -142,9 +144,7 @@ impl<S, P: FrameParser> DeltaStream<S, P> {
             if let Some(usage) = decoded.usage {
                 self.usage = Some(usage);
             }
-            for text in decoded.text {
-                self.pending.push_back(CompletionDelta::Text(text));
-            }
+            self.pending.extend(decoded.items);
             if let Some(stop) = decoded.finished {
                 self.pending.push_back(CompletionDelta::Done {
                     usage: self.usage.unwrap_or_default(),
