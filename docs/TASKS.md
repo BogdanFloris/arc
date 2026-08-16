@@ -68,8 +68,8 @@ Each schema change is its own commit, separate from code that uses it (invariant
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 3.1 | `CompletionRequest` grows tool definitions, `CompletionDelta` grows a tool-call variant — the seam `provider/mod.rs` reserved | claude | todo |
-| 3.2 | OpenAI-compat: request building with tools + SSE parsing of tool-call deltas, fixture tests from 1.1's captures | claude | todo |
+| 3.1 | `CompletionRequest` grows tool definitions, `CompletionDelta` grows a tool-call variant — the seam `provider/mod.rs` reserved | claude | in review |
+| 3.2 | OpenAI-compat: request building with tools + SSE parsing of tool-call deltas, fixture tests from 1.1's captures | claude | in review |
 
 ## 4. Engine tool loop (`arc-core` / `arcd`)
 
