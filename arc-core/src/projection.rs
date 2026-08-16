@@ -415,6 +415,11 @@ impl Projection {
                     );
                 }
             },
+            // Skipped the same way and for the same reason: record state is a
+            // projection of these, and it lands with the distilled tier.
+            event::Payload::Memory(_) => {
+                span.record("kind", "memory");
+            }
         }
         set_last_seq(&tx, event.seq)?;
         tx.commit()?;

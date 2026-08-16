@@ -477,6 +477,9 @@ mod tests {
                     arc_proto::v1::event::Payload::Session(session) => {
                         session.event.expect("session event")
                     }
+                    other @ arc_proto::v1::event::Payload::Memory(_) => {
+                        panic!("expected a session event, got {other:?}")
+                    }
                 }
             })
             .collect()

@@ -2,10 +2,12 @@
 //! forward compatibility with additive schema changes, and proto3 defaults.
 
 use arc_proto::v1::{
-    ClientFrame, Delta, Error, Event, HistoryMessage, MessageAccepted, MessageAppended, Role,
-    SendMessage, ServerFrame, SessionCreated, SessionEvent, SessionHistory, SessionInfo,
-    SessionList, Source, StreamEnd, ToolCallIssued, ToolOutcome, ToolResultRecorded, client_frame,
-    event, server_frame, session_event,
+    ClientFrame, Delta, Error, Event, HistoryMessage, MemoryEvent, MemoryRecord,
+    MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated,
+    MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, Role, SendMessage, ServerFrame,
+    SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList, Source, StreamEnd,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded, client_frame, event, memory_event,
+    memory_record, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -95,6 +97,34 @@ fn tool_result_recorded_event() -> Event {
     }
 }
 
+fn memory_record() -> MemoryRecord {
+    MemoryRecord {
+        id: "m-01".to_string(),
+        kind: memory_record::Kind::Preference as i32,
+        namespace: "global".to_string(),
+        title: "version control".to_string(),
+        summary: "uses jj, not git".to_string(),
+        body: "jj for everything; git only where a tool insists.".to_string(),
+        links: vec!["m-02".to_string(), "m-07".to_string()],
+        provenance: Some(Provenance {
+            entries: vec![ProvenanceEntry {
+                session_id: "s-01".to_string(),
+                ts: Some(ts()),
+            }],
+        }),
+        status: memory_record::Status::Active as i32,
+    }
+}
+
+fn memory_payload_event(seq: u64, source: Source, event: memory_event::Event) -> Event {
+    Event {
+        seq,
+        ts: Some(ts()),
+        source: source as i32,
+        payload: Some(event::Payload::Memory(MemoryEvent { event: Some(event) })),
+    }
+}
+
 #[test]
 fn event_session_created_round_trips() {
     round_trip(&session_created_event());
@@ -113,6 +143,57 @@ fn event_tool_call_issued_round_trips() {
 #[test]
 fn event_tool_result_recorded_round_trips() {
     round_trip(&tool_result_recorded_event());
+}
+
+#[test]
+fn event_memory_record_created_round_trips() {
+    round_trip(&memory_payload_event(
+        5,
+        Source::Model,
+        memory_event::Event::RecordCreated(MemoryRecordCreated {
+            record: Some(memory_record()),
+        }),
+    ));
+}
+
+#[test]
+fn event_memory_record_updated_round_trips() {
+    round_trip(&memory_payload_event(
+        6,
+        Source::Model,
+        memory_event::Event::RecordUpdated(MemoryRecordUpdated {
+            record: Some(MemoryRecord {
+                body: "jj for everything, no exceptions.".to_string(),
+                ..memory_record()
+            }),
+        }),
+    ));
+}
+
+#[test]
+fn event_memory_record_superseded_round_trips() {
+    round_trip(&memory_payload_event(
+        7,
+        Source::Model,
+        memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+            superseded_id: "m-01".to_string(),
+            record: Some(MemoryRecord {
+                id: "m-09".to_string(),
+                ..memory_record()
+            }),
+        }),
+    ));
+}
+
+#[test]
+fn event_memory_record_deleted_round_trips() {
+    round_trip(&memory_payload_event(
+        8,
+        Source::User,
+        memory_event::Event::RecordDeleted(MemoryRecordDeleted {
+            id: "m-01".to_string(),
+        }),
+    ));
 }
 
 #[test]
