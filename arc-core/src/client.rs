@@ -241,7 +241,8 @@ impl Client {
 /// One completion turn being read off the wire.
 ///
 /// Yields events until the closing frame ([`TurnEvent::End`] or
-/// [`TurnEvent::Failed`]), then `None`.
+/// [`TurnEvent::Failed`]), then `None`. The turn's tool-activity and reasoning
+/// frames are skipped rather than yielded — rendering them is 4.4's.
 pub struct Turn<'c> {
     client: &'c mut Client,
     request_id: u64,
@@ -259,31 +260,39 @@ impl Turn<'_> {
         if self.done {
             return Ok(None);
         }
-        let event = match self.client.answer(self.request_id).await? {
-            server_frame::Msg::MessageAccepted(accepted) => TurnEvent::Accepted {
-                session_id: accepted.session_id,
-            },
-            server_frame::Msg::Delta(delta) => TurnEvent::Delta(delta.text),
-            server_frame::Msg::StreamEnd(end) => {
-                self.done = true;
-                TurnEvent::End {
-                    input_tokens: end.input_tokens,
-                    output_tokens: end.output_tokens,
-                    partial: end.partial,
+        loop {
+            let event = match self.client.answer(self.request_id).await? {
+                server_frame::Msg::MessageAccepted(accepted) => TurnEvent::Accepted {
+                    session_id: accepted.session_id,
+                },
+                server_frame::Msg::Delta(delta) => TurnEvent::Delta(delta.text),
+                server_frame::Msg::StreamEnd(end) => {
+                    self.done = true;
+                    TurnEvent::End {
+                        input_tokens: end.input_tokens,
+                        output_tokens: end.output_tokens,
+                        partial: end.partial,
+                    }
                 }
-            }
-            server_frame::Msg::Error(error) => {
-                self.done = true;
-                TurnEvent::Failed {
-                    code: error.code,
-                    msg: error.msg,
+                server_frame::Msg::Error(error) => {
+                    self.done = true;
+                    TurnEvent::Failed {
+                        code: error.code,
+                        msg: error.msg,
+                    }
                 }
-            }
-            other @ (server_frame::Msg::SessionList(_) | server_frame::Msg::SessionHistory(_)) => {
-                return Err(unexpected("a turn frame", &other));
-            }
-        };
-        Ok(Some(event))
+                // Middle-of-turn frames this client does not render yet; the
+                // schema's whole point is that skipping them costs nothing.
+                server_frame::Msg::ReasoningDelta(_)
+                | server_frame::Msg::ToolCallStarted(_)
+                | server_frame::Msg::ToolCallEnded(_) => continue,
+                other @ (server_frame::Msg::SessionList(_)
+                | server_frame::Msg::SessionHistory(_)) => {
+                    return Err(unexpected("a turn frame", &other));
+                }
+            };
+            return Ok(Some(event));
+        }
     }
 }
 
@@ -296,6 +305,9 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::StreamEnd(_) => "StreamEnd",
         server_frame::Msg::Error(_) => "Error",
         server_frame::Msg::SessionHistory(_) => "SessionHistory",
+        server_frame::Msg::ReasoningDelta(_) => "ReasoningDelta",
+        server_frame::Msg::ToolCallStarted(_) => "ToolCallStarted",
+        server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))
 }
@@ -304,7 +316,10 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
 mod tests {
     use std::time::Duration;
 
-    use arc_proto::v1::{Delta, Error as WireError, MessageAccepted, SessionList, StreamEnd};
+    use arc_proto::v1::{
+        Delta, Error as WireError, MessageAccepted, ReasoningDelta, SessionList, StreamEnd,
+        ToolCallEnded, ToolCallStarted, ToolOutcome,
+    };
     use prost_types::Timestamp;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -489,6 +504,54 @@ mod tests {
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn tool_activity_and_reasoning_frames_are_skipped() {
+        let (url, _handle) = server(vec![vec![
+            echo(accepted("s-1")),
+            echo(server_frame::Msg::ReasoningDelta(ReasoningDelta {
+                session_id: "s-1".to_owned(),
+                text: "let me look".to_owned(),
+            })),
+            echo(server_frame::Msg::ToolCallStarted(ToolCallStarted {
+                session_id: "s-1".to_owned(),
+                call_id: "call-aa".to_owned(),
+                index: 0,
+                name: "memory_search".to_owned(),
+            })),
+            echo(server_frame::Msg::ToolCallEnded(ToolCallEnded {
+                session_id: "s-1".to_owned(),
+                call_id: "call-aa".to_owned(),
+                outcome: ToolOutcome::Ok as i32,
+            })),
+            echo(delta("s-1", "hello")),
+            echo(stream_end("s-1", false)),
+        ]])
+        .await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let mut turn = client.send_message(None, "hi").await.expect("send");
+
+        let mut events = Vec::new();
+        while let Some(event) = turn.next().await.expect("a turn event") {
+            events.push(event);
+        }
+
+        assert_eq!(
+            events,
+            [
+                TurnEvent::Accepted {
+                    session_id: "s-1".to_owned()
+                },
+                TurnEvent::Delta("hello".to_owned()),
+                TurnEvent::End {
+                    input_tokens: 3,
+                    output_tokens: 5,
+                    partial: false
+                },
+            ]
+        );
     }
 
     #[tokio::test]

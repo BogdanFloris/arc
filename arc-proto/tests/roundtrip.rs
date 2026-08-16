@@ -4,10 +4,11 @@
 use arc_proto::v1::{
     ClientFrame, Delta, Error, Event, HistoryMessage, MemoryEvent, MemoryRecord,
     MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated,
-    MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, Role, SendMessage, ServerFrame,
-    SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList, Source, StreamEnd,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded, client_frame, event, memory_event,
-    memory_record, server_frame, session_event,
+    MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role,
+    SendMessage, ServerFrame, SessionCreated, SessionEvent, SessionHistory, SessionInfo,
+    SessionList, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
+    ToolResultRecorded, client_frame, event, memory_event, memory_record, server_frame,
+    session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -248,6 +249,21 @@ fn server_frame_arms_round_trip() {
         server_frame::Msg::Error(Error {
             code: "provider_unavailable".to_string(),
             msg: "upstream returned 503".to_string(),
+        }),
+        server_frame::Msg::ReasoningDelta(ReasoningDelta {
+            session_id: "s-01".to_string(),
+            text: "let me look that up ".to_string(),
+        }),
+        server_frame::Msg::ToolCallStarted(ToolCallStarted {
+            session_id: "s-01".to_string(),
+            call_id: "call-aa".to_string(),
+            index: 1,
+            name: "memory_search".to_string(),
+        }),
+        server_frame::Msg::ToolCallEnded(ToolCallEnded {
+            session_id: "s-01".to_string(),
+            call_id: "call-aa".to_string(),
+            outcome: ToolOutcome::Error as i32,
         }),
     ];
 
