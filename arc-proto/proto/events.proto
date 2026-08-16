@@ -32,13 +32,44 @@ message MessageAppended {
   string content = 3;
   // Reply was cut before the model finished; content is what the user saw.
   bool partial = 4;
+  string turn_id = 5;
+}
+
+message ToolCallIssued {
+  string session_id = 1;
+  string turn_id = 2;
+  string call_id = 3;
+  uint32 index = 4;
+  string name = 5;
+  string arguments_json = 6;
+  reserved 7, 8; // reserved for tool source (MCP server id) and issuing model
+}
+
+enum ToolOutcome {
+  TOOL_OUTCOME_UNSPECIFIED = 0;
+  TOOL_OUTCOME_OK = 1;
+  TOOL_OUTCOME_ERROR = 2;
+  TOOL_OUTCOME_UNKNOWN = 3;
+}
+
+message ToolResultRecorded {
+  string session_id = 1;
+  string turn_id = 2;
+  string call_id = 3;
+  ToolOutcome outcome = 4;
+  string content = 5;
+  bool truncated = 6;
+  reserved 7; // reserved for structured (non-text) result content
 }
 
 message SessionEvent {
   oneof event {
     SessionCreated session_created = 1;
     MessageAppended message_appended = 2;
+    ToolCallIssued tool_call_issued = 3;
+    ToolResultRecorded tool_result_recorded = 4;
   }
+  reserved 5; // reserved for a reasoning event; streamed-only by decision
 }
 
 message Event {
