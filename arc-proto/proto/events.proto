@@ -72,12 +72,79 @@ message SessionEvent {
   reserved 5; // reserved for a reasoning event; streamed-only by decision
 }
 
+message ProvenanceEntry {
+  string session_id = 1;
+  google.protobuf.Timestamp ts = 2;
+}
+
+message Provenance {
+  // One entry per session that taught the record something, in the order they did.
+  repeated ProvenanceEntry entries = 1;
+}
+
+message MemoryRecord {
+  enum Kind {
+    KIND_UNSPECIFIED = 0; // never written
+    KIND_PERSON = 1;
+    KIND_PROJECT = 2;
+    KIND_PREFERENCE = 3;
+    KIND_FACT = 4;
+    KIND_DECISION = 5;
+  }
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0; // never written
+    STATUS_ACTIVE = 1;
+    STATUS_SUPERSEDED = 2;
+  }
+
+  string id = 1;
+  Kind kind = 2;
+  string namespace = 3; // "global" or a project id
+  string title = 4;
+  string summary = 5; // one line; appears in the always-loaded index
+  string body = 6;
+  repeated string links = 7; // related record ids
+  Provenance provenance = 8;
+  Status status = 9;
+}
+
+message MemoryRecordCreated {
+  MemoryRecord record = 1;
+}
+
+message MemoryRecordUpdated {
+  MemoryRecord record = 1;
+}
+
+message MemoryRecordSuperseded {
+  string superseded_id = 1;
+  // The replacement, whole; its id need not be superseded_id.
+  MemoryRecord record = 2;
+}
+
+message MemoryRecordDeleted {
+  // Id only: the projection excludes the record entirely, unlike SUPERSEDED.
+  string id = 1;
+}
+
+message MemoryEvent {
+  // Every arm carries the whole record, never a diff: replay is last write wins.
+  oneof event {
+    MemoryRecordCreated record_created = 1;
+    MemoryRecordUpdated record_updated = 2;
+    MemoryRecordSuperseded record_superseded = 3;
+    MemoryRecordDeleted record_deleted = 4;
+  }
+}
+
 message Event {
   uint64 seq = 1;
   google.protobuf.Timestamp ts = 2;
   Source source = 3;
   oneof payload {
     SessionEvent session = 10;
+    MemoryEvent memory = 11;
   }
-  reserved 11, 12;
+  reserved 12; // reserved for IdentityEvent
 }
