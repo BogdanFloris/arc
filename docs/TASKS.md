@@ -121,3 +121,14 @@ Each schema change is its own commit, separate from code that uses it (invariant
 
 - Batched log appends with flush checkpoint — only with trace evidence that fsync-per-append is a real cost (DESIGN.md §3, durability policy).
 - Provider routing over local + OpenRouter (DESIGN.md §12) — after Phase 2 usage shows what a router would need to know.
+
+## Next session picks up here (banked 2026-08-16)
+
+Sections 1–3 are done and reviewed: the spike, all four schemas, and a provider layer that speaks tools and reasoning. Nothing is in flight; section 4 is next and unassigned. `arcd` on erebor is stopped while the substrate is being rebuilt.
+
+Notes gathered in review for the 4.x briefs, so they aren't lost to chat history:
+
+- 4.2 mints a `call_id` when the provider's opener carried none or collides with one the session has already logged (§3.1's rule) — the parser passes an empty id through on purpose.
+- 4.2 is also where `/no_think` gets applied to interactive turns (1.1: 3–4× latency cut, identical accuracy, per-request), while consolidation (7.2) keeps thinking.
+- The dead-air fix is only half landed: the parser emits `Reasoning` deltas but the engine skips them; the TUI goes quiet until 4.4 forwards and renders them.
+- `finish_reason: "length"` reads as `EndTurn`, matching Phase 1; if truncation ever needs to be distinct, that is the existing `partial` machinery's problem, not a new signal.
