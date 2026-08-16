@@ -129,7 +129,7 @@ message MemoryRecordDeleted {
 }
 
 message MemoryEvent {
-  // Every arm carries the whole record, never a diff: replay is last write wins.
+  // Writes carry the whole record, never a diff: replay is last write wins.
   oneof event {
     MemoryRecordCreated record_created = 1;
     MemoryRecordUpdated record_updated = 2;
