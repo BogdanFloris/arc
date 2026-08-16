@@ -117,8 +117,9 @@ message SessionHistory {
 // A turn is MessageAccepted, then any number of Delta, ReasoningDelta,
 // ToolCallStarted and ToolCallEnded frames in the order the turn produced them,
 // then one StreamEnd or one Error. A client that renders none of the middle
-// frames still sees a whole turn: skipping an arm it does not know is what
-// keeps this protocol additive.
+// frames still sees a whole turn: skipping arms it does not render is what
+// keeps this protocol additive. (An arm a binary predates decodes as an empty
+// msg — the wire shares §3 rule 3's ships-together boundary.)
 message ServerFrame {
   uint64 request_id = 1; // 0 = unsolicited
   oneof msg {
