@@ -55,6 +55,33 @@ message Delta {
   string text = 2;
 }
 
+// The model's thinking, delta by delta, the way Delta carries its text. Never
+// durable (DESIGN.md §3.1): a client that missed it live cannot fetch it back.
+message ReasoningDelta {
+  string session_id = 1;
+  string text = 2;
+}
+
+// A named tool call started. `call_id` is the log's id for the call and is what
+// pairs this with its ToolCallEnded — a step can run calls in parallel, so
+// adjacency pairs nothing. `index` is the order within the step, dense from 0.
+message ToolCallStarted {
+  string session_id = 1;
+  string call_id = 2;
+  uint32 index = 3;
+  string name = 4;
+  reserved 5; // the call's arguments, if a client ever renders them
+}
+
+// The call `call_id` finished. No tool name: ToolCallStarted carried it, and a
+// second copy is a second thing that can be wrong.
+message ToolCallEnded {
+  string session_id = 1;
+  string call_id = 2;
+  ToolOutcome outcome = 3;
+  reserved 4; // a preview of the result, if a client ever renders one
+}
+
 message StreamEnd {
   string session_id = 1;
   uint32 input_tokens = 2;
@@ -87,6 +114,11 @@ message SessionHistory {
   repeated HistoryMessage messages = 2;
 }
 
+// A turn is MessageAccepted, then any number of Delta, ReasoningDelta,
+// ToolCallStarted and ToolCallEnded frames in the order the turn produced them,
+// then one StreamEnd or one Error. A client that renders none of the middle
+// frames still sees a whole turn: skipping an arm it does not know is what
+// keeps this protocol additive.
 message ServerFrame {
   uint64 request_id = 1; // 0 = unsolicited
   oneof msg {
@@ -96,5 +128,8 @@ message ServerFrame {
     StreamEnd stream_end = 13;
     Error error = 14;
     SessionHistory session_history = 15;
+    ReasoningDelta reasoning_delta = 16;
+    ToolCallStarted tool_call_started = 17;
+    ToolCallEnded tool_call_ended = 18;
   }
 }
