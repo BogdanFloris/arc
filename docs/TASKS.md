@@ -75,10 +75,18 @@ Each schema change is its own commit, separate from code that uses it (invariant
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 4.1 | Tool registry seam in `arc-core`: a trait, dispatch, result → event. Memory tools plug in at 5.2/6.3; the toy tool from 1.1 proves the seam | — | todo |
-| 4.2 | Engine loop: completion → tool-call event → execute → tool-result event → continue until final text. Iteration cap; a span per call (instrument in the same change) | — | todo |
-| 4.3 | Resume: on startup/replay, a durable call with no durable result surfaces per the 2.1 contract instead of being silently dropped | — | todo |
-| 4.4 | Wire + TUI: daemon emits 2.4's frames during the loop; `arc` renders tool activity in the transcript (dim, inline — same voice as status words) | — | todo |
+| 4.1 | Tool registry seam in `arc-core`: a trait, dispatch, result → event. Memory tools plug in at 5.2/6.3; the toy tool from 1.1 proves the seam | bogdan | todo |
+| 4.2 | Engine loop: completion → tool-call event → execute → tool-result event → continue until final text. Iteration cap; a span per call (instrument in the same change) | bogdan | todo |
+| 4.3 | Resume: on startup/replay, a durable call with no durable result surfaces per the 2.1 contract instead of being silently dropped | claude | todo |
+| 4.4 | Wire + TUI: daemon emits 2.4's frames during the loop; `arc` renders tool activity in the transcript (dim, inline — same voice as status words) | claude | todo |
+
+Decisions banked 2026-08-17, at assignment:
+
+- **The transcript gap is accepted.** Until 5.1 extends the projection, a reopened session that had a tool turn rebuilds its provider transcript without the tool steps — user message, final text, nothing between. Coherent but lossy, and 5.1's to close; 4.2 does not pull projection work forward.
+- **Iteration cap hit → one final completion with no tools offered.** Forces prose grounded in whatever results arrived; the loop never becomes the user's problem.
+- **`/no_think` is applied by the engine**, per request, behind a config flag — consolidation (7.2) builds its own requests and keeps thinking.
+- **`EngineEvent` grows in 4.2** (reasoning, call started/ended), mirroring the wire frames as it already does; 4.4 is purely translation and rendering.
+- **Reasoning collapses in the TUI** once real text arrives — a dim one-liner, so live scrollback matches what a reopened session will show (reasoning is never durable).
 
 ## 5. Archive tier (`arc-core`)
 
@@ -122,9 +130,9 @@ Each schema change is its own commit, separate from code that uses it (invariant
 - Batched log appends with flush checkpoint — only with trace evidence that fsync-per-append is a real cost (DESIGN.md §3, durability policy).
 - Provider routing over local + OpenRouter (DESIGN.md §12) — after Phase 2 usage shows what a router would need to know.
 
-## Next session picks up here (banked 2026-08-16)
+## Next session picks up here (banked 2026-08-17)
 
-Sections 1–3 are done and reviewed: the spike, all four schemas, and a provider layer that speaks tools and reasoning. Nothing is in flight; section 4 is next and unassigned. `arcd` on erebor is stopped while the substrate is being rebuilt.
+Sections 1–3 are done and reviewed. Section 4 is assigned: bogdan builds 4.1 + 4.2 (one arc — the trait is shaped by what the loop needs), claude builds 4.3 now (schema-only dependency, hand-written log fixtures) and 4.4 once 4.2's `EngineEvent`s exist. `arcd` on erebor is stopped while the substrate is being rebuilt.
 
 Notes gathered in review for the 4.x briefs, so they aren't lost to chat history:
 
