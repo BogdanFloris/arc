@@ -134,6 +134,8 @@ Decisions banked 2026-08-17, at assignment:
 
 Sections 1–3 are done and reviewed. Section 4 is assigned: bogdan builds 4.1 + 4.2 (one arc — the trait is shaped by what the loop needs), claude builds 4.3 now (schema-only dependency, hand-written log fixtures) and 4.4 once 4.2's `EngineEvent`s exist. `arcd` on erebor is stopped while the substrate is being rebuilt.
 
+Prior-art notes for the 5.x/6.x/7.x/8.1 briefs: `docs/prior-art-hermes.md` (hermes-agent, read 2026-08-17) — consolidation prompt content and nudge policy (7.2), FTS query sanitization + return shape (5.2), background-call policy and the task-label routing seam (7.1), index budget and injection framing (6.2/6.3).
+
 Notes gathered in review for the 4.x briefs, so they aren't lost to chat history:
 
 - 4.2 mints a `call_id` when the provider's opener carried none or collides with one the session has already logged (§3.1's rule) — the parser passes an empty id through on purpose.

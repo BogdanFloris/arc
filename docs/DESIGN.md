@@ -206,6 +206,8 @@ Every consolidation decision emits Perfetto spans, so tuning is done against tra
 - Three metrics tracked in traces: records created per session (hoarding detector), supersede rate (contradiction handling), and retrieval hit rate — how often a `memory_search` result is actually used in a response. The last is the honest measure of whether memory earns its tokens.
 - Once enough reviews accumulate, a hand-labeled sample of sessions ("what should have been remembered") yields precision/recall on real usage.
 
+Prior art: hermes-agent's production curation policy — its do-not-capture rules, nudge mechanics, and search/background-call lessons — is distilled in `docs/prior-art-hermes.md` (read 2026-08-17); the 5.x/6.x/7.x briefs should consult the sections keyed to them.
+
 ### 5.5 Retrieval
 
 Memory access is tools, not silent RAG injection. The model calls:
@@ -291,7 +293,7 @@ Each phase ends in something used daily. No phase begins until the previous one 
 Deferred deliberately; decide when the phase forces them:
 
 - Consolidation triggering: idle-timeout vs explicit session close vs continuous. (Phase 2, from traces. v1 placeholder decided 2026-08-14: a configurable idle timeout, so the pass has something to hang on — the question stays open; traces judge it.)
-- Model routing. The ambition is a router of our own — pick the best model per request across local + hosted (OpenRouter), aiming at what a Claude Code 100-style tier delivers. §6's per-completion provider choice is the seam it plugs into. Deliberately not now: a router needs to know what usage looks like, and Phase 2 is what generates that data. (Post-Phase 2, from usage.)
+- Model routing. The ambition is a router of our own — pick the best model per request across local + hosted (OpenRouter), aiming at what a Claude Code 100-style tier delivers. §6's per-completion provider choice is the seam it plugs into. Deliberately not now: a router needs to know what usage looks like, and Phase 2 is what generates that data. (Post-Phase 2, from usage. Prior art banked 2026-08-17: hermes-agent converged on aux-default = the main model after shipping the opposite, and its whole routing surface hangs off a per-task label at one chokepoint — so Phase 2's only routing obligation is that background requests carry a task name that reaches their spans; see `docs/prior-art-hermes.md` §3.)
 - Tool-call events. Answered 2026-08-15 in §3.1: `ToolCallIssued` and `ToolResultRecorded` as kinds inside `SessionEvent`, a `turn_id` instead of turn events, and a write-ahead resume contract that closes an unanswered call as UNKNOWN. The three questions §3.1 leaves open are scoped to the tasks that hit them and listed there.
 - Whether identity edits ever move into the event log. (Revisit if hand-editing becomes a bottleneck.)
 - Embeddings model choice for sqlite-vec, local vs API. (Phase 4/5.)
