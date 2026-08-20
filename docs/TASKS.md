@@ -76,9 +76,9 @@ Each schema change is its own commit, separate from code that uses it (invariant
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 4.1 | Tool registry seam in `arc-core`: a trait, dispatch, result → event. Memory tools plug in at 5.2/6.3; the toy tool from 1.1 proves the seam | bogdan | done |
-| 4.2 | Engine loop: completion → tool-call event → execute → tool-result event → continue until final text. Iteration cap; a span per call (instrument in the same change) | bogdan | in review |
+| 4.2 | Engine loop: completion → tool-call event → execute → tool-result event → continue until final text. Iteration cap; a span per call (instrument in the same change) | bogdan | done |
 | 4.3 | Resume: on startup/replay, a durable call with no durable result surfaces per the 2.1 contract instead of being silently dropped | claude | done |
-| 4.4 | Wire + TUI: daemon emits 2.4's frames during the loop; `arc` renders tool activity in the transcript (dim, inline — same voice as status words) | claude | in review |
+| 4.4 | Wire + TUI: daemon emits 2.4's frames during the loop; `arc` renders tool activity in the transcript (dim, inline — same voice as status words) | claude | done |
 
 Decisions banked 2026-08-17, at assignment:
 
@@ -130,11 +130,21 @@ Decisions banked 2026-08-17, at assignment:
 - Batched log appends with flush checkpoint — only with trace evidence that fsync-per-append is a real cost (DESIGN.md §3, durability policy).
 - Provider routing over local + OpenRouter (DESIGN.md §12) — after Phase 2 usage shows what a router would need to know.
 
-## Next session picks up here (banked 2026-08-17)
+## Next session picks up here (banked 2026-08-20)
 
-Sections 1–3 are done and reviewed. Section 4 is assigned: bogdan builds 4.1 + 4.2 (one arc — the trait is shaped by what the loop needs), claude builds 4.3 now (schema-only dependency, hand-written log fixtures) and 4.4 once 4.2's `EngineEvent`s exist. `arcd` on erebor is stopped while the substrate is being rebuilt.
+**Section 4 is done, reviewed, and live** — the whole agentic substrate: registry with the toy `get_time`, the engine tool loop (write-ahead calls, step cap of 8 with a final no-tools completion, `/no_think` per config, summed usage), the startup orphan closer, and tool activity + reasoning on the wire and in the TUI. `arcd` runs on erebor again as the daily driver; watching real tool turns is now possible, which is what sections 5–6 tune against.
 
-Prior-art notes for the 5.x/6.x/7.x/8.1 briefs: `docs/prior-art-hermes.md` (hermes-agent, read 2026-08-17) — consolidation prompt content and nudge policy (7.2), FTS query sanitization + return shape (5.2), background-call policy and the task-label routing seam (7.1), index budget and injection framing (6.2/6.3).
+Next: section 5 (archive tier) and 6 (distilled tier) are unassigned. Notes for those briefs, so they aren't lost to chat history:
+
+- **5.1 closes the accepted transcript gap**: projection rows for calls/results (keyed `call_id`, `turn_id` on every row), so a reopened tool-turn session rebuilds a full provider transcript. It also inherits the call-id collision check — the engine's set is in-process only (comment in `session.rs` marks it) — and the reserved `partial` column.
+- FTS indexes tool-result content tagged by row kind but excluded from `sessions_search`'s default (§3.1, open question confirmed at 5.1/5.2 against real queries).
+- Prior-art notes for 5.x–8.1: `docs/prior-art-hermes.md` (2026-08-17) — consolidation prompt + nudge policy (7.2), FTS sanitization + return shape (5.2), background-call policy (7.1), index budget (6.2/6.3).
+
+Decisions banked 2026-08-20, in review and live-driving:
+
+- **Thought traces fold in the TUI.** Closed by default (`+ thinking Ns` ticking, `+ thought for Ns` done), `ctrl-o` toggles all of them, vim-`zi` style. The text lives in client memory for the app run only — reasoning stays never-durable; a reopened session shows no trace blocks.
+- **The model device is pinned by name, not index** (`[llama] device = "RTX 5070"`), resolved via `--list-devices` at every sidecar start; no match refuses startup. Cause: Vulkan enumeration order flipped after a reboot and the model silently landed on the iGPU (~5× slower). The old `--device VulkanN` in `args` is retired.
+- `no_think` defaults `true`; erebor currently runs `false` so thinking is visible while the substrate is fresh. Flip it back when the novelty wears off — 1.1's 3–4× latency cut stands.
 
 Notes gathered in review for the 4.x briefs, so they aren't lost to chat history:
 
