@@ -300,6 +300,11 @@ async fn forward(
                 session_id: session_id.clone(),
                 text,
             }),
+            // 4.4 translates these to their wire frames; until then the
+            // engine's tool activity is durable but not forwarded.
+            EngineEvent::Reasoning(_)
+            | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallEnded { .. } => continue,
         };
         if !send_frame(ws, request_id, msg).await {
             return false;
@@ -473,6 +478,7 @@ mod tests {
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
         Stop, Usage,
     };
+    use arc_core::tool::Registry;
     use arc_proto::v1::{FetchHistory, ListSessions, Role};
     use futures::stream;
     use tempfile::TempDir;
@@ -577,12 +583,15 @@ mod tests {
             let log = Log::open(dir.path()).expect("open log");
             let projection = Projection::open(":memory:").expect("open projection");
             let provider = MockProvider::new(script);
+            let registry = Registry::new(512);
             let engine = Engine::new(
                 log,
                 projection,
                 Arc::clone(&provider),
                 "test-model",
                 Some("be terse".to_owned()),
+                registry,
+                false,
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

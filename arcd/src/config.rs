@@ -34,6 +34,9 @@ const DEFAULT_MODEL_FILE: &str = "data/models/Qwen3-8B-Q4_K_M.gguf";
 /// The sidecar's port on localhost.
 const DEFAULT_LLAMA_PORT: u16 = 8080;
 
+/// Longest tool result the registry keeps
+const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+
 /// The resolved daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -56,6 +59,12 @@ pub struct Config {
 
     /// The local sidecar, read only when `provider = "local"`.
     pub llama: LlamaConfig,
+
+    /// The maximum amount of content bytes for a tool result.
+    pub max_tool_result_bytes: usize,
+
+    /// Append `/no_think` to interactive turns' system prompt
+    pub no_think: bool,
 }
 
 /// Which provider implementation the daemon runs with.
@@ -94,6 +103,8 @@ impl Default for Config {
             model: None,
             bind: DEFAULT_BIND.parse().expect("default bind address is valid"),
             llama: LlamaConfig::default(),
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            no_think: true,
         }
     }
 }
@@ -195,6 +206,8 @@ mod tests {
                 port: 9090,
                 args: vec!["-ngl".to_owned(), "99".to_owned()],
             },
+            max_tool_result_bytes: 512,
+            no_think: false,
         };
         let text = toml::to_string(&config).expect("serializes");
         assert_eq!(toml::from_str::<Config>(&text).expect("parses"), config);

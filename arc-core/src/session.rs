@@ -15,6 +15,16 @@
 //!   user's message and the session stay in the log, and the error goes to
 //!   the caller.
 //!
+//! # The tool loop
+//!
+//! A turn is one or more completions. A completion that stops for tool calls
+//! appends every `ToolCallIssued` before dispatching any of them — §3.1's
+//! write-ahead rule, which is what makes the log's silence meaningful — then
+//! appends a `ToolResultRecorded` per call and completes again over the grown
+//! transcript, until the model ends its turn with text. After
+//! [`MAX_TOOL_STEPS`] tool steps the final completion offers no tools, so a
+//! looping model is forced to prose instead of becoming the user's problem.
+//!
 //! # Streaming to callers
 //!
 //! [`EngineEvent`]s mirror the wire protocol event for event, so the daemon's
@@ -25,10 +35,14 @@
 //! its end and appended regardless; durability does not depend on anyone
 //! watching.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arc_proto::v1::{Event, MessageAppended, Role, SessionCreated, SessionEvent, Source};
+use arc_proto::v1::{
+    Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
+    ToolOutcome, ToolResultRecorded,
+};
 use arc_proto::v1::{event, session_event};
 use futures::StreamExt as _;
 use prost_types::Timestamp;
@@ -36,7 +50,15 @@ use tokio::sync::mpsc;
 
 use crate::log::{self, Log};
 use crate::projection::{self, Projection, SessionSummary};
-use crate::provider::{self, CompletionDelta, CompletionRequest, Message, Provider, Usage};
+use crate::provider::{
+    self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
+};
+use crate::tool::Registry;
+
+/// Most tool steps one turn may take. The completion after the last step
+/// offers no tools, forcing prose grounded in whatever results arrived
+/// (banked 2026-08-17).
+const MAX_TOOL_STEPS: usize = 8;
 
 /// The conversation loop, generic over the model backend so tests drive it
 /// with a scripted provider and no network.
@@ -50,6 +72,11 @@ pub struct Engine<P> {
     model: String,
     /// The identity file's content, when there is one (DESIGN.md §5.1).
     system: Option<String>,
+    registry: Registry,
+    /// Append `/no_think` to interactive turns
+    no_think: bool,
+    /// Call ids this process has logged, per session
+    issued_call_ids: HashMap<String, HashSet<String>>,
 }
 
 /// What the engine reports to its caller while a message is in flight.
@@ -59,8 +86,23 @@ pub struct Engine<P> {
 /// returned error is the `Error` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
-    Accepted { session_id: String },
+    Accepted {
+        session_id: String,
+    },
     Delta(String),
+    /// A chunk of the model's thinking
+    Reasoning(String),
+    /// A call is durable and about to run; mirrors `ToolCallStarted`.
+    ToolCallStarted {
+        call_id: String,
+        index: u32,
+        name: String,
+    },
+    /// The call's result is durable; mirrors `ToolCallEnded`.
+    ToolCallEnded {
+        call_id: String,
+        outcome: ToolOutcome,
+    },
 }
 
 /// The outcome of one [`Engine::send_message`] call.
@@ -111,6 +153,8 @@ impl<P: Provider> Engine<P> {
         provider: Arc<P>,
         model: impl Into<String>,
         system: Option<String>,
+        registry: Registry,
+        no_think: bool,
     ) -> Self {
         Self {
             log,
@@ -118,6 +162,9 @@ impl<P: Provider> Engine<P> {
             provider,
             model: model.into(),
             system,
+            registry,
+            no_think,
+            issued_call_ids: HashMap::new(),
         }
     }
 
@@ -146,6 +193,7 @@ impl<P: Provider> Engine<P> {
             new_session = tracing::field::Empty,
             outcome = tracing::field::Empty,
             assistant_seq = tracing::field::Empty,
+            tool_steps = tracing::field::Empty,
         )
     )]
     pub async fn send_message(
@@ -164,6 +212,7 @@ impl<P: Provider> Engine<P> {
         };
         span.record("session_id", session_id.as_str());
         span.record("new_session", new_session);
+        let turn_id = uuid::Uuid::new_v4().to_string();
 
         if new_session {
             self.record(
@@ -183,7 +232,7 @@ impl<P: Provider> Engine<P> {
                 role: Role::User as i32,
                 content: content.to_owned(),
                 partial: false,
-                turn_id: String::new(),
+                turn_id: turn_id.clone(),
             }),
         )?;
 
@@ -194,78 +243,235 @@ impl<P: Provider> Engine<P> {
             })
             .await;
 
-        // History includes the message just appended, so nothing is added on
-        // top of it here.
-        let request = CompletionRequest {
-            model: self.model.clone(),
-            system: self.system.clone(),
-            messages: self.history(&session_id)?,
-            // The loop that offers tools is 4.2's.
-            tools: Vec::new(),
-        };
+        // History includes the message just appended; from here the turn's
+        // transcript grows in memory as the loop appends durable events.
+        let mut transcript = self.history(&session_id)?;
+        let mut total_usage: Option<Usage> = None;
+        let mut steps = 0;
 
+        loop {
+            // After the last allowed tool step, offer no tools: the model can
+            // only answer in prose.
+            let last_step = steps >= MAX_TOOL_STEPS;
+            let request = CompletionRequest {
+                model: self.model.clone(),
+                system: self.system_prompt(),
+                messages: transcript.clone(),
+                tools: if last_step {
+                    Vec::new()
+                } else {
+                    self.registry.definitions()
+                },
+            };
+
+            let (ending, text, calls) = self
+                .run_completion(request, &events, &mut total_usage)
+                .await?;
+
+            match ending {
+                // A tool-call stop with nothing runnable — no calls delivered,
+                // or the cap already spent — falls through to the end-turn arm:
+                // there is nothing to run, so whatever text arrived is the reply.
+                Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
+                    steps += 1;
+                    span.record("tool_steps", steps);
+                    self.tool_step(&session_id, &turn_id, text, calls, &mut transcript, &events)
+                        .await?;
+                }
+                Ending::Done(_) => {
+                    let seq = self.append_reply(&session_id, &turn_id, &text, false)?;
+                    span.record("outcome", "done");
+                    span.record("assistant_seq", seq);
+                    return Ok(Reply {
+                        session_id,
+                        seq,
+                        usage: total_usage,
+                        partial: false,
+                    });
+                }
+                Ending::Cut if text.is_empty() => {
+                    span.record("outcome", "error");
+                    return Err(Error::EmptyReply);
+                }
+                Ending::Cut => {
+                    let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
+                    span.record("outcome", "partial");
+                    span.record("assistant_seq", seq);
+                    return Ok(Reply {
+                        session_id,
+                        seq,
+                        usage: None,
+                        partial: true,
+                    });
+                }
+                Ending::Failed(error) => {
+                    // The text seen so far is appended before the error is
+                    // surfaced. An append failure takes precedence, because a
+                    // durability problem outranks a provider problem.
+                    if !text.is_empty() {
+                        let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
+                        span.record("assistant_seq", seq);
+                    }
+                    span.record("outcome", "error");
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+
+    /// Drives one completion to its end: text and reasoning forwarded as they
+    /// arrive, calls collected whole, usage summed into the turn's total.
+    // `&mut self` for the future's `Send` bound, not for mutation: a shared
+    // borrow held across an await would demand `Engine: Sync`, and the
+    // projection's SQLite connection is not.
+    async fn run_completion(
+        &mut self,
+        request: CompletionRequest,
+        events: &mpsc::Sender<EngineEvent>,
+        total_usage: &mut Option<Usage>,
+    ) -> Result<(Ending, String, Vec<ToolCall>), Error> {
         let mut stream = self.provider.complete(request).await?;
         let mut text = String::new();
-        let mut usage = None;
+        let mut calls = Vec::new();
         let ending = loop {
             match stream.next().await {
                 Some(Ok(CompletionDelta::Text(chunk))) => {
                     text.push_str(&chunk);
                     let _ = events.send(EngineEvent::Delta(chunk)).await;
                 }
-                // Reasoning and tool calls are 4.2's to act on; this loop
-                // still only knows how to say text.
-                Some(Ok(CompletionDelta::Reasoning(_) | CompletionDelta::ToolCall(_))) => {}
+                Some(Ok(CompletionDelta::Reasoning(chunk))) => {
+                    let _ = events.send(EngineEvent::Reasoning(chunk)).await;
+                }
+                Some(Ok(CompletionDelta::ToolCall(call))) => calls.push(call),
                 // The stream contract says `Done` is the last item; trusting
                 // it saves a poll that could only return `None`.
-                Some(Ok(CompletionDelta::Done { usage: done, .. })) => {
-                    usage = Some(done);
-                    break Ending::Done;
+                Some(Ok(CompletionDelta::Done { usage, stop })) => {
+                    let total = total_usage.get_or_insert(Usage::default());
+                    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+                    break Ending::Done(stop);
                 }
                 Some(Err(error)) => break Ending::Failed(error),
                 None => break Ending::Cut,
             }
         };
+        Ok((ending, text, calls))
+    }
 
-        match ending {
-            Ending::Done => {
-                let seq = self.append_reply(&session_id, &text, false)?;
-                span.record("outcome", "done");
-                span.record("assistant_seq", seq);
-                Ok(Reply {
-                    session_id,
-                    seq,
-                    usage,
+    /// One tool step
+    async fn tool_step(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        text: String,
+        mut calls: Vec<ToolCall>,
+        transcript: &mut Vec<Message>,
+        events: &mpsc::Sender<EngineEvent>,
+    ) -> Result<(), Error> {
+        // Step text is rare.
+        if !text.is_empty() {
+            self.record(
+                Source::Model,
+                session_event::Event::MessageAppended(MessageAppended {
+                    session_id: session_id.to_owned(),
+                    role: Role::Assistant as i32,
+                    content: text.clone(),
                     partial: false,
-                })
-            }
-            Ending::Cut if text.is_empty() => {
-                span.record("outcome", "error");
-                Err(Error::EmptyReply)
-            }
-            Ending::Cut => {
-                let seq = self.append_reply(&session_id, &text, true)?;
-                span.record("outcome", "partial");
-                span.record("assistant_seq", seq);
-                Ok(Reply {
-                    session_id,
-                    seq,
-                    usage: None,
-                    partial: true,
-                })
-            }
-            Ending::Failed(error) => {
-                // The text seen so far is appended before the error is
-                // surfaced — an append failure takes precedence, because a
-                // durability problem outranks a provider problem.
-                if !text.is_empty() {
-                    let seq = self.append_reply(&session_id, &text, true)?;
-                    span.record("assistant_seq", seq);
-                }
-                span.record("outcome", "error");
-                Err(error.into())
-            }
+                    turn_id: turn_id.to_owned(),
+                }),
+            )?;
+            transcript.push(Message::Text {
+                role: Role::Assistant,
+                content: text,
+            });
         }
+
+        calls.sort_unstable_by_key(|call| call.index);
+        // an id the provider left empty, or one this
+        // session has already logged, is replaced with a created one,
+        // the log then records the id that was actually used, everywhere.
+        let seen = self
+            .issued_call_ids
+            .entry(session_id.to_owned())
+            .or_default();
+        for call in &mut calls {
+            if call.id.is_empty() || seen.contains(&call.id) {
+                call.id = uuid::Uuid::new_v4().to_string();
+            }
+            seen.insert(call.id.clone());
+        }
+
+        // Write-ahead: the whole step's calls are durable before any of them
+        // runs. Nothing ran that is not on disk.
+        for call in &calls {
+            self.record(
+                Source::Model,
+                session_event::Event::ToolCallIssued(ToolCallIssued {
+                    session_id: session_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    call_id: call.id.clone(),
+                    index: call.index,
+                    name: call.name.clone(),
+                    arguments_json: call.arguments.clone(),
+                }),
+            )?;
+            let _ = events
+                .send(EngineEvent::ToolCallStarted {
+                    call_id: call.id.clone(),
+                    index: call.index,
+                    name: call.name.clone(),
+                })
+                .await;
+        }
+
+        let mut results = Vec::with_capacity(calls.len());
+        for call in &calls {
+            let dispatched = self
+                .registry
+                .dispatch(&call.name, call.arguments.clone())
+                .await;
+            let outcome = if dispatched.ok {
+                ToolOutcome::Ok
+            } else {
+                ToolOutcome::Error
+            };
+            self.record(
+                Source::System,
+                session_event::Event::ToolResultRecorded(ToolResultRecorded {
+                    session_id: session_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    call_id: call.id.clone(),
+                    outcome: outcome as i32,
+                    content: dispatched.content.clone(),
+                    truncated: dispatched.truncated,
+                }),
+            )?;
+            let _ = events
+                .send(EngineEvent::ToolCallEnded {
+                    call_id: call.id.clone(),
+                    outcome,
+                })
+                .await;
+            results.push((call.id.clone(), dispatched.content));
+        }
+
+        transcript.push(Message::ToolCalls(calls));
+        for (call_id, content) in results {
+            transcript.push(Message::ToolResult { call_id, content });
+        }
+        Ok(())
+    }
+
+    /// The system prompt as sent: the identity file, plus `/no_think` when
+    /// configured.
+    fn system_prompt(&self) -> Option<String> {
+        if !self.no_think {
+            return self.system.clone();
+        }
+        Some(match &self.system {
+            Some(identity) => format!("{identity}\n/no_think"),
+            None => "/no_think".to_owned(),
+        })
     }
 
     /// Every session, oldest first (see [`Projection::sessions`]).
@@ -319,7 +525,13 @@ impl<P: Provider> Engine<P> {
     }
 
     /// Appends the model's reply.
-    fn append_reply(&mut self, session_id: &str, text: &str, partial: bool) -> Result<u64, Error> {
+    fn append_reply(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        text: &str,
+        partial: bool,
+    ) -> Result<u64, Error> {
         self.record(
             Source::Model,
             session_event::Event::MessageAppended(MessageAppended {
@@ -327,7 +539,7 @@ impl<P: Provider> Engine<P> {
                 role: Role::Assistant as i32,
                 content: text.to_owned(),
                 partial,
-                turn_id: String::new(),
+                turn_id: turn_id.to_owned(),
             }),
         )
     }
@@ -354,9 +566,9 @@ impl<P: Provider> Engine<P> {
     }
 }
 
-/// How the provider stream ended; see the module docs.
+/// How one completion of the loop ended; see the module docs.
 enum Ending {
-    Done,
+    Done(Stop),
     Cut,
     Failed(provider::Error),
 }
@@ -380,18 +592,22 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use arc_proto::v1::{Role, Source, session_event};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use arc_proto::v1::{Role, Source, ToolOutcome, session_event};
     use futures::stream;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    use super::{Engine, EngineEvent, Error};
+    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS};
     use crate::log::{Log, LogReader, discover_segments};
     use crate::projection::Projection;
     use crate::provider::{
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
-        Provider, Stop, Usage,
+        Provider, Stop, ToolCall, ToolDefinition, Usage,
     };
+    use crate::tool::{Registry, Tool, ToolReply};
 
     /// A scripted provider: each `complete` call captures its request and
     /// yields the next script entry.
@@ -469,6 +685,28 @@ mod tests {
             Arc::clone(provider),
             "test-model",
             Some("be terse".to_owned()),
+            Registry::new(512),
+            false,
+        )
+    }
+
+    /// An engine whose model may call tools, with `/no_think` off so system
+    /// prompt assertions stay simple.
+    fn engine_with_tools(
+        provider: &Arc<MockProvider>,
+        dir: &TempDir,
+        registry: Registry,
+    ) -> Engine<MockProvider> {
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::open(":memory:").expect("open projection");
+        Engine::new(
+            log,
+            projection,
+            Arc::clone(provider),
+            "test-model",
+            Some("be terse".to_owned()),
+            registry,
+            false,
         )
     }
 
@@ -506,6 +744,73 @@ mod tests {
         match event {
             session_event::Event::MessageAppended(m) => m,
             other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    fn issued(event: &session_event::Event) -> &arc_proto::v1::ToolCallIssued {
+        match event {
+            session_event::Event::ToolCallIssued(c) => c,
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResultRecorded {
+        match event {
+            session_event::Event::ToolResultRecorded(r) => r,
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+
+    /// A test tool with a fixed reply.
+    struct Canned {
+        name: &'static str,
+        content: &'static str,
+        ok: bool,
+    }
+
+    impl Tool for Canned {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _arguments_json: String,
+        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+            let reply = ToolReply {
+                content: self.content.to_owned(),
+                ok: self.ok,
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    /// A registry of [`Canned`] tools: `(name, reply, ok)` each.
+    fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
+        let mut registry = Registry::new(512);
+        for &(name, content, ok) in entries {
+            registry.register(Box::new(Canned { name, content, ok }));
+        }
+        registry
+    }
+
+    fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {
+        CompletionDelta::ToolCall(ToolCall {
+            id: id.to_owned(),
+            index,
+            name: name.to_owned(),
+            arguments: args.to_owned(),
+        })
+    }
+
+    fn tool_stop() -> CompletionDelta {
+        CompletionDelta::Done {
+            usage: usage(),
+            stop: Stop::ToolCalls,
         }
     }
 
@@ -788,5 +1093,336 @@ mod tests {
         let requests = provider.requests();
         let turns: Vec<&str> = requests[0].messages.iter().map(|m| turn(m).1).collect();
         assert_eq!(turns, ["hi"], "the unmappable message stayed out");
+    }
+
+    #[tokio::test]
+    async fn a_tool_turn_logs_calls_results_and_final_text_in_order() {
+        let provider = MockProvider::scripted(vec![
+            vec![Ok(call("srv1", 0, "lookup", r#"{"q":1}"#)), Ok(tool_stop())],
+            done_reply("answer"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, mut rx) = channel();
+
+        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+
+        // Two completions billed; the reply sums them.
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                input_tokens: 6,
+                output_tokens: 10
+            })
+        );
+
+        let events = replay_log(&engine);
+        assert_eq!(events.len(), 5);
+        let user = appended(&events[1]);
+        let issued_call = issued(&events[2]);
+        let result = resulted(&events[3]);
+        let assistant = appended(&events[4]);
+
+        assert!(!user.turn_id.is_empty(), "the turn has an id");
+        for turn_id in [&issued_call.turn_id, &result.turn_id, &assistant.turn_id] {
+            assert_eq!(turn_id, &user.turn_id, "one turn, one id");
+        }
+        assert_eq!(issued_call.call_id, "srv1", "the provider's id, verbatim");
+        assert_eq!(issued_call.name, "lookup");
+        assert_eq!(issued_call.arguments_json, r#"{"q":1}"#);
+        assert_eq!(result.call_id, "srv1");
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(result.content, "found it");
+        assert!(!result.truncated);
+        assert_eq!(assistant.content, "answer");
+
+        // The second completion saw the calls and their results, in order.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[1].tools.is_empty(), "tools stay offered");
+        assert_eq!(requests[1].messages.len(), 3);
+        let Message::ToolCalls(calls) = &requests[1].messages[1] else {
+            panic!("expected the calls, got {:?}", requests[1].messages[1]);
+        };
+        assert_eq!(calls[0].id, "srv1");
+        assert_eq!(
+            requests[1].messages[2],
+            Message::ToolResult {
+                call_id: "srv1".to_owned(),
+                content: "found it".to_owned(),
+            }
+        );
+
+        // The caller watched the whole turn.
+        assert_eq!(
+            drain(&mut rx),
+            [
+                EngineEvent::Accepted {
+                    session_id: reply.session_id.clone()
+                },
+                EngineEvent::ToolCallStarted {
+                    call_id: "srv1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                },
+                EngineEvent::ToolCallEnded {
+                    call_id: "srv1".to_owned(),
+                    outcome: ToolOutcome::Ok,
+                },
+                EngineEvent::Delta("answer".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_calls_are_written_ahead_and_answered_in_index_order() {
+        // The provider delivers index 1 first; the log and transcript sort it.
+        let provider = MockProvider::scripted(vec![
+            vec![
+                Ok(call("b", 1, "beta", "{}")),
+                Ok(call("a", 0, "alpha", "{}")),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let registry = tools(&[("alpha", "A", true), ("beta", "B", true)]);
+        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        let events = replay_log(&engine);
+        // Both calls durable before either result: the write-ahead rule.
+        let first = issued(&events[2]);
+        let second = issued(&events[3]);
+        assert_eq!((first.index, first.call_id.as_str()), (0, "a"));
+        assert_eq!((second.index, second.call_id.as_str()), (1, "b"));
+        assert_eq!(resulted(&events[4]).call_id, "a");
+        assert_eq!(resulted(&events[5]).call_id, "b");
+
+        let requests = provider.requests();
+        let Message::ToolCalls(calls) = &requests[1].messages[1] else {
+            panic!("expected the calls");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].index, calls[1].index), (0, 1));
+        assert_eq!(
+            &requests[1].messages[2..],
+            [
+                Message::ToolResult {
+                    call_id: "a".to_owned(),
+                    content: "A".to_owned(),
+                },
+                Message::ToolResult {
+                    call_id: "b".to_owned(),
+                    content: "B".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_colliding_call_id_is_minted() {
+        let provider = MockProvider::scripted(vec![
+            vec![
+                Ok(call("", 0, "alpha", "{}")),
+                Ok(call("dup", 1, "alpha", "{}")),
+                Ok(tool_stop()),
+            ],
+            vec![Ok(call("dup", 0, "alpha", "{}")), Ok(tool_stop())],
+            done_reply("ok"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        let events = replay_log(&engine);
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::ToolCallIssued(c) => Some(c.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| !id.is_empty()), "no empty id survives");
+        assert_eq!(ids[1], "dup", "the first use of an id is kept");
+        assert_ne!(ids[2], "dup", "the second use is replaced");
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "ids are unique across the session");
+
+        // Every result names the id the log recorded, minted or not.
+        let result_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::ToolResultRecorded(r) => Some(r.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, [ids[0], ids[1], ids[2]]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_error_is_a_result_and_the_turn_continues() {
+        let provider = MockProvider::scripted(vec![
+            vec![Ok(call("x", 0, "fails", "{}")), Ok(tool_stop())],
+            done_reply("recovered"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let registry = tools(&[("fails", "ERROR: nope", false)]);
+        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (tx, mut rx) = channel();
+
+        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        assert!(!reply.partial);
+
+        let events = replay_log(&engine);
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert_eq!(result.content, "ERROR: nope");
+        assert_eq!(appended(&events[4]).content, "recovered");
+        assert!(drain(&mut rx).contains(&EngineEvent::ToolCallEnded {
+            call_id: "x".to_owned(),
+            outcome: ToolOutcome::Error,
+        }));
+    }
+
+    #[tokio::test]
+    async fn step_text_is_appended_before_its_calls() {
+        let provider = MockProvider::scripted(vec![
+            vec![
+                Ok(CompletionDelta::Text("checking".to_owned())),
+                Ok(call("s", 0, "alpha", "{}")),
+                Ok(tool_stop()),
+            ],
+            done_reply("final"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        let events = replay_log(&engine);
+        assert_eq!(events.len(), 6);
+        let step_text = appended(&events[2]);
+        assert_eq!(step_text.content, "checking");
+        assert!(!step_text.partial);
+        assert_eq!(issued(&events[3]).call_id, "s");
+        assert_eq!(appended(&events[5]).content, "final");
+        assert_eq!(step_text.turn_id, appended(&events[5]).turn_id);
+    }
+
+    #[tokio::test]
+    async fn the_step_cap_forces_a_final_completion_without_tools() {
+        let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS)
+            .map(|step| {
+                vec![
+                    Ok(call(&format!("c{step}"), 0, "alpha", "{}")),
+                    Ok(tool_stop()),
+                ]
+            })
+            .collect();
+        script.push(done_reply("enough"));
+        let provider = MockProvider::scripted(script);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+
+        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), MAX_TOOL_STEPS + 1);
+        assert!(
+            requests[..MAX_TOOL_STEPS]
+                .iter()
+                .all(|r| !r.tools.is_empty())
+        );
+        assert!(
+            requests[MAX_TOOL_STEPS].tools.is_empty(),
+            "the final completion offers no tools"
+        );
+        let events = replay_log(&engine);
+        assert_eq!(appended(events.last().expect("events")).content, "enough");
+        assert!(!reply.partial);
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_forwarded_and_never_stored() {
+        let provider = MockProvider::scripted(vec![vec![
+            Ok(CompletionDelta::Reasoning("hmm".to_owned())),
+            Ok(CompletionDelta::Text("hi there".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine(&provider, &dir);
+        let (tx, mut rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        let forwarded = drain(&mut rx);
+        assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
+        // Nothing durable carries it: session, user, assistant, and that's all.
+        let events = replay_log(&engine);
+        assert_eq!(events.len(), 3);
+        assert_eq!(appended(&events[2]).content, "hi there");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_result_marks_the_event() {
+        let provider = MockProvider::scripted(vec![
+            vec![Ok(call("t", 0, "big", "{}")), Ok(tool_stop())],
+            done_reply("ok"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut registry = Registry::new(8);
+        registry.register(Box::new(Canned {
+            name: "big",
+            content: "0123456789abcdef",
+            ok: true,
+        }));
+        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        let events = replay_log(&engine);
+        let result = resulted(&events[3]);
+        assert!(result.truncated);
+        assert_eq!(result.content, "01234567 [truncated]");
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+    }
+
+    #[tokio::test]
+    async fn no_think_rides_the_system_prompt() {
+        let provider = MockProvider::scripted(vec![done_reply("ok")]);
+        let dir = TempDir::new().expect("temp dir");
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::open(":memory:").expect("open projection");
+        let mut engine = Engine::new(
+            log,
+            projection,
+            Arc::clone(&provider),
+            "test-model",
+            Some("be terse".to_owned()),
+            Registry::new(512),
+            true,
+        );
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        assert_eq!(
+            provider.requests()[0].system.as_deref(),
+            Some("be terse\n/no_think")
+        );
     }
 }

@@ -21,6 +21,8 @@ use arc_core::projection::{self, Projection};
 use arc_core::provider::Provider;
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
+use arc_core::tool::Registry;
+use arc_core::tool::time::GetTime;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -122,12 +124,17 @@ impl<P: Provider + 'static> Daemon<P> {
             info!("no identity file, running without one");
         }
 
+        let mut registry = Registry::new(config.max_tool_result_bytes);
+        registry.register(Box::new(GetTime));
+
         let engine = Engine::new(
             log,
             projection,
             Arc::new(provider),
             config.model(),
             identity,
+            registry,
+            config.no_think,
         );
 
         Ok(Self {
