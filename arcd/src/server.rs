@@ -35,8 +35,9 @@ use arc_core::projection::SessionSummary;
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, HistoryMessage, MessageAccepted, SendMessage,
-    ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd, client_frame, server_frame,
+    ClientFrame, Delta, Error as WireError, HistoryMessage, MessageAccepted, ReasoningDelta,
+    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd, ToolCallEnded,
+    ToolCallStarted, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -300,11 +301,27 @@ async fn forward(
                 session_id: session_id.clone(),
                 text,
             }),
-            // 4.4 translates these to their wire frames; until then the
-            // engine's tool activity is durable but not forwarded.
-            EngineEvent::Reasoning(_)
-            | EngineEvent::ToolCallStarted { .. }
-            | EngineEvent::ToolCallEnded { .. } => continue,
+            EngineEvent::Reasoning(text) => server_frame::Msg::ReasoningDelta(ReasoningDelta {
+                session_id: session_id.clone(),
+                text,
+            }),
+            EngineEvent::ToolCallStarted {
+                call_id,
+                index,
+                name,
+            } => server_frame::Msg::ToolCallStarted(ToolCallStarted {
+                session_id: session_id.clone(),
+                call_id,
+                index,
+                name,
+            }),
+            EngineEvent::ToolCallEnded { call_id, outcome } => {
+                server_frame::Msg::ToolCallEnded(ToolCallEnded {
+                    session_id: session_id.clone(),
+                    call_id,
+                    outcome: outcome as i32,
+                })
+            }
         };
         if !send_frame(ws, request_id, msg).await {
             return false;
@@ -470,16 +487,17 @@ fn flow(connected: bool) -> ControlFlow<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
     use arc_core::log::Log;
     use arc_core::projection::Projection;
     use arc_core::provider::{
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
-        Stop, Usage,
+        Stop, ToolCall, ToolDefinition, Usage,
     };
-    use arc_core::tool::Registry;
-    use arc_proto::v1::{FetchHistory, ListSessions, Role};
+    use arc_core::tool::{Registry, Tool, ToolReply};
+    use arc_proto::v1::{FetchHistory, ListSessions, Role, ToolOutcome};
     use futures::stream;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -579,11 +597,14 @@ mod tests {
 
     impl Harness {
         async fn start(script: Script) -> Self {
+            Self::with_tools(script, Registry::new(512)).await
+        }
+
+        async fn with_tools(script: Script, registry: Registry) -> Self {
             let dir = TempDir::new().expect("temp dir");
             let log = Log::open(dir.path()).expect("open log");
             let projection = Projection::open(":memory:").expect("open projection");
             let provider = MockProvider::new(script);
-            let registry = Registry::new(512);
             let engine = Engine::new(
                 log,
                 projection,
@@ -624,6 +645,34 @@ mod tests {
                 .await
                 .expect("server stops within the grace")
                 .expect("server task");
+        }
+    }
+
+    /// A test tool with a fixed reply.
+    struct Canned {
+        name: &'static str,
+        content: &'static str,
+        ok: bool,
+    }
+
+    impl Tool for Canned {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _arguments_json: String,
+        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+            let reply = ToolReply {
+                content: self.content.to_owned(),
+                ok: self.ok,
+            };
+            Box::pin(async move { reply })
         }
     }
 
@@ -919,6 +968,88 @@ mod tests {
         assert_eq!(end.session_id, session_id);
         assert!(end.partial, "a cut stream says so on the wire");
         assert_eq!((end.input_tokens, end.output_tokens), (0, 0));
+
+        harness.stop().await;
+    }
+
+    /// The engine's reasoning and tool activity reach the client as their
+    /// wire frames, in the order the turn produced them.
+    #[tokio::test]
+    async fn reasoning_and_tool_activity_are_forwarded_in_turn_order() {
+        let script = Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::Reasoning("let me look".to_owned())),
+                Ok(CompletionDelta::ToolCall(ToolCall {
+                    id: "t1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                })),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("answer".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]));
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Canned {
+            name: "lookup",
+            content: "found it",
+            ok: true,
+        }));
+        let mut harness = Harness::with_tools(script, registry).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hi")).await;
+
+        let accepted = next_frame(&mut ws).await;
+        let session_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted first, got {other:?}"),
+        };
+
+        let mut middle = Vec::new();
+        let end = loop {
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.request_id, 1, "request_id is echoed");
+            match frame.msg.expect("a message") {
+                server_frame::Msg::StreamEnd(end) => break end,
+                msg => middle.push(msg),
+            }
+        };
+
+        assert_eq!(
+            middle,
+            [
+                server_frame::Msg::ReasoningDelta(ReasoningDelta {
+                    session_id: session_id.clone(),
+                    text: "let me look".to_owned(),
+                }),
+                server_frame::Msg::ToolCallStarted(ToolCallStarted {
+                    session_id: session_id.clone(),
+                    call_id: "t1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                }),
+                server_frame::Msg::ToolCallEnded(ToolCallEnded {
+                    session_id: session_id.clone(),
+                    call_id: "t1".to_owned(),
+                    outcome: ToolOutcome::Ok as i32,
+                }),
+                server_frame::Msg::Delta(Delta {
+                    session_id: session_id.clone(),
+                    text: "answer".to_owned(),
+                }),
+            ]
+        );
+        assert_eq!(end.session_id, session_id);
 
         harness.stop().await;
     }
