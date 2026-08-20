@@ -8,7 +8,8 @@
 //! Keys are modal, vim-style: insert mode types into the input line, normal
 //! mode moves and edits it (`h l 0 $ w b`, `i I a A`, `x D dd`) and scrolls
 //! the transcript (`j k`, `ctrl-d/u`, `G`, `gg`), `:` takes commands (`:q`).
-//! The app starts in insert — a chat's first act is typing.
+//! `ctrl-o` toggles the last thought trace from either mode. The app starts
+//! in insert — a chat's first act is typing.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -72,12 +73,19 @@ pub enum Block {
     Fault { code: String, msg: String },
     /// A dim aside from the client itself (e.g. "history not shown").
     Note(String),
-    /// The model's thinking, streaming live where the reply will appear.
-    /// Collapses to [`Block::Thought`] once the reply starts; never durable,
-    /// so a reopened session will not show it.
-    Thinking(String),
-    /// What a [`Block::Thinking`] collapses to: how long the model thought.
-    Thought { seconds: u64 },
+    /// The model's thinking, folded to a one-line trace; `ctrl-o` opens it.
+    ///
+    /// Streams into `text` while live (`done: false`), then freezes once the
+    /// reply, a tool call, or the turn's end arrives. The words live only in
+    /// this running app's transcript state — reasoning is never durable
+    /// (DESIGN.md §3.1), so a reopened session shows no thought blocks at
+    /// all. Client memory here is not storage.
+    Thought {
+        text: String,
+        seconds: u64,
+        done: bool,
+        open: bool,
+    },
     /// A tool call where it happened: running until its `ToolEnded` names an
     /// outcome. Transient like the thought line — history won't return it.
     Tool {
@@ -127,7 +135,7 @@ pub struct App {
     pub last_error: Option<String>,
     /// Messages typed while a turn was streaming, sent in order after it.
     pub queued: VecDeque<String>,
-    /// When the live thinking block started, for the collapsed line's clock.
+    /// When the live thought block started, for its folded line's clock.
     thinking_since: Option<Instant>,
     /// How many wrapped lines the view is scrolled up from the bottom. May
     /// overshoot; drawing clamps it to the transcript's real height.
@@ -221,6 +229,7 @@ impl App {
             // Half-page scrolls; drawing clamps the overshoot.
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
+            KeyCode::Char('o') => self.toggle_thought(),
             KeyCode::Char('p') => self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
@@ -469,7 +478,7 @@ impl App {
                 created.then_some(Command::List)
             }
             NetEvent::Delta(text) => {
-                self.collapse_thinking();
+                self.finalize_thinking();
                 if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
                     reply.push_str(&text);
                 } else {
@@ -483,20 +492,34 @@ impl App {
                 None
             }
             NetEvent::Reasoning(text) => {
-                if let Some(Block::Thinking(thinking)) = self.transcript.last_mut() {
+                if let Some(Block::Thought {
+                    text: thinking,
+                    seconds,
+                    done: false,
+                    ..
+                }) = self.transcript.last_mut()
+                {
                     thinking.push_str(&text);
+                    // Deltas arrive continuously while the model thinks, so
+                    // updating here is what makes the folded clock tick.
+                    *seconds = Self::thought_seconds(self.thinking_since);
                 } else {
                     // The thinking streams where the reply will appear, so the
                     // reply block `Accepted` opened moves out of the way until
                     // the first delta re-creates it below.
                     self.pop_empty_reply();
                     self.thinking_since = Some(Instant::now());
-                    self.transcript.push(Block::Thinking(text));
+                    self.transcript.push(Block::Thought {
+                        text,
+                        seconds: 1,
+                        done: false,
+                        open: false,
+                    });
                 }
                 None
             }
             NetEvent::ToolStarted { call_id, name } => {
-                self.collapse_thinking();
+                self.finalize_thinking();
                 self.pop_empty_reply();
                 self.transcript.push(Block::Tool {
                     call_id,
@@ -516,14 +539,14 @@ impl App {
                 None
             }
             NetEvent::End { partial } => {
-                self.collapse_thinking();
+                self.finalize_thinking();
                 if let Some(Block::Arc { partial: p, .. }) = self.transcript.last_mut() {
                     *p = partial;
                 }
                 self.turn_over(Status::Idle)
             }
             NetEvent::Failed { code, msg } => {
-                self.collapse_thinking();
+                self.finalize_thinking();
                 // A turn that failed before any delta leaves an empty reply
                 // block; the fault replaces it rather than trailing it.
                 self.pop_empty_reply();
@@ -551,20 +574,38 @@ impl App {
         Some(self.send(next))
     }
 
-    /// Collapses a live thinking block to its one-line trace.
+    /// Marks a live thought block done, freezing its clock. The words and the
+    /// open state stay — only the streaming stops.
+    fn finalize_thinking(&mut self) {
+        let since = self.thinking_since.take();
+        if let Some(Block::Thought { seconds, done, .. }) = self.transcript.last_mut() {
+            if !*done {
+                *done = true;
+                *seconds = Self::thought_seconds(since);
+            }
+        }
+    }
+
+    /// Whole seconds a thought has run, with a 1s floor so the trace line
+    /// never says 0s.
+    fn thought_seconds(since: Option<Instant>) -> u64 {
+        since.map_or(0, |since| since.elapsed().as_secs()).max(1)
+    }
+
+    /// `ctrl-o`: folds or unfolds every thought trace, from any mode.
     ///
-    /// Live scrollback has to match what a reopened session will show, and
-    /// reasoning is never durable — so once anything follows it, the words go
-    /// and only the time they took stays.
-    fn collapse_thinking(&mut self) {
-        if matches!(self.transcript.last(), Some(Block::Thinking(_))) {
-            self.transcript.pop();
-            let seconds = self
-                .thinking_since
-                .take()
-                .map_or(0, |since| since.elapsed().as_secs())
-                .max(1);
-            self.transcript.push(Block::Thought { seconds });
+    /// All of them at once, like vim's `zi`: any open → all close, none open
+    /// → all open. One global state means the key never needs a target, so
+    /// scrolling cannot change what it does. No thought block, no-op.
+    fn toggle_thought(&mut self) {
+        let any_open = self
+            .transcript
+            .iter()
+            .any(|block| matches!(block, Block::Thought { open: true, .. }));
+        for block in &mut self.transcript {
+            if let Block::Thought { open, .. } = block {
+                *open = !any_open;
+            }
         }
     }
 
@@ -791,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_streams_live_then_collapses_on_the_first_delta() {
+    fn reasoning_streams_into_a_closed_live_thought() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -805,30 +846,51 @@ mod tests {
             app.transcript,
             [
                 Block::You("hi".to_owned()),
-                Block::Thinking("let me think".to_owned()),
+                Block::Thought {
+                    text: "let me think".to_owned(),
+                    seconds: 1,
+                    done: false,
+                    open: false,
+                },
             ],
-            "the thinking streams where the reply will appear"
+            "the trace accumulates folded, where the reply will appear"
         );
+    }
+
+    #[test]
+    fn the_first_delta_finalizes_the_thought_and_keeps_the_words() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("let me think".to_owned()));
 
         app.on_net(NetEvent::Delta("hello".to_owned()));
         assert_eq!(
             app.transcript,
             [
                 Block::You("hi".to_owned()),
-                Block::Thought { seconds: 1 },
+                Block::Thought {
+                    text: "let me think".to_owned(),
+                    seconds: 1,
+                    done: true,
+                    open: false,
+                },
                 Block::Arc {
                     text: "hello".to_owned(),
                     partial: false
                 },
             ],
-            "the words go; the time they took stays"
+            "the words stay; only the streaming stops"
         );
     }
 
-    /// A turn cut (or errored) mid-thought still collapses: a live thinking
-    /// block must not outlive its turn.
+    /// A turn cut mid-thought still finalizes: a live thought block must not
+    /// outlive its turn.
     #[test]
-    fn reasoning_collapses_on_end_when_no_text_ever_came() {
+    fn reasoning_finalizes_on_end_when_no_text_ever_came() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -840,9 +902,170 @@ mod tests {
 
         assert_eq!(
             app.transcript,
-            [Block::You("hi".to_owned()), Block::Thought { seconds: 1 }]
+            [
+                Block::You("hi".to_owned()),
+                Block::Thought {
+                    text: "hmm".to_owned(),
+                    seconds: 1,
+                    done: true,
+                    open: false,
+                }
+            ]
         );
         assert_eq!(app.status, Status::Idle);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_a_done_thought_from_either_mode() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
+        app.on_net(NetEvent::Delta("hello".to_owned()));
+        app.on_net(NetEvent::End { partial: false });
+
+        assert_eq!(app.on_key(ctrl('o')), None, "insert mode opens it");
+        assert!(matches!(
+            app.transcript[1],
+            Block::Thought { open: true, .. }
+        ));
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ctrl('o'));
+        assert!(
+            matches!(app.transcript[1], Block::Thought { open: false, .. }),
+            "normal mode closes it again"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_a_live_thought_and_finalizing_keeps_it_open() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
+
+        app.on_key(ctrl('o'));
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(Block::Thought {
+                    done: false,
+                    open: true,
+                    ..
+                })
+            ),
+            "a live thought streams open"
+        );
+
+        app.on_net(NetEvent::Delta("hello".to_owned()));
+        assert!(
+            matches!(
+                app.transcript[1],
+                Block::Thought {
+                    done: true,
+                    open: true,
+                    ..
+                }
+            ),
+            "finalizing does not fold it back"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_without_a_thought_is_a_no_op() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.on_key(ctrl('o')), None);
+        assert_eq!(app.transcript, [Block::You("hi".to_owned())]);
+    }
+
+    #[test]
+    fn a_turn_that_fails_mid_thought_keeps_the_trace_openable() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
+        app.on_net(NetEvent::Failed {
+            code: "provider".to_owned(),
+            msg: "upstream 500".to_owned(),
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Thought {
+                    text: "hmm".to_owned(),
+                    seconds: 1,
+                    done: true,
+                    open: false,
+                },
+                Block::Fault {
+                    code: "provider".to_owned(),
+                    msg: "upstream 500".to_owned()
+                },
+            ]
+        );
+
+        app.on_key(ctrl('o'));
+        assert!(matches!(
+            app.transcript[1],
+            Block::Thought { open: true, .. }
+        ));
+    }
+
+    #[test]
+    fn ctrl_o_toggles_every_thought_at_once() {
+        let mut app = App::new();
+        typed(&mut app, "one");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("first".to_owned()));
+        app.on_net(NetEvent::Delta("a".to_owned()));
+        app.on_net(NetEvent::End { partial: false });
+
+        typed(&mut app, "two");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("second".to_owned()));
+        app.on_net(NetEvent::Delta("b".to_owned()));
+        app.on_net(NetEvent::End { partial: false });
+
+        app.on_key(ctrl('o'));
+        for at in [1, 4] {
+            assert!(
+                matches!(&app.transcript[at], Block::Thought { open: true, .. }),
+                "both traces open together"
+            );
+        }
+
+        // Mixed state closes everything: any open → all close.
+        if let Block::Thought { open, .. } = &mut app.transcript[1] {
+            *open = false;
+        }
+        app.on_key(ctrl('o'));
+        for at in [1, 4] {
+            assert!(
+                matches!(&app.transcript[at], Block::Thought { open: false, .. }),
+                "any open means the toggle closes all"
+            );
+        }
     }
 
     #[test]
@@ -873,7 +1096,12 @@ mod tests {
             app.transcript,
             [
                 Block::You("hi".to_owned()),
-                Block::Thought { seconds: 1 },
+                Block::Thought {
+                    text: "checking".to_owned(),
+                    seconds: 1,
+                    done: true,
+                    open: false,
+                },
                 Block::Tool {
                     call_id: "a".to_owned(),
                     name: "alpha".to_owned(),

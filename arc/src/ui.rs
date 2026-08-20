@@ -170,11 +170,23 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Block::Note(text) => {
                 out.push(Line::styled(format!("-- {text} --"), theme::CUT));
             }
-            Block::Thinking(text) => {
-                push_wrapped(&mut out, text, width, theme::DIM);
-            }
-            Block::Thought { seconds } => {
-                out.push(Line::styled(format!("thought for {seconds}s"), theme::DIM));
+            Block::Thought {
+                text,
+                seconds,
+                done,
+                open,
+            } => {
+                // The +/- prefix is the fold affordance: ASCII, no spinner.
+                let fold = if *open { '-' } else { '+' };
+                let clock = if *done {
+                    format!("{fold} thought for {seconds}s")
+                } else {
+                    format!("{fold} thinking {seconds}s")
+                };
+                out.push(Line::styled(clock, theme::DIM));
+                if *open {
+                    push_wrapped(&mut out, text, width, theme::DIM);
+                }
             }
             Block::Tool { name, outcome, .. } => {
                 let state = outcome.unwrap_or("...");
