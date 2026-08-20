@@ -132,10 +132,15 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, height: usize, sc
 fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let last = app.transcript.len().saturating_sub(1);
+    let mut previous: Option<&Block> = None;
     for (i, block) in app.transcript.iter().enumerate() {
-        if !out.is_empty() {
+        // A run of thought and tool lines reads as one unit: no blank rows
+        // inside it.
+        let grouped = activity(block) && previous.is_some_and(activity);
+        if !(out.is_empty() || grouped) {
             out.push(Line::default());
         }
+        previous = Some(block);
         match block {
             Block::You(text) => {
                 out.push(Line::styled("you", theme::DIM));
@@ -165,9 +170,24 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Block::Note(text) => {
                 out.push(Line::styled(format!("-- {text} --"), theme::CUT));
             }
+            Block::Thinking(text) => {
+                push_wrapped(&mut out, text, width, theme::DIM);
+            }
+            Block::Thought { seconds } => {
+                out.push(Line::styled(format!("thought for {seconds}s"), theme::DIM));
+            }
+            Block::Tool { name, outcome, .. } => {
+                let state = outcome.unwrap_or("...");
+                out.push(Line::styled(format!("{name} {state}"), theme::DIM));
+            }
         }
     }
     out
+}
+
+/// The turn's dim one-liners — collapsed thought, tool calls.
+fn activity(block: &Block) -> bool {
+    matches!(block, Block::Thought { .. } | Block::Tool { .. })
 }
 
 /// Wraps `text` to `width`, one styled [`Line`] per wrapped line.

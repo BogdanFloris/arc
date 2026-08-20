@@ -11,8 +11,9 @@
 //! The app starts in insert — a chat's first act is typing.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
-use arc_proto::v1::{Role, SessionInfo};
+use arc_proto::v1::{Role, SessionInfo, ToolOutcome};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
@@ -46,6 +47,12 @@ pub enum NetEvent {
     Accepted { session_id: String },
     /// A piece of the model's reply.
     Delta(String),
+    /// A piece of the model's thinking.
+    Reasoning(String),
+    /// A tool call is running.
+    ToolStarted { call_id: String, name: String },
+    /// The call finished; `outcome` is the wire's `ToolOutcome`, raw.
+    ToolEnded { call_id: String, outcome: i32 },
     /// The turn finished.
     End { partial: bool },
     /// The turn (or a list request) failed; the connection survives.
@@ -65,6 +72,19 @@ pub enum Block {
     Fault { code: String, msg: String },
     /// A dim aside from the client itself (e.g. "history not shown").
     Note(String),
+    /// The model's thinking, streaming live where the reply will appear.
+    /// Collapses to [`Block::Thought`] once the reply starts; never durable,
+    /// so a reopened session will not show it.
+    Thinking(String),
+    /// What a [`Block::Thinking`] collapses to: how long the model thought.
+    Thought { seconds: u64 },
+    /// A tool call where it happened: running until its `ToolEnded` names an
+    /// outcome. Transient like the thought line — history won't return it.
+    Tool {
+        call_id: String,
+        name: String,
+        outcome: Option<&'static str>,
+    },
 }
 
 /// What the status rule says.
@@ -107,6 +127,8 @@ pub struct App {
     pub last_error: Option<String>,
     /// Messages typed while a turn was streaming, sent in order after it.
     pub queued: VecDeque<String>,
+    /// When the live thinking block started, for the collapsed line's clock.
+    thinking_since: Option<Instant>,
     /// How many wrapped lines the view is scrolled up from the bottom. May
     /// overshoot; drawing clamps it to the transcript's real height.
     pub scroll_back: usize,
@@ -128,6 +150,7 @@ impl App {
             status: Status::Idle,
             last_error: None,
             queued: VecDeque::new(),
+            thinking_since: None,
             scroll_back: 0,
             quit: false,
         }
@@ -446,11 +469,12 @@ impl App {
                 created.then_some(Command::List)
             }
             NetEvent::Delta(text) => {
+                self.collapse_thinking();
                 if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
                     reply.push_str(&text);
                 } else {
-                    // A delta with no block to land in should not happen, but
-                    // dropping model text on the floor is worse than healing.
+                    // The turn's first text after a thought or tool line — or,
+                    // healing, a delta that arrived with no block at all.
                     self.transcript.push(Block::Arc {
                         text,
                         partial: false,
@@ -458,19 +482,51 @@ impl App {
                 }
                 None
             }
+            NetEvent::Reasoning(text) => {
+                if let Some(Block::Thinking(thinking)) = self.transcript.last_mut() {
+                    thinking.push_str(&text);
+                } else {
+                    // The thinking streams where the reply will appear, so the
+                    // reply block `Accepted` opened moves out of the way until
+                    // the first delta re-creates it below.
+                    self.pop_empty_reply();
+                    self.thinking_since = Some(Instant::now());
+                    self.transcript.push(Block::Thinking(text));
+                }
+                None
+            }
+            NetEvent::ToolStarted { call_id, name } => {
+                self.collapse_thinking();
+                self.pop_empty_reply();
+                self.transcript.push(Block::Tool {
+                    call_id,
+                    name,
+                    outcome: None,
+                });
+                None
+            }
+            NetEvent::ToolEnded { call_id, outcome } => {
+                // By call_id, never adjacency: a step can run calls in parallel.
+                let ended = self.transcript.iter_mut().rev().find(
+                    |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
+                );
+                if let Some(Block::Tool { outcome: o, .. }) = ended {
+                    *o = Some(outcome_label(outcome));
+                }
+                None
+            }
             NetEvent::End { partial } => {
+                self.collapse_thinking();
                 if let Some(Block::Arc { partial: p, .. }) = self.transcript.last_mut() {
                     *p = partial;
                 }
                 self.turn_over(Status::Idle)
             }
             NetEvent::Failed { code, msg } => {
+                self.collapse_thinking();
                 // A turn that failed before any delta leaves an empty reply
                 // block; the fault replaces it rather than trailing it.
-                if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty())
-                {
-                    self.transcript.pop();
-                }
+                self.pop_empty_reply();
                 self.last_error = Some(code.clone());
                 self.transcript.push(Block::Fault { code, msg });
                 self.turn_over(Status::Idle)
@@ -493,6 +549,31 @@ impl App {
         self.status = status;
         let next = self.queued.pop_front()?;
         Some(self.send(next))
+    }
+
+    /// Collapses a live thinking block to its one-line trace.
+    ///
+    /// Live scrollback has to match what a reopened session will show, and
+    /// reasoning is never durable — so once anything follows it, the words go
+    /// and only the time they took stays.
+    fn collapse_thinking(&mut self) {
+        if matches!(self.transcript.last(), Some(Block::Thinking(_))) {
+            self.transcript.pop();
+            let seconds = self
+                .thinking_since
+                .take()
+                .map_or(0, |since| since.elapsed().as_secs())
+                .max(1);
+            self.transcript.push(Block::Thought { seconds });
+        }
+    }
+
+    /// Drops the reply block if it is still empty, so a line that belongs
+    /// before the reply is not rendered after its `arc` label.
+    fn pop_empty_reply(&mut self) {
+        if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty()) {
+            self.transcript.pop();
+        }
     }
 
     fn cursor_left(&mut self) {
@@ -542,6 +623,16 @@ impl App {
     /// The char ending at the cursor, as `(start_offset, char)`.
     fn char_before_cursor(&self) -> Option<(usize, char)> {
         self.input[..self.cursor].char_indices().next_back()
+    }
+}
+
+/// The transcript's word for a wire `ToolOutcome`. A value this build does
+/// not know renders as unknown, not a guess (DESIGN.md §3.1).
+fn outcome_label(outcome: i32) -> &'static str {
+    match ToolOutcome::try_from(outcome) {
+        Ok(ToolOutcome::Ok) => "ok",
+        Ok(ToolOutcome::Error) => "error",
+        _ => "unknown",
     }
 }
 
@@ -697,6 +788,146 @@ mod tests {
             app.transcript.last(),
             Some(Block::Arc { partial: true, .. })
         ));
+    }
+
+    #[test]
+    fn reasoning_streams_live_then_collapses_on_the_first_delta() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+
+        app.on_net(NetEvent::Reasoning("let me ".to_owned()));
+        app.on_net(NetEvent::Reasoning("think".to_owned()));
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Thinking("let me think".to_owned()),
+            ],
+            "the thinking streams where the reply will appear"
+        );
+
+        app.on_net(NetEvent::Delta("hello".to_owned()));
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Thought { seconds: 1 },
+                Block::Arc {
+                    text: "hello".to_owned(),
+                    partial: false
+                },
+            ],
+            "the words go; the time they took stays"
+        );
+    }
+
+    /// A turn cut (or errored) mid-thought still collapses: a live thinking
+    /// block must not outlive its turn.
+    #[test]
+    fn reasoning_collapses_on_end_when_no_text_ever_came() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
+        app.on_net(NetEvent::End { partial: true });
+
+        assert_eq!(
+            app.transcript,
+            [Block::You("hi".to_owned()), Block::Thought { seconds: 1 }]
+        );
+        assert_eq!(app.status, Status::Idle);
+    }
+
+    #[test]
+    fn tool_lines_resolve_by_call_id_with_two_in_flight() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("checking".to_owned()));
+        app.on_net(NetEvent::ToolStarted {
+            call_id: "a".to_owned(),
+            name: "alpha".to_owned(),
+        });
+        app.on_net(NetEvent::ToolStarted {
+            call_id: "b".to_owned(),
+            name: "beta".to_owned(),
+        });
+
+        // The second call ends first: its line resolves, the other keeps
+        // running — call_id pairs them, not adjacency.
+        app.on_net(NetEvent::ToolEnded {
+            call_id: "b".to_owned(),
+            outcome: ToolOutcome::Ok as i32,
+        });
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Thought { seconds: 1 },
+                Block::Tool {
+                    call_id: "a".to_owned(),
+                    name: "alpha".to_owned(),
+                    outcome: None,
+                },
+                Block::Tool {
+                    call_id: "b".to_owned(),
+                    name: "beta".to_owned(),
+                    outcome: Some("ok"),
+                },
+            ]
+        );
+
+        app.on_net(NetEvent::ToolEnded {
+            call_id: "a".to_owned(),
+            outcome: ToolOutcome::Error as i32,
+        });
+        assert!(matches!(
+            &app.transcript[2],
+            Block::Tool {
+                outcome: Some("error"),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unrecognized_outcome_renders_as_unknown() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::ToolStarted {
+            call_id: "t".to_owned(),
+            name: "get_time".to_owned(),
+        });
+        app.on_net(NetEvent::ToolEnded {
+            call_id: "t".to_owned(),
+            outcome: 42,
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Tool {
+                    call_id: "t".to_owned(),
+                    name: "get_time".to_owned(),
+                    outcome: Some("unknown"),
+                },
+            ]
+        );
     }
 
     #[test]

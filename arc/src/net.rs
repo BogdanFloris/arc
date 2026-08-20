@@ -111,6 +111,13 @@ async fn send(
         let event = match event {
             TurnEvent::Accepted { session_id } => NetEvent::Accepted { session_id },
             TurnEvent::Delta(text) => NetEvent::Delta(text),
+            TurnEvent::Reasoning(text) => NetEvent::Reasoning(text),
+            TurnEvent::ToolCallStarted { call_id, name, .. } => {
+                NetEvent::ToolStarted { call_id, name }
+            }
+            TurnEvent::ToolCallEnded { call_id, outcome } => {
+                NetEvent::ToolEnded { call_id, outcome }
+            }
             TurnEvent::End { partial, .. } => NetEvent::End { partial },
             TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
         };

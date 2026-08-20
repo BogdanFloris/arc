@@ -50,7 +50,8 @@ pub enum Error {
 }
 
 /// One event of a completion turn, in the order the wire defines: one
-/// `Accepted`, zero or more `Delta`s, then exactly one `End` or `Failed`.
+/// `Accepted`; any number of `Delta`, `Reasoning`, and tool-activity events;
+/// then exactly one `End` or `Failed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     /// The daemon accepted the message and named the session.
@@ -60,6 +61,27 @@ pub enum TurnEvent {
     },
     /// A piece of the model's reply.
     Delta(String),
+    /// A piece of the model's thinking. Never durable: what is not rendered
+    /// live is gone.
+    Reasoning(String),
+    /// A tool call is durable and about to run.
+    ToolCallStarted {
+        /// Pairs this with its `ToolCallEnded` — a step can run calls in
+        /// parallel, so adjacency pairs nothing.
+        call_id: String,
+        /// The call's order within its step, dense from 0.
+        index: u32,
+        /// The tool's name; the `Ended` half does not repeat it.
+        name: String,
+    },
+    /// The call finished.
+    ToolCallEnded {
+        /// The id its `ToolCallStarted` carried.
+        call_id: String,
+        /// The wire's `ToolOutcome`, raw: match the known values and treat
+        /// the rest as unknown (DESIGN.md §3.1), the renderer's call to make.
+        outcome: i32,
+    },
     /// The turn finished; the reply is durable.
     End {
         /// Prompt tokens billed; 0 if the provider reported no usage.
@@ -241,8 +263,7 @@ impl Client {
 /// One completion turn being read off the wire.
 ///
 /// Yields events until the closing frame ([`TurnEvent::End`] or
-/// [`TurnEvent::Failed`]), then `None`. The turn's tool-activity and reasoning
-/// frames are skipped rather than yielded — rendering them is 4.4's.
+/// [`TurnEvent::Failed`]), then `None`.
 pub struct Turn<'c> {
     client: &'c mut Client,
     request_id: u64,
@@ -260,39 +281,41 @@ impl Turn<'_> {
         if self.done {
             return Ok(None);
         }
-        loop {
-            let event = match self.client.answer(self.request_id).await? {
-                server_frame::Msg::MessageAccepted(accepted) => TurnEvent::Accepted {
-                    session_id: accepted.session_id,
-                },
-                server_frame::Msg::Delta(delta) => TurnEvent::Delta(delta.text),
-                server_frame::Msg::StreamEnd(end) => {
-                    self.done = true;
-                    TurnEvent::End {
-                        input_tokens: end.input_tokens,
-                        output_tokens: end.output_tokens,
-                        partial: end.partial,
-                    }
+        let event = match self.client.answer(self.request_id).await? {
+            server_frame::Msg::MessageAccepted(accepted) => TurnEvent::Accepted {
+                session_id: accepted.session_id,
+            },
+            server_frame::Msg::Delta(delta) => TurnEvent::Delta(delta.text),
+            server_frame::Msg::ReasoningDelta(delta) => TurnEvent::Reasoning(delta.text),
+            server_frame::Msg::ToolCallStarted(started) => TurnEvent::ToolCallStarted {
+                call_id: started.call_id,
+                index: started.index,
+                name: started.name,
+            },
+            server_frame::Msg::ToolCallEnded(ended) => TurnEvent::ToolCallEnded {
+                call_id: ended.call_id,
+                outcome: ended.outcome,
+            },
+            server_frame::Msg::StreamEnd(end) => {
+                self.done = true;
+                TurnEvent::End {
+                    input_tokens: end.input_tokens,
+                    output_tokens: end.output_tokens,
+                    partial: end.partial,
                 }
-                server_frame::Msg::Error(error) => {
-                    self.done = true;
-                    TurnEvent::Failed {
-                        code: error.code,
-                        msg: error.msg,
-                    }
+            }
+            server_frame::Msg::Error(error) => {
+                self.done = true;
+                TurnEvent::Failed {
+                    code: error.code,
+                    msg: error.msg,
                 }
-                // Middle-of-turn frames this client does not render yet; the
-                // schema's whole point is that skipping them costs nothing.
-                server_frame::Msg::ReasoningDelta(_)
-                | server_frame::Msg::ToolCallStarted(_)
-                | server_frame::Msg::ToolCallEnded(_) => continue,
-                other @ (server_frame::Msg::SessionList(_)
-                | server_frame::Msg::SessionHistory(_)) => {
-                    return Err(unexpected("a turn frame", &other));
-                }
-            };
-            return Ok(Some(event));
-        }
+            }
+            other @ (server_frame::Msg::SessionList(_) | server_frame::Msg::SessionHistory(_)) => {
+                return Err(unexpected("a turn frame", &other));
+            }
+        };
+        Ok(Some(event))
     }
 }
 
@@ -507,7 +530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_activity_and_reasoning_frames_are_skipped() {
+    async fn tool_activity_and_reasoning_frames_are_yielded_in_order() {
         let (url, _handle) = server(vec![vec![
             echo(accepted("s-1")),
             echo(server_frame::Msg::ReasoningDelta(ReasoningDelta {
@@ -543,6 +566,16 @@ mod tests {
             [
                 TurnEvent::Accepted {
                     session_id: "s-1".to_owned()
+                },
+                TurnEvent::Reasoning("let me look".to_owned()),
+                TurnEvent::ToolCallStarted {
+                    call_id: "call-aa".to_owned(),
+                    index: 0,
+                    name: "memory_search".to_owned(),
+                },
+                TurnEvent::ToolCallEnded {
+                    call_id: "call-aa".to_owned(),
+                    outcome: ToolOutcome::Ok as i32,
                 },
                 TurnEvent::Delta("hello".to_owned()),
                 TurnEvent::End {
