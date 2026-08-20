@@ -1,8 +1,8 @@
 //! `arcd run` — startup composition and lifecycle.
 //!
 //! [`Daemon::start`] is the whole of the daemon's wiring: open the log, catch
-//! the index up to it, build the provider, and hand back the session engine
-//! over all three. [`Daemon::serve`] is the lifecycle: bind the socket,
+//! the index up to it, close orphaned tool calls, and hand back the session
+//! engine over all of it. [`Daemon::serve`] is the lifecycle: bind the socket,
 //! announce readiness, serve until a shutdown signal, stop.
 //!
 //! Nothing here decides anything — every rule lives in `arc-core` (DESIGN.md
@@ -17,6 +17,7 @@
 
 use anyhow::{Context as _, Result};
 use arc_core::log::Log;
+use arc_core::orphan;
 use arc_core::projection::{self, Projection};
 use arc_core::provider::Provider;
 use arc_core::provider::openai::OpenAiCompat;
@@ -98,7 +99,7 @@ impl<P: Provider + 'static> Daemon<P> {
 
         // Recovery happens inside `open`: a torn tail is sealed, never
         // truncated, and the append point comes back with it (DESIGN.md §3).
-        let log = Log::open(dirs.log())
+        let mut log = Log::open(dirs.log())
             .with_context(|| format!("opening the event log at {}", dirs.log().display()))?;
         info!(
             next_seq = log.next_seq(),
@@ -116,6 +117,22 @@ impl<P: Provider + 'static> Daemon<P> {
             skipped = stats.skipped,
             "index caught up with the log"
         );
+
+        // a durable call with no durable result is
+        // closed as UNKNOWN before anything is served, so the log the engine
+        // works over has an answer for every call.
+        let reader = log
+            .reader()
+            .context("listing log segments for the orphan scan")?;
+        let closed = orphan::close_orphans(reader, &mut log, &mut projection)
+            .context("closing orphaned tool calls")?;
+        for orphan in &closed {
+            info!(
+                session_id = %orphan.session_id,
+                call_id = %orphan.call_id,
+                "closed an orphaned tool call as UNKNOWN"
+            );
+        }
 
         let identity = identity::load(dirs.identity()).context("loading the identity file")?;
         if let Some(text) = &identity {

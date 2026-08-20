@@ -575,9 +575,9 @@ enum Ending {
 
 /// The current wall clock as a protobuf timestamp.
 ///
-/// The engine is where clock-reading lives — the log deliberately stamps
-/// nothing but seq.
-fn now_ts() -> Timestamp {
+/// Clock-reading lives with the writers — the engine and the orphan closer —
+/// because the log deliberately stamps nothing but seq.
+pub(crate) fn now_ts() -> Timestamp {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
