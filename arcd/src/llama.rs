@@ -205,6 +205,39 @@ async fn monitor(mut child: Child, killed: oneshot::Receiver<()>) {
     }
 }
 
+/// Polls `/health` until the server answers 200, the child exits, or the
+/// timeout passes.
+///
+/// `llama-server` answers 503 while the model is loading and 200 once it can
+/// serve; anything transport-shaped just means "not yet".
+async fn wait_ready(child: &mut Child, endpoint: &str) -> Result<()> {
+    let http = reqwest::Client::new();
+    let url = format!("{endpoint}/health");
+    let deadline = Instant::now() + READY_TIMEOUT;
+
+    loop {
+        if let Some(status) = child.try_wait().context("checking on llama-server")? {
+            bail!(
+                "llama-server exited with {status} before becoming ready — \
+                 its log above says why"
+            );
+        }
+        if let Ok(response) = http.get(&url).send().await {
+            if response.status().is_success() {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.start_kill();
+            bail!(
+                "llama-server did not become ready within {}s",
+                READY_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::find_device;
@@ -253,38 +286,5 @@ mod tests {
             find_device(noisy, "t4").map(|(id, _)| id),
             Some("CUDA0".to_owned())
         );
-    }
-}
-
-/// Polls `/health` until the server answers 200, the child exits, or the
-/// timeout passes.
-///
-/// `llama-server` answers 503 while the model is loading and 200 once it can
-/// serve; anything transport-shaped just means "not yet".
-async fn wait_ready(child: &mut Child, endpoint: &str) -> Result<()> {
-    let http = reqwest::Client::new();
-    let url = format!("{endpoint}/health");
-    let deadline = Instant::now() + READY_TIMEOUT;
-
-    loop {
-        if let Some(status) = child.try_wait().context("checking on llama-server")? {
-            bail!(
-                "llama-server exited with {status} before becoming ready — \
-                 its log above says why"
-            );
-        }
-        if let Ok(response) = http.get(&url).send().await {
-            if response.status().is_success() {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.start_kill();
-            bail!(
-                "llama-server did not become ready within {}s",
-                READY_TIMEOUT.as_secs()
-            );
-        }
-        tokio::time::sleep(POLL).await;
     }
 }
