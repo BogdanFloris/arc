@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 arc-proto = { workspace = true }
+chrono = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }

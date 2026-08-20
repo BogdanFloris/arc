@@ -63,6 +63,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-proto",
+ "chrono",
  "crc32fast",
  "futures",
  "prost",

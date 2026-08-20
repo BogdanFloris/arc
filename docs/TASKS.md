@@ -75,7 +75,7 @@ Each schema change is its own commit, separate from code that uses it (invariant
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 4.1 | Tool registry seam in `arc-core`: a trait, dispatch, result → event. Memory tools plug in at 5.2/6.3; the toy tool from 1.1 proves the seam | bogdan | todo |
+| 4.1 | Tool registry seam in `arc-core`: a trait, dispatch, result → event. Memory tools plug in at 5.2/6.3; the toy tool from 1.1 proves the seam | bogdan | done |
 | 4.2 | Engine loop: completion → tool-call event → execute → tool-result event → continue until final text. Iteration cap; a span per call (instrument in the same change) | bogdan | todo |
 | 4.3 | Resume: on startup/replay, a durable call with no durable result surfaces per the 2.1 contract instead of being silently dropped | claude | todo |
 | 4.4 | Wire + TUI: daemon emits 2.4's frames during the loop; `arc` renders tool activity in the transcript (dim, inline — same voice as status words) | claude | todo |
