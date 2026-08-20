@@ -118,9 +118,9 @@ impl<P: Provider + 'static> Daemon<P> {
             "index caught up with the log"
         );
 
-        // a durable call with no durable result is
-        // closed as UNKNOWN before anything is served, so the log the engine
-        // works over has an answer for every call.
+        // The resume contract: a durable call with no durable
+        // result is closed as UNKNOWN before anything is served, so the log
+        // the engine works over has an answer for every call.
         let reader = log
             .reader()
             .context("listing log segments for the orphan scan")?;
