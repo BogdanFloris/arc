@@ -10,6 +10,7 @@
 //! server     = "llama-server"
 //! model_file = "data/models/Qwen3-8B-Q4_K_M.gguf"
 //! port       = 8080
+//! device     = "RTX 5070"      # pin by name; resolved to an index at start
 //! args       = ["-ngl", "99"]
 //! ```
 
@@ -88,6 +89,15 @@ pub struct LlamaConfig {
     /// Port the sidecar listens on, always on 127.0.0.1.
     pub port: u16,
 
+    /// Pin the model to the device whose `--list-devices` name contains this
+    /// string, case-insensitive, resolved at every start. Names survive
+    /// reboots; backend indexes do not (2026-08-20: Vulkan order flipped and
+    /// the model silently landed on the iGPU). No match refuses startup.
+    /// Unset, the server picks its own devices. Do not also pass `--device`
+    /// in `args`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+
     /// Extra `llama-server` arguments, passed through verbatim — GPU offload
     /// (`-ngl`), context size (`-c`), `MoE` offload (`--n-cpu-moe`), whatever
     /// the model wants. A passthrough rather than named fields, because
@@ -115,6 +125,7 @@ impl Default for LlamaConfig {
             server: PathBuf::from(DEFAULT_LLAMA_SERVER),
             model_file: PathBuf::from(DEFAULT_MODEL_FILE),
             port: DEFAULT_LLAMA_PORT,
+            device: None,
             args: Vec::new(),
         }
     }
@@ -204,6 +215,7 @@ mod tests {
                 server: PathBuf::from("/opt/llama/llama-server"),
                 model_file: PathBuf::from("/models/q.gguf"),
                 port: 9090,
+                device: Some("RTX 5070".to_owned()),
                 args: vec!["-ngl".to_owned(), "99".to_owned()],
             },
             max_tool_result_bytes: 512,

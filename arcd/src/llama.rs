@@ -72,8 +72,17 @@ impl Sidecar {
             );
         }
 
+        // Resolved fresh at every start: device names are stable across
+        // reboots, backend indexes are not — pinning an index is how the
+        // model once silently landed on the iGPU.
+        let device = match &config.device {
+            Some(wanted) => Some(resolve_device(config, wanted).await?),
+            None => None,
+        };
+
         let endpoint = format!("http://127.0.0.1:{}", config.port);
-        let mut child = Command::new(&config.server)
+        let mut command = Command::new(&config.server);
+        command
             .arg("--model")
             .arg(&config.model_file)
             .arg("--host")
@@ -82,7 +91,11 @@ impl Sidecar {
             .arg(config.port.to_string())
             .arg("--alias")
             .arg(model)
-            .args(&config.args)
+            .args(&config.args);
+        if let Some(id) = &device {
+            command.arg("--device").arg(id);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             // stdout/stderr inherited: the server's log is part of the
             // daemon's, and hiding it would hide every model-load error.
@@ -123,6 +136,54 @@ impl Sidecar {
     }
 }
 
+/// Asks `llama-server --list-devices` which device matches `wanted` and
+/// returns its current backend id (e.g. `Vulkan0`).
+///
+/// No match is a startup refusal, with the listing in the error so the fix
+/// is one config edit away: starting on whatever device happens to hold the
+/// wanted index is the silent failure this resolution exists to prevent.
+async fn resolve_device(config: &LlamaConfig, wanted: &str) -> Result<String> {
+    let output = Command::new(&config.server)
+        .arg("--list-devices")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("running {} --list-devices", config.server.display()))?;
+    // The listing prints regardless of exit status on current builds, but an
+    // empty stdout with a failure is a real refusal.
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let Some((id, name)) = find_device(&listing, wanted) else {
+        bail!(
+            "no model device matching {wanted:?} — `{} --list-devices` says:\n{}",
+            config.server.display(),
+            listing.trim_end()
+        );
+    };
+    info!(device = %id, %name, "pinned the model device by name");
+    Ok(id)
+}
+
+/// The first `<Id>: <name> (...)` line of a `--list-devices` listing whose
+/// name contains `wanted`, case-insensitive. The id is the token before the
+/// first colon and never holds whitespace, which is what separates a device
+/// line from prose.
+fn find_device(listing: &str, wanted: &str) -> Option<(String, String)> {
+    let wanted = wanted.to_lowercase();
+    for line in listing.lines() {
+        let Some((id, rest)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let (id, name) = (id.trim(), rest.trim());
+        if id.is_empty() || id.contains(char::is_whitespace) || name.is_empty() {
+            continue;
+        }
+        if name.to_lowercase().contains(&wanted) {
+            return Some((id.to_owned(), name.to_owned()));
+        }
+    }
+    None
+}
+
 /// Owns the child until it exits or the daemon asks for it to be killed.
 ///
 /// The kill signal is the channel closing, not a message: an explicit
@@ -141,6 +202,57 @@ async fn monitor(mut child: Child, killed: oneshot::Receiver<()>) {
                 warn!(%error, "killing llama-server failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_device;
+
+    const LISTING: &str = "Available devices:\n  \
+        Vulkan0: NVIDIA GeForce RTX 5070 (12227 MiB, 8861 MiB free)\n  \
+        Vulkan1: AMD Ryzen 9 9900X 12-Core Processor (RADV RAPHAEL_MENDOCINO) (16137 MiB, 10371 MiB free)\n";
+
+    #[test]
+    fn finds_a_device_by_case_insensitive_substring() {
+        assert_eq!(
+            find_device(LISTING, "rtx 5070"),
+            Some((
+                "Vulkan0".to_owned(),
+                "NVIDIA GeForce RTX 5070 (12227 MiB, 8861 MiB free)".to_owned()
+            ))
+        );
+        assert_eq!(
+            find_device(LISTING, "RADV").map(|(id, _)| id),
+            Some("Vulkan1".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_match_is_none_not_a_guess() {
+        assert_eq!(find_device(LISTING, "RTX 4090"), None);
+        assert_eq!(find_device("", "RTX 5070"), None);
+    }
+
+    #[test]
+    fn the_first_of_several_matches_wins() {
+        // Both names contain "MiB"; the listing is ordered, so first wins.
+        assert_eq!(
+            find_device(LISTING, "MiB").map(|(id, _)| id),
+            Some("Vulkan0".to_owned())
+        );
+    }
+
+    #[test]
+    fn prose_lines_are_not_devices() {
+        // "Available devices:" has an empty rest; noise with spaces in the
+        // would-be id is skipped too.
+        let noisy =
+            "warning: something: happened here\nAvailable devices:\n  CUDA0: NVIDIA T4 (16 GiB)\n";
+        assert_eq!(
+            find_device(noisy, "t4").map(|(id, _)| id),
+            Some("CUDA0".to_owned())
+        );
     }
 }
 
