@@ -3,6 +3,11 @@ default: build
 build:
     cargo build --workspace
 
+# The binary the systemd unit runs (target/release/arcd). After this:
+# `systemctl --user restart arcd`.
+build-release:
+    cargo build --workspace --release
+
 test:
     cargo test --workspace
 
