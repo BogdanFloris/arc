@@ -550,8 +550,12 @@ impl<P: Provider> Engine<P> {
     }
 
     /// Step 1 of the consolidation pass (DESIGN.md §5.4), under the caller's
-    /// lock: the first due session with its rows and last seq, or `None` when
-    /// nothing is due. One session at a time is v1's concurrency bound.
+    /// lock: the first due session outside `skip`, with its rows, its last
+    /// seq, and the ACTIVE memory index — the extractor's entire view of
+    /// existing memory, read in the same locked step. `None` when nothing is
+    /// due. One session at a time is v1's concurrency bound; `skip` is the
+    /// caller's strike list, so a forever-failing session yields the slot to
+    /// the next due one.
     ///
     /// # Errors
     ///
@@ -559,20 +563,23 @@ impl<P: Provider> Engine<P> {
     pub fn snapshot_for_consolidation(
         &self,
         idle_cutoff_micros: i64,
+        skip: &HashSet<String>,
     ) -> Result<Option<SessionSnapshot>, Error> {
         let Some(first) = self
             .projection
             .due_for_consolidation(idle_cutoff_micros)?
             .into_iter()
-            .next()
+            .find(|due| !skip.contains(&due.session_id))
         else {
             return Ok(None);
         };
         let rows = self.projection.messages(&first.session_id)?;
+        let memory_index = self.projection.memory_index()?;
         Ok(Some(SessionSnapshot {
             session_id: first.session_id,
             rows,
             latest_seq: first.latest_seq,
+            memory_index,
         }))
     }
 

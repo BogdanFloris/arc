@@ -17,7 +17,8 @@
 
 use anyhow::{Context as _, Result};
 use arc_core::archive::Archive;
-use arc_core::consolidation::{self, NoopExtractor};
+use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION_V1};
+use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection};
@@ -28,6 +29,7 @@ use arc_core::tool::Registry;
 use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -89,6 +91,10 @@ pub struct Daemon<P: Provider> {
     /// That is Phase 1's single-user reality (DESIGN.md §1), stated once here
     /// rather than worked around in the server.
     engine: Arc<Mutex<Engine<P>>>,
+
+    /// The engine's provider, cloned to the consolidation extractor: both
+    /// run on the same sidecar (banked: consolidation uses the same model).
+    provider: Arc<P>,
 }
 
 impl<P: Provider + 'static> Daemon<P> {
@@ -166,10 +172,11 @@ impl<P: Provider + 'static> Daemon<P> {
             "memory_supersede",
         )?)));
 
+        let provider = Arc::new(provider);
         let engine = Engine::new(
             log,
             projection,
-            Arc::new(provider),
+            Arc::clone(&provider),
             config.model(),
             identity,
             registry,
@@ -180,6 +187,7 @@ impl<P: Provider + 'static> Daemon<P> {
             config,
             dirs,
             engine: Arc::new(Mutex::new(engine)),
+            provider,
         })
     }
 
@@ -207,7 +215,12 @@ impl<P: Provider + 'static> Daemon<P> {
             "arcd ready"
         );
 
-        let consolidation = consolidation_task(self.config.consolidation, Arc::clone(&self.engine));
+        let consolidation = consolidation_task(
+            self.config.consolidation,
+            self.config.model(),
+            Arc::clone(&self.engine),
+            Arc::clone(&self.provider),
+        );
 
         server::serve(listener, self.engine, shutdown()).await;
 
@@ -225,38 +238,103 @@ impl<P: Provider + 'static> Daemon<P> {
 /// How often the daemon looks for an idle session to consolidate.
 const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
 
-/// Spawns the consolidation tick, or nothing while the config keeps it off
-/// (the default until 7.2 gives the pass content).
+/// Spawns the consolidation tick, or nothing while the config keeps it off.
 ///
 /// One pass per tick, one session per pass — the concurrency bound is one.
 /// A failed pass logs and yields; it never wedges the daemon (DESIGN.md
 /// §5.4, docs/prior-art-hermes.md §3).
 fn consolidation_task<P: Provider + 'static>(
     config: ConsolidationConfig,
+    model: String,
     engine: Arc<Mutex<Engine<P>>>,
+    provider: Arc<P>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
         info!("consolidation disabled");
         return None;
     }
     let idle = Duration::from_secs(config.idle_seconds);
-    info!(idle_seconds = config.idle_seconds, "consolidation enabled");
+    let extractor =
+        ModelExtractor::new(provider, model, Duration::from_secs(config.timeout_seconds));
+    info!(
+        idle_seconds = config.idle_seconds,
+        timeout_seconds = config.timeout_seconds,
+        prompt_version = PROMPT_VERSION_V1,
+        "consolidation enabled"
+    );
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(CONSOLIDATION_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut strikes = Strikes::default();
         loop {
             tick.tick().await;
             let Some(cutoff) = idle_cutoff_micros(idle) else {
                 warn!("no usable clock reading; skipping this consolidation tick");
                 continue;
             };
-            // Outcomes land on the pass's own span; only failure needs a log
-            // line here.
-            if let Err(error) = consolidation::run_pass(&engine, &NoopExtractor, cutoff, "").await {
-                warn!(%error, "consolidation pass failed; yielding until the next tick");
-            }
+            tick_once(&engine, &extractor, cutoff, &mut strikes).await;
         }
     }))
+}
+
+/// One tick: one pass over the first due session outside the strike list,
+/// plus the strikes bookkeeping. Outcomes land on the pass's own span; only
+/// failure needs log lines here.
+async fn tick_once<P: Provider, E: Extractor>(
+    engine: &Mutex<Engine<P>>,
+    extractor: &E,
+    cutoff: i64,
+    strikes: &mut Strikes,
+) {
+    let pass =
+        consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION_V1, strikes.skip());
+    match pass.await {
+        Ok(consolidation::Outcome::Consolidated { session_id, .. }) => {
+            strikes.succeeded(&session_id);
+        }
+        Ok(_) => {}
+        Err(consolidation::Error::Extractor { session_id, source }) => {
+            warn!(%session_id, error = %source, "extraction failed; yielding until the next tick");
+            if strikes.strike(session_id.clone()) {
+                warn!(
+                    %session_id,
+                    limit = STRIKE_LIMIT,
+                    "session hit the strike limit; skipping it until the daemon restarts"
+                );
+            }
+        }
+        Err(error) => warn!(%error, "consolidation pass failed; yielding until the next tick"),
+    }
+}
+
+/// Extraction failures at [`STRIKE_LIMIT`] park the session (hermes §3:
+/// three strikes, then skip), so one forever-failing session cannot wedge
+/// the queue. In-process on purpose — a restart forgets the map, and
+/// retrying then is harmless.
+const STRIKE_LIMIT: u32 = 3;
+
+#[derive(Default)]
+struct Strikes {
+    failures: HashMap<String, u32>,
+    skip: HashSet<String>,
+}
+
+impl Strikes {
+    fn skip(&self) -> &HashSet<String> {
+        &self.skip
+    }
+
+    /// Counts one failure; true exactly when this one crossed the limit,
+    /// so the caller logs the skip loudly once.
+    fn strike(&mut self, session_id: String) -> bool {
+        let count = self.failures.entry(session_id.clone()).or_insert(0);
+        *count += 1;
+        *count >= STRIKE_LIMIT && self.skip.insert(session_id)
+    }
+
+    fn succeeded(&mut self, session_id: &str) {
+        self.failures.remove(session_id);
+    }
 }
 
 /// Now minus the idle window, in the projection's epoch-microseconds unit.
@@ -414,17 +492,128 @@ mod tests {
         let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
 
         assert!(
-            consolidation_task(Config::default().consolidation, Arc::clone(&daemon.engine))
-                .is_none(),
+            consolidation_task(
+                Config::default().consolidation,
+                "test-model".to_owned(),
+                Arc::clone(&daemon.engine),
+                Arc::clone(&daemon.provider),
+            )
+            .is_none(),
             "disabled by default: no task, so a tick can do nothing"
         );
 
         let enabled = ConsolidationConfig {
             enabled: true,
             idle_seconds: 1800,
+            timeout_seconds: 300,
         };
-        let task = consolidation_task(enabled, Arc::clone(&daemon.engine))
-            .expect("enabled spawns the tick");
+        let task = consolidation_task(
+            enabled,
+            "test-model".to_owned(),
+            Arc::clone(&daemon.engine),
+            Arc::clone(&daemon.provider),
+        )
+        .expect("enabled spawns the tick");
         task.abort();
+    }
+
+    /// An extractor that fails every session and records which it saw.
+    struct AlwaysFailing(std::sync::Mutex<Vec<String>>);
+
+    impl arc_core::consolidation::Extractor for AlwaysFailing {
+        async fn extract(
+            &self,
+            session: &arc_core::consolidation::SessionSnapshot,
+        ) -> Result<Vec<arc_proto::v1::memory_event::Event>, arc_core::consolidation::ExtractError>
+        {
+            self.0
+                .lock()
+                .expect("seen")
+                .push(session.session_id.clone());
+            Err(arc_core::consolidation::ExtractError(
+                "scripted failure".to_owned(),
+            ))
+        }
+    }
+
+    /// Seeds one session with one timestamped user message, so it reads as
+    /// idle since `at_micros`.
+    fn seed_idle_session(log: &mut Log, session_id: &str, at_micros: i64) {
+        use arc_proto::v1::{MessageAppended, Role, Source};
+        let events = [
+            session_event::Event::SessionCreated(SessionCreated {
+                session_id: session_id.to_owned(),
+                title: String::new(),
+                provider: "never".to_owned(),
+                model: "test-model".to_owned(),
+            }),
+            session_event::Event::MessageAppended(MessageAppended {
+                session_id: session_id.to_owned(),
+                role: Role::User as i32,
+                content: "hello".to_owned(),
+                partial: false,
+                turn_id: format!("{session_id}-t1"),
+            }),
+        ];
+        for event in events {
+            log.append(Event {
+                seq: 0, // added by the log
+                ts: Some(prost_types::Timestamp {
+                    seconds: at_micros / 1_000_000,
+                    nanos: i32::try_from(at_micros % 1_000_000).expect("micros") * 1_000,
+                }),
+                source: Source::User as i32,
+                payload: Some(event::Payload::Session(SessionEvent { event: Some(event) })),
+            })
+            .expect("append");
+        }
+    }
+
+    /// The three-strikes path end to end: a session whose extraction fails
+    /// three ticks is skipped with the strike map, and the next due session
+    /// gets the slot from then on.
+    #[tokio::test]
+    async fn three_strikes_skip_the_session_and_the_next_due_proceeds() {
+        let temp = TempDir::new().expect("temp dir");
+        let dirs = DataDirs::new(temp.path().join("data"));
+        dirs.create().expect("create dirs");
+        let mut log = Log::open(dirs.log()).expect("open log");
+        // s-a idles longer than s-b, so it is first in the due order.
+        seed_idle_session(&mut log, "s-a", 1_000_000);
+        seed_idle_session(&mut log, "s-b", 2_000_000);
+        drop(log);
+        let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
+
+        let extractor = AlwaysFailing(std::sync::Mutex::new(Vec::new()));
+        let mut strikes = Strikes::default();
+        for _ in 0..4 {
+            tick_once(&daemon.engine, &extractor, i64::MAX, &mut strikes).await;
+        }
+
+        let seen = extractor.0.lock().expect("seen").clone();
+        assert_eq!(
+            seen,
+            ["s-a", "s-a", "s-a", "s-b"],
+            "three failures park s-a; the fourth tick moves on to s-b"
+        );
+        assert!(strikes.skip().contains("s-a"));
+        assert!(!strikes.skip().contains("s-b"), "s-b has strikes to spare");
+    }
+
+    /// The loud-once contract: only the strike that crosses the limit
+    /// reports true, and a success wipes the count clean.
+    #[test]
+    fn strikes_report_the_crossing_once_and_reset_on_success() {
+        let mut strikes = Strikes::default();
+        assert!(!strikes.strike("s-x".to_owned()));
+        assert!(!strikes.strike("s-x".to_owned()));
+        strikes.succeeded("s-x");
+        assert!(!strikes.strike("s-x".to_owned()), "the count restarted");
+        assert!(!strikes.strike("s-x".to_owned()));
+        assert!(strikes.strike("s-x".to_owned()), "the third in a row skips");
+        assert!(
+            !strikes.strike("s-x".to_owned()),
+            "already skipped: never loud twice"
+        );
     }
 }

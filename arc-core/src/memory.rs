@@ -27,14 +27,7 @@ pub fn render_memory_index(entries: &[MemoryIndexEntry]) -> Option<String> {
     let mut block = HEADER.to_owned();
     let mut used = HEADER.chars().count();
     for (shown, entry) in entries.iter().enumerate() {
-        let line = format!(
-            "- {}/{}: {} — {} (id: {})",
-            entry.namespace,
-            kind_name(entry.kind),
-            entry.title,
-            entry.summary,
-            entry.id
-        );
+        let line = index_line(entry);
         let cost = 1 + line.chars().count(); // the joining newline
         if used + cost > MEMORY_INDEX_BUDGET {
             let hidden = entries.len() - shown;
@@ -45,6 +38,18 @@ pub fn render_memory_index(entries: &[MemoryIndexEntry]) -> Option<String> {
         block.push_str(&line);
     }
     Some(block)
+}
+
+/// One index line — the same shape everywhere a record is listed.
+pub(crate) fn index_line(entry: &MemoryIndexEntry) -> String {
+    format!(
+        "- {}/{}: {} — {} (id: {})",
+        entry.namespace,
+        kind_name(entry.kind),
+        entry.title,
+        entry.summary,
+        entry.id
+    )
 }
 
 /// The lowercase enum name; ints this build does not know render as

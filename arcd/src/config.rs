@@ -14,8 +14,9 @@
 //! args       = ["-ngl", "99"]
 //!
 //! [consolidation]              # the idle-timeout pass (DESIGN.md §5.4)
-//! enabled      = false         # off until 7.2 gives the pass content
-//! idle_seconds = 1800
+//! enabled         = false      # flipping it live is a deliberate deploy step
+//! idle_seconds    = 1800
+//! timeout_seconds = 300
 //! ```
 
 use std::net::SocketAddr;
@@ -44,6 +45,11 @@ const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 
 /// How long a session must sit untouched before consolidation covers it.
 const DEFAULT_IDLE_SECONDS: u64 = 1800;
+
+/// How long one extraction may hold the model. Generous on purpose:
+/// background summarization-class work gets its own dial, never the
+/// interactive path's (docs/prior-art-hermes.md §3).
+const DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS: u64 = 300;
 
 /// The resolved daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -83,12 +89,15 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConsolidationConfig {
-    /// Off by default: until 7.2 gives the pass content, nothing should be
-    /// marking real sessions as covered.
+    /// Off by default in code: flipping it in the live `arc.toml` is a
+    /// deliberate deploy step, not a build side effect.
     pub enabled: bool,
 
     /// How long a session must sit untouched before a pass covers it.
     pub idle_seconds: u64,
+
+    /// How long one extraction may hold the model before the pass fails.
+    pub timeout_seconds: u64,
 }
 
 impl Default for ConsolidationConfig {
@@ -96,6 +105,7 @@ impl Default for ConsolidationConfig {
         Self {
             enabled: false,
             idle_seconds: DEFAULT_IDLE_SECONDS,
+            timeout_seconds: DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS,
         }
     }
 }
@@ -220,8 +230,9 @@ mod tests {
         assert_eq!(config.llama.server, PathBuf::from("llama-server"));
         assert_eq!(config.llama.port, 8080);
         assert!(config.llama.args.is_empty());
-        assert!(!config.consolidation.enabled, "off until 7.2");
+        assert!(!config.consolidation.enabled, "off in code defaults");
         assert_eq!(config.consolidation.idle_seconds, 1800);
+        assert_eq!(config.consolidation.timeout_seconds, 300);
     }
 
     #[test]
@@ -258,6 +269,7 @@ mod tests {
             consolidation: super::ConsolidationConfig {
                 enabled: true,
                 idle_seconds: 600,
+                timeout_seconds: 120,
             },
         };
         let text = toml::to_string(&config).expect("serializes");

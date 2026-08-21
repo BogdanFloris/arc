@@ -333,18 +333,12 @@ impl Tool for MemorySupersede {
 /// Validates the record fields and mints the record: fresh id, ACTIVE, one
 /// provenance entry naming the calling session.
 fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, ToolReply> {
-    let kind = match args.kind.as_str() {
-        "person" => memory_record::Kind::Person,
-        "project" => memory_record::Kind::Project,
-        "preference" => memory_record::Kind::Preference,
-        "fact" => memory_record::Kind::Fact,
-        "decision" => memory_record::Kind::Decision,
-        other => {
-            return Err(ToolReply::error(format!(
-                "ERROR: unknown kind {other:?}. Use person, project, preference, fact, \
-                 or decision."
-            )));
-        }
+    let Some(kind) = parse_kind(&args.kind) else {
+        return Err(ToolReply::error(format!(
+            "ERROR: unknown kind {:?}. Use person, project, preference, fact, \
+             or decision.",
+            args.kind
+        )));
     };
     for (field, value) in [
         ("title", &args.title),
@@ -357,25 +351,59 @@ fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, Too
             )));
         }
     }
-    Ok(MemoryRecord {
+    Ok(mint_record(
+        kind,
+        args.namespace,
+        args.title,
+        args.summary,
+        args.body,
+        args.links,
+        &ctx.session_id,
+    ))
+}
+
+/// The five kind names every write surface accepts, or `None`.
+pub(crate) fn parse_kind(name: &str) -> Option<memory_record::Kind> {
+    match name {
+        "person" => Some(memory_record::Kind::Person),
+        "project" => Some(memory_record::Kind::Project),
+        "preference" => Some(memory_record::Kind::Preference),
+        "fact" => Some(memory_record::Kind::Fact),
+        "decision" => Some(memory_record::Kind::Decision),
+        _ => None,
+    }
+}
+
+/// Mints an ACTIVE record: fresh `mr-` id, one provenance entry naming the
+/// writing session at now. The one definition of record assembly — the write
+/// tools and the consolidation extractor both go through it.
+pub(crate) fn mint_record(
+    kind: memory_record::Kind,
+    namespace: Option<String>,
+    title: String,
+    summary: String,
+    body: String,
+    links: Vec<String>,
+    session_id: &str,
+) -> MemoryRecord {
+    MemoryRecord {
         id: format!("mr-{}", uuid::Uuid::new_v4()),
         kind: kind as i32,
-        namespace: args
-            .namespace
+        namespace: namespace
             .filter(|namespace| !namespace.trim().is_empty())
             .unwrap_or_else(|| "global".to_owned()),
-        title: args.title,
-        summary: args.summary,
-        body: args.body,
-        links: args.links,
+        title,
+        summary,
+        body,
+        links,
         provenance: Some(Provenance {
             entries: vec![ProvenanceEntry {
-                session_id: ctx.session_id.clone(),
+                session_id: session_id.to_owned(),
                 ts: Some(now_ts()),
             }],
         }),
         status: memory_record::Status::Active as i32,
-    })
+    }
 }
 
 fn unknown_record(id: &str) -> ToolReply {

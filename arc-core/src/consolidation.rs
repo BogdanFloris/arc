@@ -10,18 +10,21 @@
 //! live on the engine (`snapshot_for_consolidation`, `commit_consolidation`):
 //! arc-core owns the invariants, the daemon owns scheduling.
 //!
-//! What extraction *is* — the prompt, merging, superseding — is task 7.2,
-//! behind the [`Extractor`] seam. Until then [`NoopExtractor`] extracts
-//! nothing, and a finished pass still appends its marker: "looked and found
-//! nothing durable" is a decision, and coverage is what makes the next
-//! due-query honest.
+//! What extraction *is* — the prompt, merging, superseding — lives in
+//! [`extract`] behind the [`Extractor`] seam. [`NoopExtractor`] remains for
+//! tests of the pass itself; a finished pass always appends its marker:
+//! "looked and found nothing durable" is a decision, and coverage is what
+//! makes the next due-query honest.
 
+pub mod extract;
+
+use std::collections::HashSet;
 use std::future::Future;
 
 use arc_proto::v1::memory_event;
 use tokio::sync::Mutex;
 
-use crate::projection::MessageRow;
+use crate::projection::{MemoryIndexEntry, MessageRow};
 use crate::provider::Provider;
 use crate::session::{self, Engine};
 
@@ -36,6 +39,10 @@ pub struct SessionSnapshot {
     /// Seq of the session's last event at snapshot time. Becomes the
     /// marker's `through_seq`; the commit re-check compares against it.
     pub latest_seq: u64,
+    /// The ACTIVE records at snapshot time. The extractor cannot call tools;
+    /// this index is its entire view of existing memory, and the summaries
+    /// are its merge signal (DESIGN.md §5.4).
+    pub memory_index: Vec<MemoryIndexEntry>,
 }
 
 /// The extraction seam (task 7.2 fills it): turn a session snapshot into
@@ -52,14 +59,15 @@ pub trait Extractor: Send + Sync {
     ) -> impl Future<Output = Result<Vec<memory_event::Event>, ExtractError>> + Send;
 }
 
-/// An extraction failure, as the seam speaks it. A string for now: 7.2's
-/// model-backed extractor decides what structure failure needs.
+/// An extraction failure, as the seam speaks it. One string arm on purpose:
+/// every failure — timeout, bad JSON, bad op — means the same thing to the
+/// pass (nothing is appended), and the text is for a person reading the log.
 #[derive(Debug, thiserror::Error)]
 #[error("extractor: {0}")]
 pub struct ExtractError(pub String);
 
-/// The 7.1 extractor: extracts nothing, never calls a model. The pass around
-/// it is the whole deliverable — trigger, coverage, race handling.
+/// The extractor that extracts nothing and never calls a model. Kept for
+/// tests of the pass itself — trigger, coverage, race handling.
 pub struct NoopExtractor;
 
 impl Extractor for NoopExtractor {
@@ -79,9 +87,15 @@ pub enum Error {
     Engine(#[from] session::Error),
 
     /// The extractor failed. Nothing was appended: a pass whose output is in
-    /// doubt writes nothing (docs/prior-art-hermes.md §3).
-    #[error("consolidation extractor: {0}")]
-    Extractor(#[from] ExtractError),
+    /// doubt writes nothing (docs/prior-art-hermes.md §3). Carries the
+    /// session so the caller can keep strikes per session.
+    #[error("consolidation extractor for {session_id}: {source}")]
+    Extractor {
+        /// The session whose extraction failed.
+        session_id: String,
+        /// What went wrong.
+        source: ExtractError,
+    },
 }
 
 /// How one pass ended. Every arm is also the `outcome` field of its
@@ -120,6 +134,9 @@ pub enum Outcome {
 ///   next pass sees the session still due and re-covers it (the projection's
 ///   guarded writes make replaying the log safe regardless).
 /// - [`Error::Extractor`] if extraction failed; nothing was appended.
+// Not generalized over hashers: `skip` is a plain in-process set, and the
+// signature stays readable.
+#[allow(clippy::implicit_hasher)]
 #[tracing::instrument(
     name = "consolidation.pass",
     skip_all,
@@ -135,9 +152,10 @@ pub async fn run_pass<P: Provider, E: Extractor>(
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
+    skip: &HashSet<String>,
 ) -> Result<Outcome, Error> {
     let span = tracing::Span::current();
-    let result = pass(engine, extractor, idle_cutoff_micros, prompt_version).await;
+    let result = pass(engine, extractor, idle_cutoff_micros, prompt_version, skip).await;
     match &result {
         Ok(Outcome::NothingDue) => {
             span.record("outcome", "nothing_due");
@@ -169,18 +187,25 @@ async fn pass<P: Provider, E: Extractor>(
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
+    skip: &HashSet<String>,
 ) -> Result<Outcome, Error> {
     // Step 1 — under the lock: pick the first due session, snapshot it.
     let snapshot = engine
         .lock()
         .await
-        .snapshot_for_consolidation(idle_cutoff_micros)?;
+        .snapshot_for_consolidation(idle_cutoff_micros, skip)?;
     let Some(snapshot) = snapshot else {
         return Ok(Outcome::NothingDue);
     };
 
     // Step 2 — lock released: the model runs with nobody blocked.
-    let events = extractor.extract(&snapshot).await?;
+    let events = extractor
+        .extract(&snapshot)
+        .await
+        .map_err(|source| Error::Extractor {
+            session_id: snapshot.session_id.clone(),
+            source,
+        })?;
     let records = events.len();
 
     // Step 3 — under the lock again: commit only if the session stayed idle.
@@ -203,6 +228,8 @@ async fn pass<P: Provider, E: Extractor>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use arc_proto::v1::{
         MemoryRecord, MemoryRecordCreated, Source, event, memory_event, memory_record,
         session_event,
@@ -281,7 +308,7 @@ mod tests {
             .await
             .expect("send");
 
-        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "")
+        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &HashSet::new())
             .await
             .expect("pass");
 
@@ -303,7 +330,7 @@ mod tests {
         assert_eq!(marker(last).prompt_version, "");
 
         // Coverage holds: the next tick has nothing to do.
-        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "")
+        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &HashSet::new())
             .await
             .expect("second pass");
         assert_eq!(outcome, Outcome::NothingDue);
@@ -323,7 +350,7 @@ mod tests {
             .expect("send");
 
         // Cutoff at the epoch: nothing has been idle since before then.
-        let outcome = run_pass(&engine, &NoopExtractor, 0, "")
+        let outcome = run_pass(&engine, &NoopExtractor, 0, "", &HashSet::new())
             .await
             .expect("pass");
 
@@ -349,7 +376,7 @@ mod tests {
         let snapshot = engine
             .lock()
             .await
-            .snapshot_for_consolidation(ALL_IDLE)
+            .snapshot_for_consolidation(ALL_IDLE, &HashSet::new())
             .expect("snapshot")
             .expect("the session is due");
         assert_eq!(snapshot.session_id, reply.session_id);
@@ -415,6 +442,7 @@ mod tests {
             &Scripted(vec![created_record("mr-x")]),
             ALL_IDLE,
             "",
+            &HashSet::new(),
         )
         .await
         .expect("pass");
@@ -457,23 +485,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_extraction_appends_nothing() {
+    async fn a_failed_extraction_appends_nothing_and_names_its_session() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let engine = Mutex::new(engine(&provider, &dir));
         let (tx, _rx) = channel();
-        engine
+        let reply = engine
             .lock()
             .await
             .send_message(None, "hi", tx)
             .await
             .expect("send");
 
-        let err = run_pass(&engine, &Failing, ALL_IDLE, "")
+        let err = run_pass(&engine, &Failing, ALL_IDLE, "", &HashSet::new())
             .await
             .expect_err("the extractor's failure must surface");
 
-        assert!(matches!(err, super::Error::Extractor(_)), "got: {err:?}");
+        // The error names the session, so the caller's strikes map has a key.
+        let super::Error::Extractor { session_id, .. } = err else {
+            panic!("got: {err:?}");
+        };
+        assert_eq!(session_id, reply.session_id);
         assert_eq!(replay_events(&dir).len(), 3, "log untouched");
+    }
+
+    /// The strikes seam: a skipped session yields the slot to the next due
+    /// one, and skipping everything due reads as nothing due.
+    #[tokio::test]
+    async fn a_skipped_session_yields_to_the_next_due() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let dir = TempDir::new().expect("temp dir");
+        let engine = Mutex::new(engine(&provider, &dir));
+        for text in ["hi", "yo"] {
+            let (tx, _rx) = channel();
+            engine
+                .lock()
+                .await
+                .send_message(None, text, tx)
+                .await
+                .expect("send");
+        }
+        let due = engine
+            .lock()
+            .await
+            .due_for_consolidation(ALL_IDLE)
+            .expect("due");
+        assert_eq!(due.len(), 2);
+
+        let mut skip = HashSet::new();
+        skip.insert(due[0].session_id.clone());
+        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &skip)
+            .await
+            .expect("pass");
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Consolidated { session_id, .. } if *session_id == due[1].session_id
+            ),
+            "the pass must take the next due session, got: {outcome:?}"
+        );
+
+        // The skipped session stays due but never gets the slot.
+        assert_eq!(
+            run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &skip)
+                .await
+                .expect("pass"),
+            Outcome::NothingDue
+        );
     }
 }
