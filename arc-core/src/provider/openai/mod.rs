@@ -48,6 +48,11 @@ impl OpenAiCompat {
     ///
     /// A trailing slash is trimmed so the path built onto it is well-formed
     /// either way.
+    ///
+    /// # Panics
+    ///
+    /// If reqwest cannot assemble its default TLS/resolver stack — a broken
+    /// build environment, not a runtime condition.
     #[must_use]
     pub fn new(endpoint: impl Into<String>) -> Self {
         let mut endpoint = endpoint.into();

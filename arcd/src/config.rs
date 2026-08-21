@@ -12,6 +12,10 @@
 //! port       = 8080
 //! device     = "RTX 5070"      # pin by name; resolved to an index at start
 //! args       = ["-ngl", "99"]
+//!
+//! [consolidation]              # the idle-timeout pass (DESIGN.md §5.4)
+//! enabled      = false         # off until 7.2 gives the pass content
+//! idle_seconds = 1800
 //! ```
 
 use std::net::SocketAddr;
@@ -37,6 +41,9 @@ const DEFAULT_LLAMA_PORT: u16 = 8080;
 
 /// Longest tool result the registry keeps
 const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+/// How long a session must sit untouched before consolidation covers it.
+const DEFAULT_IDLE_SECONDS: u64 = 1800;
 
 /// The resolved daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -66,6 +73,31 @@ pub struct Config {
 
     /// Append `/no_think` to interactive turns' system prompt
     pub no_think: bool,
+
+    /// The idle-timeout consolidation pass (DESIGN.md §5.4).
+    pub consolidation: ConsolidationConfig,
+}
+
+/// The consolidation trigger's dials — its own section, hermes-style:
+/// background work never borrows the interactive path's config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsolidationConfig {
+    /// Off by default: until 7.2 gives the pass content, nothing should be
+    /// marking real sessions as covered.
+    pub enabled: bool,
+
+    /// How long a session must sit untouched before a pass covers it.
+    pub idle_seconds: u64,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_seconds: DEFAULT_IDLE_SECONDS,
+        }
+    }
 }
 
 /// Which provider implementation the daemon runs with.
@@ -115,6 +147,7 @@ impl Default for Config {
             llama: LlamaConfig::default(),
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             no_think: true,
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }
@@ -187,6 +220,8 @@ mod tests {
         assert_eq!(config.llama.server, PathBuf::from("llama-server"));
         assert_eq!(config.llama.port, 8080);
         assert!(config.llama.args.is_empty());
+        assert!(!config.consolidation.enabled, "off until 7.2");
+        assert_eq!(config.consolidation.idle_seconds, 1800);
     }
 
     #[test]
@@ -220,6 +255,10 @@ mod tests {
             },
             max_tool_result_bytes: 512,
             no_think: false,
+            consolidation: super::ConsolidationConfig {
+                enabled: true,
+                idle_seconds: 600,
+            },
         };
         let text = toml::to_string(&config).expect("serializes");
         assert_eq!(toml::from_str::<Config>(&text).expect("parses"), config);
@@ -237,6 +276,13 @@ mod tests {
         let err = toml::from_str::<Config>("[llama]\nprot = 9090\n")
             .expect_err("a typo must not be ignored");
         assert!(err.to_string().contains("prot"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_consolidation_key_is_rejected() {
+        let err = toml::from_str::<Config>("[consolidation]\nidle_secs = 60\n")
+            .expect_err("a typo must not be ignored");
+        assert!(err.to_string().contains("idle_secs"), "{err}");
     }
 
     #[test]

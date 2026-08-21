@@ -40,17 +40,18 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    Event, MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, Source,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    Event, MemoryEvent, MessageAppended, Role, SessionConsolidated, SessionCreated, SessionEvent,
+    Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
 };
 use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
 use prost_types::Timestamp;
 use tokio::sync::mpsc;
 
+use crate::consolidation::SessionSnapshot;
 use crate::log::{self, Log};
 use crate::memory::render_memory_index;
-use crate::projection::{self, MessageRow, Projection, SessionSummary};
+use crate::projection::{self, DueSession, MessageRow, Projection, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
@@ -535,6 +536,88 @@ impl<P: Provider> Engine<P> {
                 MessageRow::ToolCall { .. } | MessageRow::ToolResult { .. } => None,
             })
             .collect())
+    }
+
+    /// Sessions due for consolidation (see
+    /// [`Projection::due_for_consolidation`]) — the engine is the façade over
+    /// durable state, here as everywhere.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Projection`] if the index cannot be read.
+    pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
+        Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
+    }
+
+    /// Step 1 of the consolidation pass (DESIGN.md §5.4), under the caller's
+    /// lock: the first due session with its rows and last seq, or `None` when
+    /// nothing is due. One session at a time is v1's concurrency bound.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Projection`] if the index cannot be read.
+    pub fn snapshot_for_consolidation(
+        &self,
+        idle_cutoff_micros: i64,
+    ) -> Result<Option<SessionSnapshot>, Error> {
+        let Some(first) = self
+            .projection
+            .due_for_consolidation(idle_cutoff_micros)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let rows = self.projection.messages(&first.session_id)?;
+        Ok(Some(SessionSnapshot {
+            session_id: first.session_id,
+            rows,
+            latest_seq: first.latest_seq,
+        }))
+    }
+
+    /// Step 3 of the consolidation pass, back under the caller's lock:
+    /// re-checks the session against the snapshot, then appends the
+    /// extractor's events and the coverage marker. Returns `false` — a race,
+    /// not an error — when the session grew since the snapshot: the pass is
+    /// discarded whole and a later idle timeout re-runs it over the longer
+    /// history.
+    ///
+    /// Everything appends with [`Source::System`]: arcd initiated these
+    /// writes, not the user's turn (§5.4 amendment).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Log`] / [`Error::Projection`] if an append fails; durability
+    /// is in doubt and the caller should treat this as fatal for the pass.
+    pub fn commit_consolidation(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        events: Vec<memory_event::Event>,
+        prompt_version: &str,
+    ) -> Result<bool, Error> {
+        let latest = self.projection.latest_seq(&snapshot.session_id)?;
+        if latest != Some(snapshot.latest_seq) {
+            tracing::info!(
+                session_id = %snapshot.session_id,
+                snapshot_seq = snapshot.latest_seq,
+                latest_seq = latest,
+                "session grew during consolidation; discarding the pass"
+            );
+            return Ok(false);
+        }
+        for event in events {
+            self.record_memory(Source::System, event)?;
+        }
+        self.record(
+            Source::System,
+            session_event::Event::SessionConsolidated(SessionConsolidated {
+                session_id: snapshot.session_id.clone(),
+                through_seq: snapshot.latest_seq,
+                prompt_version: prompt_version.to_owned(),
+            }),
+        )?;
+        Ok(true)
     }
 
     /// Appends one event to the log and applies it to the index, as a pair.

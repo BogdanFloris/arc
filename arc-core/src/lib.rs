@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod client;
+pub mod consolidation;
 pub mod log;
 pub mod memory;
 pub mod orphan;

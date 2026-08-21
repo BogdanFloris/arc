@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 
 use arc_proto::v1::{
     Event, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded,
-    MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionCreated,
-    ToolCallIssued, ToolResultRecorded, event, memory_event, memory_record, session_event,
+    MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionConsolidated,
+    SessionCreated, ToolCallIssued, ToolResultRecorded, event, memory_event, memory_record,
+    session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -41,7 +42,8 @@ use crate::log;
 ///
 /// 2: tool-call and tool-result rows joined `messages`, with FTS5.
 /// 3: `memory_records` joined — the distilled tier's state table (§5.2).
-pub const SCHEMA_VERSION: u32 = 3;
+/// 4: `sessions.consolidated_through` joined — consolidation coverage (§5.4).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// `projection_meta` key holding the seq of the last applied event.
 const LAST_SEQ_KEY: &str = "last_seq";
@@ -70,6 +72,11 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// to `seq`. It is written by explicit statements inside [`Projection::apply`]'s
 /// transaction, never by triggers, so replay stays visible and deterministic.
 ///
+/// `sessions.consolidated_through` is consolidation coverage (DESIGN.md §5.4):
+/// the `through_seq` of the session's latest `SessionConsolidated`, NULL until
+/// a pass has finished the session. Derived state like everything else here —
+/// "what is due" is a query over it, never daemon memory.
+///
 /// `memory_records` is the distilled tier's current state (DESIGN.md §5.2):
 /// one row per record, keyed by `id` and mutated by replay — records are
 /// mutable state, so seq-as-PK does not apply here. `last_event_seq` is what
@@ -85,7 +92,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     fork_point     INTEGER,
     project        TEXT,
     title          TEXT,
-    started_at     INTEGER
+    started_at     INTEGER,
+    consolidated_through INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -297,6 +305,16 @@ pub struct MemoryIndexEntry {
     pub title: String,
     /// The one-line summary.
     pub summary: String,
+}
+
+/// One row of [`Projection::due_for_consolidation`]: a session the pass
+/// should cover, and how far its events go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueSession {
+    /// Session id.
+    pub session_id: String,
+    /// Seq of the session's latest event — what the pass will read through.
+    pub latest_seq: u64,
 }
 
 /// What [`Projection::memory_record`] returns: the record as last written,
@@ -559,6 +577,10 @@ impl Projection {
                     span.record("kind", "tool_result_recorded");
                     insert_tool_result(&tx, event, result)?;
                 }
+                Some(session_event::Event::SessionConsolidated(consolidated)) => {
+                    span.record("kind", "session_consolidated");
+                    mark_consolidated(&tx, event, consolidated)?;
+                }
                 None => {
                     span.record("kind", "unknown");
                     tracing::warn!(
@@ -707,6 +729,71 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Sessions due for consolidation (DESIGN.md §5.4): idle past the cutoff
+    /// and holding events past their latest marker.
+    ///
+    /// Idle means the session's last `messages` row — any kind: a tool result
+    /// is activity — has `ts` strictly older than `idle_cutoff_micros`. Due on
+    /// top of idle means its latest seq exceeds `consolidated_through`, NULL
+    /// reading as never consolidated. A session whose rows all lack a
+    /// timestamp is never due: its idleness is unknowable, and the engine
+    /// stamps every event it writes.
+    ///
+    /// Ordered longest-idle first, id as the tie-break, so the pass drains a
+    /// backlog deterministically.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read, or
+    /// [`Error::SeqOutOfRange`] if a stored seq comes back negative.
+    pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, MAX(m.seq)
+             FROM sessions s JOIN messages m ON m.session_id = s.id
+             GROUP BY s.id
+             HAVING MAX(m.ts) < ?1
+                AND (s.consolidated_through IS NULL
+                     OR MAX(m.seq) > s.consolidated_through)
+             ORDER BY MAX(m.ts), s.id",
+        )?;
+        let rows = stmt.query_map([idle_cutoff_micros], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (session_id, seq) = row?;
+            Ok(DueSession {
+                session_id,
+                latest_seq: u64::try_from(seq).map_err(|_| Error::SeqOutOfRange {
+                    seq: i128::from(seq),
+                })?,
+            })
+        })
+        .collect()
+    }
+
+    /// Seq of a session's latest `messages` row, any kind, or `None` for a
+    /// session with no rows. The consolidation pass re-checks this under the
+    /// lock: a changed value means the session spoke while the pass ran.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read, or
+    /// [`Error::SeqOutOfRange`] if the stored value is negative.
+    pub fn latest_seq(&self, session_id: &str) -> Result<Option<u64>, Error> {
+        let stored: Option<i64> = self.conn.query_row(
+            "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        stored
+            .map(|seq| {
+                u64::try_from(seq).map_err(|_| Error::SeqOutOfRange {
+                    seq: i128::from(seq),
+                })
+            })
+            .transpose()
+    }
+
     /// The always-loaded index of the distilled tier: every ACTIVE record,
     /// bodies excluded (DESIGN.md §5.2).
     ///
@@ -813,6 +900,36 @@ fn insert_session(
             epoch_micros(event.ts.as_ref()),
         ),
     )?;
+    Ok(())
+}
+
+/// Applies a `SessionConsolidated`: moves the session's coverage marker.
+///
+/// Monotonic — the marker only moves forward. A marker at or behind the
+/// current one, or for a session the projection never held, is skipped with a
+/// warning: both are foreign-log shapes, not replay failures.
+fn mark_consolidated(
+    tx: &Transaction<'_>,
+    event: &Event,
+    consolidated: &SessionConsolidated,
+) -> Result<(), Error> {
+    let changed = tx.execute(
+        "UPDATE sessions SET consolidated_through = ?2
+         WHERE id = ?1
+           AND (consolidated_through IS NULL OR consolidated_through < ?2)",
+        rusqlite::params![
+            &consolidated.session_id,
+            seq_param(consolidated.through_seq)?,
+        ],
+    )?;
+    if changed == 0 {
+        tracing::warn!(
+            seq = event.seq,
+            session_id = %consolidated.session_id,
+            through_seq = consolidated.through_seq,
+            "consolidation marker for a missing session or not past the current one; skipping"
+        );
+    }
     Ok(())
 }
 
@@ -1224,16 +1341,16 @@ mod tests {
     use arc_proto::v1::{
         Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
-        ToolResultRecorded, event, memory_event, memory_record, session_event,
+        Role, SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued,
+        ToolOutcome, ToolResultRecorded, event, memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
     use super::{
-        Error, MemoryIndexEntry, MessageRow, Projection, ReplayError, ReplayStats, SessionSummary,
-        replay,
+        DueSession, Error, MemoryIndexEntry, MessageRow, Projection, ReplayError, ReplayStats,
+        SessionSummary, replay,
     };
     use crate::log::{Log, LogReader, discover_segments};
 
@@ -2695,5 +2812,262 @@ mod tests {
             );
         }
         assert_eq!(index_ids(&first), ["mr-b"]);
+    }
+
+    // --- consolidation coverage (DESIGN.md §5.4) ---
+
+    /// A prose row in `session_id` stamped `at_seconds`, or unstamped.
+    fn message_in(seq: u64, session_id: &str, at_seconds: Option<i64>) -> Event {
+        Event {
+            seq,
+            ts: at_seconds.map(|seconds| Timestamp { seconds, nanos: 0 }),
+            source: Source::User as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::MessageAppended(MessageAppended {
+                    session_id: session_id.to_string(),
+                    role: Role::User as i32,
+                    content: "spoken".to_string(),
+                    partial: false,
+                    turn_id: String::new(),
+                })),
+            })),
+        }
+    }
+
+    /// A tool-result row in `session_id` stamped `at_seconds`.
+    fn result_in(seq: u64, session_id: &str, at_seconds: i64) -> Event {
+        Event {
+            seq,
+            ts: Some(Timestamp {
+                seconds: at_seconds,
+                nanos: 0,
+            }),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ToolResultRecorded(
+                    ToolResultRecorded {
+                        session_id: session_id.to_string(),
+                        turn_id: "t-01".to_string(),
+                        call_id: format!("c-{seq}"),
+                        outcome: ToolOutcome::Ok as i32,
+                        content: "tool said".to_string(),
+                        truncated: false,
+                    },
+                )),
+            })),
+        }
+    }
+
+    fn consolidated(seq: u64, session_id: &str, through_seq: u64) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionConsolidated(
+                    SessionConsolidated {
+                        session_id: session_id.to_string(),
+                        through_seq,
+                        prompt_version: String::new(),
+                    },
+                )),
+            })),
+        }
+    }
+
+    fn coverage(projection: &Projection, id: &str) -> Option<i64> {
+        projection
+            .conn
+            .query_row(
+                "SELECT consolidated_through FROM sessions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("coverage")
+    }
+
+    #[test]
+    fn a_marker_sets_coverage_and_only_moves_forward() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(100)))
+            .expect("apply");
+        assert_eq!(coverage(&projection, "s-01"), None);
+
+        projection
+            .apply(&consolidated(1, "s-01", 5))
+            .expect("apply");
+        assert_eq!(coverage(&projection, "s-01"), Some(5));
+
+        // Backward and repeated markers are skipped, never applied.
+        projection
+            .apply(&consolidated(2, "s-01", 3))
+            .expect("apply");
+        projection
+            .apply(&consolidated(3, "s-01", 5))
+            .expect("apply");
+        assert_eq!(coverage(&projection, "s-01"), Some(5));
+
+        projection
+            .apply(&consolidated(4, "s-01", 8))
+            .expect("apply");
+        assert_eq!(coverage(&projection, "s-01"), Some(8));
+
+        // A marker for a session this projection never held warns, no-ops,
+        // and still advances last_seq.
+        projection
+            .apply(&consolidated(5, "s-ghost", 2))
+            .expect("apply");
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(5));
+    }
+
+    #[test]
+    fn due_splits_never_consolidated_covered_and_grown_apart() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        // Three idle sessions: never consolidated, fully covered, and one
+        // that grew past its marker.
+        projection
+            .apply(&session_created_as(0, "s-new", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(1, "s-new", Some(100)))
+            .expect("apply");
+        projection
+            .apply(&session_created_as(2, "s-covered", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(3, "s-covered", Some(200)))
+            .expect("apply");
+        projection
+            .apply(&consolidated(4, "s-covered", 3))
+            .expect("apply");
+        projection
+            .apply(&session_created_as(5, "s-grown", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(6, "s-grown", Some(300)))
+            .expect("apply");
+        projection
+            .apply(&consolidated(7, "s-grown", 6))
+            .expect("apply");
+        projection
+            .apply(&message_in(8, "s-grown", Some(400)))
+            .expect("apply");
+
+        let due = projection
+            .due_for_consolidation(1_000_000_000)
+            .expect("due");
+
+        // Longest idle first; the covered session stays out.
+        assert_eq!(
+            due,
+            [
+                DueSession {
+                    session_id: "s-new".to_string(),
+                    latest_seq: 1,
+                },
+                DueSession {
+                    session_id: "s-grown".to_string(),
+                    latest_seq: 8,
+                },
+            ]
+        );
+    }
+
+    /// Idle means strictly older than the cutoff: a session whose last event
+    /// sits exactly on the cutoff has not been idle for the window yet.
+    #[test]
+    fn the_idle_boundary_is_strict() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(1, "s-01", Some(100)))
+            .expect("apply");
+
+        assert_eq!(
+            projection.due_for_consolidation(100_000_000).expect("due"),
+            [],
+            "an event at the cutoff is not yet idle"
+        );
+        assert_eq!(
+            projection
+                .due_for_consolidation(100_000_001)
+                .expect("due")
+                .len(),
+            1
+        );
+    }
+
+    /// A tool result is activity: it holds the idle clock like prose does,
+    /// and its seq is what the pass must read through.
+    #[test]
+    fn tool_result_rows_count_as_activity() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(1, "s-01", Some(100)))
+            .expect("apply");
+        projection.apply(&result_in(2, "s-01", 200)).expect("apply");
+
+        assert_eq!(
+            projection.due_for_consolidation(150_000_000).expect("due"),
+            [],
+            "the recent tool result keeps the session out"
+        );
+        assert_eq!(
+            projection.due_for_consolidation(300_000_000).expect("due"),
+            [DueSession {
+                session_id: "s-01".to_string(),
+                latest_seq: 2,
+            }],
+            "once idle, coverage extends through the tool result"
+        );
+    }
+
+    /// No timestamps means idleness is unknowable; the engine stamps every
+    /// event it writes, so this shape only comes from a foreign log.
+    #[test]
+    fn a_session_with_no_timestamped_rows_is_never_due() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", None))
+            .expect("apply");
+        projection
+            .apply(&message_in(1, "s-01", None))
+            .expect("apply");
+
+        assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
+    }
+
+    /// A session nobody has spoken in has nothing to consolidate.
+    #[test]
+    fn an_empty_session_is_never_due() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(50)))
+            .expect("apply");
+
+        assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
+    }
+
+    #[test]
+    fn latest_seq_tracks_any_row_kind() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(50)))
+            .expect("apply");
+        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), None);
+
+        projection
+            .apply(&message_in(1, "s-01", Some(100)))
+            .expect("apply");
+        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(1));
+
+        projection.apply(&result_in(2, "s-01", 200)).expect("apply");
+        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(2));
     }
 }

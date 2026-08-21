@@ -17,6 +17,7 @@
 
 use anyhow::{Context as _, Result};
 use arc_core::archive::Archive;
+use arc_core::consolidation::{self, NoopExtractor};
 use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection};
@@ -29,12 +30,14 @@ use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, ProviderChoice};
+use crate::config::{Config, ConsolidationConfig, ProviderChoice};
 use crate::dirs::DataDirs;
 use crate::identity;
 use crate::llama::Sidecar;
@@ -204,11 +207,64 @@ impl<P: Provider + 'static> Daemon<P> {
             "arcd ready"
         );
 
+        let consolidation = consolidation_task(self.config.consolidation, Arc::clone(&self.engine));
+
         server::serve(listener, self.engine, shutdown()).await;
+
+        // The tick dies with the server: a pass mid-extraction is abandoned,
+        // which loses nothing durable — it had appended nothing yet.
+        if let Some(task) = consolidation {
+            task.abort();
+        }
 
         info!("stopped");
         Ok(())
     }
+}
+
+/// How often the daemon looks for an idle session to consolidate.
+const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
+
+/// Spawns the consolidation tick, or nothing while the config keeps it off
+/// (the default until 7.2 gives the pass content).
+///
+/// One pass per tick, one session per pass — the concurrency bound is one.
+/// A failed pass logs and yields; it never wedges the daemon (DESIGN.md
+/// §5.4, docs/prior-art-hermes.md §3).
+fn consolidation_task<P: Provider + 'static>(
+    config: ConsolidationConfig,
+    engine: Arc<Mutex<Engine<P>>>,
+) -> Option<JoinHandle<()>> {
+    if !config.enabled {
+        info!("consolidation disabled");
+        return None;
+    }
+    let idle = Duration::from_secs(config.idle_seconds);
+    info!(idle_seconds = config.idle_seconds, "consolidation enabled");
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CONSOLIDATION_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(cutoff) = idle_cutoff_micros(idle) else {
+                warn!("no usable clock reading; skipping this consolidation tick");
+                continue;
+            };
+            // Outcomes land on the pass's own span; only failure needs a log
+            // line here.
+            if let Err(error) = consolidation::run_pass(&engine, &NoopExtractor, cutoff, "").await {
+                warn!(%error, "consolidation pass failed; yielding until the next tick");
+            }
+        }
+    }))
+}
+
+/// Now minus the idle window, in the projection's epoch-microseconds unit.
+fn idle_cutoff_micros(idle: Duration) -> Option<i64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    let now = i64::try_from(now.as_micros()).ok()?;
+    let idle = i64::try_from(idle.as_micros()).unwrap_or(i64::MAX);
+    Some(now.saturating_sub(idle))
 }
 
 /// Opens the index, deleting and recreating it when it was written by another
@@ -347,5 +403,28 @@ mod tests {
         let sessions = daemon.engine.lock().await.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s-01");
+    }
+
+    /// The config gate: the default (disabled) config spawns no tick at all,
+    /// and an enabled one does. The pass itself is arc-core's to test.
+    #[tokio::test]
+    async fn the_consolidation_tick_only_runs_when_enabled() {
+        let temp = TempDir::new().expect("temp dir");
+        let dirs = DataDirs::new(temp.path().join("data"));
+        let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
+
+        assert!(
+            consolidation_task(Config::default().consolidation, Arc::clone(&daemon.engine))
+                .is_none(),
+            "disabled by default: no task, so a tick can do nothing"
+        );
+
+        let enabled = ConsolidationConfig {
+            enabled: true,
+            idle_seconds: 1800,
+        };
+        let task = consolidation_task(enabled, Arc::clone(&daemon.engine))
+            .expect("enabled spawns the tick");
+        task.abort();
     }
 }
