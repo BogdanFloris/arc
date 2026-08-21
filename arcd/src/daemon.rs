@@ -16,6 +16,7 @@
 //! that it holds the runtime thread.
 
 use anyhow::{Context as _, Result};
+use arc_core::archive::Archive;
 use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection};
@@ -23,6 +24,7 @@ use arc_core::provider::Provider;
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use arc_core::tool::Registry;
+use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
 use std::path::Path;
 use std::sync::Arc;
@@ -143,6 +145,16 @@ impl<P: Provider + 'static> Daemon<P> {
 
         let mut registry = Registry::new(config.max_tool_result_bytes);
         registry.register(Box::new(GetTime));
+        // The archive tools own read-only connections to the index the
+        // projection above just caught up; they never touch its writer.
+        let open_archive = |tool: &str| {
+            Archive::open(dirs.index())
+                .with_context(|| format!("opening the index read-only for {tool}"))
+        };
+        registry.register(Box::new(SessionsSearch::new(open_archive(
+            "sessions_search",
+        )?)));
+        registry.register(Box::new(SessionRead::new(open_archive("session_read")?)));
 
         let engine = Engine::new(
             log,

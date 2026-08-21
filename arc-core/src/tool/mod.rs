@@ -18,6 +18,7 @@
 //! Tools never produce UNKNOWN: that outcome is written only by the startup
 //! closer for orphaned calls (4.3).
 
+pub mod sessions;
 pub mod time;
 
 use std::collections::BTreeMap;

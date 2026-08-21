@@ -108,8 +108,9 @@ CREATE TABLE IF NOT EXISTS projection_meta (
 );
 ";
 
-/// `messages.kind` for a prose row.
-const KIND_MESSAGE: i64 = 0;
+/// `messages.kind` for a prose row. Crate-visible: the archive query layer
+/// filters on it, and a second definition would be a second authority.
+pub(crate) const KIND_MESSAGE: i64 = 0;
 
 /// `messages.kind` for a `ToolCallIssued` row.
 const KIND_TOOL_CALL: i64 = 1;

@@ -126,6 +126,28 @@ pub(crate) fn engine_with_tools(
     )
 }
 
+/// [`engine_with_tools`], but with the projection at `dir/index.db`, caught
+/// up to the log first. The file-backed shape the archive tools need: their
+/// read-only connections cannot see a `:memory:` projection.
+pub(crate) fn engine_with_tools_at(
+    provider: &Arc<ScriptedProvider>,
+    dir: &TempDir,
+    registry: Registry,
+) -> Engine<ScriptedProvider> {
+    let log = Log::open(dir.path()).expect("open log");
+    let mut projection = Projection::open(dir.path().join("index.db")).expect("open projection");
+    crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+    Engine::new(
+        log,
+        projection,
+        Arc::clone(provider),
+        "test-model",
+        Some("be terse".to_owned()),
+        registry,
+        false,
+    )
+}
+
 /// An engine reopened over `dir`'s existing log with a fresh projection
 /// replayed from its bytes — the way a restarted daemon starts. Drop the
 /// previous engine first; two writers on one log is not a thing.

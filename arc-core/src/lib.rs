@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod client;
 pub mod log;
 pub mod orphan;
