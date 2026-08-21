@@ -54,7 +54,14 @@ impl OpenAiCompat {
         endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
             endpoint,
-            http: reqwest::Client::new(),
+            // No connection pooling: llama-server closes keep-alive sockets
+            // after a streamed response, and a POST on the stale socket fails
+            // without retry — a tool loop's back-to-back completions hit that
+            // race. A fresh loopback connection per request costs nothing.
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .expect("default reqwest client"),
         }
     }
 
