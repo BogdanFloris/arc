@@ -124,8 +124,8 @@ Live-driving finding (2026-08-21, first exit-criterion check): on "what's my nam
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 7.1 | Idle-timeout trigger in `arcd` (configurable window) → async consolidation pass on the daemon; spans on every decision | claude | in progress |
-| 7.2 | Extraction pass: versioned consolidation prompt, extract durable facts, merge with existing records, resolve contradictions by superseding (§5.4) | — | todo |
+| 7.1 | Idle-timeout trigger in `arcd` (configurable window) → async consolidation pass on the daemon; spans on every decision | claude | done |
+| 7.2 | Extraction pass: versioned consolidation prompt, extract durable facts, merge with existing records, resolve contradictions by superseding (§5.4) | claude | in progress |
 | 7.3 | `arcd memory-replay`: run a prompt version over historical sessions, diff resulting memory state against another version — the regression suite for prompt changes | — | todo |
 
 ## 8. Review + metrics
