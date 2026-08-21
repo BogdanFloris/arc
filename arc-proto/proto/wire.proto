@@ -103,10 +103,8 @@ message SessionList {
 message HistoryMessage {
   Role role = 1;
   string content = 2;
-  // 3 reserved for `partial`: the log carries it on MessageAppended, but the
-  // SQLite projection has no column for it yet, so a reopened session cannot
-  // yet tell a cut reply from a whole one.
-  reserved 3;
+  // Reply was cut before the model finished; content is what the user saw.
+  bool partial = 3;
 }
 
 message SessionHistory {

@@ -226,10 +226,12 @@ fn server_frame_arms_round_trip() {
                 HistoryMessage {
                     role: Role::User as i32,
                     content: "hello arc".to_string(),
+                    partial: false,
                 },
                 HistoryMessage {
                     role: Role::Assistant as i32,
                     content: "hello back".to_string(),
+                    partial: true,
                 },
             ],
         }),
