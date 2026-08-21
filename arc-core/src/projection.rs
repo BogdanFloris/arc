@@ -22,8 +22,9 @@
 use std::path::{Path, PathBuf};
 
 use arc_proto::v1::{
-    Event, MessageAppended, Role, SessionCreated, ToolCallIssued, ToolResultRecorded, event,
-    session_event,
+    Event, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded,
+    MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionCreated,
+    ToolCallIssued, ToolResultRecorded, event, memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -39,7 +40,8 @@ use crate::log;
 /// already reproducible.
 ///
 /// 2: tool-call and tool-result rows joined `messages`, with FTS5.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: `memory_records` joined — the distilled tier's state table (§5.2).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// `projection_meta` key holding the seq of the last applied event.
 const LAST_SEQ_KEY: &str = "last_seq";
@@ -67,6 +69,15 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// `messages_fts` is an external-content FTS5 table over `content`, rowid tied
 /// to `seq`. It is written by explicit statements inside [`Projection::apply`]'s
 /// transaction, never by triggers, so replay stays visible and deterministic.
+///
+/// `memory_records` is the distilled tier's current state (DESIGN.md §5.2):
+/// one row per record, keyed by `id` and mutated by replay — records are
+/// mutable state, so seq-as-PK does not apply here. `last_event_seq` is what
+/// keeps double-apply failing anyway: created is a plain INSERT (a duplicate
+/// id violates the PK), and every mutation guards on `last_event_seq <
+/// event.seq`, treating zero affected rows as an error. `links` and
+/// `provenance` are JSON text — nothing queries inside them yet, and the file
+/// is disposable. `provenance` NULL means the field was absent, not empty.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
@@ -100,6 +111,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content='messages',
     content_rowid='seq'
+);
+
+CREATE TABLE IF NOT EXISTS memory_records (
+    id             TEXT    PRIMARY KEY,
+    kind           INTEGER NOT NULL,
+    namespace      TEXT    NOT NULL,
+    title          TEXT    NOT NULL,
+    summary        TEXT    NOT NULL,
+    body           TEXT    NOT NULL,
+    links          TEXT    NOT NULL,
+    provenance     TEXT,
+    status         INTEGER NOT NULL,
+    superseded_by  TEXT,
+    created_seq    INTEGER NOT NULL,
+    last_event_seq INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS projection_meta (
@@ -160,6 +186,18 @@ pub enum Error {
     SeqOutOfRange {
         /// The offending value, in whichever direction it went out of range.
         seq: i128,
+    },
+
+    /// A memory event's guarded write touched zero rows: its target record is
+    /// missing, or already carries this seq or a later one. Either way the
+    /// event was fed out of order or twice — the driver's failure, surfaced
+    /// loudly like a duplicate `messages` seq.
+    #[error("memory event {seq}: record {id} is missing or not older than the event")]
+    StaleMemoryEvent {
+        /// Sequence number of the refused event.
+        seq: u64,
+        /// Id of the record the event targeted.
+        id: String,
     },
 
     /// A statement against the index failed. A constraint violation here means
@@ -240,6 +278,35 @@ pub enum MessageRow {
         /// The turn this row belongs to.
         turn_id: String,
     },
+}
+
+/// One row of [`Projection::memory_index`]: what the always-loaded index of
+/// ACTIVE records carries (DESIGN.md §5.2) — everything but the body.
+///
+/// `kind` stays a raw protobuf integer — the module convention: the
+/// projection preserves, readers interpret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryIndexEntry {
+    /// Record id.
+    pub id: String,
+    /// "global" or a project id.
+    pub namespace: String,
+    /// Raw `MemoryRecord.Kind` integer.
+    pub kind: i32,
+    /// Record title.
+    pub title: String,
+    /// The one-line summary.
+    pub summary: String,
+}
+
+/// What [`Projection::memory_record`] returns: the record as last written,
+/// plus where replay says it went.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecordState {
+    /// The record, rebuilt from columns; raw enum integers preserved.
+    pub record: MemoryRecord,
+    /// Id of the record that superseded this one, if one did.
+    pub superseded_by: Option<String>,
 }
 
 /// What a [`replay`] pass did: how many events it applied and how many it
@@ -441,8 +508,9 @@ impl Projection {
     /// - `last_seq` follows the last event applied, whatever it was. Feed
     ///   events out of order and it will say so.
     ///
-    /// An event whose kind this build does not know — a `SessionEvent` oneof
-    /// arm from a newer schema — writes no rows but still advances `last_seq`,
+    /// An event whose kind this build does not know — a `SessionEvent` or
+    /// `MemoryEvent` oneof arm from a newer schema — writes no rows but still
+    /// advances `last_seq`,
     /// with a warning. An old binary must be able to replay a newer log to its
     /// end; stalling on the first unknown event would be worse than skipping
     /// it, and the log still holds everything that was skipped.
@@ -499,11 +567,31 @@ impl Projection {
                     );
                 }
             },
-            // Skipped the same way and for the same reason: record state is a
-            // projection of these, and it lands with the distilled tier.
-            event::Payload::Memory(_) => {
-                span.record("kind", "memory");
-            }
+            event::Payload::Memory(memory) => match memory.event.as_ref() {
+                Some(memory_event::Event::RecordCreated(created)) => {
+                    span.record("kind", "memory_record_created");
+                    create_memory_record(&tx, event, created)?;
+                }
+                Some(memory_event::Event::RecordUpdated(updated)) => {
+                    span.record("kind", "memory_record_updated");
+                    update_memory_record(&tx, event, updated)?;
+                }
+                Some(memory_event::Event::RecordSuperseded(superseded)) => {
+                    span.record("kind", "memory_record_superseded");
+                    supersede_memory_record(&tx, event, superseded)?;
+                }
+                Some(memory_event::Event::RecordDeleted(deleted)) => {
+                    span.record("kind", "memory_record_deleted");
+                    delete_memory_record(&tx, event, deleted)?;
+                }
+                None => {
+                    span.record("kind", "unknown");
+                    tracing::warn!(
+                        seq = event.seq,
+                        "memory event of an unknown kind; skipping its rows"
+                    );
+                }
+            },
         }
         set_last_seq(&tx, event.seq)?;
         tx.commit()?;
@@ -618,6 +706,74 @@ impl Projection {
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// The always-loaded index of the distilled tier: every ACTIVE record,
+    /// bodies excluded (DESIGN.md §5.2).
+    ///
+    /// Ordered namespace → kind → title → id, so the index a session is
+    /// primed with does not shuffle between calls.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read.
+    pub fn memory_index(&self) -> Result<Vec<MemoryIndexEntry>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, namespace, kind, title, summary FROM memory_records
+             WHERE status = ?1 ORDER BY namespace, kind, title, id",
+        )?;
+        let rows = stmt.query_map([memory_record::Status::Active as i32], |row| {
+            Ok(MemoryIndexEntry {
+                id: row.get(0)?,
+                namespace: row.get(1)?,
+                kind: row.get(2)?,
+                title: row.get(3)?,
+                summary: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One record, whole, whatever its status — a SUPERSEDED record is still
+    /// readable ("you used to live at X"). `None` for an id the projection
+    /// does not hold, deleted ones included: DELETED excludes entirely.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read, or holds `links` or
+    /// `provenance` JSON this build cannot decode — not reachable from an
+    /// index this build wrote, so one means a hand-edited or foreign file.
+    pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kind, namespace, title, summary, body, links, provenance,
+                        status, superseded_by
+                 FROM memory_records WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(MemoryRecordState {
+                        record: MemoryRecord {
+                            id: id.to_owned(),
+                            kind: row.get(0)?,
+                            namespace: row.get(1)?,
+                            title: row.get(2)?,
+                            summary: row.get(3)?,
+                            body: row.get(4)?,
+                            links: links_from_json(&row.get::<_, String>(5)?)
+                                .map_err(|e| bad_json_column(5, &e))?,
+                            provenance: provenance_from_json(
+                                row.get::<_, Option<String>>(6)?.as_deref(),
+                            )
+                            .map_err(|e| bad_json_column(6, &e))?,
+                            status: row.get(7)?,
+                        },
+                        superseded_by: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
 }
 
 /// A row value this build cannot type, as the `rusqlite` error the row mapper
@@ -627,6 +783,15 @@ fn bad_column(index: usize, message: &str) -> rusqlite::Error {
         index,
         rusqlite::types::Type::Integer,
         message.to_owned().into(),
+    )
+}
+
+/// [`bad_column`], for a JSON text column that would not decode.
+fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        source.to_string().into(),
     )
 }
 
@@ -743,6 +908,277 @@ fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Er
     Ok(())
 }
 
+/// Writes the `memory_records` row for a `MemoryRecordCreated`.
+///
+/// A plain INSERT on purpose: a duplicate id is a constraint failure, the
+/// state-table twin of `messages`' double-apply property. Status lands as
+/// carried — sending ACTIVE is the writer's job.
+fn create_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    created: &MemoryRecordCreated,
+) -> Result<(), Error> {
+    let Some(record) = created.record.as_ref() else {
+        skip_recordless(event.seq, "created");
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO memory_records
+             (id, kind, namespace, title, summary, body, links, provenance,
+              status, superseded_by, created_seq, last_event_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)",
+        rusqlite::params![
+            &record.id,
+            // Raw enum integers, unknown values included — here and below.
+            record.kind,
+            &record.namespace,
+            &record.title,
+            &record.summary,
+            &record.body,
+            links_json(&record.links),
+            provenance_json(record.provenance.as_ref()),
+            record.status,
+            seq_param(event.seq)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Overwrites the whole `memory_records` row for a `MemoryRecordUpdated` —
+/// writes carry the whole record, never a diff, so replay is last write wins.
+/// `superseded_by` clears with the overwrite; `created_seq` stays.
+fn update_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    updated: &MemoryRecordUpdated,
+) -> Result<(), Error> {
+    let Some(record) = updated.record.as_ref() else {
+        skip_recordless(event.seq, "updated");
+        return Ok(());
+    };
+    let changed = tx.execute(
+        "UPDATE memory_records
+         SET kind = ?2, namespace = ?3, title = ?4, summary = ?5, body = ?6,
+             links = ?7, provenance = ?8, status = ?9, superseded_by = NULL,
+             last_event_seq = ?10
+         WHERE id = ?1 AND last_event_seq < ?10",
+        rusqlite::params![
+            &record.id,
+            record.kind,
+            &record.namespace,
+            &record.title,
+            &record.summary,
+            &record.body,
+            links_json(&record.links),
+            provenance_json(record.provenance.as_ref()),
+            record.status,
+            seq_param(event.seq)?,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::StaleMemoryEvent {
+            seq: event.seq,
+            id: record.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Applies a `MemoryRecordSuperseded`: marks the old row SUPERSEDED, pointed
+/// at its replacement, then upserts the replacement.
+///
+/// When the replacement reuses the superseded id, the row is simply replaced
+/// with the new content — the log keeps the history in that case, the
+/// projection doesn't.
+fn supersede_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    superseded: &MemoryRecordSuperseded,
+) -> Result<(), Error> {
+    let Some(record) = superseded.record.as_ref() else {
+        skip_recordless(event.seq, "superseded");
+        return Ok(());
+    };
+    if record.id != superseded.superseded_id {
+        let changed = tx.execute(
+            "UPDATE memory_records
+             SET status = ?2, superseded_by = ?3, last_event_seq = ?4
+             WHERE id = ?1 AND last_event_seq < ?4",
+            rusqlite::params![
+                &superseded.superseded_id,
+                memory_record::Status::Superseded as i32,
+                &record.id,
+                seq_param(event.seq)?,
+            ],
+        )?;
+        if changed == 0 {
+            if memory_record_exists(tx, &superseded.superseded_id)? {
+                return Err(Error::StaleMemoryEvent {
+                    seq: event.seq,
+                    id: superseded.superseded_id.clone(),
+                });
+            }
+            // A foreign log can supersede a record this projection never
+            // held; the replacement still lands.
+            tracing::warn!(
+                seq = event.seq,
+                id = %superseded.superseded_id,
+                "supersede target not in the projection; upserting the replacement anyway"
+            );
+        }
+    }
+    upsert_memory_record(tx, event, record)
+}
+
+/// Inserts a supersede's replacement, or overwrites the row its id already
+/// holds. `created_seq` survives an overwrite; `superseded_by` does not —
+/// whatever the row was, it is now the fresh replacement.
+fn upsert_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    record: &MemoryRecord,
+) -> Result<(), Error> {
+    let changed = tx.execute(
+        "INSERT INTO memory_records
+             (id, kind, namespace, title, summary, body, links, provenance,
+              status, superseded_by, created_seq, last_event_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)
+         ON CONFLICT (id) DO UPDATE SET
+             kind = excluded.kind, namespace = excluded.namespace,
+             title = excluded.title, summary = excluded.summary,
+             body = excluded.body, links = excluded.links,
+             provenance = excluded.provenance, status = excluded.status,
+             superseded_by = NULL, last_event_seq = excluded.last_event_seq
+         WHERE memory_records.last_event_seq < excluded.last_event_seq",
+        rusqlite::params![
+            &record.id,
+            record.kind,
+            &record.namespace,
+            &record.title,
+            &record.summary,
+            &record.body,
+            links_json(&record.links),
+            provenance_json(record.provenance.as_ref()),
+            record.status,
+            seq_param(event.seq)?,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::StaleMemoryEvent {
+            seq: event.seq,
+            id: record.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Applies a `MemoryRecordDeleted`: removes the row outright, whatever its
+/// status was — §5.2's purge, the one path that excludes a record entirely.
+fn delete_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    deleted: &MemoryRecordDeleted,
+) -> Result<(), Error> {
+    let changed = tx.execute(
+        "DELETE FROM memory_records WHERE id = ?1 AND last_event_seq < ?2",
+        rusqlite::params![&deleted.id, seq_param(event.seq)?],
+    )?;
+    if changed == 0 {
+        if memory_record_exists(tx, &deleted.id)? {
+            return Err(Error::StaleMemoryEvent {
+                seq: event.seq,
+                id: deleted.id.clone(),
+            });
+        }
+        // A foreign log can delete a record this projection never held.
+        tracing::warn!(
+            seq = event.seq,
+            id = %deleted.id,
+            "delete of an unknown memory record; nothing to remove"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `memory_records` holds `id` — what tells a stale guarded write
+/// (an error) apart from a missing target (a warning).
+fn memory_record_exists(tx: &Transaction<'_>, id: &str) -> Result<bool, Error> {
+    let found: Option<i64> = tx
+        .query_row("SELECT 1 FROM memory_records WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// A memory event whose oneof arm is known but whose record field is absent.
+/// Skipped like an unknown kind: a foreign log must not fail wholesale.
+fn skip_recordless(seq: u64, kind: &str) {
+    tracing::warn!(
+        seq,
+        kind,
+        "memory event carries no record; skipping its rows"
+    );
+}
+
+/// The private JSON shape of one `provenance` entry. Prost types do not speak
+/// serde, and the column format is this module's business alone.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvenanceEntryJson {
+    session_id: String,
+    ts: Option<TimestampJson>,
+}
+
+/// A protobuf timestamp kept whole — provenance must rebuild verbatim, so it
+/// skips the lossy `epoch_micros` flattening the `messages` columns use.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TimestampJson {
+    seconds: i64,
+    nanos: i32,
+}
+
+fn links_json(links: &[String]) -> String {
+    serde_json::to_string(links).expect("strings always serialize")
+}
+
+fn links_from_json(json: &str) -> Result<Vec<String>, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+/// Provenance as the JSON its column holds. Absent stays absent (NULL), so
+/// presence round-trips.
+fn provenance_json(provenance: Option<&Provenance>) -> Option<String> {
+    let entries: Vec<ProvenanceEntryJson> = provenance?
+        .entries
+        .iter()
+        .map(|entry| ProvenanceEntryJson {
+            session_id: entry.session_id.clone(),
+            ts: entry.ts.as_ref().map(|ts| TimestampJson {
+                seconds: ts.seconds,
+                nanos: ts.nanos,
+            }),
+        })
+        .collect();
+    Some(serde_json::to_string(&entries).expect("strings and integers always serialize"))
+}
+
+fn provenance_from_json(json: Option<&str>) -> Result<Option<Provenance>, serde_json::Error> {
+    let Some(json) = json else { return Ok(None) };
+    let entries: Vec<ProvenanceEntryJson> = serde_json::from_str(json)?;
+    Ok(Some(Provenance {
+        entries: entries
+            .into_iter()
+            .map(|entry| ProvenanceEntry {
+                session_id: entry.session_id,
+                ts: entry.ts.map(|ts| Timestamp {
+                    seconds: ts.seconds,
+                    nanos: ts.nanos,
+                }),
+            })
+            .collect(),
+    }))
+}
+
 /// Points `last_seq` at `seq`.
 fn set_last_seq(tx: &Transaction<'_>, seq: u64) -> Result<(), Error> {
     tx.execute(
@@ -784,14 +1220,19 @@ mod tests {
     use std::path::Path;
 
     use arc_proto::v1::{
-        Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
-        ToolOutcome, ToolResultRecorded, event, session_event,
+        Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
+        MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
+        Role, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
+        ToolResultRecorded, event, memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
-    use super::{Error, MessageRow, Projection, ReplayError, ReplayStats, SessionSummary, replay};
+    use super::{
+        Error, MemoryIndexEntry, MessageRow, Projection, ReplayError, ReplayStats, SessionSummary,
+        replay,
+    };
     use crate::log::{Log, LogReader, discover_segments};
 
     /// 2023-11-14T22:13:20.123456789Z, chosen so the nanos truncate visibly.
@@ -921,6 +1362,7 @@ mod tests {
     /// its shadow tables (external content, so no `_content`).
     fn expected_tables() -> Vec<String> {
         [
+            "memory_records",
             "messages",
             "messages_fts",
             "messages_fts_config",
@@ -1745,5 +2187,511 @@ mod tests {
         let mut one_shot = Projection::open(":memory:").expect("open");
         replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
         assert_eq!(dump(&projection), dump(&one_shot));
+    }
+
+    // --- memory records ---
+
+    /// An ACTIVE record with a full provenance entry, so round-trips cover
+    /// every field — the timestamp's nanos included.
+    fn record(id: &str, title: &str, summary: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: id.to_string(),
+            kind: memory_record::Kind::Fact as i32,
+            namespace: "global".to_string(),
+            title: title.to_string(),
+            summary: summary.to_string(),
+            body: format!("{title}, at length"),
+            links: vec!["mr-linked".to_string()],
+            provenance: Some(Provenance {
+                entries: vec![ProvenanceEntry {
+                    session_id: "s-01".to_string(),
+                    ts: Some(timestamp()),
+                }],
+            }),
+            status: memory_record::Status::Active as i32,
+        }
+    }
+
+    fn memory(seq: u64, event: memory_event::Event) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Memory(MemoryEvent { event: Some(event) })),
+        }
+    }
+
+    fn mem_created(seq: u64, record: MemoryRecord) -> Event {
+        memory(
+            seq,
+            memory_event::Event::RecordCreated(MemoryRecordCreated {
+                record: Some(record),
+            }),
+        )
+    }
+
+    fn mem_updated(seq: u64, record: MemoryRecord) -> Event {
+        memory(
+            seq,
+            memory_event::Event::RecordUpdated(MemoryRecordUpdated {
+                record: Some(record),
+            }),
+        )
+    }
+
+    fn mem_superseded(seq: u64, superseded_id: &str, record: MemoryRecord) -> Event {
+        memory(
+            seq,
+            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                superseded_id: superseded_id.to_string(),
+                record: Some(record),
+            }),
+        )
+    }
+
+    fn mem_deleted(seq: u64, id: &str) -> Event {
+        memory(
+            seq,
+            memory_event::Event::RecordDeleted(MemoryRecordDeleted { id: id.to_string() }),
+        )
+    }
+
+    /// The `memory_event::Event` inside one of the constructors above, in the
+    /// shape `testkit::seed_memory_log` seeds.
+    fn memory_payload(event: Event) -> memory_event::Event {
+        match event.payload {
+            Some(event::Payload::Memory(MemoryEvent { event: Some(inner) })) => inner,
+            other => panic!("expected a memory payload, got {other:?}"),
+        }
+    }
+
+    /// The ids [`Projection::memory_index`] lists, in its order.
+    fn index_ids(projection: &Projection) -> Vec<String> {
+        projection
+            .memory_index()
+            .expect("memory_index")
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_created_record_reads_back_whole_and_indexed() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        let created = record("mr-a", "gruvbox", "the palette");
+
+        projection
+            .apply(&mem_created(0, created.clone()))
+            .expect("apply");
+
+        let state = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record, created, "every field round-trips");
+        assert_eq!(state.superseded_by, None);
+        assert_eq!(
+            projection.memory_index().expect("memory_index"),
+            [MemoryIndexEntry {
+                id: "mr-a".to_string(),
+                namespace: "global".to_string(),
+                kind: memory_record::Kind::Fact as i32,
+                title: "gruvbox".to_string(),
+                summary: "the palette".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_update_overwrites_the_whole_record() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "old title", "old summary")))
+            .expect("apply");
+
+        let mut newer = record("mr-a", "new title", "new summary");
+        newer.kind = memory_record::Kind::Preference as i32;
+        newer.links = vec![];
+        newer.provenance = None;
+        projection
+            .apply(&mem_updated(1, newer.clone()))
+            .expect("apply");
+
+        let state = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record, newer, "last write wins, field by field");
+        assert_eq!(
+            index_ids(&projection),
+            ["mr-a"],
+            "still one record, under the new title"
+        );
+    }
+
+    #[test]
+    fn an_update_of_a_missing_record_is_refused() {
+        let mut projection = Projection::open(":memory:").expect("open");
+
+        let err = projection
+            .apply(&mem_updated(0, record("mr-none", "t", "s")))
+            .expect_err("nothing to overwrite");
+
+        assert!(
+            matches!(err, Error::StaleMemoryEvent { seq: 0, ref id } if id == "mr-none"),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            projection.last_seq().expect("last_seq"),
+            None,
+            "rolled back"
+        );
+    }
+
+    #[test]
+    fn a_supersede_retires_the_old_row_and_lands_the_replacement() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "old address", "lives at X")))
+            .expect("apply");
+
+        let replacement = record("mr-b", "new address", "lives at Y");
+        projection
+            .apply(&mem_superseded(1, "mr-a", replacement.clone()))
+            .expect("apply");
+
+        assert_eq!(
+            index_ids(&projection),
+            ["mr-b"],
+            "only the replacement is ACTIVE"
+        );
+        let old = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("SUPERSEDED is still readable");
+        assert_eq!(old.record.status, memory_record::Status::Superseded as i32);
+        assert_eq!(old.superseded_by, Some("mr-b".to_string()));
+        assert_eq!(
+            old.record.summary, "lives at X",
+            "the old content survives for history"
+        );
+        let new = projection
+            .memory_record("mr-b")
+            .expect("memory_record")
+            .expect("the replacement exists");
+        assert_eq!(new.record, replacement);
+        assert_eq!(new.superseded_by, None);
+    }
+
+    /// The proto allows the replacement to reuse the superseded id; the row
+    /// is then simply replaced — the log keeps the history, not the table.
+    #[test]
+    fn a_supersede_reusing_the_id_replaces_the_row_in_place() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "old address", "lives at X")))
+            .expect("apply");
+
+        let replacement = record("mr-a", "new address", "lives at Y");
+        projection
+            .apply(&mem_superseded(1, "mr-a", replacement.clone()))
+            .expect("apply");
+
+        assert_eq!(index_ids(&projection), ["mr-a"], "the row stays ACTIVE");
+        let state = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record, replacement);
+        assert_eq!(state.superseded_by, None);
+    }
+
+    #[test]
+    fn a_delete_excludes_the_record_entirely() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "t", "s")))
+            .expect("apply");
+
+        projection.apply(&mem_deleted(1, "mr-a")).expect("apply");
+
+        assert_eq!(
+            projection.memory_record("mr-a").expect("memory_record"),
+            None
+        );
+        assert_eq!(index_ids(&projection), [""; 0]);
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
+    }
+
+    /// §5.2's purge applies whatever the status was: deleting a SUPERSEDED
+    /// record removes the history row and leaves its replacement alone.
+    #[test]
+    fn deleting_a_superseded_record_removes_it_and_spares_the_replacement() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "old", "s")))
+            .expect("apply");
+        projection
+            .apply(&mem_superseded(1, "mr-a", record("mr-b", "new", "s")))
+            .expect("apply");
+
+        projection.apply(&mem_deleted(2, "mr-a")).expect("apply");
+
+        assert_eq!(
+            projection.memory_record("mr-a").expect("memory_record"),
+            None
+        );
+        assert_eq!(index_ids(&projection), ["mr-b"]);
+    }
+
+    /// A foreign log can supersede a record this log never created; the
+    /// replacement must still land (with a warning), not fail the replay.
+    #[test]
+    fn a_supersede_of_a_missing_target_still_lands_the_replacement() {
+        let mut projection = Projection::open(":memory:").expect("open");
+
+        projection
+            .apply(&mem_superseded(0, "mr-ghost", record("mr-b", "t", "s")))
+            .expect("apply");
+
+        assert_eq!(
+            projection.memory_record("mr-ghost").expect("memory_record"),
+            None
+        );
+        assert_eq!(index_ids(&projection), ["mr-b"]);
+    }
+
+    /// Same replay-safety rule for the other anomaly: deleting what the
+    /// projection never held warns, no-ops, and advances `last_seq`.
+    #[test]
+    fn a_delete_of_an_unknown_record_warns_and_no_ops() {
+        let mut projection = Projection::open(":memory:").expect("open");
+
+        projection
+            .apply(&mem_deleted(0, "mr-ghost"))
+            .expect("apply");
+
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
+        assert_eq!(index_ids(&projection), [""; 0]);
+    }
+
+    #[test]
+    fn double_applying_a_create_fails_and_rolls_back() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "t", "s")))
+            .expect("apply");
+
+        let err = projection
+            .apply(&mem_created(0, record("mr-a", "t", "s")))
+            .expect_err("a duplicate id must violate the primary key");
+
+        assert!(matches!(err, Error::Sqlite(_)), "got: {err:?}");
+        assert_eq!(row_count(&projection, "memory_records"), 1);
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
+    }
+
+    #[test]
+    fn double_applying_an_update_fails_and_rolls_back() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "t", "s")))
+            .expect("apply");
+        projection
+            .apply(&mem_updated(1, record("mr-a", "t2", "s2")))
+            .expect("apply");
+
+        let err = projection
+            .apply(&mem_updated(1, record("mr-a", "t3", "s3")))
+            .expect_err("the seq guard must refuse a replayed update");
+
+        assert!(
+            matches!(err, Error::StaleMemoryEvent { seq: 1, .. }),
+            "got: {err:?}"
+        );
+        let state = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record.title, "t2", "the refused write left no trace");
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
+    }
+
+    #[test]
+    fn double_applying_a_supersede_fails_and_rolls_back() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "old", "s")))
+            .expect("apply");
+        projection
+            .apply(&mem_superseded(1, "mr-a", record("mr-b", "new", "s")))
+            .expect("apply");
+
+        // Distinct ids: the old row's guard refuses first.
+        let err = projection
+            .apply(&mem_superseded(1, "mr-a", record("mr-b", "newer", "s")))
+            .expect_err("the seq guard must refuse a replayed supersede");
+        assert!(
+            matches!(err, Error::StaleMemoryEvent { seq: 1, .. }),
+            "got: {err:?}"
+        );
+
+        // Same id: the upsert's own guard refuses.
+        projection
+            .apply(&mem_superseded(2, "mr-b", record("mr-b", "renewed", "s")))
+            .expect("apply");
+        let err = projection
+            .apply(&mem_superseded(2, "mr-b", record("mr-b", "again", "s")))
+            .expect_err("the upsert guard must refuse a replayed same-id supersede");
+        assert!(
+            matches!(err, Error::StaleMemoryEvent { seq: 2, .. }),
+            "got: {err:?}"
+        );
+
+        let state = projection
+            .memory_record("mr-b")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(
+            state.record.title, "renewed",
+            "the refused writes left no trace"
+        );
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(2));
+    }
+
+    /// Delete's double-apply is indistinguishable from the unknown-id
+    /// anomaly — the row is gone either way — so it takes the anomaly path:
+    /// warn and no-op, never a spurious resurrection or failure.
+    #[test]
+    fn double_applying_a_delete_warns_and_no_ops() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&mem_created(0, record("mr-a", "t", "s")))
+            .expect("apply");
+        projection.apply(&mem_deleted(1, "mr-a")).expect("apply");
+
+        projection
+            .apply(&mem_deleted(1, "mr-a"))
+            .expect("a re-delete no-ops");
+
+        assert_eq!(
+            projection.memory_record("mr-a").expect("memory_record"),
+            None
+        );
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
+    }
+
+    /// Enum integers this build does not know come back verbatim — the
+    /// projection preserves, readers interpret — and an unknown status is
+    /// simply not ACTIVE, so it stays out of the index.
+    #[test]
+    fn unknown_kind_and_status_ints_survive_verbatim() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        let mut foreign = record("mr-a", "t", "s");
+        foreign.kind = 42;
+        foreign.status = 9;
+
+        projection
+            .apply(&mem_created(0, foreign.clone()))
+            .expect("apply");
+
+        let state = projection
+            .memory_record("mr-a")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record, foreign);
+        assert_eq!(index_ids(&projection), [""; 0], "status 9 is not ACTIVE");
+    }
+
+    #[test]
+    fn an_unknown_memory_event_kind_advances_last_seq_without_writing_rows() {
+        let mut projection = Projection::open(":memory:").expect("open");
+
+        let foreign = Event {
+            seq: 0,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Memory(MemoryEvent { event: None })),
+        };
+        projection.apply(&foreign).expect("apply");
+
+        assert_eq!(row_count(&projection, "memory_records"), 0);
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
+    }
+
+    /// One log, both tiers: session and memory events interleaved project
+    /// into their own tables without crosstalk — seeded through the testkit,
+    /// so the seeder is exercised where the memory tests live.
+    #[test]
+    fn a_mixed_log_projects_both_tiers() {
+        let dir = TempDir::new().expect("temp dir");
+        crate::testkit::seed_log_payloads(
+            &dir,
+            vec![
+                session_created(0).payload.expect("payload"),
+                mem_created(0, record("mr-a", "t", "s"))
+                    .payload
+                    .expect("payload"),
+                message_appended(0, "hello").payload.expect("payload"),
+                mem_updated(0, record("mr-a", "t2", "s2"))
+                    .payload
+                    .expect("payload"),
+            ],
+        );
+
+        let mut projection = Projection::open(":memory:").expect("open");
+        let segments = discover_segments(dir.path()).expect("discover");
+        let stats = replay(LogReader::new(segments), &mut projection).expect("replay");
+
+        assert_eq!(stats.applied, 4);
+        assert_eq!(projection.sessions().expect("sessions").len(), 1);
+        assert_eq!(projection.messages("s-01").expect("messages").len(), 1);
+        assert_eq!(index_ids(&projection), ["mr-a"]);
+        assert_eq!(
+            projection
+                .memory_record("mr-a")
+                .expect("memory_record")
+                .expect("the record exists")
+                .record
+                .title,
+            "t2"
+        );
+    }
+
+    #[test]
+    fn memory_replay_is_deterministic_across_fresh_indexes() {
+        let dir = TempDir::new().expect("temp dir");
+        crate::testkit::seed_memory_log(
+            &dir,
+            vec![
+                memory_payload(mem_created(0, record("mr-a", "old address", "lives at X"))),
+                memory_payload(mem_created(0, record("mr-c", "keeper", "stays put"))),
+                memory_payload(mem_superseded(
+                    0,
+                    "mr-a",
+                    record("mr-b", "new address", "lives at Y"),
+                )),
+                memory_payload(mem_deleted(0, "mr-c")),
+            ],
+        );
+
+        let mut first = Projection::open(":memory:").expect("open");
+        let mut second = Projection::open(":memory:").expect("open");
+        let segments = discover_segments(dir.path()).expect("discover");
+        replay(LogReader::new(segments.clone()), &mut first).expect("replay");
+        replay(LogReader::new(segments), &mut second).expect("replay");
+
+        assert_eq!(
+            first.memory_index().expect("memory_index"),
+            second.memory_index().expect("memory_index")
+        );
+        for id in ["mr-a", "mr-b", "mr-c"] {
+            assert_eq!(
+                first.memory_record(id).expect("memory_record"),
+                second.memory_record(id).expect("memory_record"),
+                "record {id} differs between replays"
+            );
+        }
+        assert_eq!(index_ids(&first), ["mr-b"]);
     }
 }

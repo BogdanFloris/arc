@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use arc_proto::v1::{Role, session_event};
+use arc_proto::v1::{Role, memory_event, session_event};
 use futures::stream;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -173,17 +173,44 @@ pub(crate) fn reopened_engine(
 /// Appends raw session events to `dir`'s log, for histories a live engine
 /// cannot produce — results in completion order, foreign roles, orphans.
 pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
+    seed_log_payloads(
+        dir,
+        events
+            .into_iter()
+            .map(|event| {
+                arc_proto::v1::event::Payload::Session(arc_proto::v1::SessionEvent {
+                    event: Some(event),
+                })
+            })
+            .collect(),
+    );
+}
+
+/// [`seed_log`] for the distilled tier: appends raw memory events.
+pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
+    seed_log_payloads(
+        dir,
+        events
+            .into_iter()
+            .map(|event| {
+                arc_proto::v1::event::Payload::Memory(arc_proto::v1::MemoryEvent {
+                    event: Some(event),
+                })
+            })
+            .collect(),
+    );
+}
+
+/// The general form of the seeders: whole payloads, so a test can interleave
+/// session and memory events in one log.
+pub(crate) fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {
     let mut log = Log::open(dir.path()).expect("open log");
-    for payload in events {
+    for payload in payloads {
         log.append(arc_proto::v1::Event {
             seq: 0, // added by the log
             ts: None,
             source: arc_proto::v1::Source::System as i32,
-            payload: Some(arc_proto::v1::event::Payload::Session(
-                arc_proto::v1::SessionEvent {
-                    event: Some(payload),
-                },
-            )),
+            payload: Some(payload),
         })
         .expect("append");
     }
