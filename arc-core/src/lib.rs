@@ -4,6 +4,8 @@ pub mod orphan;
 pub mod projection;
 pub mod provider;
 pub mod session;
+#[cfg(test)]
+mod testkit;
 pub mod tool;
 pub mod trace;
 

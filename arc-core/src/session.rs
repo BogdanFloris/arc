@@ -589,234 +589,24 @@ pub(crate) fn now_ts() -> Timestamp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use std::future::Future;
-    use std::pin::Pin;
+    use std::sync::Arc;
 
     use arc_proto::v1::{Role, Source, ToolOutcome, session_event};
-    use futures::stream;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
 
     use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS};
-    use crate::log::{Log, LogReader, discover_segments};
+    use crate::log::Log;
     use crate::projection::Projection;
-    use crate::provider::{
-        CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
-        Provider, Stop, ToolCall, ToolDefinition, Usage,
+    use crate::provider::{CompletionDelta, Error as ProviderError, Message, Stop, Usage};
+    use crate::testkit::{
+        Canned, ScriptedProvider, appended, call, channel, done_reply, drain, engine,
+        engine_with_tools, issued, replay_log, resulted, tool_stop, tools, turn, usage,
     };
-    use crate::tool::{Registry, Tool, ToolReply};
-
-    /// A scripted provider: each `complete` call captures its request and
-    /// yields the next script entry.
-    struct MockProvider {
-        script: Mutex<VecDeque<Vec<Result<CompletionDelta, ProviderError>>>>,
-        captured: Mutex<Vec<CompletionRequest>>,
-    }
-
-    impl MockProvider {
-        fn scripted(calls: Vec<Vec<Result<CompletionDelta, ProviderError>>>) -> Arc<Self> {
-            Arc::new(Self {
-                script: Mutex::new(calls.into()),
-                captured: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<CompletionRequest> {
-            self.captured.lock().expect("captured").clone()
-        }
-    }
-
-    impl Provider for MockProvider {
-        fn name(&self) -> &'static str {
-            "mock"
-        }
-
-        async fn complete(
-            &self,
-            request: CompletionRequest,
-        ) -> Result<CompletionStream, ProviderError> {
-            self.captured.lock().expect("captured").push(request);
-            let items = self
-                .script
-                .lock()
-                .expect("script")
-                .pop_front()
-                .expect("script exhausted");
-            Ok(Box::pin(stream::iter(items)))
-        }
-    }
-
-    fn usage() -> Usage {
-        Usage {
-            input_tokens: 3,
-            output_tokens: 5,
-        }
-    }
-
-    fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
-        vec![
-            Ok(CompletionDelta::Text(text.to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]
-    }
-
-    /// The role and text of a history message. Everything this engine sends is
-    /// text; a tool message here is a bug in the test.
-    fn turn(message: &Message) -> (Role, &str) {
-        match message {
-            Message::Text { role, content } => (*role, content.as_str()),
-            other => panic!("expected a text message, got {other:?}"),
-        }
-    }
-
-    /// An engine over a fresh log and in-memory index.
-    fn engine(provider: &Arc<MockProvider>, dir: &TempDir) -> Engine<MockProvider> {
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::open(":memory:").expect("open projection");
-        Engine::new(
-            log,
-            projection,
-            Arc::clone(provider),
-            "test-model",
-            Some("be terse".to_owned()),
-            Registry::new(512),
-            false,
-        )
-    }
-
-    /// An engine whose model may call tools, with `/no_think` off so system
-    /// prompt assertions stay simple.
-    fn engine_with_tools(
-        provider: &Arc<MockProvider>,
-        dir: &TempDir,
-        registry: Registry,
-    ) -> Engine<MockProvider> {
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::open(":memory:").expect("open projection");
-        Engine::new(
-            log,
-            projection,
-            Arc::clone(provider),
-            "test-model",
-            Some("be terse".to_owned()),
-            registry,
-            false,
-        )
-    }
-
-    fn channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
-        mpsc::channel(64)
-    }
-
-    fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        events
-    }
-
-    /// Every event in the engine's log, replayed through the real reader.
-    fn replay_log(engine: &Engine<MockProvider>) -> Vec<session_event::Event> {
-        let segments = discover_segments(engine.log.dir()).expect("discover");
-        LogReader::new(segments)
-            .map(|result| {
-                let event = result.expect("replay");
-                match event.payload.expect("payload") {
-                    arc_proto::v1::event::Payload::Session(session) => {
-                        session.event.expect("session event")
-                    }
-                    other @ arc_proto::v1::event::Payload::Memory(_) => {
-                        panic!("expected a session event, got {other:?}")
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn appended(event: &session_event::Event) -> &arc_proto::v1::MessageAppended {
-        match event {
-            session_event::Event::MessageAppended(m) => m,
-            other => panic!("expected a message, got {other:?}"),
-        }
-    }
-
-    fn issued(event: &session_event::Event) -> &arc_proto::v1::ToolCallIssued {
-        match event {
-            session_event::Event::ToolCallIssued(c) => c,
-            other => panic!("expected a tool call, got {other:?}"),
-        }
-    }
-
-    fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResultRecorded {
-        match event {
-            session_event::Event::ToolResultRecorded(r) => r,
-            other => panic!("expected a tool result, got {other:?}"),
-        }
-    }
-
-    /// A test tool with a fixed reply.
-    struct Canned {
-        name: &'static str,
-        content: &'static str,
-        ok: bool,
-    }
-
-    impl Tool for Canned {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: self.name.to_owned(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-
-        fn execute(
-            &self,
-            _arguments_json: String,
-        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            let reply = ToolReply {
-                content: self.content.to_owned(),
-                ok: self.ok,
-            };
-            Box::pin(async move { reply })
-        }
-    }
-
-    /// A registry of [`Canned`] tools: `(name, reply, ok)` each.
-    fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
-        let mut registry = Registry::new(512);
-        for &(name, content, ok) in entries {
-            registry.register(Box::new(Canned { name, content, ok }));
-        }
-        registry
-    }
-
-    fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {
-        CompletionDelta::ToolCall(ToolCall {
-            id: id.to_owned(),
-            index,
-            name: name.to_owned(),
-            arguments: args.to_owned(),
-        })
-    }
-
-    fn tool_stop() -> CompletionDelta {
-        CompletionDelta::Done {
-            usage: usage(),
-            stop: Stop::ToolCalls,
-        }
-    }
+    use crate::tool::Registry;
 
     #[tokio::test]
     async fn a_new_session_logs_created_user_and_assistant() {
-        let provider = MockProvider::scripted(vec![done_reply("hello there")]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
         let (tx, mut rx) = channel();
@@ -830,13 +620,13 @@ mod tests {
         assert!(!reply.partial);
         assert_eq!(reply.seq, 2);
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 3);
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
         assert_eq!(created.session_id, reply.session_id);
-        assert_eq!(created.provider, "mock");
+        assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
 
         let user = appended(&events[1]);
@@ -877,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_message_reuses_the_session_and_sends_history() {
         let provider =
-            MockProvider::scripted(vec![done_reply("first reply"), done_reply("second reply")]);
+            ScriptedProvider::scripted(vec![done_reply("first reply"), done_reply("second reply")]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
 
@@ -892,7 +682,7 @@ mod tests {
             .await
             .expect("second send");
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 5, "exactly one SessionCreated");
 
         let requests = provider.requests();
@@ -911,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_lists_what_send_message_created() {
-        let provider = MockProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
         assert_eq!(engine.sessions().expect("sessions"), []);
@@ -941,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_stream_appends_a_partial_reply() {
-        let provider = MockProvider::scripted(vec![vec![Ok(CompletionDelta::Text(
+        let provider = ScriptedProvider::scripted(vec![vec![Ok(CompletionDelta::Text(
             "partial tex".to_owned(),
         ))]]);
         let dir = TempDir::new().expect("temp dir");
@@ -952,7 +742,7 @@ mod tests {
 
         assert!(reply.partial);
         assert_eq!(reply.usage, None);
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial tex");
@@ -960,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_after_text_appends_partial_and_surfaces_the_error() {
-        let provider = MockProvider::scripted(vec![vec![
+        let provider = ScriptedProvider::scripted(vec![vec![
             Ok(CompletionDelta::Text("some tex".to_owned())),
             Err(ProviderError::MalformedStream("boom".to_owned())),
         ]]);
@@ -974,7 +764,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 3, "the partial text was still appended");
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
@@ -983,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_before_text_appends_no_reply() {
-        let provider = MockProvider::scripted(vec![vec![Err(ProviderError::MalformedStream(
+        let provider = ScriptedProvider::scripted(vec![vec![Err(ProviderError::MalformedStream(
             "instant".to_owned(),
         ))]]);
         let dir = TempDir::new().expect("temp dir");
@@ -996,7 +786,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(
             events.len(),
             2,
@@ -1006,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_before_any_text_is_an_empty_reply() {
-        let provider = MockProvider::scripted(vec![vec![]]);
+        let provider = ScriptedProvider::scripted(vec![vec![]]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
         let (tx, _rx) = channel();
@@ -1017,12 +807,12 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::EmptyReply), "got: {err:?}");
-        assert_eq!(replay_log(&engine).len(), 2);
+        assert_eq!(replay_log(&dir).len(), 2);
     }
 
     #[tokio::test]
     async fn a_dropped_receiver_does_not_lose_the_append() {
-        let provider = MockProvider::scripted(vec![done_reply("nobody watched")]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("nobody watched")]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
         let (tx, rx) = channel();
@@ -1031,13 +821,13 @@ mod tests {
         let reply = engine.send_message(None, "hi", tx).await.expect("send");
 
         assert!(!reply.partial);
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(appended(&events[2]).content, "nobody watched");
     }
 
     #[tokio::test]
     async fn an_empty_message_is_refused_before_anything_is_appended() {
-        let provider = MockProvider::scripted(vec![]);
+        let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
         let (tx, _rx) = channel();
@@ -1048,13 +838,13 @@ mod tests {
             .expect_err("must refuse");
 
         assert!(matches!(err, Error::EmptyMessage), "got: {err:?}");
-        assert_eq!(replay_log(&engine).len(), 0, "log untouched");
+        assert_eq!(replay_log(&dir).len(), 0, "log untouched");
         assert!(provider.requests().is_empty(), "provider never called");
     }
 
     #[tokio::test]
     async fn an_unmappable_role_in_history_is_skipped() {
-        let provider = MockProvider::scripted(vec![done_reply("ok")]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
 
@@ -1066,7 +856,7 @@ mod tests {
                 session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
                     session_id: "s-old".to_owned(),
                     title: String::new(),
-                    provider: "mock".to_owned(),
+                    provider: "scripted".to_owned(),
                     model: "test-model".to_owned(),
                 }),
             )
@@ -1097,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_turn_logs_calls_results_and_final_text_in_order() {
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("srv1", 0, "lookup", r#"{"q":1}"#)), Ok(tool_stop())],
             done_reply("answer"),
         ]);
@@ -1116,7 +906,7 @@ mod tests {
             })
         );
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 5);
         let user = appended(&events[1]);
         let issued_call = issued(&events[2]);
@@ -1177,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_calls_are_written_ahead_and_answered_in_index_order() {
         // The provider delivers index 1 first; the log and transcript sort it.
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call("b", 1, "beta", "{}")),
                 Ok(call("a", 0, "alpha", "{}")),
@@ -1192,7 +982,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         // Both calls durable before either result: the write-ahead rule.
         let first = issued(&events[2]);
         let second = issued(&events[3]);
@@ -1224,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_or_colliding_call_id_is_minted() {
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call("", 0, "alpha", "{}")),
                 Ok(call("dup", 1, "alpha", "{}")),
@@ -1239,7 +1029,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         let ids: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -1269,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_error_is_a_result_and_the_turn_continues() {
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("x", 0, "fails", "{}")), Ok(tool_stop())],
             done_reply("recovered"),
         ]);
@@ -1281,7 +1071,7 @@ mod tests {
         let reply = engine.send_message(None, "hi", tx).await.expect("send");
         assert!(!reply.partial);
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert_eq!(result.content, "ERROR: nope");
@@ -1294,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn step_text_is_appended_before_its_calls() {
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(CompletionDelta::Text("checking".to_owned())),
                 Ok(call("s", 0, "alpha", "{}")),
@@ -1308,7 +1098,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 6);
         let step_text = appended(&events[2]);
         assert_eq!(step_text.content, "checking");
@@ -1329,7 +1119,7 @@ mod tests {
             })
             .collect();
         script.push(done_reply("enough"));
-        let provider = MockProvider::scripted(script);
+        let provider = ScriptedProvider::scripted(script);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
@@ -1347,14 +1137,14 @@ mod tests {
             requests[MAX_TOOL_STEPS].tools.is_empty(),
             "the final completion offers no tools"
         );
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(appended(events.last().expect("events")).content, "enough");
         assert!(!reply.partial);
     }
 
     #[tokio::test]
     async fn reasoning_is_forwarded_and_never_stored() {
-        let provider = MockProvider::scripted(vec![vec![
+        let provider = ScriptedProvider::scripted(vec![vec![
             Ok(CompletionDelta::Reasoning("hmm".to_owned())),
             Ok(CompletionDelta::Text("hi there".to_owned())),
             Ok(CompletionDelta::Done {
@@ -1371,14 +1161,14 @@ mod tests {
         let forwarded = drain(&mut rx);
         assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
         // Nothing durable carries it: session, user, assistant, and that's all.
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
     }
 
     #[tokio::test]
     async fn a_truncated_result_marks_the_event() {
-        let provider = MockProvider::scripted(vec![
+        let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("t", 0, "big", "{}")), Ok(tool_stop())],
             done_reply("ok"),
         ]);
@@ -1394,7 +1184,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&engine);
+        let events = replay_log(&dir);
         let result = resulted(&events[3]);
         assert!(result.truncated);
         assert_eq!(result.content, "01234567 [truncated]");
@@ -1403,7 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_think_rides_the_system_prompt() {
-        let provider = MockProvider::scripted(vec![done_reply("ok")]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::open(":memory:").expect("open projection");
