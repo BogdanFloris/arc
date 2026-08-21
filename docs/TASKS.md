@@ -88,20 +88,32 @@ Decisions banked 2026-08-17, at assignment:
 - **`EngineEvent` grows in 4.2** (reasoning, call started/ended), mirroring the wire frames as it already does; 4.4 is purely translation and rendering.
 - **Reasoning collapses in the TUI** once real text arrives — a dim one-liner, so live scrollback matches what a reopened session will show (reasoning is never durable).
 
+Decisions banked 2026-08-21, at assignment:
+
+- **All 5.x–6.x tasks are implemented by the claude agent** from a brief written with full context (briefs live in chat, not the repo). Review is bogdan first, then the brief's author; fixes are applied by the author; then the task closes.
+- **Strict order: 5.0 → 5.1 → 5.2 → 6.1 → 6.2 → 6.3** — each task end-to-end verifiable on landing.
+- **Verification is two-layer.** Per-task integration tests on the scripted-provider harness (5.0), plus the live exit-criterion checklist below, run on erebor against real history.
+
+Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
+
+- [ ] "what did we say about X" → grounded answer citing a real past session (needs 5.1 + 5.2)
+- [ ] "remember this: Y" in one session, then "what do you know about Y" answered from the distilled tier in a fresh session (needs 6.1 + 6.2 + 6.3)
+
 ## 5. Archive tier (`arc-core`)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 5.1 | Projection: messages shape extended for structured turns per the 2.1 sketch, FTS5 index over `content`, replay tests. Fold in the reserved `partial` column (`HistoryMessage` field 3) while the schema is open | — | todo |
-| 5.2 | `sessions_search` (FTS, snippets + session ids) + `session_read` (targeted range) as tools over the projection | — | todo |
+| 5.0 | Integration-test harness: promote `session.rs`'s scripted `MockProvider` + real-log-and-projection setup into a shared test-support module, with an end-to-end assertion chain (scripted completion → log bytes → replayed projection → rebuilt transcript) that 5.x/6.x tests build on | claude | todo |
+| 5.1 | Projection: messages shape extended for structured turns per the 2.1 sketch, FTS5 index over `content`, replay tests. Fold in the reserved `partial` column (`HistoryMessage` field 3) while the schema is open | claude | todo |
+| 5.2 | `sessions_search` (FTS, snippets + session ids) + `session_read` (targeted range) as tools over the projection | claude | todo |
 
 ## 6. Distilled tier (`arc-core`)
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 6.1 | Memory projection: record state as a deterministic replay of `MemoryEvent`s; supersede keeps history, `DELETED` excludes entirely (§5.2) | — | todo |
-| 6.2 | Always-loaded index of ACTIVE records (namespace + kind + title + summary) into system context beside the identity file — the one sanctioned injection (invariant 6) | — | todo |
-| 6.3 | `memory_read` / `memory_search` / `memory_write` / `memory_supersede` tools; writes emit events, never touch projection state directly (invariant 2) | — | todo |
+| 6.1 | Memory projection: record state as a deterministic replay of `MemoryEvent`s; supersede keeps history, `DELETED` excludes entirely (§5.2) | claude | todo |
+| 6.2 | Always-loaded index of ACTIVE records (namespace + kind + title + summary) into system context beside the identity file — the one sanctioned injection (invariant 6) | claude | todo |
+| 6.3 | `memory_read` / `memory_search` / `memory_write` / `memory_supersede` tools; writes emit events, never touch projection state directly (invariant 2) | claude | todo |
 
 ## 7. Consolidation (`arc-core` / `arcd`)
 
