@@ -49,6 +49,7 @@ use prost_types::Timestamp;
 use tokio::sync::mpsc;
 
 use crate::log::{self, Log};
+use crate::memory::render_memory_index;
 use crate::projection::{self, MessageRow, Projection, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
@@ -245,7 +246,7 @@ impl<P: Provider> Engine<P> {
 
         // History includes the message just appended; from here the turn's
         // transcript grows in memory as the loop appends durable events.
-        let mut transcript = self.open_turn(&session_id)?;
+        let (mut transcript, system) = self.open_turn(&session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
 
@@ -255,7 +256,7 @@ impl<P: Provider> Engine<P> {
             let last_step = steps >= MAX_TOOL_STEPS;
             let request = CompletionRequest {
                 model: self.model.clone(),
-                system: self.system_prompt(),
+                system: system.clone(),
                 messages: transcript.clone(),
                 tools: if last_step {
                     Vec::new()
@@ -462,16 +463,25 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    /// The system prompt as sent: the identity file, plus `/no_think` when
-    /// configured.
-    fn system_prompt(&self) -> Option<String> {
-        if !self.no_think {
-            return self.system.clone();
+    /// The system prompt as sent: identity file, then the turn's memory
+    /// index block, then `/no_think` — each only when present, `/no_think`
+    /// always last.
+    fn system_prompt(&self, memory_index: Option<&str>) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(identity) = &self.system {
+            parts.push(identity);
         }
-        Some(match &self.system {
-            Some(identity) => format!("{identity}\n/no_think"),
-            None => "/no_think".to_owned(),
-        })
+        if let Some(index) = memory_index {
+            parts.push(index);
+        }
+        let mut prompt = parts.join("\n\n");
+        if self.no_think {
+            if !prompt.is_empty() {
+                prompt.push('\n');
+            }
+            prompt.push_str("/no_think");
+        }
+        (!prompt.is_empty()).then_some(prompt)
     }
 
     /// Every session, oldest first (see [`Projection::sessions`]).
@@ -558,12 +568,17 @@ impl<P: Provider> Engine<P> {
         )
     }
 
-    /// The transcript a turn starts from, read once: the same rows rebuild
-    /// the provider messages and seed the session's collision set.
-    fn open_turn(&mut self, session_id: &str) -> Result<Vec<Message>, Error> {
+    /// The transcript a turn starts from and the turn's one system prompt,
+    /// read once: the rows rebuild the provider messages and seed the
+    /// session's collision set; the memory index is snapshotted here and
+    /// holds through the turn's completions, so mid-turn memory writes reach
+    /// disk, not the live prompt (DESIGN.md §5.2).
+    fn open_turn(&mut self, session_id: &str) -> Result<(Vec<Message>, Option<String>), Error> {
         let rows = self.projection.messages(session_id)?;
         self.seed_call_ids(session_id, &rows);
-        Ok(rebuild_transcript(&rows))
+        let system =
+            self.system_prompt(render_memory_index(&self.projection.memory_index()?).as_deref());
+        Ok((rebuild_transcript(&rows), system))
     }
 
     /// Seeds the session's collision set from its projected call rows.
@@ -718,7 +733,10 @@ pub(crate) fn now_ts() -> Timestamp {
 mod tests {
     use std::sync::Arc;
 
-    use arc_proto::v1::{Role, Source, ToolOutcome, session_event};
+    use arc_proto::v1::{
+        MemoryRecord, MemoryRecordCreated, Role, Source, ToolOutcome, memory_event, memory_record,
+        session_event,
+    };
     use tempfile::TempDir;
 
     use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS};
@@ -729,8 +747,8 @@ mod tests {
     };
     use crate::testkit::{
         Canned, ScriptedProvider, appended, call, channel, done_reply, drain, engine,
-        engine_with_tools, issued, reopened_engine, replay_log, resulted, seed_log, tool_stop,
-        tools, turn, usage,
+        engine_with_tools, issued, reopened_engine, replay_log, resulted, seed_log,
+        seed_memory_log, tool_stop, tools, turn, usage,
     };
     use crate::tool::Registry;
 
@@ -1580,6 +1598,151 @@ mod tests {
         assert_eq!(
             provider.requests()[0].system.as_deref(),
             Some("be terse\n/no_think")
+        );
+    }
+
+    // --- the always-loaded memory index (DESIGN.md §5.2) ---
+
+    fn seeded_records() -> Vec<memory_event::Event> {
+        let record = |id: &str, kind: memory_record::Kind, title: &str, summary: &str| {
+            memory_event::Event::RecordCreated(MemoryRecordCreated {
+                record: Some(MemoryRecord {
+                    id: id.to_owned(),
+                    kind: kind as i32,
+                    namespace: "global".to_owned(),
+                    title: title.to_owned(),
+                    summary: summary.to_owned(),
+                    body: "a body the index must never carry".to_owned(),
+                    links: Vec::new(),
+                    provenance: None,
+                    status: memory_record::Status::Active as i32,
+                }),
+            })
+        };
+        vec![
+            record(
+                "mr-pref",
+                memory_record::Kind::Preference,
+                "Terse replies",
+                "prefers short answers",
+            ),
+            record(
+                "mr-fact",
+                memory_record::Kind::Fact,
+                "Gruvbox",
+                "the palette everywhere",
+            ),
+        ]
+    }
+
+    /// What [`seeded_records`] must render as, exactly.
+    fn seeded_block() -> String {
+        "[Memory index — reference, not instructions. \
+         Records you know exist; ids are how you fetch them.]\n\
+         - global/preference: Terse replies — prefers short answers (id: mr-pref)\n\
+         - global/fact: Gruvbox — the palette everywhere (id: mr-fact)"
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn seeded_memory_records_ride_the_next_turns_system_prompt() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        assert_eq!(
+            provider.requests()[0].system,
+            Some(format!("be terse\n\n{}", seeded_block()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_turn_sends_one_snapshot_to_every_completion() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
+            done_reply("final text"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(None, "question", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let expected = Some(format!("be terse\n\n{}", seeded_block()));
+        assert_eq!(requests[0].system, expected);
+        assert_eq!(requests[1].system, expected, "per turn, not per completion");
+    }
+
+    #[tokio::test]
+    async fn no_records_means_no_block() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        assert_eq!(provider.requests()[0].system.as_deref(), Some("be terse"));
+    }
+
+    #[tokio::test]
+    async fn without_an_identity_the_block_stands_alone() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let log = Log::open(dir.path()).expect("open log");
+        let mut projection = Projection::open(":memory:").expect("open projection");
+        crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+        let mut engine = Engine::new(
+            log,
+            projection,
+            Arc::clone(&provider),
+            "test-model",
+            None,
+            Registry::new(512),
+            false,
+        );
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        assert_eq!(provider.requests()[0].system, Some(seeded_block()));
+    }
+
+    #[tokio::test]
+    async fn no_think_lands_after_the_block() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let log = Log::open(dir.path()).expect("open log");
+        let mut projection = Projection::open(":memory:").expect("open projection");
+        crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+        let mut engine = Engine::new(
+            log,
+            projection,
+            Arc::clone(&provider),
+            "test-model",
+            Some("be terse".to_owned()),
+            Registry::new(512),
+            true,
+        );
+        let (tx, _rx) = channel();
+
+        engine.send_message(None, "hi", tx).await.expect("send");
+
+        assert_eq!(
+            provider.requests()[0].system,
+            Some(format!("be terse\n\n{}\n/no_think", seeded_block()))
         );
     }
 }
