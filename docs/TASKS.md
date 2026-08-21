@@ -96,7 +96,7 @@ Decisions banked 2026-08-21, at assignment:
 
 Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
 
-- [ ] "what did we say about X" → grounded answer citing a real past session (needs 5.1 + 5.2)
+- [x] "what did we say about X" → grounded answer citing a real past session (5.1 + 5.2, verified live 2026-08-21)
 - [ ] "remember this: Y" in one session, then "what do you know about Y" answered from the distilled tier in a fresh session (needs 6.1 + 6.2 + 6.3)
 
 ## 5. Archive tier (`arc-core`)
@@ -109,6 +109,8 @@ Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
 | 5.2 | `sessions_search` (FTS, snippets + session ids) + `session_read` (targeted range) as tools over the projection | claude | done |
 
 Noted at 5.2 review (2026-08-21): `sessions_search` can match the *current* session — the user's just-appended question contains the search terms, so it can claim the hydrated top slot. The tool has no way to know the current session id (`Tool::execute` sees only arguments), so excluding it means threading turn context through the 4.1 dispatch seam. Deliberately not fixed blind: watch live driving; if it bites, the fix is a registry-seam change, not a query hack.
+
+Live-driving finding (2026-08-21, first exit-criterion check): on "what's my name?" the 8B planned the search in its thinking, then refused in prose — the harness was fine, the model called the tool in only 3/6 bare runs. Measured against llama-server directly: a WHEN clause in `sessions_search`'s description 6/8, a memory line in `identity.md` 6/8, both 8/8. Both applied (description in code; identity line is Bogdan's, human-owned). The exit-criterion checkbox for the archive half is confirmed working live. If flakiness returns at the edge, the 1.1 fallback stands: a bigger model is a config line.
 
 ## 6. Distilled tier (`arc-core`)
 
