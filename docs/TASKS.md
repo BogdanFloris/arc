@@ -117,7 +117,7 @@ Live-driving finding (2026-08-21, first exit-criterion check): on "what's my nam
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 6.1 | Memory projection: record state as a deterministic replay of `MemoryEvent`s; supersede keeps history, `DELETED` excludes entirely (§5.2) | claude | done |
-| 6.2 | Always-loaded index of ACTIVE records (namespace + kind + title + summary) into system context beside the identity file — the one sanctioned injection (invariant 6) | claude | todo |
+| 6.2 | Always-loaded index of ACTIVE records (namespace + kind + title + summary) into system context beside the identity file — the one sanctioned injection (invariant 6) | claude | done |
 | 6.3 | `memory_read` / `memory_search` / `memory_write` / `memory_supersede` tools; writes emit events, never touch projection state directly (invariant 2) | claude | todo |
 
 ## 7. Consolidation (`arc-core` / `arcd`)
