@@ -104,7 +104,8 @@ Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 5.0 | Integration-test harness: promote `session.rs`'s scripted `MockProvider` + real-log-and-projection setup into a shared test-support module, with an end-to-end assertion chain (scripted completion → log bytes → replayed projection → rebuilt transcript) that 5.x/6.x tests build on | claude | done |
-| 5.1 | Projection: messages shape extended for structured turns per the 2.1 sketch, FTS5 index over `content`, replay tests. Fold in the reserved `partial` column (`HistoryMessage` field 3) while the schema is open | claude | todo |
+| 5.1 | Projection: messages shape extended for structured turns per the 2.1 sketch, FTS5 index over `content`, replay tests. Fold in the reserved `partial` column (`HistoryMessage` field 3) while the schema is open. Provider transcript only; the display half of §3.1's promise is 5.1b | claude | in progress |
+| 5.1b | Reopened-session display: `SessionHistory` grows tool rows on the wire (additive), TUI renders past tool activity dim like live turns (decided 2026-08-21: split from 5.1 to keep diffs reviewable) | claude | todo |
 | 5.2 | `sessions_search` (FTS, snippets + session ids) + `session_read` (targeted range) as tools over the projection | claude | todo |
 
 ## 6. Distilled tier (`arc-core`)
