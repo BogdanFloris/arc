@@ -126,6 +126,47 @@ pub(crate) fn engine_with_tools(
     )
 }
 
+/// An engine reopened over `dir`'s existing log with a fresh projection
+/// replayed from its bytes — the way a restarted daemon starts. Drop the
+/// previous engine first; two writers on one log is not a thing.
+pub(crate) fn reopened_engine(
+    provider: &Arc<ScriptedProvider>,
+    dir: &TempDir,
+    registry: Registry,
+) -> Engine<ScriptedProvider> {
+    let log = Log::open(dir.path()).expect("reopen log");
+    let mut projection = Projection::open(":memory:").expect("open projection");
+    crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+    Engine::new(
+        log,
+        projection,
+        Arc::clone(provider),
+        "test-model",
+        Some("be terse".to_owned()),
+        registry,
+        false,
+    )
+}
+
+/// Appends raw session events to `dir`'s log, for histories a live engine
+/// cannot produce — results in completion order, foreign roles, orphans.
+pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
+    let mut log = Log::open(dir.path()).expect("open log");
+    for payload in events {
+        log.append(arc_proto::v1::Event {
+            seq: 0, // added by the log
+            ts: None,
+            source: arc_proto::v1::Source::System as i32,
+            payload: Some(arc_proto::v1::event::Payload::Session(
+                arc_proto::v1::SessionEvent {
+                    event: Some(payload),
+                },
+            )),
+        })
+        .expect("append");
+    }
+}
+
 pub(crate) fn channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
     mpsc::channel(64)
 }
@@ -237,15 +278,19 @@ mod tests {
 
     use super::{
         ScriptedProvider, appended, call, channel, done_reply, drain, engine_with_tools, issued,
-        replay_log, resulted, tool_stop, tools, turn,
+        replay_log, resulted, tool_stop, tools,
     };
     use crate::log::{LogReader, discover_segments};
-    use crate::projection::{self, Projection};
+    use crate::projection::{self, MessageRow, Projection};
+    use crate::provider::{Message, ToolCall};
     use crate::session::EngineEvent;
 
     /// The template for the archive- and memory-tier tests: one tool turn,
     /// asserted across the whole chain — engine events, log bytes, a fresh
     /// projection replay, and the rebuilt provider transcript.
+    // One turn across the whole chain is the template's point; splitting it
+    // would hide the chain.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn a_tool_turn_holds_up_across_the_whole_chain() {
         let provider = ScriptedProvider::scripted(vec![
@@ -311,7 +356,8 @@ mod tests {
             (Role::Assistant as i32, "final text")
         );
 
-        // (c) a fresh projection replayed from those bytes holds the rows.
+        // (c) a fresh projection replayed from those bytes holds every row,
+        // tool rows included, typed and in seq order.
         let mut fresh = Projection::open(":memory:").expect("open projection");
         let segments = discover_segments(dir.path()).expect("discover");
         let stats = projection::replay(LogReader::new(segments), &mut fresh).expect("replay");
@@ -319,31 +365,73 @@ mod tests {
         let sessions = fresh.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, reply.session_id);
+        let turn_id = user.turn_id.clone();
         assert_eq!(
             fresh.messages(&reply.session_id).expect("messages"),
             [
-                (Role::User as i32, "question".to_owned()),
-                (Role::Assistant as i32, "final text".to_owned()),
+                MessageRow::Message {
+                    role: Role::User as i32,
+                    content: "question".to_owned(),
+                    partial: false,
+                    turn_id: turn_id.clone(),
+                },
+                MessageRow::ToolCall {
+                    call_id: "c1".to_owned(),
+                    call_index: 0,
+                    name: "lookup".to_owned(),
+                    arguments_json: r#"{"q":1}"#.to_owned(),
+                    turn_id: turn_id.clone(),
+                },
+                MessageRow::ToolResult {
+                    call_id: "c1".to_owned(),
+                    outcome: ToolOutcome::Ok as i32,
+                    content: "found it".to_owned(),
+                    truncated: false,
+                    turn_id: turn_id.clone(),
+                },
+                MessageRow::Message {
+                    role: Role::Assistant as i32,
+                    content: "final text".to_owned(),
+                    partial: false,
+                    turn_id,
+                },
             ]
         );
 
         // (d) the rebuilt provider transcript — observed as the next turn's
-        // request — is today's documented-lossy shape: user message and final
-        // text only, no tool steps (the accepted 4.2 gap; 5.1 flips this to
-        // assert the calls and results are rebuilt too).
+        // request — carries the whole tool step back to the model: the call,
+        // its result, and the ids unchanged (DESIGN.md §3.1).
         let (tx, _rx) = channel();
         engine
             .send_message(Some(&reply.session_id), "again", tx)
             .await
             .expect("second send");
         let requests = provider.requests();
-        let turns: Vec<(Role, &str)> = requests[2].messages.iter().map(turn).collect();
         assert_eq!(
-            turns,
+            requests[2].messages,
             [
-                (Role::User, "question"),
-                (Role::Assistant, "final text"),
-                (Role::User, "again"),
+                Message::Text {
+                    role: Role::User,
+                    content: "question".to_owned(),
+                },
+                Message::ToolCalls(vec![ToolCall {
+                    id: "c1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                    arguments: r#"{"q":1}"#.to_owned(),
+                }]),
+                Message::ToolResult {
+                    call_id: "c1".to_owned(),
+                    content: "found it".to_owned(),
+                },
+                Message::Text {
+                    role: Role::Assistant,
+                    content: "final text".to_owned(),
+                },
+                Message::Text {
+                    role: Role::User,
+                    content: "again".to_owned(),
+                },
             ]
         );
     }

@@ -407,7 +407,11 @@ async fn fetch_history<P: Provider>(
             session_id: session_id.to_owned(),
             messages: messages
                 .into_iter()
-                .map(|(role, content)| HistoryMessage { role, content })
+                .map(|(role, content, partial)| HistoryMessage {
+                    role,
+                    content,
+                    partial,
+                })
                 .collect(),
         }),
         Err(error) => {

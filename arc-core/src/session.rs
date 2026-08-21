@@ -49,7 +49,7 @@ use prost_types::Timestamp;
 use tokio::sync::mpsc;
 
 use crate::log::{self, Log};
-use crate::projection::{self, Projection, SessionSummary};
+use crate::projection::{self, MessageRow, Projection, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
@@ -245,7 +245,7 @@ impl<P: Provider> Engine<P> {
 
         // History includes the message just appended; from here the turn's
         // transcript grows in memory as the loop appends durable events.
-        let mut transcript = self.history(&session_id)?;
+        let mut transcript = self.open_turn(&session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
 
@@ -487,11 +487,12 @@ impl<P: Provider> Engine<P> {
     }
 
     /// One session's messages as a client renders them, oldest first, as
-    /// `(role, content)` pairs.
+    /// `(role, content, partial)` rows.
     ///
-    /// Unlike the private `history`, this keeps every role verbatim: a client
-    /// showing a transcript should not silently drop a message the provider
-    /// vocabulary happens not to cover.
+    /// Prose only: tool rows reach the wire with task 5.1b. Unlike the
+    /// private rebuild, this keeps every role verbatim: a client showing a
+    /// transcript should not silently drop a message the provider vocabulary
+    /// happens not to cover.
     ///
     /// An unknown id reads as a session with nothing in it — the projection
     /// has no row to distinguish "never existed" from "never spoken in", and
@@ -500,8 +501,21 @@ impl<P: Provider> Engine<P> {
     /// # Errors
     ///
     /// [`Error::Projection`] if the index cannot be read.
-    pub fn transcript(&self, session_id: &str) -> Result<Vec<(i32, String)>, Error> {
-        Ok(self.projection.messages(session_id)?)
+    pub fn transcript(&self, session_id: &str) -> Result<Vec<(i32, String, bool)>, Error> {
+        Ok(self
+            .projection
+            .messages(session_id)?
+            .into_iter()
+            .filter_map(|row| match row {
+                MessageRow::Message {
+                    role,
+                    content,
+                    partial,
+                    ..
+                } => Some((role, content, partial)),
+                MessageRow::ToolCall { .. } | MessageRow::ToolResult { .. } => None,
+            })
+            .collect())
     }
 
     /// Appends one event to the log and applies it to the index, as a pair.
@@ -544,26 +558,139 @@ impl<P: Provider> Engine<P> {
         )
     }
 
-    /// The session's history as provider messages.
+    /// The transcript a turn starts from, read once: the same rows rebuild
+    /// the provider messages and seed the session's collision set.
+    fn open_turn(&mut self, session_id: &str) -> Result<Vec<Message>, Error> {
+        let rows = self.projection.messages(session_id)?;
+        self.seed_call_ids(session_id, &rows);
+        Ok(rebuild_transcript(&rows))
+    }
+
+    /// Seeds the session's collision set from its projected call rows.
     ///
-    /// Roles the provider vocabulary has no place for — a value from a newer
-    /// schema, or a system role that should never be in message history — are
-    /// skipped with a warning rather than failing the turn: an old binary
-    /// must be able to converse over a newer log.
-    fn history(&self, session_id: &str) -> Result<Vec<Message>, Error> {
-        let mut messages = Vec::new();
-        for (role, content) in self.projection.messages(session_id)? {
-            if let Ok(mapped @ (Role::User | Role::Assistant)) = Role::try_from(role) {
-                messages.push(Message::Text {
-                    role: mapped,
-                    content,
-                });
-            } else {
-                tracing::warn!(role, "skipping history message with an unmappable role");
+    /// The in-process set forgets everything at a restart; the log does not.
+    /// Without this, a provider id that collides with a call an earlier
+    /// daemon run logged would slip past `tool_step`'s check and put the
+    /// same string on two calls of one session (DESIGN.md §3.1).
+    fn seed_call_ids(&mut self, session_id: &str, rows: &[MessageRow]) {
+        self.issued_call_ids
+            .entry(session_id.to_owned())
+            .or_insert_with(|| {
+                rows.iter()
+                    .filter_map(|row| match row {
+                        MessageRow::ToolCall { call_id, .. } => Some(call_id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+    }
+}
+
+/// The provider transcript a session's projected rows imply (DESIGN.md §3.1).
+///
+/// Prose becomes [`Message::Text`]. A step — consecutive call rows of one
+/// turn, §3.1's grouping rule — becomes one [`Message::ToolCalls`], followed
+/// by its results sorted by the `call_index` of the call each one closes, not
+/// completion order. Results are paired by `call_id` alone, never adjacency:
+/// the orphan closer lands at the log tail, possibly far from its call.
+///
+/// Anomalies are skipped with a warning, never a panic, matching the engine's
+/// tolerance for foreign logs: an unmappable role, a result no call claimed,
+/// and a call with no result — legitimate only before arcd's orphan closer
+/// has run, and this reader appends no repair (§3.1: only arcd at startup
+/// may). A skipped call keeps the transcript valid: every call the provider
+/// sees has a result answering it.
+fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
+    // Results first, keyed by call id, so a step finds its answers wherever
+    // they landed in the log. First result wins; the log never holds two.
+    let mut results: HashMap<&str, &str> = HashMap::new();
+    let mut issued: HashSet<&str> = HashSet::new();
+    for row in rows {
+        match row {
+            MessageRow::ToolResult {
+                call_id, content, ..
+            } => {
+                results.entry(call_id.as_str()).or_insert(content.as_str());
+            }
+            MessageRow::ToolCall { call_id, .. } => {
+                issued.insert(call_id.as_str());
+            }
+            MessageRow::Message { .. } => {}
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        match &rows[i] {
+            MessageRow::Message { role, content, .. } => {
+                if let Ok(mapped @ (Role::User | Role::Assistant)) = Role::try_from(*role) {
+                    messages.push(Message::Text {
+                        role: mapped,
+                        content: content.clone(),
+                    });
+                } else {
+                    tracing::warn!(role, "skipping history message with an unmappable role");
+                }
+                i += 1;
+            }
+            MessageRow::ToolCall {
+                turn_id: step_turn, ..
+            } => {
+                // One step: this turn's consecutive call rows.
+                let mut step = Vec::new();
+                while let Some(MessageRow::ToolCall {
+                    call_id,
+                    call_index,
+                    name,
+                    arguments_json,
+                    turn_id,
+                }) = rows.get(i)
+                {
+                    if turn_id != step_turn {
+                        break;
+                    }
+                    step.push(ToolCall {
+                        id: call_id.clone(),
+                        index: *call_index,
+                        name: name.clone(),
+                        arguments: arguments_json.clone(),
+                    });
+                    i += 1;
+                }
+                step.sort_unstable_by_key(|call| call.index);
+
+                let mut answered = Vec::with_capacity(step.len());
+                let mut step_results = Vec::with_capacity(step.len());
+                for call in step {
+                    let Some(content) = results.get(call.id.as_str()) else {
+                        tracing::warn!(
+                            call_id = %call.id,
+                            "skipping a call with no result; the orphan closer has not run"
+                        );
+                        continue;
+                    };
+                    step_results.push(Message::ToolResult {
+                        call_id: call.id.clone(),
+                        content: (*content).to_owned(),
+                    });
+                    answered.push(call);
+                }
+                if !answered.is_empty() {
+                    messages.push(Message::ToolCalls(answered));
+                    messages.append(&mut step_results);
+                }
+            }
+            MessageRow::ToolResult { call_id, .. } => {
+                // Emitted beside its step above; alone it answers nothing.
+                if !issued.contains(call_id.as_str()) {
+                    tracing::warn!(%call_id, "skipping a tool result no call claimed");
+                }
+                i += 1;
             }
         }
-        Ok(messages)
     }
+    messages
 }
 
 /// How one completion of the loop ended; see the module docs.
@@ -597,12 +724,58 @@ mod tests {
     use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS};
     use crate::log::Log;
     use crate::projection::Projection;
-    use crate::provider::{CompletionDelta, Error as ProviderError, Message, Stop, Usage};
+    use crate::provider::{
+        CompletionDelta, Error as ProviderError, Message, Stop, ToolCall, Usage,
+    };
     use crate::testkit::{
         Canned, ScriptedProvider, appended, call, channel, done_reply, drain, engine,
-        engine_with_tools, issued, replay_log, resulted, tool_stop, tools, turn, usage,
+        engine_with_tools, issued, reopened_engine, replay_log, resulted, seed_log, tool_stop,
+        tools, turn, usage,
     };
     use crate::tool::Registry;
+
+    // --- seed events, for histories a live engine cannot produce ---
+
+    fn seeded_session() -> session_event::Event {
+        session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+            session_id: "s-01".to_owned(),
+            title: String::new(),
+            provider: "scripted".to_owned(),
+            model: "test-model".to_owned(),
+        })
+    }
+
+    fn seeded_message(role: Role, content: &str) -> session_event::Event {
+        session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+            session_id: "s-01".to_owned(),
+            role: role as i32,
+            content: content.to_owned(),
+            partial: false,
+            turn_id: "t-01".to_owned(),
+        })
+    }
+
+    fn seeded_call(call_id: &str, index: u32) -> session_event::Event {
+        session_event::Event::ToolCallIssued(arc_proto::v1::ToolCallIssued {
+            session_id: "s-01".to_owned(),
+            turn_id: "t-01".to_owned(),
+            call_id: call_id.to_owned(),
+            index,
+            name: "lookup".to_owned(),
+            arguments_json: "{}".to_owned(),
+        })
+    }
+
+    fn seeded_result(call_id: &str, content: &str) -> session_event::Event {
+        session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
+            session_id: "s-01".to_owned(),
+            turn_id: "t-01".to_owned(),
+            call_id: call_id.to_owned(),
+            outcome: ToolOutcome::Ok as i32,
+            content: content.to_owned(),
+            truncated: false,
+        })
+    }
 
     #[tokio::test]
     async fn a_new_session_logs_created_user_and_assistant() {
@@ -746,6 +919,16 @@ mod tests {
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial tex");
+
+        // The flag reaches clients too: a reopened session can tell a cut
+        // reply from a whole one.
+        assert_eq!(
+            engine.transcript(&reply.session_id).expect("transcript"),
+            [
+                (Role::User as i32, "hi".to_owned(), false),
+                (Role::Assistant as i32, "partial tex".to_owned(), true),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1055,6 +1238,190 @@ mod tests {
             })
             .collect();
         assert_eq!(result_ids, [ids[0], ids[1], ids[2]]);
+    }
+
+    /// The in-process collision set dies with the daemon; the log does not.
+    /// A reopened engine must reject an id an earlier run already logged.
+    #[tokio::test]
+    async fn a_reopened_engine_still_rejects_logged_call_ids() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("dup", 0, "alpha", "{}")), Ok(tool_stop())],
+            done_reply("first"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        drop(engine);
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("dup", 0, "alpha", "{}")), Ok(tool_stop())],
+            done_reply("second"),
+        ]);
+        let mut engine = reopened_engine(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some(&reply.session_id), "again", tx)
+            .await
+            .expect("send after restart");
+
+        let ids: Vec<String> = replay_log(&dir)
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::ToolCallIssued(c) => Some(c.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], "dup");
+        assert_ne!(ids[1], "dup", "the logged id stays taken across restarts");
+        assert!(!ids[1].is_empty());
+    }
+
+    /// The log records results in completion order; the rebuilt transcript
+    /// sorts them by the index of the call each closes (DESIGN.md §3.1) —
+    /// the replay side of the `index 1 first` engine test.
+    #[tokio::test]
+    async fn completion_order_results_rebuild_sorted_by_call_index() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                seeded_session(),
+                seeded_message(Role::User, "question"),
+                seeded_call("a", 0),
+                seeded_call("b", 1),
+                // b finished first; the log says so.
+                seeded_result("b", "B"),
+                seeded_result("a", "A"),
+            ],
+        );
+
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some("s-01"), "again", tx)
+            .await
+            .expect("send");
+
+        let messages = &provider.requests()[0].messages;
+        let Message::ToolCalls(calls) = &messages[1] else {
+            panic!("expected the calls, got {:?}", messages[1]);
+        };
+        assert_eq!(
+            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"],
+            "calls in index order"
+        );
+        assert_eq!(
+            messages[2..4],
+            [
+                Message::ToolResult {
+                    call_id: "a".to_owned(),
+                    content: "A".to_owned(),
+                },
+                Message::ToolResult {
+                    call_id: "b".to_owned(),
+                    content: "B".to_owned(),
+                },
+            ],
+            "results by call index, not completion order"
+        );
+    }
+
+    /// A call the orphan closer has not reached and a result no call claims
+    /// are both skipped with a warning: the transcript stays valid and the
+    /// turn goes on.
+    #[tokio::test]
+    async fn history_anomalies_are_skipped_not_fatal() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                seeded_session(),
+                seeded_message(Role::User, "question"),
+                seeded_call("open", 0),
+                seeded_result("ghost", "answers nothing"),
+            ],
+        );
+
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some("s-01"), "again", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            provider.requests()[0].messages,
+            [
+                Message::Text {
+                    role: Role::User,
+                    content: "question".to_owned(),
+                },
+                Message::Text {
+                    role: Role::User,
+                    content: "again".to_owned(),
+                },
+            ],
+            "the unanswered call and the unclaimed result stay out"
+        );
+    }
+
+    /// The flipped 4.2 gap, focused: a daemon restart loses nothing — the
+    /// next request over a replayed projection carries the whole tool step.
+    #[tokio::test]
+    async fn a_reopened_session_rebuilds_the_tool_step_into_the_next_request() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "lookup", r#"{"q":1}"#)), Ok(tool_stop())],
+            done_reply("final text"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(None, "question", tx)
+            .await
+            .expect("send");
+        drop(engine);
+
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello again")]);
+        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some(&reply.session_id), "again", tx)
+            .await
+            .expect("send after restart");
+
+        assert_eq!(
+            provider.requests()[0].messages,
+            [
+                Message::Text {
+                    role: Role::User,
+                    content: "question".to_owned(),
+                },
+                Message::ToolCalls(vec![ToolCall {
+                    id: "c1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                    arguments: r#"{"q":1}"#.to_owned(),
+                }]),
+                Message::ToolResult {
+                    call_id: "c1".to_owned(),
+                    content: "found it".to_owned(),
+                },
+                Message::Text {
+                    role: Role::Assistant,
+                    content: "final text".to_owned(),
+                },
+                Message::Text {
+                    role: Role::User,
+                    content: "again".to_owned(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

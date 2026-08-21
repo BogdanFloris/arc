@@ -110,6 +110,7 @@ dependencies = [
  "prost",
  "prost-types",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

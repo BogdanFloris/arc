@@ -24,11 +24,12 @@ use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use arc_core::tool::Registry;
 use arc_core::tool::time::GetTime;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::{Config, ProviderChoice};
 use crate::dirs::DataDirs;
@@ -107,8 +108,7 @@ impl<P: Provider + 'static> Daemon<P> {
             "event log ready"
         );
 
-        let mut projection = Projection::open(dirs.index())
-            .with_context(|| format!("opening the index at {}", dirs.index().display()))?;
+        let mut projection = open_index(dirs.index())?;
         let reader = log.reader().context("listing log segments for replay")?;
         let stats = projection::replay(reader, &mut projection)
             .context("replaying the event log into the index")?;
@@ -192,6 +192,45 @@ impl<P: Provider + 'static> Daemon<P> {
     }
 }
 
+/// Opens the index, deleting and recreating it when it was written by another
+/// schema version.
+///
+/// The index is documented disposable (DESIGN.md §5.3): a version bump is a
+/// planned rebuild — the replay in [`Daemon::start`] refills the fresh file
+/// from the log — not a failure, and refusing to start over one would be
+/// friction. Any other open error still refuses: those mean durable state is
+/// not in a known condition.
+fn open_index(path: &Path) -> Result<Projection> {
+    let opening = || format!("opening the index at {}", path.display());
+    match Projection::open(path) {
+        Ok(projection) => Ok(projection),
+        Err(projection::Error::SchemaVersion {
+            found, expected, ..
+        }) => {
+            warn!(
+                found,
+                expected,
+                path = %path.display(),
+                "index written by another schema version; deleting it to rebuild from the log"
+            );
+            // The WAL siblings go too: a stale journal must not outlive the
+            // database it belonged to.
+            for suffix in ["", "-wal", "-shm"] {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                if let Err(error) = std::fs::remove_file(Path::new(&file)) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error)
+                            .with_context(|| format!("deleting stale index file {file:?}"));
+                    }
+                }
+            }
+            Projection::open(path).with_context(opening)
+        }
+        Err(error) => Err(error).with_context(opening),
+    }
+}
+
 /// Resolves when the daemon should stop: Ctrl-C, or `SIGTERM`.
 ///
 /// `SIGTERM` is what a service manager sends, and it is not optional here —
@@ -216,5 +255,78 @@ async fn shutdown() {
             Err(error) => error!(%error, "the shutdown signal handler failed; stopping"),
         },
         _ = terminate.recv() => info!("terminated"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arc_core::provider::{CompletionRequest, CompletionStream, Error as ProviderError};
+    use arc_proto::v1::{Event, SessionCreated, SessionEvent, event, session_event};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::dirs::DataDirs;
+
+    /// Startup opens durable state; it must never need the model.
+    struct NeverCalled;
+
+    impl Provider for NeverCalled {
+        fn name(&self) -> &'static str {
+            "never"
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            panic!("startup must not call the provider")
+        }
+    }
+
+    /// The index is disposable by contract: an index stamped with another
+    /// schema version is deleted and rebuilt from the log, and the daemon
+    /// starts. Any other open failure still refuses — that path stays as
+    /// `open_index`'s error arm.
+    #[tokio::test]
+    async fn a_foreign_schema_version_index_is_deleted_and_rebuilt() {
+        let temp = TempDir::new().expect("temp dir");
+        let dirs = DataDirs::new(temp.path().join("data"));
+        dirs.create().expect("create dirs");
+
+        // A log with one session in it...
+        let mut log = Log::open(dirs.log()).expect("open log");
+        log.append(Event {
+            seq: 0, // added by the log
+            ts: None,
+            source: arc_proto::v1::Source::User as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionCreated(SessionCreated {
+                    session_id: "s-01".to_owned(),
+                    title: String::new(),
+                    provider: "never".to_owned(),
+                    model: "test-model".to_owned(),
+                })),
+            })),
+        })
+        .expect("append");
+        drop(log);
+
+        // ...and an index a previous build left at schema version 1.
+        drop(Projection::open(dirs.index()).expect("create index"));
+        let conn = rusqlite::Connection::open(dirs.index()).expect("open raw");
+        conn.execute(
+            "UPDATE projection_meta SET value = 1 WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("age the version");
+        drop(conn);
+
+        let daemon =
+            Daemon::start(Config::default(), dirs, NeverCalled).expect("start over a stale index");
+
+        // The rebuilt index was refilled from the log before serving.
+        let sessions = daemon.engine.lock().await.sessions().expect("sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "s-01");
     }
 }

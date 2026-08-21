@@ -21,7 +21,10 @@
 
 use std::path::{Path, PathBuf};
 
-use arc_proto::v1::{Event, MessageAppended, Role, SessionCreated, event, session_event};
+use arc_proto::v1::{
+    Event, MessageAppended, Role, SessionCreated, ToolCallIssued, ToolResultRecorded, event,
+    session_event,
+};
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
@@ -34,7 +37,9 @@ use crate::log;
 /// [`Projection::open`] so the caller can delete it and re-project the log,
 /// which is cheaper and more honest than a migration path for a file that is
 /// already reproducible.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// 2: tool-call and tool-result rows joined `messages`, with FTS5.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// `projection_meta` key holding the seq of the last applied event.
 const LAST_SEQ_KEY: &str = "last_seq";
@@ -51,10 +56,17 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// `messages.seq` is the log's sequence number, so it is globally unique and
 /// makes the natural primary key: it ties every row back to the record that
 /// produced it and turns a double-applied event into a constraint failure
-/// rather than a duplicate row.
+/// rather than a duplicate row — on every row kind, tool rows included.
 ///
-/// There is no FTS5 index over `content`. Full-text search is Phase 2, and
-/// adding it then is a re-projection of the log, not a migration.
+/// `messages` holds prose, tool calls and tool results in one table, told
+/// apart by `kind` with per-kind nullable columns (DESIGN.md §3.1, "what the
+/// projection will need"): one seq-ordered query rebuilds a session, and FTS
+/// row-tagging is a join, not a union. `content` is the prose of a message,
+/// the text of a result, and empty for a call — arguments are not indexed.
+///
+/// `messages_fts` is an external-content FTS5 table over `content`, rowid tied
+/// to `seq`. It is written by explicit statements inside [`Projection::apply`]'s
+/// transaction, never by triggers, so replay stays visible and deterministic.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
@@ -66,20 +78,44 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-    session_id TEXT    NOT NULL,
-    seq        INTEGER PRIMARY KEY,
-    role       INTEGER NOT NULL,
-    content    TEXT    NOT NULL,
-    ts         INTEGER
+    session_id     TEXT    NOT NULL,
+    seq            INTEGER PRIMARY KEY,
+    kind           INTEGER NOT NULL,
+    turn_id        TEXT    NOT NULL,
+    role           INTEGER,
+    content        TEXT    NOT NULL,
+    partial        INTEGER,
+    call_id        TEXT,
+    call_index     INTEGER,
+    name           TEXT,
+    arguments_json TEXT,
+    outcome        INTEGER,
+    truncated      INTEGER,
+    ts             INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='seq'
+);
 
 CREATE TABLE IF NOT EXISTS projection_meta (
     key   TEXT PRIMARY KEY,
     value
 );
 ";
+
+/// `messages.kind` for a prose row.
+const KIND_MESSAGE: i64 = 0;
+
+/// `messages.kind` for a `ToolCallIssued` row.
+const KIND_TOOL_CALL: i64 = 1;
+
+/// `messages.kind` for a `ToolResultRecorded` row.
+const KIND_TOOL_RESULT: i64 = 2;
 
 /// Everything that can go wrong in the `SQLite` projection.
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +191,54 @@ pub struct SessionSummary {
     /// has been said in it. What recency means for a session: `started_at` is
     /// when it was opened, which is not when you last used it.
     pub last_at: Option<i64>,
+}
+
+/// One row of [`Projection::messages`]: a session's transcript in the shapes
+/// of `provider::Message`, not a struct of per-kind options.
+///
+/// `role` and `outcome` stay raw protobuf integers, unknown values included —
+/// the module convention: the projection preserves, readers interpret (and
+/// treat an unrecognized outcome as UNKNOWN, per DESIGN.md §3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageRow {
+    /// Prose one side said.
+    Message {
+        /// Speaker, as `MessageAppended` carried it.
+        role: i32,
+        /// The turn's text, verbatim.
+        content: String,
+        /// The reply was cut before the model finished.
+        partial: bool,
+        /// The turn this row belongs to. Empty on Phase 1 rows, which reads
+        /// as "one message, one turn" (DESIGN.md §3.1).
+        turn_id: String,
+    },
+    /// A tool call the model issued.
+    ToolCall {
+        /// The call's id, unique within its session.
+        call_id: String,
+        /// Position within its step, dense from 0.
+        call_index: u32,
+        /// The tool asked for.
+        name: String,
+        /// The arguments, one complete JSON object, verbatim.
+        arguments_json: String,
+        /// The turn this row belongs to.
+        turn_id: String,
+    },
+    /// What the tool answered, addressed to `call_id`.
+    ToolResult {
+        /// The call this closes.
+        call_id: String,
+        /// Raw `ToolOutcome` integer.
+        outcome: i32,
+        /// What the model was shown, verbatim.
+        content: String,
+        /// The registry cut the result before recording it.
+        truncated: bool,
+        /// The turn this row belongs to.
+        turn_id: String,
+    },
 }
 
 /// What a [`replay`] pass did: how many events it applied and how many it
@@ -398,14 +482,13 @@ impl Projection {
                     span.record("kind", "message_appended");
                     insert_message(&tx, event, appended)?;
                 }
-                // Skipped deliberately, not lost: the projection is disposable,
-                // and the messages shape that holds tool rows lands with the
-                // archive tier, which re-projects.
-                Some(session_event::Event::ToolCallIssued(_)) => {
+                Some(session_event::Event::ToolCallIssued(call)) => {
                     span.record("kind", "tool_call_issued");
+                    insert_tool_call(&tx, event, call)?;
                 }
-                Some(session_event::Event::ToolResultRecorded(_)) => {
+                Some(session_event::Event::ToolResultRecorded(result)) => {
                     span.record("kind", "tool_result_recorded");
+                    insert_tool_result(&tx, event, result)?;
                 }
                 None => {
                     span.record("kind", "unknown");
@@ -471,16 +554,18 @@ impl Projection {
     /// [`Error::Sqlite`] if the index cannot be read.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         // The subqueries ride along rather than costing a query per session:
-        // `messages_by_session` makes each one an index seek.
+        // `messages_by_session` makes each one an index seek. Both consider
+        // only prose rows — a tool result is not a thing anyone said.
         let mut stmt = self.conn.prepare(
             "SELECT s.id, coalesce(s.title, ''), s.started_at,
                     coalesce((SELECT m.content FROM messages m
-                              WHERE m.session_id = s.id AND m.role = ?1
+                              WHERE m.session_id = s.id AND m.kind = ?2 AND m.role = ?1
                               ORDER BY m.seq LIMIT 1), ''),
-                    (SELECT MAX(m.ts) FROM messages m WHERE m.session_id = s.id)
+                    (SELECT MAX(m.ts) FROM messages m
+                     WHERE m.session_id = s.id AND m.kind = ?2)
              FROM sessions s ORDER BY s.started_at, s.id",
         )?;
-        let rows = stmt.query_map([Role::User as i32], |row| {
+        let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -492,19 +577,56 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The conversation history of one session: `(role, content)` pairs in
-    /// seq order.
+    /// The conversation history of one session: every row kind, in seq order.
     ///
     /// # Errors
     ///
-    /// [`Error::Sqlite`] if the index cannot be read.
-    pub fn messages(&self, session_id: &str) -> Result<Vec<(i32, String)>, Error> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY seq")?;
-        let rows = stmt.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    /// [`Error::Sqlite`] if the index cannot be read, or holds a row this
+    /// build cannot type — a `kind` it does not know, or a `call_index` no
+    /// provider produces. Neither is reachable from an index this build
+    /// wrote, so one means a hand-edited or foreign file.
+    pub fn messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, role, content, partial, turn_id,
+                    call_id, call_index, name, arguments_json, outcome, truncated
+             FROM messages WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
+            KIND_MESSAGE => Ok(MessageRow::Message {
+                role: row.get(1)?,
+                content: row.get(2)?,
+                partial: row.get(3)?,
+                turn_id: row.get(4)?,
+            }),
+            KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
+                call_id: row.get(5)?,
+                call_index: u32::try_from(row.get::<_, i64>(6)?)
+                    .map_err(|_| bad_column(6, "call_index out of range"))?,
+                name: row.get(7)?,
+                arguments_json: row.get(8)?,
+                turn_id: row.get(4)?,
+            }),
+            KIND_TOOL_RESULT => Ok(MessageRow::ToolResult {
+                call_id: row.get(5)?,
+                outcome: row.get(9)?,
+                content: row.get(2)?,
+                truncated: row.get(10)?,
+                turn_id: row.get(4)?,
+            }),
+            other => Err(bad_column(0, &format!("unknown message kind {other}"))),
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+}
+
+/// A row value this build cannot type, as the `rusqlite` error the row mapper
+/// must speak.
+fn bad_column(index: usize, message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Integer,
+        message.to_owned().into(),
+    )
 }
 
 /// Writes the `sessions` row for a `SessionCreated`.
@@ -528,22 +650,94 @@ fn insert_session(
     Ok(())
 }
 
-/// Writes the `messages` row for a `MessageAppended`.
+/// Writes the `messages` row for a `MessageAppended`, and its FTS row.
 fn insert_message(
     tx: &Transaction<'_>,
     event: &Event,
     appended: &MessageAppended,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO messages (session_id, seq, role, content, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
-        (
+        "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
             &appended.session_id,
             seq_param(event.seq)?,
+            KIND_MESSAGE,
+            &appended.turn_id,
             // Raw enum integer, unknown values included.
             appended.role,
             &appended.content,
+            appended.partial,
             epoch_micros(event.ts.as_ref()),
-        ),
+        ],
+    )?;
+    index_content(tx, event.seq, &appended.content)
+}
+
+/// Writes the `messages` row for a `ToolCallIssued`.
+///
+/// No FTS row: `content` is empty for a call, and arguments are deliberately
+/// not indexed (DESIGN.md §3.1) — the call is findable by name.
+fn insert_tool_call(
+    tx: &Transaction<'_>,
+    event: &Event,
+    call: &ToolCallIssued,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO messages
+             (session_id, seq, kind, turn_id, content, call_id, call_index, name,
+              arguments_json, ts)
+         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            &call.session_id,
+            seq_param(event.seq)?,
+            KIND_TOOL_CALL,
+            &call.turn_id,
+            &call.call_id,
+            call.index,
+            &call.name,
+            &call.arguments_json,
+            epoch_micros(event.ts.as_ref()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Writes the `messages` row for a `ToolResultRecorded`, and its FTS row —
+/// result text is searchable, tagged by `kind` through the join.
+fn insert_tool_result(
+    tx: &Transaction<'_>,
+    event: &Event,
+    result: &ToolResultRecorded,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO messages
+             (session_id, seq, kind, turn_id, content, call_id, outcome, truncated, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            &result.session_id,
+            seq_param(event.seq)?,
+            KIND_TOOL_RESULT,
+            &result.turn_id,
+            &result.content,
+            &result.call_id,
+            // Raw enum integer, unknown values included.
+            result.outcome,
+            result.truncated,
+            epoch_micros(event.ts.as_ref()),
+        ],
+    )?;
+    index_content(tx, event.seq, &result.content)
+}
+
+/// Adds one row's content to the FTS index, inside the caller's transaction.
+///
+/// Explicit statement, not a trigger: replay stays visible and deterministic,
+/// and the write path stays this module's inserts and nothing else.
+fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
+        (seq_param(seq)?, content),
     )?;
     Ok(())
 }
@@ -589,13 +783,14 @@ mod tests {
     use std::path::Path;
 
     use arc_proto::v1::{
-        Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, event, session_event,
+        Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
+        ToolOutcome, ToolResultRecorded, event, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
-    use super::{Error, Projection, ReplayError, ReplayStats, SessionSummary, replay};
+    use super::{Error, MessageRow, Projection, ReplayError, ReplayStats, SessionSummary, replay};
     use crate::log::{Log, LogReader, discover_segments};
 
     /// 2023-11-14T22:13:20.123456789Z, chosen so the nanos truncate visibly.
@@ -643,6 +838,47 @@ mod tests {
         }
     }
 
+    /// A `ToolCallIssued` in session `s-01`, turn `t-01`.
+    fn tool_call(seq: u64, call_id: &str, index: u32, arguments: &str) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ToolCallIssued(ToolCallIssued {
+                    session_id: "s-01".to_string(),
+                    turn_id: "t-01".to_string(),
+                    call_id: call_id.to_string(),
+                    index,
+                    name: "lookup".to_string(),
+                    arguments_json: arguments.to_string(),
+                })),
+            })),
+        }
+    }
+
+    /// A `ToolResultRecorded` in session `s-01`, turn `t-01`. `outcome` stays
+    /// a raw integer so tests can feed values this build does not know.
+    fn tool_result(seq: u64, call_id: &str, outcome: i32, content: &str, truncated: bool) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ToolResultRecorded(
+                    ToolResultRecorded {
+                        session_id: "s-01".to_string(),
+                        turn_id: "t-01".to_string(),
+                        call_id: call_id.to_string(),
+                        outcome,
+                        content: content.to_string(),
+                        truncated,
+                    },
+                )),
+            })),
+        }
+    }
+
     /// An event this build cannot interpret: the payload is a session event,
     /// but no oneof arm is set — what a newer schema's event kind decodes to
     /// here.
@@ -678,6 +914,26 @@ mod tests {
             .expect("rows")
     }
 
+    /// Every table [`SCHEMA`](super::SCHEMA) creates. `messages_fts` being
+    /// here is the proof the bundled `rusqlite` build ships FTS5 — creating
+    /// the virtual table would fail without it. The `messages_fts_*` rows are
+    /// its shadow tables (external content, so no `_content`).
+    fn expected_tables() -> Vec<String> {
+        [
+            "messages",
+            "messages_fts",
+            "messages_fts_config",
+            "messages_fts_data",
+            "messages_fts_docsize",
+            "messages_fts_idx",
+            "projection_meta",
+            "sessions",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
     fn row_count(projection: &Projection, table: &str) -> i64 {
         projection
             .conn
@@ -691,14 +947,7 @@ mod tests {
     fn open_creates_the_schema() {
         let projection = Projection::open(":memory:").expect("open");
 
-        assert_eq!(
-            table_names(&projection),
-            vec![
-                "messages".to_string(),
-                "projection_meta".to_string(),
-                "sessions".to_string(),
-            ]
-        );
+        assert_eq!(table_names(&projection), expected_tables());
         assert_eq!(projection.last_seq().expect("last_seq"), None);
     }
 
@@ -712,14 +961,7 @@ mod tests {
         drop(projection);
 
         let mut projection = Projection::open(&path).expect("reopen");
-        assert_eq!(
-            table_names(&projection),
-            vec![
-                "messages".to_string(),
-                "projection_meta".to_string(),
-                "sessions".to_string(),
-            ]
-        );
+        assert_eq!(table_names(&projection), expected_tables());
         assert_eq!(row_count(&projection, "sessions"), 1);
         assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
 
@@ -771,10 +1013,10 @@ mod tests {
             }
         );
 
-        let message: (String, i64, i64, String, Option<i64>) = projection
+        let message: (String, i64, i64, i64, String, bool, Option<i64>) = projection
             .conn
             .query_row(
-                "SELECT session_id, seq, role, content, ts FROM messages",
+                "SELECT session_id, seq, kind, role, content, partial, ts FROM messages",
                 [],
                 |row| {
                     Ok((
@@ -783,6 +1025,8 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -792,8 +1036,10 @@ mod tests {
             (
                 "s-01".to_string(),
                 1,
+                super::KIND_MESSAGE,
                 i64::from(Role::User as i32),
                 "hello".to_string(),
+                false,
                 Some(TS_MICROS),
             )
         );
@@ -838,10 +1084,165 @@ mod tests {
         let conv = projection.messages("s-01").expect("messages");
 
         assert_eq!(conv.len(), 10);
-        for (i, (role, content)) in conv.iter().enumerate() {
+        for (i, row) in conv.iter().enumerate() {
+            let MessageRow::Message { role, content, .. } = row else {
+                panic!("expected a prose row, got {row:?}");
+            };
             assert_eq!(*role, Role::User as i32);
             assert_eq!(content, &format!("hello_{}", i + 1));
         }
+    }
+
+    /// One tool turn's rows, typed: the columns DESIGN.md §3.1 says the
+    /// projection needs, kind by kind.
+    #[test]
+    fn a_tool_turn_projects_call_and_result_rows() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        let mut asked = message_appended(1, "look this up");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(m)),
+        })) = &mut asked.payload
+        {
+            m.turn_id = "t-01".to_string();
+        }
+        projection.apply(&asked).expect("apply");
+        projection
+            .apply(&tool_call(2, "c-a", 0, r#"{"q":1}"#))
+            .expect("apply");
+        projection
+            .apply(&tool_result(
+                3,
+                "c-a",
+                ToolOutcome::Ok as i32,
+                "found it",
+                false,
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            projection.messages("s-01").expect("messages"),
+            [
+                MessageRow::Message {
+                    role: Role::User as i32,
+                    content: "look this up".to_string(),
+                    partial: false,
+                    turn_id: "t-01".to_string(),
+                },
+                MessageRow::ToolCall {
+                    call_id: "c-a".to_string(),
+                    call_index: 0,
+                    name: "lookup".to_string(),
+                    arguments_json: r#"{"q":1}"#.to_string(),
+                    turn_id: "t-01".to_string(),
+                },
+                MessageRow::ToolResult {
+                    call_id: "c-a".to_string(),
+                    outcome: ToolOutcome::Ok as i32,
+                    content: "found it".to_string(),
+                    truncated: false,
+                    turn_id: "t-01".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The flags and the raw outcome integer must survive a log-in →
+    /// state-out replay, unknown enum values included: the projection
+    /// preserves, readers interpret.
+    #[test]
+    fn partial_truncated_and_unknown_outcomes_survive_replay() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut log = Log::open(dir.path()).expect("open log");
+        log.append(session_created(0)).expect("append");
+        let mut cut = message_appended(1, "half a th");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(m)),
+        })) = &mut cut.payload
+        {
+            m.partial = true;
+        }
+        log.append(cut).expect("append");
+        log.append(tool_call(2, "c-a", 0, "{}")).expect("append");
+        // Outcome 99 is from a newer schema; it must come back verbatim.
+        log.append(tool_result(3, "c-a", 99, "cut resul [truncated]", true))
+            .expect("append");
+
+        let mut projection = Projection::open(":memory:").expect("open");
+        replay(log.reader().expect("reader"), &mut projection).expect("replay");
+
+        let rows = projection.messages("s-01").expect("messages");
+        assert_eq!(
+            rows[0],
+            MessageRow::Message {
+                role: Role::User as i32,
+                content: "half a th".to_string(),
+                partial: true,
+                turn_id: String::new(),
+            }
+        );
+        assert_eq!(
+            rows[2],
+            MessageRow::ToolResult {
+                call_id: "c-a".to_string(),
+                outcome: 99,
+                content: "cut resul [truncated]".to_string(),
+                truncated: true,
+                turn_id: "t-01".to_string(),
+            }
+        );
+    }
+
+    /// FTS finds prose and result text, and the `kind` join is what excludes
+    /// result rows — the filter `sessions_search` will default to (§3.1's
+    /// open FTS question, proven answerable here).
+    #[test]
+    fn fts_matches_prose_and_results_and_kind_filters_them_apart() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&message_appended(1, "what is a walking skeleton"))
+            .expect("apply");
+        projection
+            .apply(&tool_call(2, "c-a", 0, r#"{"needle":"argsecret"}"#))
+            .expect("apply");
+        projection
+            .apply(&tool_result(
+                3,
+                "c-a",
+                ToolOutcome::Ok as i32,
+                "directory listing gruvbox",
+                false,
+            ))
+            .expect("apply");
+
+        let matches = |query: &str, kind: Option<i64>| -> Vec<i64> {
+            let mut stmt = projection
+                .conn
+                .prepare(
+                    "SELECT m.seq FROM messages_fts f JOIN messages m ON m.seq = f.rowid
+                     WHERE messages_fts MATCH ?1 AND (?2 IS NULL OR m.kind = ?2)
+                     ORDER BY m.seq",
+                )
+                .expect("prepare");
+            stmt.query_map(rusqlite::params![query, kind], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<Vec<i64>, _>>()
+                .expect("rows")
+        };
+
+        assert_eq!(matches("skeleton", None), [1], "prose is indexed");
+        assert_eq!(matches("gruvbox", None), [3], "result text is indexed");
+        assert_eq!(
+            matches("gruvbox", Some(super::KIND_MESSAGE)),
+            [0i64; 0],
+            "the kind join excludes the result row"
+        );
+        assert_eq!(
+            matches("argsecret", None),
+            [0i64; 0],
+            "call arguments are not indexed"
+        );
     }
 
     /// A `SessionCreated` with its own id, title, and creation second.
@@ -1012,7 +1413,10 @@ mod tests {
             .messages("s-01")
             .expect("messages")
             .into_iter()
-            .map(|(_, content)| content)
+            .map(|row| match row {
+                MessageRow::Message { content, .. } => content,
+                other => panic!("expected a prose row, got {other:?}"),
+            })
             .collect();
         assert_eq!(conv, ["a", "b"]);
     }
@@ -1063,6 +1467,48 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
+    /// Seq is the primary key on tool rows too, and the rollback covers the
+    /// FTS insert that rides in the same transaction.
+    #[test]
+    fn double_applying_a_tool_row_fails_and_rolls_back_its_fts_row() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&tool_result(
+                1,
+                "c-a",
+                ToolOutcome::Ok as i32,
+                "gruvbox",
+                false,
+            ))
+            .expect("apply");
+
+        let err = projection
+            .apply(&tool_result(
+                1,
+                "c-a",
+                ToolOutcome::Ok as i32,
+                "gruvbox",
+                false,
+            ))
+            .expect_err("a duplicate seq must violate the primary key");
+        assert!(matches!(err, Error::Sqlite(_)), "got: {err:?}");
+
+        assert_eq!(row_count(&projection, "messages"), 1);
+        let fts_hits: i64 = projection
+            .conn
+            .query_row(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'gruvbox'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts count");
+        assert_eq!(fts_hits, 1, "the second FTS insert rolled back");
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
+    }
+
+    /// Version 1 is what a pre-tool-rows daemon left behind; open must
+    /// refuse it (arcd then deletes the file and re-projects).
     #[test]
     fn an_index_from_another_schema_version_is_refused() {
         let dir = TempDir::new().expect("temp dir");
@@ -1072,15 +1518,15 @@ mod tests {
         projection
             .conn
             .execute(
-                "UPDATE projection_meta SET value = 99 WHERE key = 'schema_version'",
+                "UPDATE projection_meta SET value = 1 WHERE key = 'schema_version'",
                 [],
             )
-            .expect("bump version");
+            .expect("age the version");
         drop(projection);
 
         let err = Projection::open(&path).expect_err("a foreign schema version must be refused");
         assert!(
-            matches!(err, Error::SchemaVersion { found: 99, .. }),
+            matches!(err, Error::SchemaVersion { found: 1, .. }),
             "got: {err:?}"
         );
     }
@@ -1104,9 +1550,9 @@ mod tests {
 
     // --- replay driver ---
 
-    /// A log directory with one session and three messages (seqs 0..=3).
-    /// The tiny segment cap forces several segments, so replay always crosses
-    /// segment boundaries in these tests.
+    /// A log directory with one session, three messages, and a tool exchange
+    /// (seqs 0..=5). The tiny segment cap forces several segments, so replay
+    /// always crosses segment boundaries in these tests.
     fn build_log(dir: &Path) -> Log {
         let mut log = Log::open_with_max_segment_len(dir, 64).expect("open log");
         log.append(session_created(0)).expect("append");
@@ -1114,8 +1560,20 @@ mod tests {
             log.append(message_appended(i as u64 + 1, content))
                 .expect("append");
         }
+        log.append(tool_call(4, "c-a", 0, "{}")).expect("append");
+        log.append(tool_result(
+            5,
+            "c-a",
+            ToolOutcome::Ok as i32,
+            "found",
+            false,
+        ))
+        .expect("append");
         log
     }
+
+    /// How many events [`build_log`] holds.
+    const BUILT_EVENTS: u64 = 6;
 
     /// Every user-visible row in the index, in deterministic order. Two
     /// projections are the same state exactly when their dumps are equal.
@@ -1144,20 +1602,24 @@ mod tests {
         let mut stmt = projection
             .conn
             .prepare(
-                "SELECT 'm', session_id, seq, role, content, coalesce(ts, -1)
+                "SELECT 'm', session_id, seq, kind, coalesce(role, -1), content,
+                        coalesce(call_id, ''), coalesce(outcome, -1), coalesce(ts, -1)
                  FROM messages ORDER BY seq",
             )
             .expect("prepare");
         rows.extend(
             stmt.query_map([], |row| {
                 Ok(format!(
-                    "{}|{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .expect("query")
@@ -1177,7 +1639,7 @@ mod tests {
         assert_eq!(
             stats,
             ReplayStats {
-                applied: 4,
+                applied: BUILT_EVENTS,
                 skipped: 0
             },
             "a fresh index applies everything — seq 0 included"
@@ -1185,7 +1647,7 @@ mod tests {
         replay(log.reader().expect("reader"), &mut second).expect("replay");
 
         assert_eq!(dump(&first), dump(&second));
-        assert_eq!(first.last_seq().expect("last_seq"), Some(3));
+        assert_eq!(first.last_seq().expect("last_seq"), Some(BUILT_EVENTS - 1));
     }
 
     #[test]
@@ -1203,7 +1665,7 @@ mod tests {
             stats,
             ReplayStats {
                 applied: 0,
-                skipped: 4
+                skipped: BUILT_EVENTS
             }
         );
         assert_eq!(dump(&projection), before);
@@ -1220,11 +1682,14 @@ mod tests {
         let mut resumed = Projection::open(":memory:").expect("open");
         let partial =
             replay(LogReader::new(segments[..1].to_vec()), &mut resumed).expect("partial replay");
-        assert!(partial.applied < 4, "the partial replay must be partial");
+        assert!(
+            partial.applied < BUILT_EVENTS,
+            "the partial replay must be partial"
+        );
 
         // Resuming over the full log completes it...
         let stats = replay(log.reader().expect("reader"), &mut resumed).expect("resume");
-        assert_eq!(stats.applied + stats.skipped, 4);
+        assert_eq!(stats.applied + stats.skipped, BUILT_EVENTS);
         assert_eq!(stats.skipped, partial.applied, "resume skips what landed");
 
         // ...to exactly the state a one-shot replay produces.
@@ -1244,7 +1709,8 @@ mod tests {
         projection
             .conn
             .execute(
-                "INSERT INTO messages (session_id, seq, role, content) VALUES ('s-01', 2, 0, 'x')",
+                "INSERT INTO messages (session_id, seq, kind, turn_id, role, content)
+                 VALUES ('s-01', 2, 0, '', 0, 'x')",
                 [],
             )
             .expect("sabotage");
@@ -1270,7 +1736,7 @@ mod tests {
         assert_eq!(
             stats,
             ReplayStats {
-                applied: 2,
+                applied: BUILT_EVENTS - 2,
                 skipped: 2
             }
         );
