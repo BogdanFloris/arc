@@ -97,7 +97,7 @@ Decisions banked 2026-08-21, at assignment:
 Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
 
 - [x] "what did we say about X" → grounded answer citing a real past session (5.1 + 5.2, verified live 2026-08-21)
-- [ ] "remember this: Y" in one session, then "what do you know about Y" answered from the distilled tier in a fresh session (needs 6.1 + 6.2 + 6.3)
+- [x] "remember this: Y" in one session, then "what do you know about Y" answered from the distilled tier in a fresh session (6.1–6.3, verified live 2026-08-21)
 
 ## 5. Archive tier (`arc-core`)
 
