@@ -103,7 +103,7 @@ Live exit-criterion checklist (the phase's definition of done, DESIGN.md §11):
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 5.0 | Integration-test harness: promote `session.rs`'s scripted `MockProvider` + real-log-and-projection setup into a shared test-support module, with an end-to-end assertion chain (scripted completion → log bytes → replayed projection → rebuilt transcript) that 5.x/6.x tests build on | claude | todo |
+| 5.0 | Integration-test harness: promote `session.rs`'s scripted `MockProvider` + real-log-and-projection setup into a shared test-support module, with an end-to-end assertion chain (scripted completion → log bytes → replayed projection → rebuilt transcript) that 5.x/6.x tests build on | claude | done |
 | 5.1 | Projection: messages shape extended for structured turns per the 2.1 sketch, FTS5 index over `content`, replay tests. Fold in the reserved `partial` column (`HistoryMessage` field 3) while the schema is open | claude | todo |
 | 5.2 | `sessions_search` (FTS, snippets + session ids) + `session_read` (targeted range) as tools over the projection | claude | todo |
 
