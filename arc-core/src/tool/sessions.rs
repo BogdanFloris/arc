@@ -37,8 +37,10 @@ impl Tool for SessionsSearch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "sessions_search".to_owned(),
-            description: "Find past conversations about a topic; returns matching sessions \
-                          with snippets and an anchor_seq for session_read."
+            description: "Search the archive of all past conversations. Use whenever the user \
+                          asks about themselves, their preferences, or anything discussed in \
+                          an earlier session — search before saying you do not know. Returns \
+                          sessions with snippets and an anchor_seq for session_read."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
