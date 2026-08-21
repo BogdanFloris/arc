@@ -40,10 +40,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    Event, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
-    ToolOutcome, ToolResultRecorded,
+    Event, MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, Source,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded,
 };
-use arc_proto::v1::{event, session_event};
+use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
 use prost_types::Timestamp;
 use tokio::sync::mpsc;
@@ -54,7 +54,7 @@ use crate::projection::{self, MessageRow, Projection, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
-use crate::tool::Registry;
+use crate::tool::{Registry, TurnContext};
 
 /// Most tool steps one turn may take. The completion after the last step
 /// offers no tools, forcing prose grounded in whatever results arrived
@@ -427,15 +427,24 @@ impl<P: Provider> Engine<P> {
 
         let mut results = Vec::with_capacity(calls.len());
         for call in &calls {
+            let ctx = TurnContext {
+                session_id: session_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+            };
             let dispatched = self
                 .registry
-                .dispatch(&call.name, call.arguments.clone())
+                .dispatch(&call.name, call.arguments.clone(), ctx)
                 .await;
             let outcome = if dispatched.ok {
                 ToolOutcome::Ok
             } else {
                 ToolOutcome::Error
             };
+            // A write tool's events go durable before the result that says
+            // "saved" — the report must follow the write it reports.
+            for memory_event in dispatched.memory_events {
+                self.record_memory(Source::Model, memory_event)?;
+            }
             self.record(
                 Source::System,
                 session_event::Event::ToolResultRecorded(ToolResultRecorded {
@@ -539,6 +548,27 @@ impl<P: Provider> Engine<P> {
             ts: Some(now_ts()),
             source: source as i32,
             payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(payload),
+            })),
+        };
+        let seq = self.log.append(event.clone())?;
+        event.seq = seq;
+        self.projection.apply(&event)?;
+        Ok(seq)
+    }
+
+    /// [`Engine::record`] for the memory arm: appends one `MemoryEvent` and
+    /// applies it, so a mid-turn `Archive` read sees the write.
+    fn record_memory(
+        &mut self,
+        source: Source,
+        payload: memory_event::Event,
+    ) -> Result<u64, Error> {
+        let mut event = Event {
+            seq: 0, // added by the log
+            ts: Some(now_ts()),
+            source: source as i32,
+            payload: Some(event::Payload::Memory(MemoryEvent {
                 event: Some(payload),
             })),
         };

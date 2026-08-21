@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use chrono::Local;
 
-use super::{Tool, ToolReply};
+use super::{Tool, ToolReply, TurnContext};
 use crate::provider::ToolDefinition;
 
 /// Answers with the current local date and time. Takes no arguments and
@@ -25,12 +25,10 @@ impl Tool for GetTime {
     fn execute(
         &self,
         _arguments_json: String,
+        _ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         Box::pin(async {
-            ToolReply {
-                content: Local::now().format("%Y-%m-%d %H:%M:%S %:z, %A").to_string(),
-                ok: true,
-            }
+            ToolReply::ok(Local::now().format("%Y-%m-%d %H:%M:%S %:z, %A").to_string())
         })
     }
 }
@@ -46,7 +44,9 @@ mod tests {
         let mut registry = Registry::new(32 * 1024);
         registry.register(Box::new(GetTime));
 
-        let outcome = registry.dispatch("get_time", "{}".into()).await;
+        let outcome = registry
+            .dispatch("get_time", "{}".into(), crate::tool::TurnContext::default())
+            .await;
         assert!(outcome.ok);
         assert!(!outcome.truncated);
         // The year is the one stable substring; everything else moves.

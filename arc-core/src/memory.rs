@@ -49,7 +49,7 @@ pub fn render_memory_index(entries: &[MemoryIndexEntry]) -> Option<String> {
 
 /// The lowercase enum name; ints this build does not know render as
 /// `kind_<n>` rather than lying or vanishing.
-fn kind_name(kind: i32) -> String {
+pub(crate) fn kind_name(kind: i32) -> String {
     use arc_proto::v1::memory_record::Kind;
     match Kind::try_from(kind) {
         Ok(Kind::Person) => "person".to_owned(),

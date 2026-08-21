@@ -10,7 +10,7 @@ use std::pin::Pin;
 
 use serde::Deserialize;
 
-use super::{Tool, ToolReply};
+use super::{Tool, ToolReply, TurnContext, to_json};
 use crate::archive::{Archive, Error};
 use crate::provider::ToolDefinition;
 
@@ -62,41 +62,33 @@ impl Tool for SessionsSearch {
     fn execute(
         &self,
         arguments_json: String,
+        ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         Box::pin(async move {
             let args: SearchArgs = match serde_json::from_str(&arguments_json) {
                 Ok(args) => args,
                 Err(error) => {
-                    return ToolReply {
-                        content: format!(
-                            "ERROR: bad sessions_search arguments ({error}). \
-                             Pass {{\"query\": \"words to find\"}}."
-                        ),
-                        ok: false,
-                    };
+                    return ToolReply::error(format!(
+                        "ERROR: bad sessions_search arguments ({error}). \
+                         Pass {{\"query\": \"words to find\"}}."
+                    ));
                 }
             };
-            match self.archive.search(&args.query, args.include_tool_results) {
-                Ok(reply) if reply.sessions.is_empty() => ToolReply {
-                    content: "No results.".to_owned(),
-                    ok: true,
-                },
-                Ok(reply) => ToolReply {
-                    content: to_json(&reply),
-                    ok: true,
-                },
+            // The current session stays out: the just-appended question
+            // contains the search terms and would claim the top slot.
+            let exclude = (!ctx.session_id.is_empty()).then_some(ctx.session_id.as_str());
+            match self
+                .archive
+                .search(&args.query, args.include_tool_results, exclude)
+            {
+                Ok(reply) if reply.sessions.is_empty() => ToolReply::ok("No results."),
+                Ok(reply) => ToolReply::ok(to_json(&reply)),
                 // A query FTS cannot parse is an answer naming the problem,
                 // never a swallowed empty (hermes policy).
-                Err(Error::Query { message }) => ToolReply {
-                    content: format!(
-                        "No results: {message}. Try plain words or \"quoted phrases\"."
-                    ),
-                    ok: true,
-                },
-                Err(error) => ToolReply {
-                    content: format!("ERROR: session search failed ({error})."),
-                    ok: false,
-                },
+                Err(Error::Query { message }) => ToolReply::ok(format!(
+                    "No results: {message}. Try plain words or \"quoted phrases\"."
+                )),
+                Err(error) => ToolReply::error(format!("ERROR: session search failed ({error}).")),
             }
         })
     }
@@ -151,62 +143,48 @@ impl Tool for SessionRead {
     fn execute(
         &self,
         arguments_json: String,
+        _ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         Box::pin(async move {
             let args: ReadArgs = match serde_json::from_str(&arguments_json) {
                 Ok(args) => args,
                 Err(error) => {
-                    return ToolReply {
-                        content: format!(
-                            "ERROR: bad session_read arguments ({error}). Pass \
-                             {{\"session_id\": \"...\", \"start_seq\": N, \"end_seq\": N}} \
-                             or {{\"session_id\": \"...\", \"ends\": true}}."
-                        ),
-                        ok: false,
-                    };
+                    return ToolReply::error(format!(
+                        "ERROR: bad session_read arguments ({error}). Pass \
+                         {{\"session_id\": \"...\", \"start_seq\": N, \"end_seq\": N}} \
+                         or {{\"session_id\": \"...\", \"ends\": true}}."
+                    ));
                 }
             };
 
             if args.ends {
                 return match self.archive.ends(&args.session_id) {
-                    Ok(Some(reply)) => ToolReply {
-                        content: to_json(&reply),
-                        ok: true,
-                    },
+                    Ok(Some(reply)) => ToolReply::ok(to_json(&reply)),
                     Ok(None) => unknown_session(&args.session_id),
                     Err(error) => read_failed(&error),
                 };
             }
 
             let (Some(start_seq), Some(end_seq)) = (args.start_seq, args.end_seq) else {
-                return ToolReply {
-                    content: "ERROR: pass both start_seq and end_seq, or ends: true. \
-                              Whole sessions are not readable in one call."
-                        .to_owned(),
-                    ok: false,
-                };
+                return ToolReply::error(
+                    "ERROR: pass both start_seq and end_seq, or ends: true. \
+                     Whole sessions are not readable in one call.",
+                );
             };
             if start_seq > end_seq {
-                return ToolReply {
-                    content: format!("ERROR: start_seq {start_seq} is after end_seq {end_seq}."),
-                    ok: false,
-                };
+                return ToolReply::error(format!(
+                    "ERROR: start_seq {start_seq} is after end_seq {end_seq}."
+                ));
             }
             match self
                 .archive
                 .read_range(&args.session_id, start_seq, end_seq)
             {
-                Ok(Some(reply)) if reply.messages.is_empty() => ToolReply {
-                    content: format!(
-                        "No messages between seq {start_seq} and {end_seq} in session {}.",
-                        args.session_id
-                    ),
-                    ok: true,
-                },
-                Ok(Some(reply)) => ToolReply {
-                    content: to_json(&reply),
-                    ok: true,
-                },
+                Ok(Some(reply)) if reply.messages.is_empty() => ToolReply::ok(format!(
+                    "No messages between seq {start_seq} and {end_seq} in session {}.",
+                    args.session_id
+                )),
+                Ok(Some(reply)) => ToolReply::ok(to_json(&reply)),
                 Ok(None) => unknown_session(&args.session_id),
                 Err(error) => read_failed(&error),
             }
@@ -215,24 +193,13 @@ impl Tool for SessionRead {
 }
 
 fn unknown_session(session_id: &str) -> ToolReply {
-    ToolReply {
-        content: format!("ERROR: no session {session_id}. Session ids come from sessions_search."),
-        ok: false,
-    }
+    ToolReply::error(format!(
+        "ERROR: no session {session_id}. Session ids come from sessions_search."
+    ))
 }
 
 fn read_failed(error: &Error) -> ToolReply {
-    ToolReply {
-        content: format!("ERROR: session read failed ({error})."),
-        ok: false,
-    }
-}
-
-/// Serializes a reply shape. The shapes are plain structs, so failure is
-/// unreachable; if it happens anyway the model sees an error, not a panic.
-fn to_json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|error| format!("ERROR: could not serialize the reply ({error})."))
+    ToolReply::error(format!("ERROR: session read failed ({error})."))
 }
 
 #[cfg(test)]
@@ -243,14 +210,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{SessionRead, SessionsSearch};
-    use crate::archive::Archive;
-    use crate::log::Log;
-    use crate::projection::{self, Projection};
     use crate::testkit::{
-        ScriptedProvider, call, channel, done_reply, engine_with_tools_at, replay_log, seed_log,
-        tool_stop,
+        ScriptedProvider, archive_at, call, channel, done_reply, engine_with_tools_at, replay_log,
+        seed_log, tool_stop,
     };
-    use crate::tool::{Registry, Tool as _};
+    use crate::tool::{Registry, Tool as _, TurnContext};
 
     fn created(id: &str, title: &str) -> session_event::Event {
         session_event::Event::SessionCreated(SessionCreated {
@@ -280,17 +244,6 @@ mod tests {
             content: content.to_owned(),
             truncated: false,
         })
-    }
-
-    /// An archive over `dir`'s log, the daemon's way: the projection is
-    /// opened (and replayed) first, then the read-only connection.
-    fn archive_at(dir: &TempDir) -> Archive {
-        let log = Log::open(dir.path()).expect("open log");
-        let index = dir.path().join("index.db");
-        let mut projection = Projection::open(&index).expect("open projection");
-        projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        drop(projection);
-        Archive::open(index).expect("open archive")
     }
 
     fn search_registry(dir: &TempDir) -> Registry {
@@ -357,6 +310,45 @@ mod tests {
         assert!(content.contains("gruvbox"), "{content}");
         assert!(content.contains("anchor_seq"), "{content}");
         assert!(!content.contains("s-deploy"), "{content}");
+    }
+
+    /// The 5.2-review fix, live: the searching session's own just-appended
+    /// question matches the query, but the current session never appears in
+    /// its own results — only real history does.
+    #[tokio::test]
+    async fn a_live_search_never_returns_the_searching_session() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                created("s-colors", ""),
+                said("s-colors", Role::User, "gruvbox everywhere please"),
+            ],
+        );
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "sessions_search", r#"{"query":"gruvbox"}"#)),
+                Ok(tool_stop()),
+            ],
+            done_reply("answered from history"),
+        ]);
+        let registry = search_registry(&dir);
+        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(None, "gruvbox gruvbox gruvbox — what did we say?", tx)
+            .await
+            .expect("send");
+
+        let results = logged_results(&dir);
+        assert_eq!(results.len(), 1);
+        let content = &results[0].content;
+        assert!(content.contains("s-colors"), "{content}");
+        assert!(
+            !content.contains(&reply.session_id),
+            "the current session leaked into its own search: {content}"
+        );
     }
 
     /// The §3.1 default, live: a matching tool-result row is invisible until
@@ -474,7 +466,9 @@ mod tests {
         let dir = seeded_dir();
         let tool = SessionsSearch::new(archive_at(&dir));
 
-        let reply = tool.execute(r#"{"query""#.to_owned()).await;
+        let reply = tool
+            .execute(r#"{"query""#.to_owned(), TurnContext::default())
+            .await;
 
         assert!(!reply.ok);
         assert!(
@@ -490,7 +484,9 @@ mod tests {
         let dir = seeded_dir();
         let tool = SessionsSearch::new(archive_at(&dir));
 
-        let reply = tool.execute(r#"{"query":"%%% ---"}"#.to_owned()).await;
+        let reply = tool
+            .execute(r#"{"query":"%%% ---"}"#.to_owned(), TurnContext::default())
+            .await;
 
         assert!(reply.ok, "an unsearchable query is not a tool error");
         assert!(
@@ -506,7 +502,10 @@ mod tests {
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
-            .execute(r#"{"session_id":"s-01","start_seq":1,"end_seq":2}"#.to_owned())
+            .execute(
+                r#"{"session_id":"s-01","start_seq":1,"end_seq":2}"#.to_owned(),
+                TurnContext::default(),
+            )
             .await;
 
         assert!(reply.ok);
@@ -529,7 +528,10 @@ mod tests {
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
-            .execute(r#"{"session_id":"s-01","ends":true}"#.to_owned())
+            .execute(
+                r#"{"session_id":"s-01","ends":true}"#.to_owned(),
+                TurnContext::default(),
+            )
             .await;
 
         assert!(reply.ok);
@@ -543,7 +545,12 @@ mod tests {
         let dir = seeded_dir();
         let tool = SessionRead::new(archive_at(&dir));
 
-        let reply = tool.execute(r#"{"session_id":"s-01"}"#.to_owned()).await;
+        let reply = tool
+            .execute(
+                r#"{"session_id":"s-01"}"#.to_owned(),
+                TurnContext::default(),
+            )
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("start_seq"), "{}", reply.content);
@@ -556,7 +563,10 @@ mod tests {
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
-            .execute(r#"{"session_id":"s-01","start_seq":9,"end_seq":1}"#.to_owned())
+            .execute(
+                r#"{"session_id":"s-01","start_seq":9,"end_seq":1}"#.to_owned(),
+                TurnContext::default(),
+            )
             .await;
 
         assert!(!reply.ok);
@@ -569,7 +579,10 @@ mod tests {
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
-            .execute(r#"{"session_id":"s-none","start_seq":0,"end_seq":5}"#.to_owned())
+            .execute(
+                r#"{"session_id":"s-none","start_seq":0,"end_seq":5}"#.to_owned(),
+                TurnContext::default(),
+            )
             .await;
 
         assert!(!reply.ok);
@@ -587,7 +600,10 @@ mod tests {
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
-            .execute(r#"{"session_id":"s-01","start_seq":500,"end_seq":600}"#.to_owned())
+            .execute(
+                r#"{"session_id":"s-01","start_seq":500,"end_seq":600}"#.to_owned(),
+                TurnContext::default(),
+            )
             .await;
 
         assert!(reply.ok);

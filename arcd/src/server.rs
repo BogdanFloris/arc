@@ -500,7 +500,7 @@ mod tests {
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
         Stop, ToolCall, ToolDefinition, Usage,
     };
-    use arc_core::tool::{Registry, Tool, ToolReply};
+    use arc_core::tool::{Registry, Tool, ToolReply, TurnContext};
     use arc_proto::v1::{FetchHistory, ListSessions, Role, ToolOutcome};
     use futures::stream;
     use tempfile::TempDir;
@@ -671,10 +671,12 @@ mod tests {
         fn execute(
             &self,
             _arguments_json: String,
+            _ctx: TurnContext,
         ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            let reply = ToolReply {
-                content: self.content.to_owned(),
-                ok: self.ok,
+            let reply = if self.ok {
+                ToolReply::ok(self.content)
+            } else {
+                ToolReply::error(self.content)
             };
             Box::pin(async move { reply })
         }

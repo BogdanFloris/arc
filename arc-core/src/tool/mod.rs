@@ -18,6 +18,7 @@
 //! Tools never produce UNKNOWN: that outcome is written only by the startup
 //! closer for orphaned calls (4.3).
 
+pub mod memory;
 pub mod sessions;
 pub mod time;
 
@@ -27,11 +28,44 @@ use std::pin::Pin;
 
 use crate::provider::ToolDefinition;
 
+/// The turn a call runs inside, threaded through dispatch so a tool can know
+/// where it is being called from — provenance for memory writes, the
+/// current-session exclusion for `sessions_search`. Tools that need neither
+/// ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct TurnContext {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
 /// What a tool answered. An error is a reply the model will read, with
 /// `ok: false`; it is not a Rust error.
 pub struct ToolReply {
     pub content: String,
     pub ok: bool,
+    /// Events the engine appends durably before the result that reports them.
+    /// Tools never touch the log or projection themselves (invariant 2).
+    pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
+}
+
+impl ToolReply {
+    #[must_use]
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            ok: true,
+            memory_events: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            ok: false,
+            memory_events: Vec::new(),
+        }
+    }
 }
 
 /// What [`Registry::dispatch`] yields: a [`ToolReply`] after the registry's
@@ -42,6 +76,8 @@ pub struct DispatchOutcome {
     /// `false` → `TOOL_OUTCOME_ERROR`.
     pub ok: bool,
     pub truncated: bool,
+    /// Passed through from the reply, untouched by truncation.
+    pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
 }
 
 /// One callable tool.
@@ -55,7 +91,15 @@ pub trait Tool: Send + Sync {
     fn execute(
         &self,
         arguments_json: String,
+        ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>>;
+}
+
+/// Serializes a reply shape. The shapes are plain structs, so failure is
+/// unreachable; if it happens anyway the model sees an error, not a panic.
+pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|error| format!("ERROR: could not serialize the reply ({error})."))
 }
 
 pub struct Registry {
@@ -102,7 +146,12 @@ impl Registry {
         skip_all,
         fields(tool = name, outcome = tracing::field::Empty)
     )]
-    pub async fn dispatch(&self, name: &str, arguments_json: String) -> DispatchOutcome {
+    pub async fn dispatch(
+        &self,
+        name: &str,
+        arguments_json: String,
+        ctx: TurnContext,
+    ) -> DispatchOutcome {
         let span = tracing::Span::current();
         let Some(tool) = self.tools.get(name) else {
             span.record("outcome", "unknown-tool");
@@ -110,15 +159,17 @@ impl Registry {
                 content: format!("ERROR: Tool {name} is not available."),
                 ok: false,
                 truncated: false,
+                memory_events: Vec::new(),
             };
         };
-        let reply = tool.execute(arguments_json).await;
+        let reply = tool.execute(arguments_json, ctx).await;
         span.record("outcome", if reply.ok { "ok" } else { "error" });
         let (content, truncated) = self.truncate(reply.content);
         DispatchOutcome {
             content,
             ok: reply.ok,
             truncated,
+            memory_events: reply.memory_events,
         }
     }
 
@@ -136,7 +187,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOutcome, Registry, Tool, ToolReply};
+    use super::{DispatchOutcome, Registry, Tool, ToolReply, TurnContext};
     use crate::provider::ToolDefinition;
     use std::future::Future;
     use std::pin::Pin;
@@ -160,10 +211,12 @@ mod tests {
         fn execute(
             &self,
             _arguments_json: String,
+            _ctx: TurnContext,
         ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            let reply = ToolReply {
-                content: self.content.to_owned(),
-                ok: self.ok,
+            let reply = if self.ok {
+                ToolReply::ok(self.content)
+            } else {
+                ToolReply::error(self.content)
             };
             Box::pin(async move { reply })
         }
@@ -184,13 +237,30 @@ mod tests {
         fn execute(
             &self,
             arguments_json: String,
+            _ctx: TurnContext,
         ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            Box::pin(async move {
-                ToolReply {
-                    content: arguments_json,
-                    ok: true,
-                }
-            })
+            Box::pin(async move { ToolReply::ok(arguments_json) })
+        }
+    }
+
+    /// A tool that replies with the session id it was dispatched under.
+    struct WhereAmI;
+
+    impl Tool for WhereAmI {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "where_am_i".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _arguments_json: String,
+            ctx: TurnContext,
+        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+            Box::pin(async move { ToolReply::ok(format!("{}/{}", ctx.session_id, ctx.turn_id)) })
         }
     }
 
@@ -213,7 +283,9 @@ mod tests {
             scripted("beta", "from beta", true),
         ]);
 
-        let DispatchOutcome { content, ok, .. } = registry.dispatch("beta", "{}".into()).await;
+        let DispatchOutcome { content, ok, .. } = registry
+            .dispatch("beta", "{}".into(), TurnContext::default())
+            .await;
         assert!(ok);
         assert_eq!(content, "from beta");
     }
@@ -222,15 +294,32 @@ mod tests {
     async fn arguments_reach_the_tool_verbatim() {
         let registry = registry(vec![Box::new(Echo)]);
 
-        let outcome = registry.dispatch("echo", r#"{"q":"café"}"#.into()).await;
+        let outcome = registry
+            .dispatch("echo", r#"{"q":"café"}"#.into(), TurnContext::default())
+            .await;
         assert_eq!(outcome.content, r#"{"q":"café"}"#);
+    }
+
+    #[tokio::test]
+    async fn dispatch_hands_the_turn_context_to_the_tool() {
+        let mut registry = Registry::new(32 * 1024);
+        registry.register(Box::new(WhereAmI));
+
+        let ctx = TurnContext {
+            session_id: "s-77".to_owned(),
+            turn_id: "t-42".to_owned(),
+        };
+        let outcome = registry.dispatch("where_am_i", "{}".into(), ctx).await;
+        assert_eq!(outcome.content, "s-77/t-42");
     }
 
     #[tokio::test]
     async fn an_unknown_tool_is_an_error_result_not_a_failure() {
         let registry = registry(vec![]);
 
-        let outcome = registry.dispatch("missing", "{}".into()).await;
+        let outcome = registry
+            .dispatch("missing", "{}".into(), TurnContext::default())
+            .await;
         assert!(!outcome.ok);
         assert!(!outcome.truncated);
         assert!(outcome.content.contains("missing"), "{}", outcome.content);
@@ -240,7 +329,9 @@ mod tests {
     async fn a_tool_error_keeps_its_outcome_and_text() {
         let registry = registry(vec![scripted("fails", "ERROR: no such record", false)]);
 
-        let outcome = registry.dispatch("fails", "{}".into()).await;
+        let outcome = registry
+            .dispatch("fails", "{}".into(), TurnContext::default())
+            .await;
         assert!(!outcome.ok, "an error reply must not come back OK");
         assert_eq!(outcome.content, "ERROR: no such record");
     }
@@ -250,7 +341,9 @@ mod tests {
         let mut registry = Registry::new(8);
         registry.register(scripted("big", "0123456789abcdef", true));
 
-        let outcome = registry.dispatch("big", "{}".into()).await;
+        let outcome = registry
+            .dispatch("big", "{}".into(), TurnContext::default())
+            .await;
         assert!(outcome.truncated);
         assert!(outcome.ok, "truncation is not an error");
         assert_eq!(outcome.content, "01234567 [truncated]");
@@ -262,7 +355,9 @@ mod tests {
         let mut registry = Registry::new(3);
         registry.register(scripted("accents", "ééé", true));
 
-        let outcome = registry.dispatch("accents", "{}".into()).await;
+        let outcome = registry
+            .dispatch("accents", "{}".into(), TurnContext::default())
+            .await;
         assert!(outcome.truncated);
         assert_eq!(outcome.content, "é [truncated]");
     }
@@ -272,7 +367,9 @@ mod tests {
         let mut registry = Registry::new(4);
         registry.register(scripted("fits", "1234", true));
 
-        let outcome = registry.dispatch("fits", "{}".into()).await;
+        let outcome = registry
+            .dispatch("fits", "{}".into(), TurnContext::default())
+            .await;
         assert!(!outcome.truncated);
         assert_eq!(outcome.content, "1234");
     }

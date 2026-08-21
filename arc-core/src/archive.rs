@@ -14,15 +14,17 @@
 //! cannot parse must surface as an answer naming the problem, never as a
 //! silently empty result.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use arc_proto::v1::Role;
+use arc_proto::v1::{Role, memory_record};
 use chrono::{DateTime, SecondsFormat};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
-use crate::projection::KIND_MESSAGE;
+use crate::memory::kind_name;
+use crate::projection::{KIND_MESSAGE, bad_json_column, links_from_json, provenance_from_json};
 
 /// Longest raw query the sanitizer looks at; the rest is dropped.
 const MAX_QUERY_CHARS: usize = 256;
@@ -148,6 +150,48 @@ pub struct EndsReply {
     pub last: Vec<ProseMessage>,
 }
 
+/// One memory record a search matched: the index row, never the body —
+/// read stays targeted via `memory_read`.
+#[derive(Debug, Serialize)]
+pub struct MemoryHit {
+    pub id: String,
+    pub namespace: String,
+    /// Lowercase kind name.
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+}
+
+/// A whole memory record, as `memory_read` shows it.
+#[derive(Debug, Serialize)]
+pub struct MemoryRecordReply {
+    pub id: String,
+    pub namespace: String,
+    /// Lowercase kind name.
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
+    /// Where the record was learned (DESIGN.md §5.2: provenance answers
+    /// "where did you learn that").
+    pub provenance: Vec<ProvenanceLine>,
+    /// `active` or `superseded`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+/// One provenance entry: a session and when it taught the record.
+#[derive(Debug, Serialize)]
+pub struct ProvenanceLine {
+    pub session_id: String,
+    /// RFC 3339 UTC; omitted if the entry carried no timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+}
+
 /// A read-only view of the projection index.
 pub struct Archive {
     conn: Mutex<Connection>,
@@ -182,7 +226,9 @@ impl Archive {
     /// context window and bookends.
     ///
     /// Prose rows only by default; `include_tool_results` lifts the kind
-    /// filter so tool output is searched too.
+    /// filter so tool output is searched too. `exclude_session` drops one
+    /// session's rows — the caller's own, whose just-appended question would
+    /// otherwise claim the top slot (noted at 5.2 review).
     ///
     /// # Errors
     ///
@@ -203,6 +249,7 @@ impl Archive {
         &self,
         raw_query: &str,
         include_tool_results: bool,
+        exclude_session: Option<&str>,
     ) -> Result<SearchReply, Error> {
         let query = sanitize_query(raw_query);
         let span = tracing::Span::current();
@@ -218,12 +265,19 @@ impl Archive {
             "SELECT m.session_id, m.seq, snippet(messages_fts, 0, '', '', '…', 12)
              FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
              WHERE messages_fts MATCH ?1 AND (?2 OR m.kind = ?3)
+               AND (?5 IS NULL OR m.session_id != ?5)
              ORDER BY bm25(messages_fts)
              LIMIT ?4",
         )?;
         let mapped = stmt
             .query_map(
-                rusqlite::params![query, include_tool_results, KIND_MESSAGE, limit(OVERFETCH)],
+                rusqlite::params![
+                    query,
+                    include_tool_results,
+                    KIND_MESSAGE,
+                    limit(OVERFETCH),
+                    exclude_session
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -359,6 +413,108 @@ impl Archive {
             first,
             last,
         }))
+    }
+
+    /// One memory record, whole, whatever its status — a SUPERSEDED record is
+    /// still readable. `None` for an id the projection does not hold; DELETED
+    /// records read as absent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read, or holds `links` or
+    /// `provenance` JSON this build cannot decode.
+    #[tracing::instrument(name = "memory.read", skip_all, fields(id = %id))]
+    pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordReply>, Error> {
+        let row = self
+            .lock()
+            .query_row(
+                "SELECT namespace, kind, title, summary, body, links, provenance,
+                        status, superseded_by
+                 FROM memory_records WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(MemoryRecordReply {
+                        id: id.to_owned(),
+                        namespace: row.get(0)?,
+                        kind: kind_name(row.get(1)?),
+                        title: row.get(2)?,
+                        summary: row.get(3)?,
+                        body: row.get(4)?,
+                        links: links_from_json(&row.get::<_, String>(5)?)
+                            .map_err(|e| bad_json_column(5, &e))?,
+                        provenance: provenance_lines(row.get::<_, Option<String>>(6)?.as_deref())
+                            .map_err(|e| bad_json_column(6, &e))?,
+                        status: status_name(row.get(7)?),
+                        superseded_by: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Case-insensitive substring search over ACTIVE memory records: every
+    /// whitespace-separated word must match title, summary, or body. Ordered
+    /// like the always-loaded index, bodies never returned.
+    ///
+    /// LIKE over tens of records by design; earn an FTS index only if records
+    /// ever number thousands.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Query`] if the query holds no searchable words.
+    /// - [`Error::Sqlite`] if the index cannot be read.
+    #[tracing::instrument(
+        name = "memory.search",
+        skip_all,
+        fields(query = %query, hits = tracing::field::Empty)
+    )]
+    pub fn memory_search(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<MemoryHit>, Error> {
+        let words: Vec<String> = query.split_whitespace().map(like_pattern).collect();
+        if words.is_empty() {
+            return Err(Error::Query {
+                message: "no searchable words in the query".to_owned(),
+            });
+        }
+        let active = memory_record::Status::Active as i32;
+        let mut sql = format!(
+            "SELECT id, namespace, kind, title, summary FROM memory_records
+             WHERE status = {active} AND (?1 IS NULL OR namespace = ?1)"
+        );
+        let mut params: Vec<Option<String>> = vec![namespace.map(str::to_owned)];
+        for word in words {
+            params.push(Some(word));
+            let n = params.len();
+            let _ = write!(
+                sql,
+                " AND (title LIKE ?{n} ESCAPE '\\'
+                    OR summary LIKE ?{n} ESCAPE '\\'
+                    OR body LIKE ?{n} ESCAPE '\\')"
+            );
+        }
+        sql.push_str(" ORDER BY namespace, kind, title, id");
+
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(MemoryHit {
+                id: row.get(0)?,
+                namespace: row.get(1)?,
+                kind: kind_name(row.get(2)?),
+                title: row.get(3)?,
+                summary: row.get(4)?,
+            })
+        })?;
+        let mut hits = Vec::new();
+        for hit in mapped {
+            hits.push(hit?);
+        }
+        tracing::Span::current().record("hits", hits.len());
+        Ok(hits)
     }
 
     /// The connection, poisoned or not: a read-only handle has no state a
@@ -549,6 +705,52 @@ fn clip_message(mut message: ProseMessage) -> ProseMessage {
     message
 }
 
+/// Wraps a word for LIKE: `%word%`, its `%`/`_`/`\` metacharacters escaped.
+fn like_pattern(word: &str) -> String {
+    let mut pattern = String::with_capacity(word.len() + 2);
+    pattern.push('%');
+    for c in word.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// Status name for a raw status integer; unknown ints render as `status_<n>`.
+fn status_name(status: i32) -> String {
+    use arc_proto::v1::memory_record::Status;
+    match Status::try_from(status) {
+        Ok(Status::Active) => "active".to_owned(),
+        Ok(Status::Superseded) => "superseded".to_owned(),
+        Ok(Status::Unspecified) | Err(_) => format!("status_{status}"),
+    }
+}
+
+/// The provenance column as `memory_read` shows it: session ids with RFC 3339
+/// timestamps. NULL (absent) reads as empty.
+fn provenance_lines(json: Option<&str>) -> Result<Vec<ProvenanceLine>, serde_json::Error> {
+    Ok(provenance_from_json(json)?
+        .map(|provenance| {
+            provenance
+                .entries
+                .into_iter()
+                .map(|entry| ProvenanceLine {
+                    session_id: entry.session_id,
+                    ts: entry.ts.and_then(|ts| {
+                        u32::try_from(ts.nanos).ok().and_then(|nanos| {
+                            DateTime::from_timestamp(ts.seconds, nanos)
+                                .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+                        })
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// Speaker name for a raw role integer.
 fn role_name(role: i64) -> String {
     match i32::try_from(role).map(Role::try_from) {
@@ -572,7 +774,9 @@ fn limit(n: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use arc_proto::v1::{
-        MessageAppended, Role, SessionCreated, ToolOutcome, ToolResultRecorded, session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Provenance,
+        ProvenanceEntry, Role, SessionCreated, ToolOutcome, ToolResultRecorded, memory_event,
+        memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -679,7 +883,7 @@ mod tests {
             "50%",
             "TODO: fix",
         ] {
-            let reply = archive.search(query, false).expect(query);
+            let reply = archive.search(query, false, None).expect(query);
             assert_eq!(reply.sessions.len(), 1, "query: {query}");
             assert_eq!(reply.sessions[0].session_id, "s-fix", "query: {query}");
         }
@@ -696,12 +900,12 @@ mod tests {
         ]);
 
         let err = archive
-            .search("prose AND OR bar", false)
+            .search("prose AND OR bar", false, None)
             .expect_err("FTS must reject doubled operators");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
 
         let err = archive
-            .search("%%%", false)
+            .search("%%%", false, None)
             .expect_err("nothing searchable must be a query error");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
     }
@@ -726,7 +930,7 @@ mod tests {
         }
         let (_dir, archive) = archive_over(events);
 
-        let reply = archive.search("zebra", false).expect("search");
+        let reply = archive.search("zebra", false, None).expect("search");
 
         assert_eq!(reply.sessions.len(), 5, "seven matching sessions cap at 5");
         let mut ids: Vec<&str> = reply
@@ -763,7 +967,7 @@ mod tests {
         events.push(said("s-other", Role::User, "a quasar aside"));
         let (_dir, archive) = archive_over(events);
 
-        let reply = archive.search("quasar", false).expect("search");
+        let reply = archive.search("quasar", false, None).expect("search");
 
         let top = &reply.sessions[0];
         assert_eq!(top.session_id, "s-long");
@@ -803,7 +1007,7 @@ mod tests {
         let (_dir, archive) =
             archive_over(vec![created("s-01", ""), said("s-01", Role::User, &long)]);
 
-        let reply = archive.search("nebula", false).expect("search");
+        let reply = archive.search("nebula", false, None).expect("search");
 
         let message = &reply.sessions[0].context[0];
         assert!(
@@ -822,13 +1026,13 @@ mod tests {
             tool_answered("s-01", "vulkanpin gpu listing output"),
         ]);
 
-        let reply = archive.search("vulkanpin", false).expect("search");
+        let reply = archive.search("vulkanpin", false, None).expect("search");
         assert!(
             reply.sessions.is_empty(),
             "the default filter excludes tool output"
         );
 
-        let reply = archive.search("vulkanpin", true).expect("search");
+        let reply = archive.search("vulkanpin", true, None).expect("search");
         assert_eq!(reply.sessions.len(), 1);
         assert_eq!(
             reply.sessions[0].anchor_seq, 2,
@@ -931,6 +1135,225 @@ mod tests {
         assert_eq!(
             format_micros(1_700_000_000_123_456).as_deref(),
             Some("2023-11-14T22:13:20Z")
+        );
+    }
+
+    // --- the distilled tier: memory_search and memory_record ---
+
+    fn record(id: &str, namespace: &str, title: &str, summary: &str, body: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: id.to_owned(),
+            kind: memory_record::Kind::Fact as i32,
+            namespace: namespace.to_owned(),
+            title: title.to_owned(),
+            summary: summary.to_owned(),
+            body: body.to_owned(),
+            links: Vec::new(),
+            provenance: None,
+            status: memory_record::Status::Active as i32,
+        }
+    }
+
+    fn written(record: MemoryRecord) -> memory_event::Event {
+        memory_event::Event::RecordCreated(MemoryRecordCreated {
+            record: Some(record),
+        })
+    }
+
+    /// An archive over a replayed log of memory events.
+    fn memory_archive_over(events: Vec<memory_event::Event>) -> (TempDir, Archive) {
+        let dir = TempDir::new().expect("temp dir");
+        testkit::seed_memory_log(&dir, events);
+        let archive = testkit::archive_at(&dir);
+        (dir, archive)
+    }
+
+    #[test]
+    fn memory_search_matches_words_case_insensitively_across_fields() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-1",
+                "global",
+                "Gruvbox",
+                "the palette everywhere",
+                "User prefers gruvbox via the terminal palette.",
+            )),
+            written(record(
+                "mr-2",
+                "global",
+                "Erebor",
+                "the NixOS box",
+                "RTX 5070, pin Vulkan1.",
+            )),
+        ]);
+
+        for query in ["PALETTE", "gruvbox terminal", "Terminal Palette"] {
+            let hits = archive.memory_search(query, None).expect(query);
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].id, "mr-1", "query: {query}");
+            assert_eq!(hits[0].kind, "fact");
+            assert_eq!(hits[0].summary, "the palette everywhere");
+        }
+        // Every word must match: one hit each alone, none together.
+        assert!(
+            archive
+                .memory_search("gruvbox vulkan1", None)
+                .expect("search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn memory_search_filters_by_namespace() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record("mr-g", "global", "Palette", "gruvbox", "gruvbox")),
+            written(record(
+                "mr-p",
+                "arc",
+                "Palette",
+                "gruvbox in arc",
+                "gruvbox",
+            )),
+        ]);
+
+        let hits = archive
+            .memory_search("gruvbox", Some("arc"))
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "mr-p");
+
+        let hits = archive.memory_search("gruvbox", None).expect("search");
+        assert_eq!(hits.len(), 2, "no namespace means all namespaces");
+    }
+
+    #[test]
+    fn memory_search_sees_only_active_records() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-old",
+                "global",
+                "Home",
+                "lives at X",
+                "lives at X",
+            )),
+            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                superseded_id: "mr-old".to_owned(),
+                record: Some(record(
+                    "mr-new",
+                    "global",
+                    "Home",
+                    "lives at Y",
+                    "lives at Y",
+                )),
+            }),
+        ]);
+
+        let hits = archive.memory_search("lives", None).expect("search");
+        assert_eq!(hits.len(), 1, "the retired record stays out");
+        assert_eq!(hits[0].id, "mr-new");
+    }
+
+    #[test]
+    fn memory_search_treats_like_metacharacters_literally() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-pct", "global", "Progress", "50% done", "50% done",
+            )),
+            written(record(
+                "mr-num",
+                "global",
+                "Progress",
+                "505 items",
+                "505 items",
+            )),
+        ]);
+
+        let hits = archive.memory_search("50%", None).expect("search");
+        assert_eq!(hits.len(), 1, "% must not act as a wildcard");
+        assert_eq!(hits[0].id, "mr-pct");
+    }
+
+    #[test]
+    fn an_empty_memory_query_is_a_query_error() {
+        let (_dir, archive) = memory_archive_over(vec![]);
+
+        let err = archive
+            .memory_search("   ", None)
+            .expect_err("nothing searchable must be a query error");
+        assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn memory_record_returns_the_whole_record_with_provenance() {
+        let mut full = record(
+            "mr-full",
+            "global",
+            "Gruvbox",
+            "the palette",
+            "User prefers gruvbox.",
+        );
+        full.links = vec!["mr-other".to_owned()];
+        full.provenance = Some(Provenance {
+            entries: vec![ProvenanceEntry {
+                session_id: "s-taught".to_owned(),
+                ts: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+            }],
+        });
+        let (_dir, archive) = memory_archive_over(vec![written(full)]);
+
+        let reply = archive
+            .memory_record("mr-full")
+            .expect("read")
+            .expect("record exists");
+
+        assert_eq!(reply.kind, "fact");
+        assert_eq!(reply.status, "active");
+        assert_eq!(reply.body, "User prefers gruvbox.");
+        assert_eq!(reply.links, ["mr-other"]);
+        assert_eq!(reply.superseded_by, None);
+        assert_eq!(reply.provenance.len(), 1);
+        assert_eq!(reply.provenance[0].session_id, "s-taught");
+        assert_eq!(
+            reply.provenance[0].ts.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+    }
+
+    #[test]
+    fn a_superseded_record_reads_back_pointing_at_its_replacement() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-old",
+                "global",
+                "Home",
+                "lives at X",
+                "lives at X",
+            )),
+            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                superseded_id: "mr-old".to_owned(),
+                record: Some(record(
+                    "mr-new",
+                    "global",
+                    "Home",
+                    "lives at Y",
+                    "lives at Y",
+                )),
+            }),
+        ]);
+
+        let reply = archive
+            .memory_record("mr-old")
+            .expect("read")
+            .expect("still readable");
+        assert_eq!(reply.status, "superseded");
+        assert_eq!(reply.superseded_by.as_deref(), Some("mr-new"));
+
+        assert!(
+            archive.memory_record("mr-none").expect("read").is_none(),
+            "an unknown id reads as None"
         );
     }
 }

@@ -24,6 +24,7 @@ use arc_core::provider::Provider;
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
 use arc_core::tool::Registry;
+use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
 use std::path::Path;
@@ -155,6 +156,12 @@ impl<P: Provider + 'static> Daemon<P> {
             "sessions_search",
         )?)));
         registry.register(Box::new(SessionRead::new(open_archive("session_read")?)));
+        registry.register(Box::new(MemoryRead::new(open_archive("memory_read")?)));
+        registry.register(Box::new(MemorySearch::new(open_archive("memory_search")?)));
+        registry.register(Box::new(MemoryWrite));
+        registry.register(Box::new(MemorySupersede::new(open_archive(
+            "memory_supersede",
+        )?)));
 
         let engine = Engine::new(
             log,

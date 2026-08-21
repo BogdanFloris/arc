@@ -16,6 +16,7 @@ use futures::stream;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
+use crate::archive::Archive;
 use crate::log::{Log, LogReader, discover_segments};
 use crate::projection::Projection;
 use crate::provider::{
@@ -23,7 +24,7 @@ use crate::provider::{
     Provider, Stop, ToolCall, ToolDefinition, Usage,
 };
 use crate::session::{Engine, EngineEvent};
-use crate::tool::{Registry, Tool, ToolReply};
+use crate::tool::{Registry, Tool, ToolReply, TurnContext};
 
 /// A scripted provider: each `complete` call captures its request and
 /// yields the next script entry.
@@ -228,6 +229,27 @@ pub(crate) fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
     events
 }
 
+/// An archive over `dir`'s log, the daemon's way: the projection at
+/// `dir/index.db` is opened (and replayed) first, then the read-only
+/// connection.
+pub(crate) fn archive_at(dir: &TempDir) -> Archive {
+    let log = Log::open(dir.path()).expect("open log");
+    let index = dir.path().join("index.db");
+    let mut projection = Projection::open(&index).expect("open projection");
+    crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+    drop(projection);
+    Archive::open(index).expect("open archive")
+}
+
+/// Every whole event in `dir`'s log — payload arm, source, seq — for tests
+/// that assert across session and memory events at once.
+pub(crate) fn replay_events(dir: impl AsRef<std::path::Path>) -> Vec<arc_proto::v1::Event> {
+    let segments = discover_segments(dir.as_ref()).expect("discover");
+    LogReader::new(segments)
+        .map(|result| result.expect("replay"))
+        .collect()
+}
+
 /// Every event in `dir`'s log, replayed through the real reader.
 pub(crate) fn replay_log(dir: impl AsRef<std::path::Path>) -> Vec<session_event::Event> {
     let segments = discover_segments(dir.as_ref()).expect("discover");
@@ -286,10 +308,12 @@ impl Tool for Canned {
     fn execute(
         &self,
         _arguments_json: String,
+        _ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-        let reply = ToolReply {
-            content: self.content.to_owned(),
-            ok: self.ok,
+        let reply = if self.ok {
+            ToolReply::ok(self.content)
+        } else {
+            ToolReply::error(self.content)
         };
         Box::pin(async move { reply })
     }

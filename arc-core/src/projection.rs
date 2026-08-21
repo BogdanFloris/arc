@@ -787,7 +787,7 @@ fn bad_column(index: usize, message: &str) -> rusqlite::Error {
 }
 
 /// [`bad_column`], for a JSON text column that would not decode.
-fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
+pub(crate) fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
         rusqlite::types::Type::Text,
@@ -1141,7 +1141,7 @@ fn links_json(links: &[String]) -> String {
     serde_json::to_string(links).expect("strings always serialize")
 }
 
-fn links_from_json(json: &str) -> Result<Vec<String>, serde_json::Error> {
+pub(crate) fn links_from_json(json: &str) -> Result<Vec<String>, serde_json::Error> {
     serde_json::from_str(json)
 }
 
@@ -1162,7 +1162,9 @@ fn provenance_json(provenance: Option<&Provenance>) -> Option<String> {
     Some(serde_json::to_string(&entries).expect("strings and integers always serialize"))
 }
 
-fn provenance_from_json(json: Option<&str>) -> Result<Option<Provenance>, serde_json::Error> {
+pub(crate) fn provenance_from_json(
+    json: Option<&str>,
+) -> Result<Option<Provenance>, serde_json::Error> {
     let Some(json) = json else { return Ok(None) };
     let entries: Vec<ProvenanceEntryJson> = serde_json::from_str(json)?;
     Ok(Some(Provenance {
