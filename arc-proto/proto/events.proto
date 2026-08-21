@@ -62,12 +62,21 @@ message ToolResultRecorded {
   reserved 7; // reserved for structured (non-text) result content
 }
 
+message SessionConsolidated {
+  string session_id = 1;
+  // The last event the consolidation pass read; coverage, not a claim of output.
+  uint64 through_seq = 2;
+  // Empty until the extraction prompt is versioned (task 7.2).
+  string prompt_version = 3;
+}
+
 message SessionEvent {
   oneof event {
     SessionCreated session_created = 1;
     MessageAppended message_appended = 2;
     ToolCallIssued tool_call_issued = 3;
     ToolResultRecorded tool_result_recorded = 4;
+    SessionConsolidated session_consolidated = 6;
   }
   reserved 5; // reserved for a reasoning event; streamed-only by decision
 }

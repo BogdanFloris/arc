@@ -5,10 +5,10 @@ use arc_proto::v1::{
     ClientFrame, Delta, Error, Event, HistoryMessage, MemoryEvent, MemoryRecord,
     MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated,
     MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role,
-    SendMessage, ServerFrame, SessionCreated, SessionEvent, SessionHistory, SessionInfo,
-    SessionList, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
-    ToolResultRecorded, client_frame, event, memory_event, memory_record, server_frame,
-    session_event,
+    SendMessage, ServerFrame, SessionConsolidated, SessionCreated, SessionEvent, SessionHistory,
+    SessionInfo, SessionList, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted,
+    ToolOutcome, ToolResultRecorded, client_frame, event, memory_event, memory_record,
+    server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -98,6 +98,23 @@ fn tool_result_recorded_event() -> Event {
     }
 }
 
+fn session_consolidated_event() -> Event {
+    Event {
+        seq: 9,
+        ts: Some(ts()),
+        source: Source::System as i32,
+        payload: Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionConsolidated(
+                SessionConsolidated {
+                    session_id: "s-01".to_string(),
+                    through_seq: 4,
+                    prompt_version: String::new(), // unversioned until 7.2
+                },
+            )),
+        })),
+    }
+}
+
 fn memory_record() -> MemoryRecord {
     MemoryRecord {
         id: "m-01".to_string(),
@@ -144,6 +161,11 @@ fn event_tool_call_issued_round_trips() {
 #[test]
 fn event_tool_result_recorded_round_trips() {
     round_trip(&tool_result_recorded_event());
+}
+
+#[test]
+fn event_session_consolidated_round_trips() {
+    round_trip(&session_consolidated_event());
 }
 
 #[test]
