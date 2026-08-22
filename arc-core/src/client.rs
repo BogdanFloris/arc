@@ -10,8 +10,8 @@
 //! over the wire, safe to drop and reconnect.
 
 use arc_proto::v1::{
-    ClientFrame, FetchHistory, HistoryMessage, ListSessions, MemoryReviewAccept,
-    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame, SessionInfo,
+    ClientFrame, FetchHistory, ListSessions, MemoryReviewAccept, MemoryReviewDelete,
+    MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame, SessionHistory, SessionInfo,
     client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
@@ -146,25 +146,27 @@ impl Client {
         }
     }
 
-    /// Asks the daemon for one session's messages, oldest first.
+    /// Asks the daemon for one session's history, oldest first — both wire
+    /// shapes, so a caller can render `entries` and fall back to the
+    /// prose-only `messages` of an old daemon.
     ///
     /// The whole history, unpaginated — see `FetchHistory` in `wire.proto`.
-    /// An unknown session id is not an error: it answers with no messages,
-    /// the same as a session nobody has spoken in.
+    /// An unknown session id is not an error: it answers with no rows, the
+    /// same as a session nobody has spoken in.
     ///
     /// # Errors
     ///
     /// [`Error::Server`] if the daemon refused the request; any other variant
     /// means the connection is unusable.
     #[tracing::instrument(name = "client.fetch_history", skip_all, fields(session_id))]
-    pub async fn fetch_history(&mut self, session_id: &str) -> Result<Vec<HistoryMessage>, Error> {
+    pub async fn fetch_history(&mut self, session_id: &str) -> Result<SessionHistory, Error> {
         let id = self
             .send(client_frame::Msg::FetchHistory(FetchHistory {
                 session_id: session_id.to_owned(),
             }))
             .await?;
         match self.answer(id).await? {
-            server_frame::Msg::SessionHistory(history) => Ok(history.messages),
+            server_frame::Msg::SessionHistory(history) => Ok(history),
             server_frame::Msg::Error(error) => Err(Error::Server {
                 code: error.code,
                 msg: error.msg,

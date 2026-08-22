@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use arc_proto::v1::{Role, SessionInfo, ToolOutcome};
+use arc_proto::v1::{HistoryEntry, HistoryMessage, Role, SessionInfo, ToolOutcome, history_entry};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
@@ -49,10 +49,13 @@ pub enum Command {
 pub enum NetEvent {
     /// The daemon answered `ListSessions`.
     Sessions(Vec<SessionInfo>),
-    /// The daemon answered `FetchHistory` for `session_id`.
+    /// The daemon answered `FetchHistory` for `session_id`. `entries` is the
+    /// whole transcript, tool rows included; `messages` is the prose-only
+    /// fallback an old daemon fills instead.
     History {
         session_id: String,
-        messages: Vec<(i32, String)>,
+        messages: Vec<HistoryMessage>,
+        entries: Vec<HistoryEntry>,
     },
     /// The daemon accepted the message and named the session.
     Accepted { session_id: String },
@@ -126,7 +129,8 @@ pub enum Block {
         open: bool,
     },
     /// A tool call where it happened: running until its `ToolEnded` names an
-    /// outcome. Transient like the thought line — history won't return it.
+    /// outcome. A reopened session rebuilds these from its history entries,
+    /// closing a call whose result never arrived as unknown.
     Tool {
         call_id: String,
         name: String,
@@ -584,11 +588,17 @@ impl App {
             NetEvent::History {
                 session_id,
                 messages,
+                entries,
             } => {
                 // Switching sessions twice in a row leaves an answer for the
                 // one we left in flight; it must not land in this transcript.
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    self.transcript = messages.into_iter().filter_map(history_block).collect();
+                    self.transcript = if entries.is_empty() {
+                        // An old daemon fills only the prose-only field.
+                        messages.into_iter().filter_map(prose_block).collect()
+                    } else {
+                        history_blocks(entries)
+                    };
                     self.scroll_back = 0;
                 }
                 None
@@ -831,21 +841,63 @@ fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
 /// a newer schema — are dropped rather than guessed at: the daemon never puts
 /// them in a session's history today, and inventing a speaker label for one
 /// would be worse than its absence.
-fn history_block((role, content): (i32, String)) -> Option<Block> {
-    match Role::try_from(role) {
-        Ok(Role::User) => Some(Block::You(content)),
+fn prose_block(message: HistoryMessage) -> Option<Block> {
+    match Role::try_from(message.role) {
+        Ok(Role::User) => Some(Block::You(message.content)),
         Ok(Role::Assistant) => Some(Block::Arc {
-            text: content,
-            // The projection carries no `partial` column, so a cut reply
-            // reopens without its `-- cut --` marker. See `wire.proto`.
-            partial: false,
+            text: message.content,
+            partial: message.partial,
         }),
         _ => None,
     }
 }
 
+/// A reopened session's transcript: the block sequence a live turn leaves
+/// behind once it collapses, minus thought traces — reasoning is never
+/// durable (DESIGN.md §3.1), so none are faked here.
+fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    for entry in entries {
+        match entry.entry {
+            Some(history_entry::Entry::Message(message)) => {
+                blocks.extend(prose_block(message));
+            }
+            Some(history_entry::Entry::ToolCall(call)) => blocks.push(Block::Tool {
+                call_id: call.call_id,
+                name: call.name,
+                outcome: None,
+            }),
+            Some(history_entry::Entry::ToolResult(result)) => {
+                // By call_id, never adjacency — the live path's rule.
+                let ended = blocks.iter_mut().rev().find(
+                    |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
+                );
+                if let Some(Block::Tool { outcome, .. }) = ended {
+                    *outcome = Some(outcome_label(result.outcome));
+                }
+            }
+            // An entry kind from a newer daemon has no rendering to guess at.
+            None => {}
+        }
+    }
+    // A call no entry closed is not still running — nothing is. Its outcome
+    // is unknown, the reading DESIGN.md §3.1 attaches to a missing result.
+    for block in &mut blocks {
+        if let Block::Tool {
+            outcome: outcome @ None,
+            ..
+        } = block
+        {
+            *outcome = Some("unknown");
+        }
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
+    use arc_proto::v1::{HistoryToolCall, HistoryToolResult};
+
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1554,6 +1606,39 @@ mod tests {
         );
     }
 
+    fn prose(role: i32, content: &str, partial: bool) -> HistoryMessage {
+        HistoryMessage {
+            role,
+            content: content.to_owned(),
+            partial,
+        }
+    }
+
+    fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::Message(prose(role, content, partial))),
+        }
+    }
+
+    fn call_entry(call_id: &str, name: &str) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
+                call_id: call_id.to_owned(),
+                name: name.to_owned(),
+            })),
+        }
+    }
+
+    fn result_entry(call_id: &str, outcome: i32) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
+                call_id: call_id.to_owned(),
+                outcome,
+                truncated: false,
+            })),
+        }
+    }
+
     #[test]
     fn history_replaces_the_loading_note_with_the_transcript() {
         let mut app = App::new();
@@ -1564,10 +1649,11 @@ mod tests {
 
         app.on_net(NetEvent::History {
             session_id: "old".to_owned(),
-            messages: vec![
-                (Role::User as i32, "what is a walking skeleton?".to_owned()),
-                (Role::Assistant as i32, "a thin end-to-end slice".to_owned()),
-                (Role::System as i32, "the identity file".to_owned()),
+            messages: Vec::new(),
+            entries: vec![
+                prose_entry(Role::User as i32, "what is a walking skeleton?", false),
+                prose_entry(Role::Assistant as i32, "a thin end-to-end slice", true),
+                prose_entry(Role::System as i32, "the identity file", false),
             ],
         });
 
@@ -1577,10 +1663,106 @@ mod tests {
                 Block::You("what is a walking skeleton?".to_owned()),
                 Block::Arc {
                     text: "a thin end-to-end slice".to_owned(),
-                    partial: false
+                    partial: true
                 }
             ],
-            "user and model render; a system message has no speaker to be"
+            "user and model render, partial included; a system message has no speaker to be"
+        );
+    }
+
+    /// A reopened tool turn shows exactly what the live one left behind once
+    /// it collapsed — minus the thought trace, which is never durable.
+    #[test]
+    fn a_reopened_tool_turn_matches_the_blocks_a_live_one_leaves() {
+        let mut live = App::new();
+        typed(&mut live, "hi");
+        live.on_key(key(KeyCode::Enter));
+        live.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        live.on_net(NetEvent::ToolStarted {
+            call_id: "t1".to_owned(),
+            name: "lookup".to_owned(),
+        });
+        live.on_net(NetEvent::ToolEnded {
+            call_id: "t1".to_owned(),
+            outcome: ToolOutcome::Ok as i32,
+        });
+        live.on_net(NetEvent::Delta("answer".to_owned()));
+        live.on_net(NetEvent::End { partial: false });
+
+        let mut reopened = App::new();
+        reopened.session_id = Some("s-1".to_owned());
+        reopened.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            messages: Vec::new(),
+            entries: vec![
+                prose_entry(Role::User as i32, "hi", false),
+                call_entry("t1", "lookup"),
+                result_entry("t1", ToolOutcome::Ok as i32),
+                prose_entry(Role::Assistant as i32, "answer", false),
+            ],
+        });
+
+        assert_eq!(reopened.transcript, live.transcript);
+    }
+
+    /// The two shapes a call reads as unknown on reopen: an outcome this
+    /// build does not recognize, and a call no entry ever closed.
+    #[test]
+    fn unrecognized_and_missing_history_outcomes_read_unknown() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            messages: Vec::new(),
+            entries: vec![
+                call_entry("a", "alpha"),
+                call_entry("b", "beta"),
+                result_entry("b", 42),
+            ],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::Tool {
+                    call_id: "a".to_owned(),
+                    name: "alpha".to_owned(),
+                    outcome: Some("unknown"),
+                },
+                Block::Tool {
+                    call_id: "b".to_owned(),
+                    name: "beta".to_owned(),
+                    outcome: Some("unknown"),
+                },
+            ]
+        );
+    }
+
+    /// An old daemon fills only `messages`; the transcript still renders.
+    #[test]
+    fn history_without_entries_falls_back_to_prose_messages() {
+        let mut app = App::new();
+        app.session_id = Some("old".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "old".to_owned(),
+            messages: vec![
+                prose(Role::User as i32, "hello", false),
+                prose(Role::Assistant as i32, "hi there", true),
+            ],
+            entries: Vec::new(),
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hello".to_owned()),
+                Block::Arc {
+                    text: "hi there".to_owned(),
+                    partial: true
+                }
+            ]
         );
     }
 
@@ -1593,7 +1775,8 @@ mod tests {
 
         app.on_net(NetEvent::History {
             session_id: "first".to_owned(),
-            messages: vec![(Role::User as i32, "stale".to_owned())],
+            messages: Vec::new(),
+            entries: vec![prose_entry(Role::User as i32, "stale", false)],
         });
 
         assert_eq!(

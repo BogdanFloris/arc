@@ -40,11 +40,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    Event, MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role,
-    SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
-    ToolResultRecorded,
+    Event, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryEvent,
+    MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role, SessionConsolidated,
+    SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
 };
-use arc_proto::v1::{event, memory_event, session_event};
+use arc_proto::v1::{event, history_entry, memory_event, session_event};
 use futures::StreamExt as _;
 use prost_types::Timestamp;
 use tokio::sync::mpsc;
@@ -529,13 +529,13 @@ impl<P: Provider> Engine<P> {
         Ok(self.projection.sessions()?)
     }
 
-    /// One session's messages as a client renders them, oldest first, as
-    /// `(role, content, partial)` rows.
+    /// One session's rows as a client renders them, oldest first, in the
+    /// wire's `HistoryEntry` shape: prose, tool calls, tool results.
     ///
-    /// Prose only: tool rows reach the wire with task 5.1b. Unlike the
-    /// private rebuild, this keeps every role verbatim: a client showing a
-    /// transcript should not silently drop a message the provider vocabulary
-    /// happens not to cover.
+    /// Unlike the private rebuild, this keeps every role — and every raw
+    /// outcome integer — verbatim: a client showing a transcript should not
+    /// silently drop a message the provider vocabulary happens not to cover,
+    /// and readers treat an unrecognized outcome as UNKNOWN (DESIGN.md §3.1).
     ///
     /// An unknown id reads as a session with nothing in it — the projection
     /// has no row to distinguish "never existed" from "never spoken in", and
@@ -544,20 +544,12 @@ impl<P: Provider> Engine<P> {
     /// # Errors
     ///
     /// [`Error::Projection`] if the index cannot be read.
-    pub fn transcript(&self, session_id: &str) -> Result<Vec<(i32, String, bool)>, Error> {
+    pub fn transcript(&self, session_id: &str) -> Result<Vec<HistoryEntry>, Error> {
         Ok(self
             .projection
             .messages(session_id)?
             .into_iter()
-            .filter_map(|row| match row {
-                MessageRow::Message {
-                    role,
-                    content,
-                    partial,
-                    ..
-                } => Some((role, content, partial)),
-                MessageRow::ToolCall { .. } | MessageRow::ToolResult { .. } => None,
-            })
+            .map(history_entry)
             .collect())
     }
 
@@ -828,6 +820,38 @@ impl<P: Provider> Engine<P> {
     }
 }
 
+/// One projected row as the wire's `HistoryEntry`: a direct mapping — role
+/// and outcome integers pass through raw, arguments and result content stay
+/// off the wire (display needs the name and the outcome, nothing more).
+fn history_entry(row: MessageRow) -> HistoryEntry {
+    let entry = match row {
+        MessageRow::Message {
+            role,
+            content,
+            partial,
+            ..
+        } => history_entry::Entry::Message(HistoryMessage {
+            role,
+            content,
+            partial,
+        }),
+        MessageRow::ToolCall { call_id, name, .. } => {
+            history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })
+        }
+        MessageRow::ToolResult {
+            call_id,
+            outcome,
+            truncated,
+            ..
+        } => history_entry::Entry::ToolResult(HistoryToolResult {
+            call_id,
+            outcome,
+            truncated,
+        }),
+    };
+    HistoryEntry { entry: Some(entry) }
+}
+
 /// The provider transcript a session's projected rows imply (DESIGN.md §3.1).
 ///
 /// Prose becomes [`Message::Text`]. A step — consecutive call rows of one
@@ -1048,7 +1072,8 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Role, Source, ToolOutcome,
+        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
+        MemoryRecordCreated, MemoryRecordSuperseded, Role, Source, ToolOutcome, history_entry,
         memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
@@ -1108,6 +1133,17 @@ mod tests {
             content: content.to_owned(),
             truncated: false,
         })
+    }
+
+    /// A prose `HistoryEntry`, as `transcript` returns it.
+    fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::Message(HistoryMessage {
+                role,
+                content: content.to_owned(),
+                partial,
+            })),
+        }
     }
 
     #[tokio::test]
@@ -1258,8 +1294,8 @@ mod tests {
         assert_eq!(
             engine.transcript(&reply.session_id).expect("transcript"),
             [
-                (Role::User as i32, "hi".to_owned(), false),
-                (Role::Assistant as i32, "partial tex".to_owned(), true),
+                prose_entry(Role::User as i32, "hi", false),
+                prose_entry(Role::Assistant as i32, "partial tex", true),
             ]
         );
     }
@@ -1700,6 +1736,59 @@ mod tests {
                 },
             ],
             "the unanswered call and the unclaimed result stay out"
+        );
+    }
+
+    /// `transcript` is the wire's entries shape: every row kind in seq order,
+    /// role and outcome integers passed through raw — readers interpret.
+    #[test]
+    fn transcript_maps_every_row_kind_and_preserves_raw_integers() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                seeded_session(),
+                seeded_message(Role::User, "question"),
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: "s-01".to_owned(),
+                    role: 99,
+                    content: "from the future".to_owned(),
+                    partial: false,
+                    turn_id: "t-01".to_owned(),
+                }),
+                seeded_call("c1", 0),
+                session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
+                    session_id: "s-01".to_owned(),
+                    turn_id: "t-01".to_owned(),
+                    call_id: "c1".to_owned(),
+                    outcome: 42,
+                    content: "what the model saw".to_owned(),
+                    truncated: true,
+                }),
+            ],
+        );
+        let provider = ScriptedProvider::scripted(vec![]);
+        let engine = reopened_engine(&provider, &dir, Registry::new(512));
+
+        assert_eq!(
+            engine.transcript("s-01").expect("transcript"),
+            [
+                prose_entry(Role::User as i32, "question", false),
+                prose_entry(99, "from the future", false),
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
+                        call_id: "c1".to_owned(),
+                        name: "lookup".to_owned(),
+                    })),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
+                        call_id: "c1".to_owned(),
+                        outcome: 42,
+                        truncated: true,
+                    })),
+                },
+            ]
         );
     }
 

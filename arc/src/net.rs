@@ -90,13 +90,11 @@ async fn history(
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
     match client.fetch_history(session_id).await {
-        Ok(messages) => {
+        Ok(answer) => {
             let _ = events.send(NetEvent::History {
                 session_id: session_id.to_owned(),
-                messages: messages
-                    .into_iter()
-                    .map(|message| (message.role, message.content))
-                    .collect(),
+                messages: answer.messages,
+                entries: answer.entries,
             });
             Ok(())
         }

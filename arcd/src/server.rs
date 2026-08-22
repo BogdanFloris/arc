@@ -35,9 +35,9 @@ use arc_core::projection::{ReviewItem, SessionSummary};
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, HistoryMessage, MemoryReviewItem, MemoryReviewItems,
-    MessageAccepted, ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame, server_frame,
+    ClientFrame, Delta, Error as WireError, MemoryReviewItem, MemoryReviewItems, MessageAccepted,
+    ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd,
+    ToolCallEnded, ToolCallStarted, client_frame, history_entry, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -481,17 +481,22 @@ async fn fetch_history<P: Provider>(
 ) -> ControlFlow<()> {
     let read = engine.lock().await.transcript(session_id);
     let msg = match read {
-        Ok(messages) => server_frame::Msg::SessionHistory(SessionHistory {
-            session_id: session_id.to_owned(),
-            messages: messages
-                .into_iter()
-                .map(|(role, content, partial)| HistoryMessage {
-                    role,
-                    content,
-                    partial,
+        Ok(entries) => {
+            // `messages` is superseded by `entries` (prose only, as before)
+            // and still filled so a client that predates entries renders.
+            let messages = entries
+                .iter()
+                .filter_map(|entry| match entry.entry.as_ref() {
+                    Some(history_entry::Entry::Message(message)) => Some(message.clone()),
+                    _ => None,
                 })
-                .collect(),
-        }),
+                .collect();
+            server_frame::Msg::SessionHistory(SessionHistory {
+                session_id: session_id.to_owned(),
+                messages,
+                entries,
+            })
+        }
         Err(error) => {
             warn!(%error, session_id, "reading history failed");
             error_frame("internal", &error)
@@ -584,9 +589,10 @@ mod tests {
     };
     use arc_core::tool::{Registry, Tool, ToolReply, TurnContext};
     use arc_proto::v1::{
-        Event, FetchHistory, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
-        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Role, Source, ToolOutcome, event,
-        memory_event, memory_record,
+        Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
+        ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
+        MemoryReviewDelete, MemoryReviewList, Role, Source, ToolOutcome, event, memory_event,
+        memory_record,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -887,7 +893,7 @@ mod tests {
         }
     }
 
-    async fn history(ws: &mut Client, request_id: u64, session_id: &str) -> Vec<HistoryMessage> {
+    async fn history(ws: &mut Client, request_id: u64, session_id: &str) -> SessionHistory {
         send(
             ws,
             request_id,
@@ -904,7 +910,7 @@ mod tests {
                     history.session_id, session_id,
                     "the answer names its session"
                 );
-                history.messages
+                history
             }
             other => panic!("expected SessionHistory, got {other:?}"),
         }
@@ -1015,9 +1021,10 @@ mod tests {
         send(&mut ws, 2, say(&session_id, "again")).await;
         turn(&mut ws, 2).await;
 
-        let messages = history(&mut ws, 3, &session_id).await;
+        let answer = history(&mut ws, 3, &session_id).await;
 
-        let said: Vec<(Role, &str)> = messages
+        let said: Vec<(Role, &str)> = answer
+            .messages
             .iter()
             .map(|m| {
                 (
@@ -1037,9 +1044,16 @@ mod tests {
             "both turns, in the order they happened"
         );
 
+        assert_eq!(
+            answer.entries.len(),
+            4,
+            "an all-prose session's entries mirror its messages"
+        );
+
         // A read, not a turn: the connection is good for the next request.
+        let empty = history(&mut ws, 4, "no-such-session").await;
         assert!(
-            history(&mut ws, 4, "no-such-session").await.is_empty(),
+            empty.messages.is_empty() && empty.entries.is_empty(),
             "an unknown session reads as an empty one"
         );
 
@@ -1186,6 +1200,96 @@ mod tests {
             ]
         );
         assert_eq!(end.session_id, session_id);
+
+        harness.stop().await;
+    }
+
+    /// A reopened tool turn's history carries its call and result entries in
+    /// seq order, beside the prose-only `messages` an old client reads.
+    #[tokio::test]
+    async fn history_carries_tool_entries_alongside_prose_messages() {
+        let script = Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::ToolCall(ToolCall {
+                    id: "t1".to_owned(),
+                    index: 0,
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                })),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("answer".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]));
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Canned {
+            name: "lookup",
+            content: "found it",
+            ok: true,
+        }));
+        let mut harness = Harness::with_tools(script, registry).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hi")).await;
+        let accepted = next_frame(&mut ws).await;
+        let session_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted first, got {other:?}"),
+        };
+        // Drain the turn's middle frames; `turn` would stop at the first one.
+        loop {
+            if let Some(server_frame::Msg::StreamEnd(_)) = next_frame(&mut ws).await.msg {
+                break;
+            }
+        }
+
+        let answer = history(&mut ws, 2, &session_id).await;
+
+        let prose = |role: Role, content: &str| HistoryMessage {
+            role: role as i32,
+            content: content.to_owned(),
+            partial: false,
+        };
+        assert_eq!(
+            answer.entries,
+            [
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::Message(prose(Role::User, "hi"))),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
+                        call_id: "t1".to_owned(),
+                        name: "lookup".to_owned(),
+                    })),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
+                        call_id: "t1".to_owned(),
+                        outcome: ToolOutcome::Ok as i32,
+                        truncated: false,
+                    })),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::Message(prose(
+                        Role::Assistant,
+                        "answer"
+                    ))),
+                },
+            ]
+        );
+        assert_eq!(
+            answer.messages,
+            [prose(Role::User, "hi"), prose(Role::Assistant, "answer")],
+            "the superseded field stays prose-only"
+        );
 
         harness.stop().await;
     }
