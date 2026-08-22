@@ -1,3 +1,13 @@
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::implicit_hasher,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::needless_raw_string_hashes,
+    clippy::too_many_lines
+)]
+
 mod app;
 mod markdown;
 mod net;
