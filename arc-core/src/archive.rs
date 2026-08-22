@@ -610,6 +610,8 @@ fn limit(n: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arc_proto::v1::{
         MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Provenance,
         ProvenanceEntry, Role, SessionCreated, ToolOutcome, ToolResultRecorded, memory_event,
@@ -976,7 +978,7 @@ mod tests {
         })
     }
 
-    fn memory_archive_over(events: Vec<memory_event::Event>) -> (TempDir, Archive) {
+    fn memory_archive_over(events: Vec<memory_event::Event>) -> (TempDir, Arc<Archive>) {
         let dir = TempDir::new().expect("temp dir");
         testkit::seed_memory_log(&dir, events);
         let archive = testkit::archive_at(&dir);

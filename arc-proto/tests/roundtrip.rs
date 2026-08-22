@@ -288,18 +288,6 @@ fn server_frame_arms_round_trip() {
         }),
         server_frame::Msg::SessionHistory(SessionHistory {
             session_id: "s-01".to_string(),
-            messages: vec![
-                HistoryMessage {
-                    role: Role::User as i32,
-                    content: "hello arc".to_string(),
-                    partial: false,
-                },
-                HistoryMessage {
-                    role: Role::Assistant as i32,
-                    content: "hello back".to_string(),
-                    partial: true,
-                },
-            ],
             entries: vec![
                 HistoryEntry {
                     entry: Some(history_entry::Entry::Message(HistoryMessage {

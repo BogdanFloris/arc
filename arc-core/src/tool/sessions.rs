@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -8,11 +9,11 @@ use crate::archive::{Archive, Error};
 use crate::provider::ToolDefinition;
 
 pub struct SessionsSearch {
-    archive: Archive,
+    archive: Arc<Archive>,
 }
 
 impl SessionsSearch {
-    pub fn new(archive: Archive) -> Self {
+    pub fn new(archive: Arc<Archive>) -> Self {
         Self { archive }
     }
 }
@@ -82,11 +83,11 @@ impl Tool for SessionsSearch {
 }
 
 pub struct SessionRead {
-    archive: Archive,
+    archive: Arc<Archive>,
 }
 
 impl SessionRead {
-    pub fn new(archive: Archive) -> Self {
+    pub fn new(archive: Arc<Archive>) -> Self {
         Self { archive }
     }
 }

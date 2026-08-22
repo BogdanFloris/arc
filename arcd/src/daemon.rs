@@ -4,10 +4,11 @@ use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION_V1};
 use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
-use arc_core::projection::{self, Projection};
+use arc_core::projection::{self, Projection, Reader};
 use arc_core::provider::Provider;
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::session::Engine;
+use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use arc_core::tool::sessions::{SessionRead, SessionsSearch};
@@ -49,6 +50,8 @@ pub struct Daemon<P: Provider> {
 
     engine: Arc<Mutex<Engine<P>>>,
 
+    reads: Arc<Reader>,
+
     provider: Arc<P>,
 }
 
@@ -58,7 +61,7 @@ impl<P: Provider + 'static> Daemon<P> {
         dirs.create()
             .with_context(|| format!("preparing {}", dirs.root().display()))?;
 
-        let mut log = Log::open(dirs.log())
+        let log = Log::open(dirs.log())
             .with_context(|| format!("opening the event log at {}", dirs.log().display()))?;
         info!(
             next_seq = log.next_seq(),
@@ -76,11 +79,12 @@ impl<P: Provider + 'static> Daemon<P> {
             "index caught up with the log"
         );
 
-        let reader = log
+        let mut store = Store::new(log, projection);
+        let reader = store
             .reader()
             .context("listing log segments for the orphan scan")?;
-        let closed = orphan::close_orphans(reader, &mut log, &mut projection)
-            .context("closing orphaned tool calls")?;
+        let closed =
+            orphan::close_orphans(reader, &mut store).context("closing orphaned tool calls")?;
         for orphan in &closed {
             info!(
                 session_id = %orphan.session_id,
@@ -98,25 +102,25 @@ impl<P: Provider + 'static> Daemon<P> {
 
         let mut registry = Registry::new(config.max_tool_result_bytes);
         registry.register(Box::new(GetTime));
-        let open_archive = |tool: &str| {
+        let archive = Arc::new(
             Archive::open(dirs.index())
-                .with_context(|| format!("opening the index read-only for {tool}"))
-        };
-        registry.register(Box::new(SessionsSearch::new(open_archive(
-            "sessions_search",
-        )?)));
-        registry.register(Box::new(SessionRead::new(open_archive("session_read")?)));
-        registry.register(Box::new(MemoryRead::new(open_archive("memory_read")?)));
-        registry.register(Box::new(MemorySearch::new(open_archive("memory_search")?)));
+                .with_context(|| format!("opening {} read-only", dirs.index().display()))?,
+        );
+        registry.register(Box::new(SessionsSearch::new(Arc::clone(&archive))));
+        registry.register(Box::new(SessionRead::new(Arc::clone(&archive))));
+        registry.register(Box::new(MemoryRead::new(Arc::clone(&archive))));
+        registry.register(Box::new(MemorySearch::new(Arc::clone(&archive))));
         registry.register(Box::new(MemoryWrite));
-        registry.register(Box::new(MemorySupersede::new(open_archive(
-            "memory_supersede",
-        )?)));
+        registry.register(Box::new(MemorySupersede::new(archive)));
+
+        let reads = Arc::new(
+            Reader::open(dirs.index())
+                .with_context(|| format!("opening {} for reads", dirs.index().display()))?,
+        );
 
         let provider = Arc::new(provider);
         let engine = Engine::new(
-            log,
-            projection,
+            store,
             Arc::clone(&provider),
             &config.model(),
             identity,
@@ -128,6 +132,7 @@ impl<P: Provider + 'static> Daemon<P> {
             config,
             dirs,
             engine: Arc::new(Mutex::new(engine)),
+            reads,
             provider,
         })
     }
@@ -154,7 +159,7 @@ impl<P: Provider + 'static> Daemon<P> {
             Arc::clone(&self.provider),
         );
 
-        server::serve(listener, self.engine, shutdown()).await;
+        server::serve(listener, self.engine, self.reads, shutdown()).await;
 
         if let Some(task) = consolidation {
             task.abort();

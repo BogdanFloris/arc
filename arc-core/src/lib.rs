@@ -17,8 +17,9 @@ pub mod orphan;
 pub mod projection;
 pub mod provider;
 pub mod session;
-#[cfg(test)]
-mod testkit;
+pub mod store;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod tool;
 pub mod trace;
 

@@ -120,8 +120,8 @@ message HistoryEntry {
 }
 
 message SessionHistory {
+  reserved 2;  // was `messages`, a prose-only copy of `entries`
   string session_id = 1;
-  repeated HistoryMessage messages = 2;
   repeated HistoryEntry entries = 3;
 }
 

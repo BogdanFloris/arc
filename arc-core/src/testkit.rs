@@ -17,22 +17,23 @@ use crate::provider::{
     Provider, Stop, ToolCall, ToolDefinition, Usage,
 };
 use crate::session::{Engine, EngineEvent};
+use crate::store::Store;
 use crate::tool::{Registry, Tool, ToolReply, TurnContext};
 
-pub(crate) struct ScriptedProvider {
+pub struct ScriptedProvider {
     script: Mutex<VecDeque<Vec<Result<CompletionDelta, ProviderError>>>>,
     captured: Mutex<Vec<CompletionRequest>>,
 }
 
 impl ScriptedProvider {
-    pub(crate) fn scripted(calls: Vec<Vec<Result<CompletionDelta, ProviderError>>>) -> Arc<Self> {
+    pub fn scripted(calls: Vec<Vec<Result<CompletionDelta, ProviderError>>>) -> Arc<Self> {
         Arc::new(Self {
             script: Mutex::new(calls.into()),
             captured: Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn requests(&self) -> Vec<CompletionRequest> {
+    pub fn requests(&self) -> Vec<CompletionRequest> {
         self.captured.lock().expect("captured").clone()
     }
 }
@@ -57,14 +58,14 @@ impl Provider for ScriptedProvider {
     }
 }
 
-pub(crate) fn usage() -> Usage {
+pub fn usage() -> Usage {
     Usage {
         input_tokens: 3,
         output_tokens: 5,
     }
 }
 
-pub(crate) fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
+pub fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
     vec![
         Ok(CompletionDelta::Text(text.to_owned())),
         Ok(CompletionDelta::Done {
@@ -74,19 +75,18 @@ pub(crate) fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderErro
     ]
 }
 
-pub(crate) fn turn(message: &Message) -> (Role, &str) {
+pub fn turn(message: &Message) -> (Role, &str) {
     match message {
         Message::Text { role, content } => (*role, content.as_str()),
         other => panic!("expected a text message, got {other:?}"),
     }
 }
 
-pub(crate) fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
+pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::in_memory().expect("open projection");
     Engine::new(
-        log,
-        projection,
+        Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
         Some("be terse".to_owned()),
@@ -95,7 +95,7 @@ pub(crate) fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<
     )
 }
 
-pub(crate) fn engine_with_tools(
+pub fn engine_with_tools(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
@@ -103,8 +103,7 @@ pub(crate) fn engine_with_tools(
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::in_memory().expect("open projection");
     Engine::new(
-        log,
-        projection,
+        Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
         Some("be terse".to_owned()),
@@ -113,7 +112,7 @@ pub(crate) fn engine_with_tools(
     )
 }
 
-pub(crate) fn engine_with_tools_at(
+pub fn engine_with_tools_at(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
@@ -122,8 +121,7 @@ pub(crate) fn engine_with_tools_at(
     let mut projection = Projection::open(&dir.path().join("index.db")).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     Engine::new(
-        log,
-        projection,
+        Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
         Some("be terse".to_owned()),
@@ -132,7 +130,7 @@ pub(crate) fn engine_with_tools_at(
     )
 }
 
-pub(crate) fn reopened_engine(
+pub fn reopened_engine(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
@@ -141,8 +139,7 @@ pub(crate) fn reopened_engine(
     let mut projection = Projection::in_memory().expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     Engine::new(
-        log,
-        projection,
+        Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
         Some("be terse".to_owned()),
@@ -151,7 +148,7 @@ pub(crate) fn reopened_engine(
     )
 }
 
-pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
+pub fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
     seed_log_payloads(
         dir,
         events
@@ -165,7 +162,7 @@ pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
     );
 }
 
-pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
+pub fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     seed_log_payloads(
         dir,
         events
@@ -179,7 +176,7 @@ pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     );
 }
 
-pub(crate) fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>, at_micros: i64) {
+pub fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>, at_micros: i64) {
     let mut log = Log::open(dir.path()).expect("open log");
     for event in events {
         log.append(arc_proto::v1::Event {
@@ -197,7 +194,7 @@ pub(crate) fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>
     }
 }
 
-pub(crate) fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {
+pub fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {
     let mut log = Log::open(dir.path()).expect("open log");
     for payload in payloads {
         log.append(arc_proto::v1::Event {
@@ -210,11 +207,11 @@ pub(crate) fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::even
     }
 }
 
-pub(crate) fn channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
+pub fn channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
     mpsc::channel(64)
 }
 
-pub(crate) fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
+pub fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -222,23 +219,23 @@ pub(crate) fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
     events
 }
 
-pub(crate) fn archive_at(dir: &TempDir) -> Archive {
+pub fn archive_at(dir: &TempDir) -> Arc<Archive> {
     let log = Log::open(dir.path()).expect("open log");
     let index = dir.path().join("index.db");
     let mut projection = Projection::open(&index).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     drop(projection);
-    Archive::open(&index).expect("open archive")
+    Arc::new(Archive::open(&index).expect("open archive"))
 }
 
-pub(crate) fn replay_events(dir: &std::path::Path) -> Vec<arc_proto::v1::Event> {
+pub fn replay_events(dir: &std::path::Path) -> Vec<arc_proto::v1::Event> {
     let segments = discover_segments(dir).expect("discover");
     LogReader::new(segments)
         .map(|result| result.expect("replay"))
         .collect()
 }
 
-pub(crate) fn replay_log(dir: &std::path::Path) -> Vec<session_event::Event> {
+pub fn replay_log(dir: &std::path::Path) -> Vec<session_event::Event> {
     let segments = discover_segments(dir).expect("discover");
     LogReader::new(segments)
         .map(|result| {
@@ -255,31 +252,31 @@ pub(crate) fn replay_log(dir: &std::path::Path) -> Vec<session_event::Event> {
         .collect()
 }
 
-pub(crate) fn appended(event: &session_event::Event) -> &arc_proto::v1::MessageAppended {
+pub fn appended(event: &session_event::Event) -> &arc_proto::v1::MessageAppended {
     match event {
         session_event::Event::MessageAppended(m) => m,
         other => panic!("expected a message, got {other:?}"),
     }
 }
 
-pub(crate) fn issued(event: &session_event::Event) -> &arc_proto::v1::ToolCallIssued {
+pub fn issued(event: &session_event::Event) -> &arc_proto::v1::ToolCallIssued {
     match event {
         session_event::Event::ToolCallIssued(c) => c,
         other => panic!("expected a tool call, got {other:?}"),
     }
 }
 
-pub(crate) fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResultRecorded {
+pub fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResultRecorded {
     match event {
         session_event::Event::ToolResultRecorded(r) => r,
         other => panic!("expected a tool result, got {other:?}"),
     }
 }
 
-pub(crate) struct Canned {
-    pub(crate) name: &'static str,
-    pub(crate) content: &'static str,
-    pub(crate) ok: bool,
+pub struct Canned {
+    pub name: &'static str,
+    pub content: &'static str,
+    pub ok: bool,
 }
 
 impl Tool for Canned {
@@ -305,7 +302,7 @@ impl Tool for Canned {
     }
 }
 
-pub(crate) fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
+pub fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
     let mut registry = Registry::new(512);
     for &(name, content, ok) in entries {
         registry.register(Box::new(Canned { name, content, ok }));
@@ -313,14 +310,14 @@ pub(crate) fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry 
     registry
 }
 
-pub(crate) struct TraceCapture {
+pub struct TraceCapture {
     _dir: TempDir,
     path: PathBuf,
     guard: tracing::subscriber::DefaultGuard,
 }
 
 impl TraceCapture {
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         use tracing_subscriber::prelude::*;
         let dir = TempDir::new().expect("trace dir");
         let (layer, path) = crate::trace::perfetto(dir.path(), "test").expect("trace file");
@@ -333,7 +330,7 @@ impl TraceCapture {
         }
     }
 
-    pub(crate) fn finish(self) -> arc_proto::perfetto::Trace {
+    pub fn finish(self) -> arc_proto::perfetto::Trace {
         use prost::Message as _;
         let Self { _dir, path, guard } = self;
         drop(guard);
@@ -342,7 +339,7 @@ impl TraceCapture {
     }
 }
 
-pub(crate) fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) -> Vec<f64> {
+pub fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) -> Vec<f64> {
     let Some(uuid) = trace
         .packet
         .iter()
@@ -361,7 +358,7 @@ pub(crate) fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) ->
         .collect()
 }
 
-pub(crate) fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {
+pub fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {
     CompletionDelta::ToolCall(ToolCall {
         id: id.to_owned(),
         index,
@@ -370,7 +367,7 @@ pub(crate) fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDe
     })
 }
 
-pub(crate) fn tool_stop() -> CompletionDelta {
+pub fn tool_stop() -> CompletionDelta {
     CompletionDelta::Done {
         usage: usage(),
         stop: Stop::ToolCalls,

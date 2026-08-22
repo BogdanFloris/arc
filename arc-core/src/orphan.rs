@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use arc_proto::v1::{Event, SessionEvent, Source, ToolOutcome, ToolResultRecorded};
+use arc_proto::v1::{SessionEvent, Source, ToolOutcome, ToolResultRecorded};
 use arc_proto::v1::{event, session_event};
 
-use crate::log::{self, Log, LogReader};
-use crate::projection::{self, Projection};
+use crate::log::{self, LogReader};
+use crate::projection;
 use crate::session::now_ts;
+use crate::store::Store;
 
 pub(crate) const CLOSER_CONTENT: &str = "The daemon restarted before this call's result was recorded; the call may or may not have run.";
 
@@ -23,6 +24,9 @@ pub enum Error {
 
     #[error("orphan pass projection: {0}")]
     Projection(#[from] projection::Error),
+
+    #[error("orphan pass store: {0}")]
+    Store(#[from] crate::store::Error),
 }
 
 pub(crate) fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
@@ -53,32 +57,21 @@ pub(crate) fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
     Ok(slots.into_iter().flatten().collect())
 }
 
-pub(crate) fn close(
-    orphans: &[OrphanCall],
-    log: &mut Log,
-    projection: &mut Projection,
-) -> Result<(), Error> {
+pub(crate) fn close(orphans: &[OrphanCall], store: &mut Store) -> Result<(), Error> {
     for orphan in orphans {
-        let mut event = Event {
-            seq: 0,
-            ts: Some(now_ts()),
-            source: Source::System as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::ToolResultRecorded(
-                    ToolResultRecorded {
-                        session_id: orphan.session_id.clone(),
-                        turn_id: orphan.turn_id.clone(),
-                        call_id: orphan.call_id.clone(),
-                        outcome: ToolOutcome::Unknown as i32,
-                        content: CLOSER_CONTENT.to_owned(),
-                        truncated: false,
-                    },
-                )),
-            })),
-        };
-        let seq = log.append(event.clone())?;
-        event.seq = seq;
-        projection.apply(&event)?;
+        let payload = event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::ToolResultRecorded(
+                ToolResultRecorded {
+                    session_id: orphan.session_id.clone(),
+                    turn_id: orphan.turn_id.clone(),
+                    call_id: orphan.call_id.clone(),
+                    outcome: ToolOutcome::Unknown as i32,
+                    content: CLOSER_CONTENT.to_owned(),
+                    truncated: false,
+                },
+            )),
+        });
+        store.append(Source::System, Some(now_ts()), payload)?;
     }
     Ok(())
 }
@@ -89,14 +82,10 @@ pub(crate) fn close(
     skip_all,
     fields(orphans = tracing::field::Empty)
 )]
-pub fn close_orphans(
-    reader: LogReader,
-    log: &mut Log,
-    projection: &mut Projection,
-) -> Result<Vec<OrphanCall>, Error> {
+pub fn close_orphans(reader: LogReader, store: &mut Store) -> Result<Vec<OrphanCall>, Error> {
     let orphans = scan(reader)?;
     tracing::Span::current().record("orphans", orphans.len());
-    close(&orphans, log, projection)?;
+    close(&orphans, store)?;
     Ok(orphans)
 }
 
@@ -112,6 +101,7 @@ mod tests {
     use super::{CLOSER_CONTENT, OrphanCall, close, close_orphans, scan};
     use crate::log::Log;
     use crate::projection::{self, Projection};
+    use crate::store::Store;
 
     fn wrap(source: Source, payload: session_event::Event) -> Event {
         Event {
@@ -181,18 +171,20 @@ mod tests {
         log
     }
 
-    fn replayed(log: &Log) -> Projection {
+    fn store_with(dir: &TempDir, events: Vec<Event>) -> Store {
+        let log = log_with(dir, events);
         let mut projection = Projection::in_memory().expect("open projection");
         projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        projection
+        Store::new(log, projection)
     }
 
-    fn scan_log(log: &Log) -> Vec<OrphanCall> {
-        scan(log.reader().expect("reader")).expect("scan")
+    fn scan_store(store: &Store) -> Vec<OrphanCall> {
+        scan(store.reader().expect("reader")).expect("scan")
     }
 
-    fn replay_events(log: &Log) -> Vec<Event> {
-        log.reader()
+    fn replay_events(store: &Store) -> Vec<Event> {
+        store
+            .reader()
             .expect("reader")
             .map(|read| read.expect("replay"))
             .collect()
@@ -211,18 +203,17 @@ mod tests {
     #[test]
     fn an_unanswered_call_is_closed_as_unknown() {
         let dir = TempDir::new().expect("temp dir");
-        let mut log = log_with(
+        let mut store = store_with(
             &dir,
             vec![message("s1", "t1", "hi"), issued("s1", "t1", "c1")],
         );
-        let mut projection = replayed(&log);
 
-        let orphans = scan_log(&log);
+        let orphans = scan_store(&store);
         assert_eq!(orphans, [orphan("s1", "t1", "c1")]);
 
-        close(&orphans, &mut log, &mut projection).expect("close");
+        close(&orphans, &mut store).expect("close");
 
-        let events = replay_events(&log);
+        let events = replay_events(&store);
         let last = events.last().expect("events");
         assert_eq!(last.source, Source::System as i32);
         let result = closer_of(last);
@@ -234,7 +225,7 @@ mod tests {
         assert!(!result.truncated);
 
         assert_eq!(
-            projection.last_seq().expect("last_seq"),
+            store.projection().last_seq().expect("last_seq"),
             Some(last.seq),
             "log and index in lockstep"
         );
@@ -243,38 +234,36 @@ mod tests {
     #[test]
     fn the_pass_is_idempotent_across_restarts() {
         let dir = TempDir::new().expect("temp dir");
-        let mut log = log_with(&dir, vec![issued("s1", "t1", "c1")]);
-        let mut projection = replayed(&log);
-        let reader = log.reader().expect("reader");
-        let closed = close_orphans(reader, &mut log, &mut projection).expect("close pass");
+        let mut store = store_with(&dir, vec![issued("s1", "t1", "c1")]);
+        let reader = store.reader().expect("reader");
+        let closed = close_orphans(reader, &mut store).expect("close pass");
         assert_eq!(closed.len(), 1);
 
-        drop(log);
-        let mut log = Log::open(dir.path()).expect("reopen log");
-        let mut projection = replayed(&log);
-        let before = log.next_seq();
-        let reader = log.reader().expect("reader");
-        let closed = close_orphans(reader, &mut log, &mut projection).expect("close pass");
+        drop(store);
+        let mut store = store_with(&dir, Vec::new());
+        let before = store.next_seq();
+        let reader = store.reader().expect("reader");
+        let closed = close_orphans(reader, &mut store).expect("close pass");
 
         assert_eq!(closed, [], "the first pass left no open call");
-        assert_eq!(log.next_seq(), before, "nothing appended");
+        assert_eq!(store.next_seq(), before, "nothing appended");
     }
 
     #[test]
     fn an_answered_call_is_not_an_orphan() {
         let dir = TempDir::new().expect("temp dir");
-        let log = log_with(
+        let store = store_with(
             &dir,
             vec![issued("s1", "t1", "c1"), resulted("s1", "t1", "c1")],
         );
 
-        assert_eq!(scan_log(&log), []);
+        assert_eq!(scan_store(&store), []);
     }
 
     #[test]
     fn only_the_unanswered_parallel_call_closes() {
         let dir = TempDir::new().expect("temp dir");
-        let mut log = log_with(
+        let mut store = store_with(
             &dir,
             vec![
                 issued("s1", "t1", "a"),
@@ -282,14 +271,13 @@ mod tests {
                 resulted("s1", "t1", "b"),
             ],
         );
-        let mut projection = replayed(&log);
 
-        let orphans = scan_log(&log);
+        let orphans = scan_store(&store);
         assert_eq!(orphans, [orphan("s1", "t1", "a")]);
 
-        close(&orphans, &mut log, &mut projection).expect("close");
+        close(&orphans, &mut store).expect("close");
 
-        let events = replay_events(&log);
+        let events = replay_events(&store);
         let unknowns: Vec<&ToolResultRecorded> = events
             .iter()
             .filter_map(|event| match event.payload.as_ref() {
@@ -311,7 +299,7 @@ mod tests {
     #[test]
     fn the_same_call_id_in_two_sessions_is_tracked_independently() {
         let dir = TempDir::new().expect("temp dir");
-        let log = log_with(
+        let store = store_with(
             &dir,
             vec![
                 issued("s1", "t1", "c1"),
@@ -321,7 +309,7 @@ mod tests {
         );
 
         assert_eq!(
-            scan_log(&log),
+            scan_store(&store),
             [orphan("s2", "t9", "c1")],
             "only the truly open call is orphaned"
         );
@@ -330,7 +318,7 @@ mod tests {
     #[test]
     fn later_events_in_the_turn_do_not_hide_the_orphan() {
         let dir = TempDir::new().expect("temp dir");
-        let log = log_with(
+        let store = store_with(
             &dir,
             vec![
                 issued("s1", "t1", "c1"),
@@ -340,7 +328,7 @@ mod tests {
         );
 
         assert_eq!(
-            scan_log(&log),
+            scan_store(&store),
             [orphan("s1", "t1", "c1")],
             "correlation is by id, not adjacency"
         );
@@ -349,7 +337,7 @@ mod tests {
     #[test]
     fn zero_orphans_leaves_the_log_untouched() {
         let dir = TempDir::new().expect("temp dir");
-        let mut log = log_with(
+        let mut store = store_with(
             &dir,
             vec![
                 message("s1", "t1", "hi"),
@@ -357,33 +345,31 @@ mod tests {
                 resulted("s1", "t1", "c1"),
             ],
         );
-        let mut projection = replayed(&log);
-        let before = log.next_seq();
+        let before = store.next_seq();
 
-        let reader = log.reader().expect("reader");
-        let closed = close_orphans(reader, &mut log, &mut projection).expect("close pass");
+        let reader = store.reader().expect("reader");
+        let closed = close_orphans(reader, &mut store).expect("close pass");
 
         assert_eq!(closed, []);
-        assert_eq!(log.next_seq(), before, "no event appended");
+        assert_eq!(store.next_seq(), before, "no event appended");
     }
 
     #[test]
     fn orphans_close_in_log_order() {
         let dir = TempDir::new().expect("temp dir");
-        let mut log = log_with(
+        let mut store = store_with(
             &dir,
             vec![issued("s1", "t1", "first"), issued("s2", "t2", "second")],
         );
-        let mut projection = replayed(&log);
 
-        let reader = log.reader().expect("reader");
-        let closed = close_orphans(reader, &mut log, &mut projection).expect("close pass");
+        let reader = store.reader().expect("reader");
+        let closed = close_orphans(reader, &mut store).expect("close pass");
 
         assert_eq!(
             closed,
             [orphan("s1", "t1", "first"), orphan("s2", "t2", "second")]
         );
-        let events = replay_events(&log);
+        let events = replay_events(&store);
         let tail = &events[events.len() - 2..];
         assert_eq!(closer_of(&tail[0]).call_id, "first");
         assert_eq!(closer_of(&tail[1]).call_id, "second");

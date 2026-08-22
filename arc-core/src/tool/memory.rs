@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use arc_proto::v1::{
     MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Provenance, ProvenanceEntry,
@@ -13,11 +14,11 @@ use crate::provider::ToolDefinition;
 use crate::session::now_ts;
 
 pub struct MemoryRead {
-    archive: Archive,
+    archive: Arc<Archive>,
 }
 
 impl MemoryRead {
-    pub fn new(archive: Archive) -> Self {
+    pub fn new(archive: Arc<Archive>) -> Self {
         Self { archive }
     }
 }
@@ -68,11 +69,11 @@ impl Tool for MemoryRead {
 }
 
 pub struct MemorySearch {
-    archive: Archive,
+    archive: Arc<Archive>,
 }
 
 impl MemorySearch {
-    pub fn new(archive: Archive) -> Self {
+    pub fn new(archive: Arc<Archive>) -> Self {
         Self { archive }
     }
 }
@@ -145,11 +146,11 @@ impl Tool for MemorySearch {
 pub struct MemoryWrite;
 
 pub struct MemorySupersede {
-    archive: Archive,
+    archive: Arc<Archive>,
 }
 
 impl MemorySupersede {
-    pub fn new(archive: Archive) -> Self {
+    pub fn new(archive: Arc<Archive>) -> Self {
         Self { archive }
     }
 }

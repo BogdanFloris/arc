@@ -84,7 +84,6 @@ async fn history(
         Ok(answer) => {
             let _ = events.send(NetEvent::History {
                 session_id: session_id.to_owned(),
-                messages: answer.messages,
                 entries: answer.entries,
             });
             Ok(())

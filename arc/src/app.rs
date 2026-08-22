@@ -34,7 +34,6 @@ pub enum NetEvent {
     Sessions(Vec<SessionInfo>),
     History {
         session_id: String,
-        messages: Vec<HistoryMessage>,
         entries: Vec<HistoryEntry>,
     },
     Accepted {
@@ -481,15 +480,10 @@ impl App {
             }
             NetEvent::History {
                 session_id,
-                messages,
                 entries,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    self.transcript = if entries.is_empty() {
-                        messages.into_iter().filter_map(prose_block).collect()
-                    } else {
-                        history_blocks(entries)
-                    };
+                    self.transcript = history_blocks(entries);
                     self.scroll_back = 0;
                 }
                 None
@@ -1475,7 +1469,6 @@ mod tests {
 
         app.on_net(NetEvent::History {
             session_id: "old".to_owned(),
-            messages: Vec::new(),
             entries: vec![
                 prose_entry(Role::User as i32, "what is a walking skeleton?", false),
                 prose_entry(Role::Assistant as i32, "a thin end-to-end slice", true),
@@ -1519,7 +1512,6 @@ mod tests {
         reopened.session_id = Some("s-1".to_owned());
         reopened.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
-            messages: Vec::new(),
             entries: vec![
                 prose_entry(Role::User as i32, "hi", false),
                 call_entry("t1", "lookup"),
@@ -1537,7 +1529,6 @@ mod tests {
         app.session_id = Some("s-1".to_owned());
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
-            messages: Vec::new(),
             entries: vec![
                 call_entry("a", "alpha"),
                 call_entry("b", "beta"),
@@ -1563,31 +1554,6 @@ mod tests {
     }
 
     #[test]
-    fn history_without_entries_falls_back_to_prose_messages() {
-        let mut app = App::new();
-        app.session_id = Some("old".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "old".to_owned(),
-            messages: vec![
-                prose(Role::User as i32, "hello", false),
-                prose(Role::Assistant as i32, "hi there", true),
-            ],
-            entries: Vec::new(),
-        });
-
-        assert_eq!(
-            app.transcript,
-            [
-                Block::You("hello".to_owned()),
-                Block::Arc {
-                    text: "hi there".to_owned(),
-                    partial: true
-                }
-            ]
-        );
-    }
-
-    #[test]
     fn history_for_a_session_already_left_is_dropped() {
         let mut app = App::new();
         app.session_id = Some("second".to_owned());
@@ -1595,7 +1561,6 @@ mod tests {
 
         app.on_net(NetEvent::History {
             session_id: "first".to_owned(),
-            messages: Vec::new(),
             entries: vec![prose_entry(Role::User as i32, "stale", false)],
         });
 

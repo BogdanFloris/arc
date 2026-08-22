@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use arc_proto::v1::{
-    Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
-    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
-    ProvenanceEntry, Role, SessionConsolidated, SessionCreated, SessionEvent, ToolCallIssued,
-    ToolResultRecorded, event, memory_event, memory_record, session_event,
+    Event, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryEvent,
+    MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
+    MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
+    Role, SessionConsolidated, SessionCreated, SessionEvent, ToolCallIssued, ToolResultRecorded,
+    event, history_entry, memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::log;
 
@@ -392,58 +394,11 @@ impl Projection {
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, coalesce(s.title, ''), s.started_at,
-                    coalesce((SELECT m.content FROM messages m
-                              WHERE m.session_id = s.id AND m.kind = ?2 AND m.role = ?1
-                              ORDER BY m.seq LIMIT 1), ''),
-                    (SELECT MAX(m.ts) FROM messages m
-                     WHERE m.session_id = s.id AND m.kind = ?2)
-             FROM sessions s ORDER BY s.started_at, s.id",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
-            Ok(SessionSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                started_at: row.get(2)?,
-                preview: row.get(3)?,
-                last_at: row.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        sessions(&self.conn)
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT kind, role, content, partial, turn_id,
-                    call_id, call_index, name, arguments_json, outcome, truncated
-             FROM messages WHERE session_id = ?1 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
-            KIND_MESSAGE => Ok(MessageRow::Message {
-                role: row.get(1)?,
-                content: row.get(2)?,
-                partial: row.get(3)?,
-                turn_id: row.get(4)?,
-            }),
-            KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
-                call_id: row.get(5)?,
-                call_index: u32::try_from(row.get::<_, i64>(6)?)
-                    .map_err(|_| bad_column(6, "call_index out of range"))?,
-                name: row.get(7)?,
-                arguments_json: row.get(8)?,
-                turn_id: row.get(4)?,
-            }),
-            KIND_TOOL_RESULT => Ok(MessageRow::ToolResult {
-                call_id: row.get(5)?,
-                outcome: row.get(9)?,
-                content: row.get(2)?,
-                truncated: row.get(10)?,
-                turn_id: row.get(4)?,
-            }),
-            other => Err(bad_column(0, &format!("unknown message kind {other}"))),
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        messages(&self.conn, session_id)
     }
 
     pub(crate) fn due_for_consolidation(
@@ -507,34 +462,7 @@ impl Projection {
     }
 
     pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, namespace, title, summary, body, links, provenance,
-                    status, superseded_by, changed_at
-             FROM memory_records
-             WHERE changed_at >= ?1
-               AND (reviewed_at IS NULL OR reviewed_at < changed_at)
-             ORDER BY changed_at, id",
-        )?;
-        let rows = stmt.query_map([since_micros], |row| {
-            Ok(ReviewItem {
-                record: MemoryRecord {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    namespace: row.get(2)?,
-                    title: row.get(3)?,
-                    summary: row.get(4)?,
-                    body: row.get(5)?,
-                    links: links_from_json(&row.get::<_, String>(6)?)
-                        .map_err(|e| bad_json_column(6, &e))?,
-                    provenance: provenance_from_json(row.get::<_, Option<String>>(7)?.as_deref())
-                        .map_err(|e| bad_json_column(7, &e))?,
-                    status: row.get(8)?,
-                },
-                superseded_by: row.get(9)?,
-                changed_at: row.get(10)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        review_items(&self.conn, since_micros)
     }
 
     pub(crate) fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
@@ -577,6 +505,157 @@ fn bad_column(index: usize, message: &str) -> rusqlite::Error {
         rusqlite::types::Type::Integer,
         message.to_owned().into(),
     )
+}
+
+pub struct Reader {
+    conn: Mutex<Connection>,
+}
+
+impl Reader {
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(opened(path))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
+        sessions(&self.conn())
+    }
+
+    pub fn transcript(&self, session_id: &str) -> Result<Vec<HistoryEntry>, Error> {
+        Ok(messages(&self.conn(), session_id)?
+            .into_iter()
+            .map(history_entry)
+            .collect())
+    }
+
+    pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
+        review_items(&self.conn(), since_micros)
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, coalesce(s.title, ''), s.started_at,
+                coalesce((SELECT m.content FROM messages m
+                          WHERE m.session_id = s.id AND m.kind = ?2 AND m.role = ?1
+                          ORDER BY m.seq LIMIT 1), ''),
+                (SELECT MAX(m.ts) FROM messages m
+                 WHERE m.session_id = s.id AND m.kind = ?2)
+         FROM sessions s ORDER BY s.started_at, s.id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
+        Ok(SessionSummary {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            started_at: row.get(2)?,
+            preview: row.get(3)?,
+            last_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, role, content, partial, turn_id,
+                call_id, call_index, name, arguments_json, outcome, truncated
+         FROM messages WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
+        KIND_MESSAGE => Ok(MessageRow::Message {
+            role: row.get(1)?,
+            content: row.get(2)?,
+            partial: row.get(3)?,
+            turn_id: row.get(4)?,
+        }),
+        KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
+            call_id: row.get(5)?,
+            call_index: u32::try_from(row.get::<_, i64>(6)?)
+                .map_err(|_| bad_column(6, "call_index out of range"))?,
+            name: row.get(7)?,
+            arguments_json: row.get(8)?,
+            turn_id: row.get(4)?,
+        }),
+        KIND_TOOL_RESULT => Ok(MessageRow::ToolResult {
+            call_id: row.get(5)?,
+            outcome: row.get(9)?,
+            content: row.get(2)?,
+            truncated: row.get(10)?,
+            turn_id: row.get(4)?,
+        }),
+        other => Err(bad_column(0, &format!("unknown message kind {other}"))),
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, namespace, title, summary, body, links, provenance,
+                status, superseded_by, changed_at
+         FROM memory_records
+         WHERE changed_at >= ?1
+           AND (reviewed_at IS NULL OR reviewed_at < changed_at)
+         ORDER BY changed_at, id",
+    )?;
+    let rows = stmt.query_map([since_micros], |row| {
+        Ok(ReviewItem {
+            record: MemoryRecord {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                namespace: row.get(2)?,
+                title: row.get(3)?,
+                summary: row.get(4)?,
+                body: row.get(5)?,
+                links: links_from_json(&row.get::<_, String>(6)?)
+                    .map_err(|e| bad_json_column(6, &e))?,
+                provenance: provenance_from_json(row.get::<_, Option<String>>(7)?.as_deref())
+                    .map_err(|e| bad_json_column(7, &e))?,
+                status: row.get(8)?,
+            },
+            superseded_by: row.get(9)?,
+            changed_at: row.get(10)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
+    let entry = match row {
+        MessageRow::Message {
+            role,
+            content,
+            partial,
+            ..
+        } => history_entry::Entry::Message(HistoryMessage {
+            role,
+            content,
+            partial,
+        }),
+        MessageRow::ToolCall { call_id, name, .. } => {
+            history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })
+        }
+        MessageRow::ToolResult {
+            call_id,
+            outcome,
+            truncated,
+            ..
+        } => history_entry::Entry::ToolResult(HistoryToolResult {
+            call_id,
+            outcome,
+            truncated,
+        }),
+    };
+    HistoryEntry { entry: Some(entry) }
 }
 
 fn event_kind(payload: &event::Payload) -> &'static str {

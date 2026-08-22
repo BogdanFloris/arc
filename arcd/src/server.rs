@@ -4,13 +4,13 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_core::projection::{ReviewItem, SessionSummary};
+use arc_core::projection::{Reader, ReviewItem, SessionSummary};
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_proto::v1::{
     ClientFrame, Delta, Error as WireError, MemoryReviewItem, MemoryReviewItems, MessageAccepted,
     ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd,
-    ToolCallEnded, ToolCallStarted, client_frame, history_entry, server_frame,
+    ToolCallEnded, ToolCallStarted, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -31,6 +31,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 pub async fn serve<P: Provider + 'static>(
     listener: TcpListener,
     engine: Arc<Mutex<Engine<P>>>,
+    reads: Arc<Reader>,
     shutdown: impl Future<Output = ()> + Send,
 ) {
     let (closing, closing_rx) = watch::channel(false);
@@ -48,6 +49,7 @@ pub async fn serve<P: Provider + 'static>(
                         stream,
                         peer,
                         Arc::clone(&engine),
+                        Arc::clone(&reads),
                         closing_rx.clone(),
                     ));
                 }
@@ -81,6 +83,7 @@ async fn connection<P: Provider>(
     stream: TcpStream,
     peer: SocketAddr,
     engine: Arc<Mutex<Engine<P>>>,
+    reads: Arc<Reader>,
     mut closing: watch::Receiver<bool>,
 ) {
     let mut ws = match tokio_tungstenite::accept_async(stream).await {
@@ -105,7 +108,7 @@ async fn connection<P: Provider>(
         match message {
             Some(Ok(WsMessage::Binary(bytes))) => match ClientFrame::decode(bytes) {
                 Ok(frame) => {
-                    if request(&mut ws, &engine, frame).await.is_break() {
+                    if request(&mut ws, &engine, &reads, frame).await.is_break() {
                         break;
                     }
                 }
@@ -144,6 +147,7 @@ async fn told_to_close(closing: &mut watch::Receiver<bool>) {
 async fn request<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
+    reads: &Reader,
     frame: ClientFrame,
 ) -> ControlFlow<()> {
     match frame.msg {
@@ -151,13 +155,13 @@ async fn request<P: Provider>(
             send_message(ws, engine, frame.request_id, send).await
         }
         Some(client_frame::Msg::ListSessions(_)) => {
-            list_sessions(ws, engine, frame.request_id).await
+            list_sessions(ws, reads, frame.request_id).await
         }
         Some(client_frame::Msg::FetchHistory(fetch)) => {
-            fetch_history(ws, engine, frame.request_id, &fetch.session_id).await
+            fetch_history(ws, reads, frame.request_id, &fetch.session_id).await
         }
         Some(client_frame::Msg::MemoryReviewList(list)) => {
-            review_list(ws, engine, frame.request_id, list.since_micros).await
+            review_list(ws, reads, frame.request_id, list.since_micros).await
         }
         Some(client_frame::Msg::MemoryReviewAccept(accept)) => {
             review_accept(ws, engine, frame.request_id, &accept.record_id).await
@@ -249,12 +253,8 @@ async fn forward(
     true
 }
 
-async fn list_sessions<P: Provider>(
-    ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
-    request_id: u64,
-) -> ControlFlow<()> {
-    let listed = engine.lock().await.sessions();
+async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> ControlFlow<()> {
+    let listed = reads.sessions();
     let msg = match listed {
         Ok(sessions) => server_frame::Msg::SessionList(SessionList {
             sessions: sessions.iter().map(session_info).collect(),
@@ -267,20 +267,20 @@ async fn list_sessions<P: Provider>(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-async fn review_list<P: Provider>(
+async fn review_list(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    reads: &Reader,
     request_id: u64,
     since_micros: i64,
 ) -> ControlFlow<()> {
-    let listed = engine.lock().await.review_items(since_micros);
+    let listed = reads.review_items(since_micros);
     let msg = match listed {
         Ok(items) => server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
             items: items.into_iter().map(review_item).collect(),
         }),
         Err(error) => {
             warn!(%error, "listing review items failed");
-            error_frame(error_code(&error), &error)
+            error_frame("internal", &error)
         }
     };
     flow(send_frame(ws, request_id, msg).await)
@@ -360,28 +360,18 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
     })
 }
 
-async fn fetch_history<P: Provider>(
+async fn fetch_history(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    reads: &Reader,
     request_id: u64,
     session_id: &str,
 ) -> ControlFlow<()> {
-    let read = engine.lock().await.transcript(session_id);
+    let read = reads.transcript(session_id);
     let msg = match read {
-        Ok(entries) => {
-            let messages = entries
-                .iter()
-                .filter_map(|entry| match entry.entry.as_ref() {
-                    Some(history_entry::Entry::Message(message)) => Some(message.clone()),
-                    _ => None,
-                })
-                .collect();
-            server_frame::Msg::SessionHistory(SessionHistory {
-                session_id: session_id.to_owned(),
-                messages,
-                entries,
-            })
-        }
+        Ok(entries) => server_frame::Msg::SessionHistory(SessionHistory {
+            session_id: session_id.to_owned(),
+            entries,
+        }),
         Err(error) => {
             warn!(%error, session_id, "reading history failed");
             error_frame("internal", &error)
@@ -447,16 +437,16 @@ fn flow(connected: bool) -> ControlFlow<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
     use arc_core::log::Log;
     use arc_core::projection::Projection;
     use arc_core::provider::{
         CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
-        Stop, ToolCall, ToolDefinition, Usage,
+        Stop, ToolCall,
     };
-    use arc_core::tool::{Registry, Tool, ToolReply, TurnContext};
+    use arc_core::store::Store;
+    use arc_core::tool::Registry;
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
         ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
@@ -470,15 +460,9 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     use super::*;
+    use arc_core::testkit::{Canned, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
-
-    fn usage() -> Usage {
-        Usage {
-            input_tokens: 3,
-            output_tokens: 5,
-        }
-    }
 
     enum Script {
         Echo,
@@ -592,26 +576,33 @@ mod tests {
             for event in events {
                 log.append(event).expect("seed");
             }
-            let mut projection = Projection::in_memory().expect("open projection");
+            // a file, not :memory:, so the read handle can open the same index
+            let index = dir.path().join("index.db");
+            let mut projection = Projection::open(&index).expect("open projection");
             arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
                 .expect("replay");
             let provider = MockProvider::new(script);
             let engine = Engine::new(
-                log,
-                projection,
+                Store::new(log, projection),
                 Arc::clone(&provider),
                 "test-model",
                 Some("be terse".to_owned()),
                 registry,
                 false,
             );
+            let reads = Arc::new(Reader::open(&index).expect("open reads"));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, signal) = oneshot::channel();
-            let server = tokio::spawn(serve(listener, Arc::new(Mutex::new(engine)), async {
-                let _ = signal.await;
-            }));
+            let server = tokio::spawn(serve(
+                listener,
+                Arc::new(Mutex::new(engine)),
+                reads,
+                async {
+                    let _ = signal.await;
+                },
+            ));
 
             Self {
                 addr,
@@ -635,35 +626,6 @@ mod tests {
                 .await
                 .expect("server stops within the grace")
                 .expect("server task");
-        }
-    }
-
-    struct Canned {
-        name: &'static str,
-        content: &'static str,
-        ok: bool,
-    }
-
-    impl Tool for Canned {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: self.name.to_owned(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-
-        fn execute(
-            &self,
-            _arguments_json: String,
-            _ctx: TurnContext,
-        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            let reply = if self.ok {
-                ToolReply::ok(self.content.to_owned())
-            } else {
-                ToolReply::error(self.content.to_owned())
-            };
-            Box::pin(async move { reply })
         }
     }
 
@@ -722,6 +684,22 @@ mod tests {
                 None => panic!("a server frame with no message"),
             }
         }
+    }
+
+    use arc_proto::v1::history_entry;
+
+    fn said(answer: &SessionHistory) -> Vec<(Role, &str)> {
+        answer
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.entry.as_ref() {
+                Some(history_entry::Entry::Message(m)) => Some((
+                    Role::try_from(m.role).expect("a known role"),
+                    m.content.as_str(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     fn ended(msg: server_frame::Msg) -> StreamEnd {
@@ -865,18 +843,8 @@ mod tests {
 
         let answer = history(&mut ws, 3, &session_id).await;
 
-        let said: Vec<(Role, &str)> = answer
-            .messages
-            .iter()
-            .map(|m| {
-                (
-                    Role::try_from(m.role).expect("a known role"),
-                    m.content.as_str(),
-                )
-            })
-            .collect();
         assert_eq!(
-            said,
+            said(&answer),
             [
                 (Role::User, "hello"),
                 (Role::Assistant, "re: hello"),
@@ -886,15 +854,11 @@ mod tests {
             "both turns, in the order they happened"
         );
 
-        assert_eq!(
-            answer.entries.len(),
-            4,
-            "an all-prose session's entries mirror its messages"
-        );
+        assert_eq!(answer.entries.len(), 4, "an all-prose session is all prose");
 
         let empty = history(&mut ws, 4, "no-such-session").await;
         assert!(
-            empty.messages.is_empty() && empty.entries.is_empty(),
+            empty.entries.is_empty(),
             "an unknown session reads as an empty one"
         );
 
@@ -1120,9 +1084,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            answer.messages,
-            [prose(Role::User, "hi"), prose(Role::Assistant, "answer")],
-            "the superseded field stays prose-only"
+            said(&answer),
+            [(Role::User, "hi"), (Role::Assistant, "answer")],
+            "the prose reads in order with the tool entries between"
         );
 
         harness.stop().await;

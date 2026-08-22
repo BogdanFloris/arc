@@ -140,6 +140,14 @@ Open, and deliberately left to the task that hits them:
 - open: the FTS default for tool-result rows is 5.1/5.2's call to confirm against real queries; the sketch only insists the rows be tagged so the choice stays a query change, not a re-projection.
 - open: the redaction policy for a tool that can incidentally capture its environment (a shell tool, a device tool that echoes config). None exists in Phase 2; the first one that does decides it, and it is a tool-side policy either way.
 
+### 3.2 One writer, many readers
+
+Amended 2026-08-22. The append-and-project pair from §3 is owned by one type, `arc-core::store::Store`, which holds the log and the index together and exposes a single `append`. Nothing else may write: invariants 1 and 2 stop being a discipline four call sites remember and become a property of the type that owns the state.
+
+Reads do not go through it. The index runs in WAL mode, so a second connection reads committed state while the writer works. `arcd` holds one `projection::Reader` — read-only flags, its own lock — and serves `list_sessions`, `fetch_history`, and `memory_review_list` from it without touching the engine. Only a turn, a memory verdict, and the consolidation commit take the engine lock, and they hold it for an append rather than for a completion.
+
+This is why the consolidation pass may re-lock instead of holding: it snapshots, runs the model unlocked, then commits and re-checks that the session has not grown (§5.4). That was already true; the split is what makes it structural rather than remembered.
+
 ## 4. Sessions
 
 Sessions are pi-style: a tree, not a list. Forking a session at any message creates a child session with a `parent_session` and `fork_point`; the tree structure is just parent pointers in the projection. Clients render the tree; the daemon only stores it.

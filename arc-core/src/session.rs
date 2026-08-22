@@ -3,29 +3,29 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    Event, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryEvent,
-    MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role, SessionConsolidated,
-    SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role,
+    SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
+    ToolResultRecorded,
 };
-use arc_proto::v1::{event, history_entry, memory_event, session_event};
+use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
 use prost_types::Timestamp;
 use tokio::sync::mpsc;
 
 use crate::consolidation::SessionSnapshot;
-use crate::log::{self, Log};
+use crate::log::{self};
 use crate::memory::render_memory_index;
-use crate::projection::{self, MessageRow, Projection, ReviewItem, SessionSummary};
+use crate::projection::{self, MessageRow, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
+use crate::store::{self, Store};
 use crate::tool::{Registry, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
 pub struct Engine<P> {
-    log: Log,
-    projection: Projection,
+    store: Store,
     provider: Arc<P>,
     model: String,
     system: Option<String>,
@@ -81,10 +81,18 @@ pub enum Error {
     EmptyReply,
 }
 
+impl From<store::Error> for Error {
+    fn from(error: store::Error) -> Self {
+        match error {
+            store::Error::Log(error) => Self::Log(error),
+            store::Error::Projection(error) => Self::Projection(error),
+        }
+    }
+}
+
 impl<P: Provider> Engine<P> {
     pub fn new(
-        log: Log,
-        projection: Projection,
+        store: Store,
         provider: Arc<P>,
         model: &str,
         system: Option<String>,
@@ -92,8 +100,7 @@ impl<P: Provider> Engine<P> {
         no_think: bool,
     ) -> Self {
         Self {
-            log,
-            projection,
+            store,
             provider,
             model: model.to_owned(),
             system,
@@ -396,15 +403,20 @@ impl<P: Provider> Engine<P> {
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
-        Ok(self.projection.sessions()?)
+        Ok(self.store.projection().sessions()?)
     }
 
-    pub fn transcript(&self, session_id: &str) -> Result<Vec<HistoryEntry>, Error> {
+    #[cfg(test)]
+    pub(crate) fn transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<arc_proto::v1::HistoryEntry>, Error> {
         Ok(self
-            .projection
+            .store
+            .projection()
             .messages(session_id)?
             .into_iter()
-            .map(history_entry)
+            .map(projection::history_entry)
             .collect())
     }
 
@@ -413,11 +425,18 @@ impl<P: Provider> Engine<P> {
         &self,
         idle_cutoff_micros: i64,
     ) -> Result<Vec<projection::DueSession>, Error> {
-        Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
+        Ok(self
+            .store
+            .projection()
+            .due_for_consolidation(idle_cutoff_micros)?)
     }
 
-    pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
-        Ok(self.projection.review_items(since_micros)?)
+    #[cfg(test)]
+    pub(crate) fn review_items(
+        &self,
+        since_micros: i64,
+    ) -> Result<Vec<projection::ReviewItem>, Error> {
+        Ok(self.store.projection().review_items(since_micros)?)
     }
 
     #[tracing::instrument(name = "session.review_accept", skip(self), fields(record_id))]
@@ -445,7 +464,7 @@ impl<P: Provider> Engine<P> {
     }
 
     fn reviewable(&self, record_id: &str) -> Result<(), Error> {
-        if self.projection.memory_record(record_id)?.is_none() {
+        if self.store.projection().memory_record(record_id)?.is_none() {
             return Err(Error::UnknownRecord {
                 id: record_id.to_owned(),
             });
@@ -459,15 +478,16 @@ impl<P: Provider> Engine<P> {
         skip: &HashSet<String>,
     ) -> Result<Option<SessionSnapshot>, Error> {
         let Some(first) = self
-            .projection
+            .store
+            .projection()
             .due_for_consolidation(idle_cutoff_micros)?
             .into_iter()
             .find(|due| !skip.contains(&due.session_id))
         else {
             return Ok(None);
         };
-        let rows = self.projection.messages(&first.session_id)?;
-        let memory_index = self.projection.memory_index()?;
+        let rows = self.store.projection().messages(&first.session_id)?;
+        let memory_index = self.store.projection().memory_index()?;
         Ok(Some(SessionSnapshot {
             session_id: first.session_id,
             rows,
@@ -482,7 +502,7 @@ impl<P: Provider> Engine<P> {
         events: Vec<memory_event::Event>,
         prompt_version: &str,
     ) -> Result<bool, Error> {
-        let latest = self.projection.latest_seq(&snapshot.session_id)?;
+        let latest = self.store.projection().latest_seq(&snapshot.session_id)?;
         if latest != Some(snapshot.latest_seq) {
             tracing::info!(
                 session_id = %snapshot.session_id,
@@ -507,18 +527,10 @@ impl<P: Provider> Engine<P> {
     }
 
     fn record(&mut self, source: Source, payload: session_event::Event) -> Result<u64, Error> {
-        let mut event = Event {
-            seq: 0,
-            ts: Some(now_ts()),
-            source: source as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(payload),
-            })),
-        };
-        let seq = self.log.append(event.clone())?;
-        event.seq = seq;
-        self.projection.apply(&event)?;
-        Ok(seq)
+        let payload = event::Payload::Session(SessionEvent {
+            event: Some(payload),
+        });
+        Ok(self.store.append(source, Some(now_ts()), payload)?)
     }
 
     fn record_memory(
@@ -526,18 +538,10 @@ impl<P: Provider> Engine<P> {
         source: Source,
         payload: memory_event::Event,
     ) -> Result<u64, Error> {
-        let mut event = Event {
-            seq: 0,
-            ts: Some(now_ts()),
-            source: source as i32,
-            payload: Some(event::Payload::Memory(MemoryEvent {
-                event: Some(payload),
-            })),
-        };
-        let seq = self.log.append(event.clone())?;
-        event.seq = seq;
-        self.projection.apply(&event)?;
-        Ok(seq)
+        let payload = event::Payload::Memory(MemoryEvent {
+            event: Some(payload),
+        });
+        Ok(self.store.append(source, Some(now_ts()), payload)?)
     }
 
     fn append_reply(
@@ -560,10 +564,11 @@ impl<P: Provider> Engine<P> {
     }
 
     fn open_turn(&mut self, session_id: &str) -> Result<(Vec<Message>, Option<String>), Error> {
-        let rows = self.projection.messages(session_id)?;
+        let rows = self.store.projection().messages(session_id)?;
         self.seed_call_ids(session_id, &rows);
-        let system =
-            self.system_prompt(render_memory_index(&self.projection.memory_index()?).as_deref());
+        let system = self.system_prompt(
+            render_memory_index(&self.store.projection().memory_index()?).as_deref(),
+        );
         Ok((rebuild_transcript(&rows), system))
     }
 
@@ -598,35 +603,6 @@ impl<P: Provider> Engine<P> {
                     .collect()
             });
     }
-}
-
-fn history_entry(row: MessageRow) -> HistoryEntry {
-    let entry = match row {
-        MessageRow::Message {
-            role,
-            content,
-            partial,
-            ..
-        } => history_entry::Entry::Message(HistoryMessage {
-            role,
-            content,
-            partial,
-        }),
-        MessageRow::ToolCall { call_id, name, .. } => {
-            history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })
-        }
-        MessageRow::ToolResult {
-            call_id,
-            outcome,
-            truncated,
-            ..
-        } => history_entry::Entry::ToolResult(HistoryToolResult {
-            call_id,
-            outcome,
-            truncated,
-        }),
-    };
-    HistoryEntry { entry: Some(entry) }
 }
 
 fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
@@ -824,6 +800,7 @@ mod tests {
     use crate::provider::{
         CompletionDelta, Error as ProviderError, Message, Stop, ToolCall, Usage,
     };
+    use crate::store::Store;
     use crate::testkit::{
         Canned, ScriptedProvider, TraceCapture, appended, call, channel, counter_samples,
         done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_events,
@@ -919,10 +896,14 @@ mod tests {
         assert_eq!(assistant.content, "hello there");
         assert!(!assistant.partial);
 
-        assert_eq!(engine.projection.last_seq().expect("last_seq"), Some(2));
+        assert_eq!(
+            engine.store.projection().last_seq().expect("last_seq"),
+            Some(2)
+        );
         assert_eq!(
             engine
-                .projection
+                .store
+                .projection()
                 .messages(&reply.session_id)
                 .expect("messages")
                 .len(),
@@ -1696,8 +1677,7 @@ mod tests {
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
         let mut engine = Engine::new(
-            log,
-            projection,
+            Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
             Some("be terse".to_owned()),
@@ -1814,8 +1794,7 @@ mod tests {
         let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let mut engine = Engine::new(
-            log,
-            projection,
+            Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
             None,
@@ -2095,8 +2074,7 @@ mod tests {
         let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let mut engine = Engine::new(
-            log,
-            projection,
+            Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
             Some("be terse".to_owned()),
