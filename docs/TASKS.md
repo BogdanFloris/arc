@@ -138,7 +138,7 @@ Live-driving finding (2026-08-21, first exit-criterion check): on "what's my nam
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 8.1 | Weekly review flow in the TUI: records created/superseded that week; accept / fix / delete, each an ordinary `MemoryEvent` | claude | in progress |
+| 8.1 | Weekly review flow in the TUI: records created/superseded that week; accept / fix / delete, each an ordinary `MemoryEvent` | claude | done |
 | 8.2 | The three §5.4 counters in traces: records per session, supersede rate, retrieval hit rate — `counter.*` fields, so the 8.x trace layer needs no new code | claude | done |
 
 ## Carried from Phase 1 (fold into the next touch, no own task)
