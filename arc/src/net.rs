@@ -8,7 +8,7 @@
 use arc_core::client::{Client, Error, TurnEvent};
 use tokio::sync::mpsc;
 
-use crate::app::{Command, NetEvent};
+use crate::app::{Command, NetEvent, ReviewEntry};
 
 /// Runs commands against `url` until the command channel closes.
 pub async fn run(
@@ -48,6 +48,15 @@ async fn handle(
             session_id,
             content,
         } => send(&mut client, session_id.as_deref(), &content, events).await,
+        Command::ReviewList { since_micros } => {
+            review_list(&mut client, since_micros, events).await
+        }
+        Command::ReviewAccept { record_id } => {
+            verdict(client.review_accept(&record_id).await, events)
+        }
+        Command::ReviewDelete { record_id } => {
+            verdict(client.review_delete(&record_id).await, events)
+        }
     };
     match result {
         Ok(()) => Some(client),
@@ -92,6 +101,57 @@ async fn history(
             Ok(())
         }
         // The daemon said no to this request; the connection is fine.
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn review_list(
+    client: &mut Client,
+    since_micros: i64,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.review_items(since_micros).await {
+        Ok(items) => {
+            let entries = items
+                .into_iter()
+                .filter_map(|item| {
+                    // A record-less item is a newer daemon's shape; skip it
+                    // rather than render an empty row.
+                    let record = item.record?;
+                    Some(ReviewEntry {
+                        id: record.id,
+                        kind: record.kind,
+                        namespace: record.namespace,
+                        title: record.title,
+                        summary: record.summary,
+                        superseded: !item.superseded_by.is_empty(),
+                    })
+                })
+                .collect();
+            let _ = events.send(NetEvent::ReviewItems(entries));
+            Ok(())
+        }
+        // The daemon said no to this request; the connection is fine.
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A verdict's outcome: silence on success — the pane already dropped the
+/// item — and a fault the rule shows when the daemon said no.
+fn verdict(
+    result: Result<(), Error>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())

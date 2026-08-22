@@ -287,6 +287,7 @@ fn operation(event: &memory_event::Event) -> ReplayOperation {
         }
         memory_event::Event::RecordUpdated(updated) => ("update", updated.record.as_ref()),
         memory_event::Event::RecordDeleted(_) => ("delete", None),
+        memory_event::Event::RecordReviewed(_) => ("review", None),
     };
     record.map_or(
         ReplayOperation {

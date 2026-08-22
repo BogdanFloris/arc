@@ -65,6 +65,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(selected) = app.picker {
         draw_picker(frame, frame.area(), app, selected);
     }
+    if let Some(review) = &app.review {
+        draw_review(frame, frame.area(), review);
+    }
 }
 
 /// An area pulled in by [`MARGIN`] on both sides.
@@ -294,7 +297,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let style = if app.picker.is_some() {
+    let style = if app.picker.is_some() || app.review.is_some() {
         theme::DIM
     } else {
         theme::PLAIN
@@ -305,7 +308,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     ]);
     frame.render_widget(line, area);
 
-    if app.picker.is_none() {
+    if app.picker.is_none() && app.review.is_none() {
         let ahead = u16::try_from(app.input[..app.cursor].chars().count()).unwrap_or(u16::MAX);
         frame.set_cursor_position((area.x.saturating_add(2 + ahead), area.y));
     }
@@ -357,6 +360,93 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The review pane (DESIGN.md §5.4): a cleared rectangle like the picker's,
+/// one row per record awaiting a verdict.
+///
+/// A row is `kind/namespace: title — summary` — the memory index's own
+/// vocabulary — with a `[superseded]` tag when it applies, and the id dim at
+/// the right edge the way the picker right-aligns its times. An armed delete
+/// says so on its row; nothing else about the pane changes.
+fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
+    let rows = review.items.len().max(1);
+    let width = 72.min(full.width.saturating_sub(4));
+    let height = u16::try_from(rows + 3)
+        .unwrap_or(u16::MAX)
+        .min(full.height.saturating_sub(2));
+    let area = Rect {
+        x: (full.width - width) / 2,
+        y: (full.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![Line::styled(" review", theme::DIM), Line::default()];
+    if review.items.is_empty() {
+        let word = if review.loaded {
+            "nothing to review"
+        } else {
+            "loading"
+        };
+        lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let visible = (height as usize).saturating_sub(3);
+    let start = review.selected.saturating_sub(visible.saturating_sub(1));
+    // Room for the row prefix, the id column, and the two spaces between.
+    let room = (width as usize).saturating_sub(ID_WIDTH + 5);
+    let end = review.items.len().min(start + visible);
+    for (row, entry) in review.items.iter().enumerate().take(end).skip(start) {
+        let selected = row == review.selected;
+        let (prefix, style) = if selected {
+            (" > ", theme::ACCENT)
+        } else {
+            ("   ", theme::DIM)
+        };
+        let tag = if entry.superseded {
+            " [superseded]"
+        } else {
+            ""
+        };
+        let label = elide(
+            &format!(
+                "{}/{}: {} — {}{tag}",
+                arc_core::memory::kind_name(entry.kind),
+                entry.namespace,
+                entry.title,
+                entry.summary
+            ),
+            room,
+        );
+        let mut spans = vec![
+            Span::styled(format!("{prefix}{label:<room$}"), style),
+            Span::styled(
+                format!("  {:>ID_WIDTH$}", elide(&entry.id, ID_WIDTH)),
+                theme::DIM,
+            ),
+        ];
+        if selected && review.pending_delete {
+            spans.push(Span::styled(" d deletes", theme::ERROR));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Columns the review pane's dim id renders into.
+const ID_WIDTH: usize = 8;
+
+/// `text` cut to `room` chars, an ellipsis standing for the rest.
+fn elide(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_owned();
+    }
+    let cut: String = text.chars().take(room.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
 /// Columns [`last_active`] renders into: `just now`, `3h ago`, `08-13`.
 const TIME_WIDTH: usize = 8;
 
@@ -377,11 +467,7 @@ fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
     if first.is_empty() {
         return session.id.chars().take(8).collect();
     }
-    if first.chars().count() <= room {
-        return first.to_owned();
-    }
-    let cut: String = first.chars().take(room.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
+    elide(first, room)
 }
 
 /// How long ago the session was last spoken in: `just now`, `12m ago`,

@@ -10,7 +10,8 @@
 //! over the wire, safe to drop and reconnect.
 
 use arc_proto::v1::{
-    ClientFrame, FetchHistory, HistoryMessage, ListSessions, SendMessage, ServerFrame, SessionInfo,
+    ClientFrame, FetchHistory, HistoryMessage, ListSessions, MemoryReviewAccept,
+    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame, SessionInfo,
     client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
@@ -172,6 +173,79 @@ impl Client {
         }
     }
 
+    /// Asks the daemon for the review queue (DESIGN.md §5.4): records changed
+    /// at or after `since_micros` and not reviewed since their last change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Server`] if the daemon refused the request; any other variant
+    /// means the connection is unusable.
+    #[tracing::instrument(name = "client.review_items", skip_all, fields(since_micros))]
+    pub async fn review_items(
+        &mut self,
+        since_micros: i64,
+    ) -> Result<Vec<MemoryReviewItem>, Error> {
+        let id = self
+            .send(client_frame::Msg::MemoryReviewList(MemoryReviewList {
+                since_micros,
+            }))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::MemoryReviewItems(items) => Ok(items.items),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("MemoryReviewItems", &other)),
+        }
+    }
+
+    /// Records the accept verdict for `record_id` — durable as a
+    /// `MemoryRecordReviewed` event on the daemon's log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Server`] if the daemon refused the verdict (an unknown record
+    /// id included); any other variant means the connection is unusable.
+    #[tracing::instrument(name = "client.review_accept", skip_all, fields(record_id))]
+    pub async fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::MemoryReviewAccept(MemoryReviewAccept {
+                record_id: record_id.to_owned(),
+            }))
+            .await?;
+        self.verdict_ack(id).await
+    }
+
+    /// Records the delete verdict for `record_id` — durable as a
+    /// `MemoryRecordDeleted` event on the daemon's log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Server`] if the daemon refused the verdict (an unknown record
+    /// id included); any other variant means the connection is unusable.
+    #[tracing::instrument(name = "client.review_delete", skip_all, fields(record_id))]
+    pub async fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+                record_id: record_id.to_owned(),
+            }))
+            .await?;
+        self.verdict_ack(id).await
+    }
+
+    /// Reads a verdict's closing frame: the protocol's ack, or its error.
+    async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
+        match self.answer(id).await? {
+            server_frame::Msg::MessageAccepted(_) => Ok(()),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("MessageAccepted", &other)),
+        }
+    }
+
     /// Sends a user message and returns the turn to read its events from.
     ///
     /// `session_id: None` starts a new session; the daemon names it in the
@@ -311,7 +385,9 @@ impl Turn<'_> {
                     msg: error.msg,
                 }
             }
-            other @ (server_frame::Msg::SessionList(_) | server_frame::Msg::SessionHistory(_)) => {
+            other @ (server_frame::Msg::SessionList(_)
+            | server_frame::Msg::SessionHistory(_)
+            | server_frame::Msg::MemoryReviewItems(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
         };
@@ -331,6 +407,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::ReasoningDelta(_) => "ReasoningDelta",
         server_frame::Msg::ToolCallStarted(_) => "ToolCallStarted",
         server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
+        server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))
 }
@@ -340,8 +417,8 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{
-        Delta, Error as WireError, MessageAccepted, ReasoningDelta, SessionList, StreamEnd,
-        ToolCallEnded, ToolCallStarted, ToolOutcome,
+        Delta, Error as WireError, MemoryReviewItems, MessageAccepted, ReasoningDelta, SessionList,
+        StreamEnd, ToolCallEnded, ToolCallStarted, ToolOutcome,
     };
     use prost_types::Timestamp;
     use tokio::net::TcpListener;
@@ -479,6 +556,71 @@ mod tests {
             frames[0].msg,
             Some(client_frame::Msg::ListSessions(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn review_items_round_trips() {
+        let item = MemoryReviewItem {
+            record: Some(arc_proto::v1::MemoryRecord {
+                id: "m-01".to_owned(),
+                ..Default::default()
+            }),
+            changed_at_micros: 1_700_000_000_000_000,
+            superseded_by: String::new(),
+        };
+        let items = server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
+            items: vec![item.clone()],
+        });
+        let (url, handle) = server(vec![vec![echo(items)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let listed = client.review_items(123).await.expect("review_items");
+
+        assert_eq!(listed, [item]);
+        let frames = received(handle).await;
+        match &frames[0].msg {
+            Some(client_frame::Msg::MemoryReviewList(list)) => {
+                assert_eq!(list.since_micros, 123);
+            }
+            other => panic!("expected MemoryReviewList, got {other:?}"),
+        }
+    }
+
+    /// A verdict's closing frame is the protocol's ack, or the error the
+    /// connection survives.
+    #[tokio::test]
+    async fn a_review_verdict_acks_and_a_refusal_is_a_server_error() {
+        let ack = || accepted("");
+        let (url, handle) = server(vec![
+            vec![echo(ack())],
+            vec![echo(ack())],
+            vec![echo(error("unknown_record", "no memory record m-9"))],
+        ])
+        .await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.review_accept("m-1").await.expect("accept");
+        client.review_delete("m-2").await.expect("delete");
+        match client.review_accept("m-9").await {
+            Err(Error::Server { code, .. }) => assert_eq!(code, "unknown_record"),
+            other => panic!("expected Error::Server, got {other:?}"),
+        }
+
+        let sent: Vec<_> = received(handle)
+            .await
+            .into_iter()
+            .map(|frame| frame.msg.expect("a message"))
+            .collect();
+        assert!(
+            matches!(&sent[0], client_frame::Msg::MemoryReviewAccept(a) if a.record_id == "m-1"),
+            "got: {:?}",
+            sent[0]
+        );
+        assert!(
+            matches!(&sent[1], client_frame::Msg::MemoryReviewDelete(d) if d.record_id == "m-2"),
+            "got: {:?}",
+            sent[1]
+        );
     }
 
     #[tokio::test]

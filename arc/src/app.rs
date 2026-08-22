@@ -7,7 +7,8 @@
 //!
 //! Keys are modal, vim-style: insert mode types into the input line, normal
 //! mode moves and edits it (`h l 0 $ w b`, `i I a A`, `x D dd`) and scrolls
-//! the transcript (`j k`, `ctrl-d/u`, `G`, `gg`), `:` takes commands (`:q`).
+//! the transcript (`j k`, `ctrl-d/u`, `G`, `gg`), `:` takes commands (`:q`,
+//! `:review`).
 //! `ctrl-o` toggles the last thought trace from either mode. The app starts
 //! in insert — a chat's first act is typing.
 
@@ -19,6 +20,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
 pub const PAGE: usize = 10;
+
+/// How far back the review window reaches: 7 days, §5.4's weekly cadence.
+const REVIEW_WINDOW_MICROS: i64 = 7 * 24 * 3_600 * 1_000_000;
 
 /// What the connection task is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +36,12 @@ pub enum Command {
         session_id: Option<String>,
         content: String,
     },
+    /// Ask the daemon for the review queue since `since_micros`.
+    ReviewList { since_micros: i64 },
+    /// Record the accept verdict for one record.
+    ReviewAccept { record_id: String },
+    /// Record the delete verdict for one record.
+    ReviewDelete { record_id: String },
 }
 
 /// What the connection task reports back.
@@ -60,6 +70,35 @@ pub enum NetEvent {
     Failed { code: String, msg: String },
     /// The connection is gone; the next command will try to reconnect.
     Disconnected { reason: String },
+    /// The daemon answered `ReviewList`.
+    ReviewItems(Vec<ReviewEntry>),
+}
+
+/// One record awaiting a verdict, as the review pane shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEntry {
+    /// Record id — what the verdict commands and the fix prefill carry.
+    pub id: String,
+    /// Raw `MemoryRecord.Kind` integer; the renderer names it.
+    pub kind: i32,
+    pub namespace: String,
+    pub title: String,
+    pub summary: String,
+    /// The record was superseded; the pane tags it.
+    pub superseded: bool,
+}
+
+/// The review pane's state, open on `:review`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    /// The queue, in the daemon's `(changed_at, id)` order.
+    pub items: Vec<ReviewEntry>,
+    /// Selected row.
+    pub selected: usize,
+    /// The daemon has answered; before that the pane says "loading".
+    pub loaded: bool,
+    /// `d` pressed once — the next `d` deletes, anything else cancels.
+    pub pending_delete: bool,
 }
 
 /// One block of the transcript.
@@ -130,6 +169,8 @@ pub struct App {
     /// Selected picker row when the picker is open. Row 0 is "new session";
     /// row `i + 1` is `sessions` newest-first.
     pub picker: Option<usize>,
+    /// The review pane, when `:review` opened it.
+    pub review: Option<Review>,
     pub status: Status,
     /// The last error code, shown on the rule until the next send.
     pub last_error: Option<String>,
@@ -155,6 +196,7 @@ impl App {
             session_id: None,
             sessions: Vec::new(),
             picker: None,
+            review: None,
             status: Status::Idle,
             last_error: None,
             queued: VecDeque::new(),
@@ -164,17 +206,27 @@ impl App {
         }
     }
 
-    /// Scrolls the transcript by `lines`, or moves the picker if it is open.
+    /// Scrolls the transcript by `lines`, or moves the open modal's selection.
     ///
     /// Every scroll gesture lands here — `ctrl-d/u` and the page keys. When
-    /// the picker is open it takes the gesture instead: scrolling the
-    /// transcript behind a modal reads as the wrong thing moving.
+    /// the review pane or the picker is open it takes the gesture instead:
+    /// scrolling the transcript behind a modal reads as the wrong thing
+    /// moving.
     ///
     /// There is deliberately no mouse wheel. Reporting it means asking the
     /// terminal for mouse motion, and a terminal that reports motion stops
     /// doing its own text selection — which broke selecting text out of the
     /// pane far worse than the wheel was worth.
     pub fn on_scroll(&mut self, up: bool, lines: usize) {
+        if let Some(review) = self.review.as_mut() {
+            review.pending_delete = false;
+            review.selected = if up {
+                review.selected.saturating_sub(1)
+            } else {
+                (review.selected + 1).min(review.items.len().saturating_sub(1))
+            };
+            return;
+        }
         if let Some(selected) = self.picker {
             let last = self.sessions.len();
             self.picker = Some(if up {
@@ -209,16 +261,16 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.on_control(key.code);
         }
+        if self.review.is_some() {
+            return self.on_review_key(key.code);
+        }
         if self.picker.is_some() {
             return self.on_picker_key(key.code);
         }
         match self.mode {
             Mode::Insert => self.on_insert(key.code),
             Mode::Normal => self.on_normal(key.code),
-            Mode::Cmd => {
-                self.on_cmd(key.code);
-                None
-            }
+            Mode::Cmd => self.on_cmd(key.code),
         }
     }
 
@@ -331,7 +383,7 @@ impl App {
     }
 
     /// The `:` line.
-    fn on_cmd(&mut self, code: KeyCode) {
+    fn on_cmd(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char(c) => self.cmd.push(c),
@@ -342,15 +394,88 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                self.mode = Mode::Normal;
                 match self.cmd.as_str() {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
+                    "review" => return Some(self.open_review()),
                     // Vim's "not an editor command", verbatim.
                     _ => self.last_error = Some("E492".to_owned()),
                 }
-                self.mode = Mode::Normal;
             }
             _ => {}
         }
+        None
+    }
+
+    /// `:review`: opens the pane and asks the daemon for the last 7 days'
+    /// queue (DESIGN.md §5.4).
+    fn open_review(&mut self) -> Command {
+        self.review = Some(Review {
+            items: Vec::new(),
+            selected: 0,
+            loaded: false,
+            pending_delete: false,
+        });
+        Command::ReviewList {
+            since_micros: chrono::Utc::now().timestamp_micros() - REVIEW_WINDOW_MICROS,
+        }
+    }
+
+    /// Keys while the review pane is open. Verdicts leave the pane's state
+    /// immediately — the daemon's answer only matters if it says no, which
+    /// lands as a `Failed` on the rule.
+    fn on_review_key(&mut self, code: KeyCode) -> Option<Command> {
+        let review = self.review.as_mut().expect("review is open");
+        let last = review.items.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.review = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                review.selected = review.selected.saturating_sub(1);
+                review.pending_delete = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                review.selected = (review.selected + 1).min(last);
+                review.pending_delete = false;
+            }
+            KeyCode::Char('a') => {
+                review.pending_delete = false;
+                return Self::take_verdict(review)
+                    .map(|record_id| Command::ReviewAccept { record_id });
+            }
+            // Deletion is the one destructive verdict: the first `d` arms it,
+            // only a second in a row fires.
+            KeyCode::Char('d') if review.pending_delete => {
+                review.pending_delete = false;
+                return Self::take_verdict(review)
+                    .map(|record_id| Command::ReviewDelete { record_id });
+            }
+            KeyCode::Char('d') => {
+                review.pending_delete = !review.items.is_empty();
+            }
+            KeyCode::Char('f') => {
+                // Fix routes through chat (§5.4): prefill a supersede
+                // instruction for the user to finish, never edit in the pane.
+                if let Some(entry) = review.items.get(review.selected) {
+                    self.input = format!("fix memory {}: {} — ", entry.id, entry.title);
+                    self.cursor = self.input.len();
+                    self.mode = Mode::Insert;
+                    self.review = None;
+                }
+            }
+            _ => review.pending_delete = false,
+        }
+        None
+    }
+
+    /// Removes the selected entry — the verdict is cast, the item leaves the
+    /// list — and hands back its id.
+    fn take_verdict(review: &mut Review) -> Option<String> {
+        if review.items.is_empty() {
+            return None;
+        }
+        let entry = review.items.remove(review.selected);
+        review.selected = review.selected.min(review.items.len().saturating_sub(1));
+        Some(entry.id)
     }
 
     /// Keys while the picker is open.
@@ -376,9 +501,10 @@ impl App {
     }
 
     /// Opens the picker — not mid-stream: the in-flight turn would keep
-    /// rendering into whatever session the view switched to.
+    /// rendering into whatever session the view switched to. Not under the
+    /// review pane either: two modals is one too many.
     fn open_picker(&mut self) {
-        if self.status != Status::Streaming {
+        if self.status != Status::Streaming && self.review.is_none() {
             self.picker = Some(0);
         }
     }
@@ -447,6 +573,8 @@ impl App {
     }
 
     /// Handles one event from the connection task.
+    // One event, one arm; splitting the match would hide the protocol's shape.
+    #[allow(clippy::too_many_lines)]
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
         match event {
             NetEvent::Sessions(sessions) => {
@@ -553,6 +681,17 @@ impl App {
                 self.last_error = Some(code.clone());
                 self.transcript.push(Block::Fault { code, msg });
                 self.turn_over(Status::Idle)
+            }
+            NetEvent::ReviewItems(items) => {
+                // The pane may already be closed; a late answer has nowhere
+                // to land, like a stale history.
+                if let Some(review) = self.review.as_mut() {
+                    review.items = items;
+                    review.selected = 0;
+                    review.loaded = true;
+                    review.pending_delete = false;
+                }
+                None
             }
             NetEvent::Disconnected { reason } => {
                 self.last_error = Some("disconnected".to_owned());
@@ -1493,6 +1632,184 @@ mod tests {
         let mut app = App::new();
         app.on_key(ctrl('c'));
         assert!(app.quit);
+    }
+
+    // --- the review pane (DESIGN.md §5.4) ---
+
+    fn entry(id: &str, title: &str) -> ReviewEntry {
+        ReviewEntry {
+            id: id.to_owned(),
+            kind: 4, // KIND_FACT
+            namespace: "global".to_owned(),
+            title: title.to_owned(),
+            summary: "a summary".to_owned(),
+            superseded: false,
+        }
+    }
+
+    /// An app with the review pane open and `entries` already answered.
+    fn reviewing(entries: Vec<ReviewEntry>) -> App {
+        let mut app = App::new();
+        normal(&mut app, ":review");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::ReviewItems(entries));
+        app
+    }
+
+    #[test]
+    fn colon_review_opens_the_pane_and_asks_for_the_last_week() {
+        let mut app = App::new();
+        normal(&mut app, ":review");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        let Some(Command::ReviewList { since_micros }) = command else {
+            panic!("expected ReviewList, got {command:?}");
+        };
+        let expected = chrono::Utc::now().timestamp_micros() - REVIEW_WINDOW_MICROS;
+        assert!(
+            (since_micros - expected).abs() < 60 * 1_000_000,
+            "the window reaches a week back, got {since_micros}"
+        );
+        let review = app.review.as_ref().expect("the pane is open");
+        assert!(!review.loaded, "nothing has been answered yet");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.last_error, None, ":review is a command, not E492");
+    }
+
+    #[test]
+    fn review_items_land_in_the_open_pane_and_nowhere_after_it_closed() {
+        let mut app = reviewing(vec![entry("mr-1", "one")]);
+        let review = app.review.as_ref().expect("open");
+        assert!(review.loaded);
+        assert_eq!(review.items, [entry("mr-1", "one")]);
+        assert_eq!(review.selected, 0);
+
+        // Close, then a late answer: nowhere to land, like a stale history.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.review, None);
+        app.on_net(NetEvent::ReviewItems(vec![entry("mr-2", "two")]));
+        assert_eq!(app.review, None);
+    }
+
+    #[test]
+    fn j_and_k_move_the_selection_within_bounds() {
+        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
+
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.review.as_ref().expect("open").selected, 1);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.review.as_ref().expect("open").selected,
+            1,
+            "j stops at the last row"
+        );
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+    }
+
+    #[test]
+    fn a_accepts_the_selected_record_and_it_leaves_the_list() {
+        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
+        app.on_key(key(KeyCode::Char('j')));
+
+        let command = app.on_key(key(KeyCode::Char('a')));
+
+        assert_eq!(
+            command,
+            Some(Command::ReviewAccept {
+                record_id: "mr-2".to_owned()
+            })
+        );
+        let review = app.review.as_ref().expect("still open");
+        assert_eq!(review.items, [entry("mr-1", "one")]);
+        assert_eq!(review.selected, 0, "the selection is clamped to the list");
+    }
+
+    #[test]
+    fn delete_takes_two_ds_and_anything_else_disarms() {
+        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('d'))),
+            None,
+            "the first d arms"
+        );
+        assert!(app.review.as_ref().expect("open").pending_delete);
+
+        // Moving disarms: the second d must confirm the row it armed on.
+        app.on_key(key(KeyCode::Char('j')));
+        assert!(!app.review.as_ref().expect("open").pending_delete);
+        assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);
+
+        let command = app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(
+            command,
+            Some(Command::ReviewDelete {
+                record_id: "mr-2".to_owned()
+            })
+        );
+        let review = app.review.as_ref().expect("still open");
+        assert_eq!(review.items, [entry("mr-1", "one")]);
+        assert!(!review.pending_delete);
+    }
+
+    #[test]
+    fn f_prefills_the_fix_instruction_and_closes_the_pane() {
+        let mut app = reviewing(vec![entry("mr-1", "Old address")]);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('f'))),
+            None,
+            "fix sends nothing"
+        );
+
+        assert_eq!(app.review, None, "the pane closed");
+        assert_eq!(app.input, "fix memory mr-1: Old address — ");
+        assert_eq!(app.cursor, app.input.len(), "ready to finish the sentence");
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn q_closes_the_pane_and_verdict_keys_on_an_empty_pane_are_no_ops() {
+        let mut app = reviewing(Vec::new());
+
+        assert_eq!(app.on_key(key(KeyCode::Char('a'))), None);
+        assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('d'))),
+            None,
+            "nothing to delete"
+        );
+        assert_eq!(app.on_key(key(KeyCode::Char('f'))), None);
+        assert!(app.review.is_some(), "an empty pane still shows its line");
+
+        app.on_key(key(KeyCode::Char('q')));
+        assert_eq!(app.review, None);
+        assert!(!app.quit, "q closed the pane, not the app");
+    }
+
+    #[test]
+    fn the_picker_does_not_open_under_the_review_pane() {
+        let mut app = reviewing(vec![entry("mr-1", "one")]);
+        app.on_key(ctrl('p'));
+        assert_eq!(app.picker, None);
+    }
+
+    #[test]
+    fn scrolling_moves_the_review_selection_when_the_pane_is_open() {
+        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
+
+        app.on_scroll(false, PAGE);
+        assert_eq!(
+            app.review.as_ref().expect("open").selected,
+            1,
+            "one row per gesture, not one page"
+        );
+        app.on_scroll(true, PAGE);
+        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
     #[test]

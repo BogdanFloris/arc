@@ -40,8 +40,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    Event, MemoryEvent, MessageAppended, Role, SessionConsolidated, SessionCreated, SessionEvent,
-    Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    Event, MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role,
+    SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
+    ToolResultRecorded,
 };
 use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
@@ -51,7 +52,7 @@ use tokio::sync::mpsc;
 use crate::consolidation::SessionSnapshot;
 use crate::log::{self, Log};
 use crate::memory::render_memory_index;
-use crate::projection::{self, DueSession, MessageRow, Projection, SessionSummary};
+use crate::projection::{self, DueSession, MessageRow, Projection, ReviewItem, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
@@ -137,6 +138,14 @@ pub enum Error {
     /// A whitespace-only message. Nothing was appended.
     #[error("refusing to send an empty message")]
     EmptyMessage,
+
+    /// A review verdict named a record the projection does not hold. Nothing
+    /// was appended; the daemon maps this to a wire error frame.
+    #[error("no memory record {id} to review")]
+    UnknownRecord {
+        /// The id the verdict carried.
+        id: String,
+    },
 
     /// The stream ended before the first token. No assistant message was
     /// appended: there was nothing seen to record.
@@ -561,6 +570,68 @@ impl<P: Provider> Engine<P> {
     /// [`Error::Projection`] if the index cannot be read.
     pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
         Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
+    }
+
+    /// The review queue (see [`Projection::review_items`]): records changed
+    /// at or after `since_micros` and not reviewed since their last change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Projection`] if the index cannot be read.
+    pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
+        Ok(self.projection.review_items(since_micros)?)
+    }
+
+    /// The accept verdict (DESIGN.md §5.4): appends a `MemoryRecordReviewed`
+    /// with [`Source::User`] — durable, because reviews are the ground truth
+    /// the precision labels rest on.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnknownRecord`] if the projection does not hold `record_id`;
+    ///   nothing is appended.
+    /// - [`Error::Log`] / [`Error::Projection`] if durability fails; fatal.
+    #[tracing::instrument(name = "session.review_accept", skip(self), fields(record_id))]
+    pub fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
+        self.reviewable(record_id)?;
+        self.record_memory(
+            Source::User,
+            memory_event::Event::RecordReviewed(MemoryRecordReviewed {
+                record_id: record_id.to_owned(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// The delete verdict (DESIGN.md §5.4): appends a `MemoryRecordDeleted`
+    /// with [`Source::User`], excluding the record entirely.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnknownRecord`] if the projection does not hold `record_id`;
+    ///   nothing is appended.
+    /// - [`Error::Log`] / [`Error::Projection`] if durability fails; fatal.
+    #[tracing::instrument(name = "session.review_delete", skip(self), fields(record_id))]
+    pub fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
+        self.reviewable(record_id)?;
+        self.record_memory(
+            Source::User,
+            memory_event::Event::RecordDeleted(MemoryRecordDeleted {
+                id: record_id.to_owned(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Refuses a verdict for a record the projection does not hold, before
+    /// anything touches the log.
+    fn reviewable(&self, record_id: &str) -> Result<(), Error> {
+        if self.projection.memory_record(record_id)?.is_none() {
+            return Err(Error::UnknownRecord {
+                id: record_id.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Step 1 of the consolidation pass (DESIGN.md §5.4), under the caller's
@@ -990,8 +1061,9 @@ mod tests {
     };
     use crate::testkit::{
         Canned, ScriptedProvider, TraceCapture, appended, call, channel, counter_samples,
-        done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_log,
-        resulted, seed_log, seed_memory_log, tool_stop, tools, turn, usage,
+        done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_events,
+        replay_log, resulted, seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools,
+        turn, usage,
     };
     use crate::tool::Registry;
 
@@ -2250,5 +2322,117 @@ mod tests {
             provider.requests()[0].system,
             Some(format!("be terse\n\n{}\n/no_think", seeded_block()))
         );
+    }
+
+    // --- the weekly review (DESIGN.md §5.4) ---
+
+    /// An engine over [`seeded_records`] stamped into the log at a fixed
+    /// clock, so the records sit in every review window.
+    fn review_engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
+        seed_memory_log_at(dir, seeded_records(), 1_700_000_000_000_000);
+        reopened_engine(provider, dir, Registry::new(512))
+    }
+
+    /// The memory payload of one whole log event.
+    fn memory_payload(event: &arc_proto::v1::Event) -> &memory_event::Event {
+        match &event.payload {
+            Some(arc_proto::v1::event::Payload::Memory(memory)) => {
+                memory.event.as_ref().expect("memory event")
+            }
+            other => panic!("expected a memory payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_accept_appends_a_user_reviewed_event_and_clears_the_queue() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = review_engine(&provider, &dir);
+
+        let queued: Vec<String> = engine
+            .review_items(0)
+            .expect("review_items")
+            .into_iter()
+            .map(|item| item.record.id)
+            .collect();
+        assert_eq!(
+            queued,
+            ["mr-fact", "mr-pref"],
+            "both records await a verdict"
+        );
+
+        engine.review_accept("mr-fact").expect("accept");
+
+        let events = replay_events(&dir);
+        let verdict = events.last().expect("the verdict");
+        assert_eq!(
+            verdict.source,
+            Source::User as i32,
+            "the verdict is the user's"
+        );
+        assert!(
+            verdict.ts.is_some(),
+            "stamped, so the projection can order it"
+        );
+        match memory_payload(verdict) {
+            memory_event::Event::RecordReviewed(reviewed) => {
+                assert_eq!(reviewed.record_id, "mr-fact");
+            }
+            other => panic!("expected RecordReviewed, got {other:?}"),
+        }
+
+        let queued: Vec<String> = engine
+            .review_items(0)
+            .expect("review_items")
+            .into_iter()
+            .map(|item| item.record.id)
+            .collect();
+        assert_eq!(queued, ["mr-pref"], "the accepted record left the queue");
+    }
+
+    #[tokio::test]
+    async fn review_delete_appends_a_user_deleted_event_and_removes_the_record() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = review_engine(&provider, &dir);
+
+        engine.review_delete("mr-pref").expect("delete");
+
+        let events = replay_events(&dir);
+        let verdict = events.last().expect("the verdict");
+        assert_eq!(verdict.source, Source::User as i32);
+        match memory_payload(verdict) {
+            memory_event::Event::RecordDeleted(deleted) => assert_eq!(deleted.id, "mr-pref"),
+            other => panic!("expected RecordDeleted, got {other:?}"),
+        }
+
+        let queued: Vec<String> = engine
+            .review_items(0)
+            .expect("review_items")
+            .into_iter()
+            .map(|item| item.record.id)
+            .collect();
+        assert_eq!(queued, ["mr-fact"], "the deleted record is gone entirely");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_an_unknown_record_is_refused_before_the_log() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = review_engine(&provider, &dir);
+        let before = replay_events(&dir).len();
+
+        let accept = engine.review_accept("mr-ghost");
+        assert!(
+            matches!(accept, Err(Error::UnknownRecord { ref id }) if id == "mr-ghost"),
+            "got: {accept:?}"
+        );
+        let delete = engine.review_delete("mr-ghost");
+        assert!(
+            matches!(delete, Err(Error::UnknownRecord { ref id }) if id == "mr-ghost"),
+            "got: {delete:?}"
+        );
+
+        assert_eq!(replay_events(&dir).len(), before, "nothing was appended");
     }
 }

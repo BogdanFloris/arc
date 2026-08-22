@@ -22,10 +22,10 @@
 use std::path::{Path, PathBuf};
 
 use arc_proto::v1::{
-    Event, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded,
-    MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionConsolidated,
-    SessionCreated, ToolCallIssued, ToolResultRecorded, event, memory_event, memory_record,
-    session_event,
+    Event, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
+    MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
+    Role, SessionConsolidated, SessionCreated, ToolCallIssued, ToolResultRecorded, event,
+    memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -43,7 +43,8 @@ use crate::log;
 /// 2: tool-call and tool-result rows joined `messages`, with FTS5.
 /// 3: `memory_records` joined — the distilled tier's state table (§5.2).
 /// 4: `sessions.consolidated_through` joined — consolidation coverage (§5.4).
-pub const SCHEMA_VERSION: u32 = 4;
+/// 5: `memory_records.changed_at` and `.reviewed_at` — review bookkeeping (§5.4).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// `projection_meta` key holding the seq of the last applied event.
 const LAST_SEQ_KEY: &str = "last_seq";
@@ -85,6 +86,12 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// event.seq`, treating zero affected rows as an error. `links` and
 /// `provenance` are JSON text — nothing queries inside them yet, and the file
 /// is disposable. `provenance` NULL means the field was absent, not empty.
+///
+/// `changed_at` and `reviewed_at` are review bookkeeping (DESIGN.md §5.4):
+/// the `Event.ts` micros of the record's last create/update/supersede, and of
+/// its last `MemoryRecordReviewed`. The review queue is the rows where
+/// `changed_at` is in the window and not covered by `reviewed_at` — an
+/// accepted record leaves it, a later change re-enters it.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
@@ -133,7 +140,9 @@ CREATE TABLE IF NOT EXISTS memory_records (
     status         INTEGER NOT NULL,
     superseded_by  TEXT,
     created_seq    INTEGER NOT NULL,
-    last_event_seq INTEGER NOT NULL
+    last_event_seq INTEGER NOT NULL,
+    changed_at     INTEGER,
+    reviewed_at    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS projection_meta (
@@ -315,6 +324,18 @@ pub struct DueSession {
     pub session_id: String,
     /// Seq of the session's latest event — what the pass will read through.
     pub latest_seq: u64,
+}
+
+/// One row of [`Projection::review_items`]: a record awaiting a verdict
+/// (DESIGN.md §5.4), whole, with the review bookkeeping a pane shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewItem {
+    /// The record as last written; raw enum integers preserved.
+    pub record: MemoryRecord,
+    /// When the record last changed, microseconds since the Unix epoch.
+    pub changed_at: i64,
+    /// Id of the record that superseded this one, if one did.
+    pub superseded_by: Option<String>,
 }
 
 /// What [`Projection::memory_record`] returns: the record as last written,
@@ -606,6 +627,10 @@ impl Projection {
                     span.record("kind", "memory_record_deleted");
                     delete_memory_record(&tx, event, deleted)?;
                 }
+                Some(memory_event::Event::RecordReviewed(reviewed)) => {
+                    span.record("kind", "memory_record_reviewed");
+                    review_memory_record(&tx, event, reviewed)?;
+                }
                 None => {
                     span.record("kind", "unknown");
                     tracing::warn!(
@@ -815,6 +840,50 @@ impl Projection {
                 kind: row.get(2)?,
                 title: row.get(3)?,
                 summary: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The review queue (DESIGN.md §5.4): records changed at or after
+    /// `since_micros` and not reviewed since their last change, any status —
+    /// deleted rows are already gone from the table, which is the exclusion.
+    ///
+    /// Ordered `(changed_at, id)` so the queue never shuffles between calls.
+    /// A row whose events carried no timestamp has `changed_at` NULL and
+    /// never enters the queue: its window position is unknowable, and the
+    /// engine stamps every event it writes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sqlite`] if the index cannot be read, or holds JSON this
+    /// build cannot decode — see [`Projection::memory_record`].
+    pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, namespace, title, summary, body, links, provenance,
+                    status, superseded_by, changed_at
+             FROM memory_records
+             WHERE changed_at >= ?1
+               AND (reviewed_at IS NULL OR reviewed_at < changed_at)
+             ORDER BY changed_at, id",
+        )?;
+        let rows = stmt.query_map([since_micros], |row| {
+            Ok(ReviewItem {
+                record: MemoryRecord {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    namespace: row.get(2)?,
+                    title: row.get(3)?,
+                    summary: row.get(4)?,
+                    body: row.get(5)?,
+                    links: links_from_json(&row.get::<_, String>(6)?)
+                        .map_err(|e| bad_json_column(6, &e))?,
+                    provenance: provenance_from_json(row.get::<_, Option<String>>(7)?.as_deref())
+                        .map_err(|e| bad_json_column(7, &e))?,
+                    status: row.get(8)?,
+                },
+                superseded_by: row.get(9)?,
+                changed_at: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1042,8 +1111,8 @@ fn create_memory_record(
     tx.execute(
         "INSERT INTO memory_records
              (id, kind, namespace, title, summary, body, links, provenance,
-              status, superseded_by, created_seq, last_event_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)",
+              status, superseded_by, created_seq, last_event_seq, changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11)",
         rusqlite::params![
             &record.id,
             // Raw enum integers, unknown values included — here and below.
@@ -1056,6 +1125,7 @@ fn create_memory_record(
             provenance_json(record.provenance.as_ref()),
             record.status,
             seq_param(event.seq)?,
+            epoch_micros(event.ts.as_ref()),
         ],
     )?;
     Ok(())
@@ -1077,7 +1147,7 @@ fn update_memory_record(
         "UPDATE memory_records
          SET kind = ?2, namespace = ?3, title = ?4, summary = ?5, body = ?6,
              links = ?7, provenance = ?8, status = ?9, superseded_by = NULL,
-             last_event_seq = ?10
+             last_event_seq = ?10, changed_at = ?11
          WHERE id = ?1 AND last_event_seq < ?10",
         rusqlite::params![
             &record.id,
@@ -1090,6 +1160,7 @@ fn update_memory_record(
             provenance_json(record.provenance.as_ref()),
             record.status,
             seq_param(event.seq)?,
+            epoch_micros(event.ts.as_ref()),
         ],
     )?;
     if changed == 0 {
@@ -1119,13 +1190,14 @@ fn supersede_memory_record(
     if record.id != superseded.superseded_id {
         let changed = tx.execute(
             "UPDATE memory_records
-             SET status = ?2, superseded_by = ?3, last_event_seq = ?4
+             SET status = ?2, superseded_by = ?3, last_event_seq = ?4, changed_at = ?5
              WHERE id = ?1 AND last_event_seq < ?4",
             rusqlite::params![
                 &superseded.superseded_id,
                 memory_record::Status::Superseded as i32,
                 &record.id,
                 seq_param(event.seq)?,
+                epoch_micros(event.ts.as_ref()),
             ],
         )?;
         if changed == 0 {
@@ -1158,14 +1230,15 @@ fn upsert_memory_record(
     let changed = tx.execute(
         "INSERT INTO memory_records
              (id, kind, namespace, title, summary, body, links, provenance,
-              status, superseded_by, created_seq, last_event_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)
+              status, superseded_by, created_seq, last_event_seq, changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11)
          ON CONFLICT (id) DO UPDATE SET
              kind = excluded.kind, namespace = excluded.namespace,
              title = excluded.title, summary = excluded.summary,
              body = excluded.body, links = excluded.links,
              provenance = excluded.provenance, status = excluded.status,
-             superseded_by = NULL, last_event_seq = excluded.last_event_seq
+             superseded_by = NULL, last_event_seq = excluded.last_event_seq,
+             changed_at = excluded.changed_at
          WHERE memory_records.last_event_seq < excluded.last_event_seq",
         rusqlite::params![
             &record.id,
@@ -1178,6 +1251,7 @@ fn upsert_memory_record(
             provenance_json(record.provenance.as_ref()),
             record.status,
             seq_param(event.seq)?,
+            epoch_micros(event.ts.as_ref()),
         ],
     )?;
     if changed == 0 {
@@ -1212,6 +1286,41 @@ fn delete_memory_record(
             seq = event.seq,
             id = %deleted.id,
             "delete of an unknown memory record; nothing to remove"
+        );
+    }
+    Ok(())
+}
+
+/// Applies a `MemoryRecordReviewed`: stamps the record's `reviewed_at`.
+///
+/// Monotonic — the stamp only moves forward, so a foreign log's out-of-order
+/// review cannot un-review a later verdict. An unknown record id, a stale
+/// stamp, or a review with no timestamp is skipped with a warning: all are
+/// foreign-log shapes, not replay failures (the tolerance
+/// [`mark_consolidated`] set).
+fn review_memory_record(
+    tx: &Transaction<'_>,
+    event: &Event,
+    reviewed: &MemoryRecordReviewed,
+) -> Result<(), Error> {
+    let Some(at) = epoch_micros(event.ts.as_ref()) else {
+        tracing::warn!(
+            seq = event.seq,
+            id = %reviewed.record_id,
+            "review event carries no timestamp; skipping"
+        );
+        return Ok(());
+    };
+    let changed = tx.execute(
+        "UPDATE memory_records SET reviewed_at = ?2
+         WHERE id = ?1 AND (reviewed_at IS NULL OR reviewed_at < ?2)",
+        rusqlite::params![&reviewed.record_id, at],
+    )?;
+    if changed == 0 {
+        tracing::warn!(
+            seq = event.seq,
+            id = %reviewed.record_id,
+            "review of an unknown record or not past the current stamp; skipping"
         );
     }
     Ok(())
@@ -1350,7 +1459,7 @@ mod tests {
 
     use super::{
         DueSession, Error, MemoryIndexEntry, MessageRow, Projection, ReplayError, ReplayStats,
-        SessionSummary, replay,
+        ReviewItem, SessionSummary, replay,
     };
     use crate::log::{Log, LogReader, discover_segments};
 
@@ -3069,5 +3178,250 @@ mod tests {
 
         projection.apply(&result_in(2, "s-01", 200)).expect("apply");
         assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(2));
+    }
+
+    // --- review bookkeeping ---
+
+    /// A memory event at an explicit time — the review queue is about when
+    /// things happened, so these tests set each event's clock.
+    fn memory_at(seq: u64, at_micros: i64, event: memory_event::Event) -> Event {
+        let mut wrapped = memory(seq, event);
+        wrapped.ts = Some(Timestamp {
+            seconds: at_micros / 1_000_000,
+            nanos: i32::try_from((at_micros % 1_000_000) * 1_000).expect("in range"),
+        });
+        wrapped
+    }
+
+    fn reviewed(seq: u64, at_micros: i64, id: &str) -> Event {
+        memory_at(
+            seq,
+            at_micros,
+            memory_event::Event::RecordReviewed(super::MemoryRecordReviewed {
+                record_id: id.to_string(),
+            }),
+        )
+    }
+
+    /// The ids [`Projection::review_items`] lists, in its order.
+    fn review_ids(projection: &Projection, since: i64) -> Vec<String> {
+        projection
+            .review_items(since)
+            .expect("review_items")
+            .into_iter()
+            .map(|item| item.record.id)
+            .collect()
+    }
+
+    #[test]
+    fn created_records_enter_the_queue_in_changed_then_id_order() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        let created = record("mr-b", "gruvbox", "the palette");
+        projection
+            .apply(&memory_at(
+                0,
+                200,
+                memory_payload(mem_created(0, created.clone())),
+            ))
+            .expect("apply");
+        projection
+            .apply(&memory_at(
+                1,
+                100,
+                memory_payload(mem_created(1, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+
+        assert_eq!(review_ids(&projection, 0), ["mr-a", "mr-b"]);
+
+        let items = projection.review_items(0).expect("review_items");
+        assert_eq!(
+            items[1],
+            ReviewItem {
+                record: created,
+                changed_at: 200,
+                superseded_by: None,
+            },
+            "the record comes back whole, with its bookkeeping"
+        );
+    }
+
+    #[test]
+    fn a_review_clears_the_record_and_a_later_change_re_enters_it() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                100,
+                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+
+        projection.apply(&reviewed(1, 150, "mr-a")).expect("apply");
+        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
+
+        projection
+            .apply(&memory_at(
+                2,
+                200,
+                memory_payload(mem_updated(2, record("mr-a", "jj", "jj everywhere"))),
+            ))
+            .expect("apply");
+        assert_eq!(
+            review_ids(&projection, 0),
+            ["mr-a"],
+            "a change after the accept re-enters the queue"
+        );
+    }
+
+    #[test]
+    fn the_window_boundary_is_inclusive() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                100,
+                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+
+        assert_eq!(review_ids(&projection, 100), ["mr-a"]);
+        assert_eq!(review_ids(&projection, 101), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_supersede_puts_both_rows_in_the_queue() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                100,
+                memory_payload(mem_created(0, record("mr-old", "address", "lives at X"))),
+            ))
+            .expect("apply");
+        // Accepted once; the supersede must bring it back.
+        projection
+            .apply(&reviewed(1, 150, "mr-old"))
+            .expect("apply");
+
+        projection
+            .apply(&memory_at(
+                2,
+                200,
+                memory_payload(mem_superseded(
+                    2,
+                    "mr-old",
+                    record("mr-new", "address", "lives at Y"),
+                )),
+            ))
+            .expect("apply");
+
+        let items = projection.review_items(0).expect("review_items");
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (
+                    item.record.id.as_str(),
+                    item.record.status,
+                    item.superseded_by.as_deref(),
+                    item.changed_at,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("mr-new", memory_record::Status::Active as i32, None, 200i64),
+                (
+                    "mr-old",
+                    memory_record::Status::Superseded as i32,
+                    Some("mr-new"),
+                    200
+                ),
+            ],
+            "the retired record and its replacement both await a verdict"
+        );
+    }
+
+    #[test]
+    fn a_deleted_record_leaves_the_queue_entirely() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                100,
+                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+        projection
+            .apply(&memory_at(1, 200, memory_payload(mem_deleted(1, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_review_of_an_unknown_record_warns_and_no_ops() {
+        let mut projection = Projection::open(":memory:").expect("open");
+
+        projection
+            .apply(&reviewed(0, 100, "mr-ghost"))
+            .expect("skipped, not an error");
+
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
+        assert_eq!(row_count(&projection, "memory_records"), 0);
+    }
+
+    /// An out-of-order review from a foreign log must not un-review a later
+    /// verdict.
+    #[test]
+    fn the_review_stamp_only_moves_forward() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                400,
+                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+        projection.apply(&reviewed(1, 500, "mr-a")).expect("apply");
+
+        // Earlier clock, later seq: skipped. Were it applied, reviewed_at
+        // (300) would fall behind changed_at (400) and re-open the record.
+        projection.apply(&reviewed(2, 300, "mr-a")).expect("apply");
+
+        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
+        assert_eq!(projection.last_seq().expect("last_seq"), Some(2));
+    }
+
+    #[test]
+    fn a_review_with_no_timestamp_is_skipped() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        projection
+            .apply(&memory_at(
+                0,
+                100,
+                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
+            ))
+            .expect("apply");
+
+        let mut unstamped = reviewed(1, 0, "mr-a");
+        unstamped.ts = None;
+        projection.apply(&unstamped).expect("skipped, not an error");
+
+        assert_eq!(
+            review_ids(&projection, 0),
+            ["mr-a"],
+            "an unorderable review reviews nothing"
+        );
+    }
+
+    /// A record whose events carried no clock has no window position: it
+    /// never enters the queue rather than sorting somewhere arbitrary.
+    #[test]
+    fn a_record_with_no_timestamp_never_enters_the_queue() {
+        let mut projection = Projection::open(":memory:").expect("open");
+        let mut unstamped = mem_created(0, record("mr-a", "jj", "not git"));
+        unstamped.ts = None;
+        projection.apply(&unstamped).expect("apply");
+
+        assert_eq!(review_ids(&projection, i64::MIN), Vec::<String>::new());
     }
 }

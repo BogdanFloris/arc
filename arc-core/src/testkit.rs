@@ -203,6 +203,27 @@ pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     );
 }
 
+/// [`seed_memory_log`] with every event stamped `at_micros` — review
+/// bookkeeping is time-keyed, so its tests seed a clock the plain seeders
+/// deliberately leave out.
+pub(crate) fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>, at_micros: i64) {
+    let mut log = Log::open(dir.path()).expect("open log");
+    for event in events {
+        log.append(arc_proto::v1::Event {
+            seq: 0, // added by the log
+            ts: Some(prost_types::Timestamp {
+                seconds: at_micros / 1_000_000,
+                nanos: i32::try_from((at_micros % 1_000_000) * 1_000).expect("in range"),
+            }),
+            source: arc_proto::v1::Source::System as i32,
+            payload: Some(arc_proto::v1::event::Payload::Memory(
+                arc_proto::v1::MemoryEvent { event: Some(event) },
+            )),
+        })
+        .expect("append");
+    }
+}
+
 /// The general form of the seeders: whole payloads, so a test can interleave
 /// session and memory events in one log.
 pub(crate) fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {

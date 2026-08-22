@@ -31,13 +31,13 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_core::projection::SessionSummary;
+use arc_core::projection::{ReviewItem, SessionSummary};
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, HistoryMessage, MessageAccepted, ReasoningDelta,
-    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd, ToolCallEnded,
-    ToolCallStarted, client_frame, server_frame,
+    ClientFrame, Delta, Error as WireError, HistoryMessage, MemoryReviewItem, MemoryReviewItems,
+    MessageAccepted, ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -226,6 +226,15 @@ async fn request<P: Provider>(
         Some(client_frame::Msg::FetchHistory(fetch)) => {
             fetch_history(ws, engine, frame.request_id, &fetch.session_id).await
         }
+        Some(client_frame::Msg::MemoryReviewList(list)) => {
+            review_list(ws, engine, frame.request_id, list.since_micros).await
+        }
+        Some(client_frame::Msg::MemoryReviewAccept(accept)) => {
+            review_accept(ws, engine, frame.request_id, &accept.record_id).await
+        }
+        Some(client_frame::Msg::MemoryReviewDelete(delete)) => {
+            review_delete(ws, engine, frame.request_id, &delete.record_id).await
+        }
         // A frame from a newer client, or one that asked for nothing. Either
         // way this binary cannot answer it, and guessing would be worse.
         None => {
@@ -349,6 +358,75 @@ async fn list_sessions<P: Provider>(
     flow(send_frame(ws, request_id, msg).await)
 }
 
+/// Answers `MemoryReviewList` from the index.
+///
+/// A read, not a turn: like `fetch_history`, it holds the engine lock only
+/// long enough to query.
+async fn review_list<P: Provider>(
+    ws: &mut Socket,
+    engine: &Mutex<Engine<P>>,
+    request_id: u64,
+    since_micros: i64,
+) -> ControlFlow<()> {
+    let listed = engine.lock().await.review_items(since_micros);
+    let msg = match listed {
+        Ok(items) => server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
+            items: items.into_iter().map(review_item).collect(),
+        }),
+        Err(error) => {
+            warn!(%error, "listing review items failed");
+            error_frame(error_code(&error), &error)
+        }
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+/// Records the accept verdict, answering with the protocol's ack or error.
+async fn review_accept<P: Provider>(
+    ws: &mut Socket,
+    engine: &Mutex<Engine<P>>,
+    request_id: u64,
+    record_id: &str,
+) -> ControlFlow<()> {
+    let done = engine.lock().await.review_accept(record_id);
+    flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
+}
+
+/// Records the delete verdict, answering like `review_accept`.
+async fn review_delete<P: Provider>(
+    ws: &mut Socket,
+    engine: &Mutex<Engine<P>>,
+    request_id: u64,
+    record_id: &str,
+) -> ControlFlow<()> {
+    let done = engine.lock().await.review_delete(record_id);
+    flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
+}
+
+/// A verdict's closing frame: `MessageAccepted` — the protocol's existing
+/// ack, its `session_id` empty because the request already named the record —
+/// or the error frame.
+fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame::Msg {
+    match done {
+        Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: String::new(),
+        }),
+        Err(error) => {
+            warn!(%error, record_id, "review verdict failed");
+            error_frame(error_code(&error), &error)
+        }
+    }
+}
+
+/// A projection review row as the wire describes it.
+fn review_item(item: ReviewItem) -> MemoryReviewItem {
+    MemoryReviewItem {
+        record: Some(item.record),
+        changed_at_micros: item.changed_at,
+        superseded_by: item.superseded_by.unwrap_or_default(),
+    }
+}
+
 /// Tells the client its bytes were not a frame, then closes.
 async fn refuse(ws: &mut Socket, request_id: u64) {
     send_frame(
@@ -438,6 +516,7 @@ fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
+        SessionError::UnknownRecord { .. } => "unknown_record",
         SessionError::Provider(_) => "provider",
         // Durable state is in doubt and no client can do anything about it.
         SessionError::Log(_) | SessionError::Projection(_) => "internal",
@@ -450,6 +529,9 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::SendMessage(_)) => "send_message",
         Some(client_frame::Msg::ListSessions(_)) => "list_sessions",
         Some(client_frame::Msg::FetchHistory(_)) => "fetch_history",
+        Some(client_frame::Msg::MemoryReviewList(_)) => "memory_review_list",
+        Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
+        Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         None => "unknown",
     }
 }
@@ -501,7 +583,11 @@ mod tests {
         Stop, ToolCall, ToolDefinition, Usage,
     };
     use arc_core::tool::{Registry, Tool, ToolReply, TurnContext};
-    use arc_proto::v1::{FetchHistory, ListSessions, Role, ToolOutcome};
+    use arc_proto::v1::{
+        Event, FetchHistory, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Role, Source, ToolOutcome, event,
+        memory_event, memory_record,
+    };
     use futures::stream;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -599,15 +685,59 @@ mod tests {
         _dir: TempDir,
     }
 
+    /// When the seeded memory records changed, as the projection will report
+    /// it back in `changed_at_micros`.
+    const SEEDED_AT_MICROS: i64 = 1_700_000_000_000_000;
+
+    /// A `MemoryRecordCreated` for the review tests' seed, stamped at
+    /// [`SEEDED_AT_MICROS`] so the records sit in every review window.
+    fn seeded_record(id: &str, title: &str) -> Event {
+        Event {
+            seq: 0, // added by the log
+            ts: Some(Timestamp {
+                seconds: SEEDED_AT_MICROS / 1_000_000,
+                nanos: 0,
+            }),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Memory(MemoryEvent {
+                event: Some(memory_event::Event::RecordCreated(MemoryRecordCreated {
+                    record: Some(MemoryRecord {
+                        id: id.to_owned(),
+                        kind: memory_record::Kind::Fact as i32,
+                        namespace: "global".to_owned(),
+                        title: title.to_owned(),
+                        summary: "a summary".to_owned(),
+                        body: "a body".to_owned(),
+                        links: Vec::new(),
+                        provenance: None,
+                        status: memory_record::Status::Active as i32,
+                    }),
+                })),
+            })),
+        }
+    }
+
     impl Harness {
         async fn start(script: Script) -> Self {
             Self::with_tools(script, Registry::new(512)).await
         }
 
         async fn with_tools(script: Script, registry: Registry) -> Self {
+            Self::with_seed(script, registry, Vec::new()).await
+        }
+
+        /// [`with_tools`](Self::with_tools) over a log pre-seeded with
+        /// `events`, replayed into the projection — how the review tests get
+        /// memory records without driving a tool turn.
+        async fn with_seed(script: Script, registry: Registry, events: Vec<Event>) -> Self {
             let dir = TempDir::new().expect("temp dir");
-            let log = Log::open(dir.path()).expect("open log");
-            let projection = Projection::open(":memory:").expect("open projection");
+            let mut log = Log::open(dir.path()).expect("open log");
+            for event in events {
+                log.append(event).expect("seed");
+            }
+            let mut projection = Projection::open(":memory:").expect("open projection");
+            arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
+                .expect("replay");
             let provider = MockProvider::new(script);
             let engine = Engine::new(
                 log,
@@ -1130,6 +1260,133 @@ mod tests {
             assert_eq!(request.messages.len(), 1, "no history bled across sessions");
             assert_eq!(request.system.as_deref(), Some("be terse"));
         }
+
+        harness.stop().await;
+    }
+
+    /// Asks for the review queue and returns its items.
+    async fn review_list(
+        ws: &mut Client,
+        request_id: u64,
+        since_micros: i64,
+    ) -> Vec<arc_proto::v1::MemoryReviewItem> {
+        send(
+            ws,
+            request_id,
+            client_frame::Msg::MemoryReviewList(MemoryReviewList { since_micros }),
+        )
+        .await;
+        let frame = next_frame(ws).await;
+        assert_eq!(frame.request_id, request_id);
+        match frame.msg {
+            Some(server_frame::Msg::MemoryReviewItems(items)) => items.items,
+            other => panic!("expected MemoryReviewItems, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_list_answers_the_seeded_queue_and_accept_clears_a_record() {
+        let mut harness = Harness::with_seed(
+            Script::Echo,
+            Registry::new(512),
+            vec![seeded_record("m-a", "alpha"), seeded_record("m-b", "beta")],
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        let items = review_list(&mut ws, 1, 0).await;
+        let listed: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let record = item.record.as_ref().expect("a record");
+                (
+                    record.id.as_str(),
+                    record.title.as_str(),
+                    item.changed_at_micros,
+                    item.superseded_by.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("m-a", "alpha", SEEDED_AT_MICROS, ""),
+                ("m-b", "beta", SEEDED_AT_MICROS, ""),
+            ],
+            "both records, whole, in (changed_at, id) order"
+        );
+
+        // A window past the seed is empty — since_micros reaches the query.
+        assert_eq!(review_list(&mut ws, 2, SEEDED_AT_MICROS + 1).await, []);
+
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::MemoryReviewAccept(MemoryReviewAccept {
+                record_id: "m-a".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 3);
+        match frame.msg {
+            Some(server_frame::Msg::MessageAccepted(ack)) => {
+                assert_eq!(ack.session_id, "", "a verdict ack names no session");
+            }
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+
+        let remaining: Vec<_> = review_list(&mut ws, 4, 0)
+            .await
+            .into_iter()
+            .map(|item| item.record.expect("a record").id)
+            .collect();
+        assert_eq!(remaining, ["m-b"], "the accepted record left the queue");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn review_delete_removes_the_record_and_a_second_try_is_unknown() {
+        let mut harness = Harness::with_seed(
+            Script::Echo,
+            Registry::new(512),
+            vec![seeded_record("m-a", "alpha")],
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+                record_id: "m-a".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert!(
+            matches!(frame.msg, Some(server_frame::Msg::MessageAccepted(_))),
+            "got: {frame:?}"
+        );
+        assert_eq!(review_list(&mut ws, 2, 0).await, [], "the record is gone");
+
+        // Deleted means unknown now; the error rides the connection, which
+        // survives for the next request.
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+                record_id: "m-a".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 3);
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "unknown_record");
+        assert!(!error.msg.is_empty(), "the code comes with an explanation");
+        assert_eq!(review_list(&mut ws, 4, 0).await, []);
 
         harness.stop().await;
     }

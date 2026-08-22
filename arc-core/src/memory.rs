@@ -53,8 +53,11 @@ pub(crate) fn index_line(entry: &MemoryIndexEntry) -> String {
 }
 
 /// The lowercase enum name; ints this build does not know render as
-/// `kind_<n>` rather than lying or vanishing.
-pub(crate) fn kind_name(kind: i32) -> String {
+/// `kind_<n>` rather than lying or vanishing. Public because every listing of
+/// a record — the index block, the TUI's review pane — must say kinds the
+/// same way.
+#[must_use]
+pub fn kind_name(kind: i32) -> String {
     use arc_proto::v1::memory_record::Kind;
     match Kind::try_from(kind) {
         Ok(Kind::Person) => "person".to_owned(),
