@@ -2,14 +2,15 @@
 //! forward compatibility with additive schema changes, and proto3 defaults.
 
 use arc_proto::v1::{
-    ClientFrame, Delta, Error, Event, HistoryMessage, MemoryEvent, MemoryRecord,
-    MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded,
-    MemoryRecordUpdated, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
-    MemoryReviewItems, MemoryReviewList, MessageAccepted, MessageAppended, Provenance,
-    ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame, SessionConsolidated,
-    SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList, Source, StreamEnd,
-    ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome, ToolResultRecorded, client_frame,
-    event, memory_event, memory_record, server_frame, session_event,
+    ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
+    HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
+    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MemoryReviewAccept,
+    MemoryReviewDelete, MemoryReviewItem, MemoryReviewItems, MemoryReviewList, MessageAccepted,
+    MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame,
+    SessionConsolidated, SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList,
+    Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
+    ToolResultRecorded, client_frame, event, history_entry, memory_event, memory_record,
+    server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -301,6 +302,28 @@ fn server_frame_arms_round_trip() {
                     role: Role::Assistant as i32,
                     content: "hello back".to_string(),
                     partial: true,
+                },
+            ],
+            entries: vec![
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::Message(HistoryMessage {
+                        role: Role::User as i32,
+                        content: "hello arc".to_string(),
+                        partial: false,
+                    })),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
+                        call_id: "call-aa".to_string(),
+                        name: "memory_search".to_string(),
+                    })),
+                },
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
+                        call_id: "call-aa".to_string(),
+                        outcome: ToolOutcome::Ok as i32,
+                        truncated: true,
+                    })),
                 },
             ],
         }),

@@ -130,9 +130,39 @@ message HistoryMessage {
   bool partial = 3;
 }
 
+// A tool call in a past turn. Name and id only: display needs no arguments,
+// and they stay off the wire until something renders them (additive later).
+message HistoryToolCall {
+  string call_id = 1;
+  string name = 2;
+}
+
+// The result closing `call_id`. Outcome only, no content — same rule.
+message HistoryToolResult {
+  string call_id = 1;
+  ToolOutcome outcome = 2;
+  // The registry cut the result before recording it.
+  bool truncated = 3;
+}
+
+// One transcript row of a reopened session, in the session's seq order —
+// what rebuilds the display a live turn left behind (DESIGN.md §3.1).
+message HistoryEntry {
+  oneof entry {
+    HistoryMessage message = 1;
+    HistoryToolCall tool_call = 2;
+    HistoryToolResult tool_result = 3;
+  }
+}
+
 message SessionHistory {
   string session_id = 1;
+  // Prose only. Superseded by `entries`; still filled so a client that
+  // predates entries keeps rendering.
   repeated HistoryMessage messages = 2;
+  // Every row kind, in seq order. Empty means an old daemon; clients fall
+  // back to `messages`.
+  repeated HistoryEntry entries = 3;
 }
 
 // One record awaiting a verdict, whole — a review pane renders from this
