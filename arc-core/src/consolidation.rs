@@ -17,6 +17,7 @@
 //! makes the next due-query honest.
 
 pub mod extract;
+pub mod replay;
 
 use std::collections::HashSet;
 use std::future::Future;

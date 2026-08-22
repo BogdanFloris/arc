@@ -75,6 +75,11 @@ pub struct CompletionRequest {
     /// the tool answers from memory instead, and nothing downstream can tell
     /// that apart from a model choosing not to call it.
     pub tools: Vec<ToolDefinition>,
+
+    /// Fixed sampler seed, for callers that need repeatability — memory
+    /// replay sets it per session (task 7.3); live turns leave it `None`.
+    /// A backend that ignores it degrades to noise, not breakage.
+    pub seed: Option<u64>,
 }
 
 /// A tool the model may call: what it is called, what it does, what it takes.
@@ -415,6 +420,7 @@ mod tests {
                 content: "hello".to_owned(),
             }],
             tools: Vec::new(),
+            seed: None,
         }
     }
 

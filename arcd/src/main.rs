@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! arcd run [--config <path>]
+//! arcd memory-replay --prompt <version> [--against <version>] [--session <id>]...
 //! ```
 //!
 //! Exit codes: 0 fine, 1 something failed, 2 the command line did not parse.
@@ -16,6 +17,7 @@ mod daemon;
 mod dirs;
 mod identity;
 mod llama;
+mod replay;
 mod server;
 mod telemetry;
 
@@ -69,5 +71,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Run => daemon::run(config, dirs).await,
+        Command::MemoryReplay {
+            prompt,
+            against,
+            sessions,
+        } => replay::run(config, dirs, &prompt, against.as_deref(), &sessions).await,
     }
 }

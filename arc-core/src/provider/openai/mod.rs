@@ -141,6 +141,10 @@ struct Payload<'a> {
     /// tokens in the chat template that renders it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
+    /// Pins the sampler. llama.cpp honors it; a server that ignores it
+    /// degrades to noise, not breakage. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -243,6 +247,7 @@ impl<'a> Payload<'a> {
                 include_usage: true,
             },
             tools: request.tools.iter().map(wire_tool).collect(),
+            seed: request.seed,
         })
     }
 }
@@ -377,6 +382,7 @@ mod tests {
                 })
                 .collect(),
             tools: Vec::new(),
+            seed: None,
         }
     }
 
@@ -478,6 +484,20 @@ mod tests {
 
         let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
         assert_eq!(body.get("tools"), None, "{body}");
+        assert_eq!(body.get("seed"), None, "unset seed sends no key: {body}");
+    }
+
+    /// A set seed rides the payload; replay's determinism depends on it.
+    #[tokio::test]
+    async fn a_set_seed_is_serialized() {
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.seed = Some(42);
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["seed"], 42, "{body}");
     }
 
     #[tokio::test]

@@ -73,6 +73,10 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
 
+/// Every prompt version this build can run, for 7.3's replay: a new prompt
+/// is a new entry here, never an edit to an old one.
+pub const KNOWN_VERSIONS: &[(&str, &str)] = &[(PROMPT_VERSION_V1, PROMPT_V1)];
+
 /// Longest rendered transcript, in chars. The tail is kept — the most
 /// recent turns — behind an explicit truncation head-line. User messages
 /// are windowed, never paraphrased (hermes' micro-compaction lesson).
@@ -87,6 +91,8 @@ pub struct ModelExtractor<P> {
     provider: Arc<P>,
     model: String,
     timeout: Duration,
+    prompt: String,
+    seed: Option<u64>,
 }
 
 impl<P: Provider> ModelExtractor<P> {
@@ -98,7 +104,25 @@ impl<P: Provider> ModelExtractor<P> {
             provider,
             model: model.into(),
             timeout,
+            prompt: PROMPT_V1.to_owned(),
+            seed: None,
         }
+    }
+
+    /// Replay's prompt dial (task 7.3): run under this prompt text instead
+    /// of [`PROMPT_V1`]. The live pass never calls this.
+    #[must_use]
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Replay's determinism dial: pin the sampler so run-to-run differences
+    /// are attributable to the prompt. The live pass leaves it unset.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
     }
 
     /// Runs the completion and concatenates its text, rejecting every shape
@@ -158,12 +182,13 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
     ) -> Result<Vec<memory_event::Event>, ExtractError> {
         let request = CompletionRequest {
             model: self.model.clone(),
-            system: Some(PROMPT_V1.to_owned()),
+            system: Some(self.prompt.clone()),
             messages: vec![Message::Text {
                 role: Role::User,
                 content: render_input(session),
             }],
             tools: Vec::new(),
+            seed: self.seed,
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await

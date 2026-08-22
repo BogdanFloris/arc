@@ -252,19 +252,8 @@ impl<P: Provider> Engine<P> {
         let mut steps = 0;
 
         loop {
-            // After the last allowed tool step, offer no tools: the model can
-            // only answer in prose.
             let last_step = steps >= MAX_TOOL_STEPS;
-            let request = CompletionRequest {
-                model: self.model.clone(),
-                system: system.clone(),
-                messages: transcript.clone(),
-                tools: if last_step {
-                    Vec::new()
-                } else {
-                    self.registry.definitions()
-                },
-            };
+            let request = self.completion_request(system.clone(), transcript.clone(), last_step);
 
             let (ending, text, calls) = self
                 .run_completion(request, &events, &mut total_usage)
@@ -699,6 +688,28 @@ impl<P: Provider> Engine<P> {
         let system =
             self.system_prompt(render_memory_index(&self.projection.memory_index()?).as_deref());
         Ok((rebuild_transcript(&rows), system))
+    }
+
+    /// One step's completion request. After the last allowed tool step no
+    /// tools are offered, so the model can only answer in prose. Interactive
+    /// turns never pin a seed; that dial is replay's (task 7.3).
+    fn completion_request(
+        &self,
+        system: Option<String>,
+        messages: Vec<Message>,
+        last_step: bool,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            model: self.model.clone(),
+            system,
+            messages,
+            tools: if last_step {
+                Vec::new()
+            } else {
+                self.registry.definitions()
+            },
+            seed: None,
+        }
     }
 
     /// Seeds the session's collision set from its projected call rows.
