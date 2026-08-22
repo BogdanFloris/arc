@@ -37,12 +37,35 @@ message FetchHistory {
   reserved 2; // a paging cursor, when it is needed
 }
 
+// Ask for the review queue (DESIGN.md §5.4): records changed at or after
+// `since_micros` (microseconds since the Unix epoch) and not reviewed since
+// their last change. Answered with MemoryReviewItems or Error.
+message MemoryReviewList {
+  int64 since_micros = 1;
+}
+
+// The accept verdict for one record. Answered with the protocol's existing
+// ack, MessageAccepted (its session_id empty — the request already names the
+// record), or Error.
+message MemoryReviewAccept {
+  string record_id = 1;
+}
+
+// The delete verdict for one record — the one destructive verdict. Answered
+// like MemoryReviewAccept.
+message MemoryReviewDelete {
+  string record_id = 1;
+}
+
 message ClientFrame {
   uint64 request_id = 1; // client-chosen, echoed back
   oneof msg {
     SendMessage send_message = 11;
     ListSessions list_sessions = 12;
     FetchHistory fetch_history = 13;
+    MemoryReviewList memory_review_list = 14;
+    MemoryReviewAccept memory_review_accept = 15;
+    MemoryReviewDelete memory_review_delete = 16;
   }
 }
 
@@ -112,6 +135,22 @@ message SessionHistory {
   repeated HistoryMessage messages = 2;
 }
 
+// One record awaiting a verdict, whole — a review pane renders from this
+// alone, and `fix` needs the id and title to prefill from.
+message MemoryReviewItem {
+  MemoryRecord record = 1;
+  // When the record last changed (created/updated/superseded), microseconds
+  // since the Unix epoch.
+  int64 changed_at_micros = 2;
+  // Id of the replacement when the record is superseded; empty otherwise.
+  string superseded_by = 3;
+}
+
+// The review queue, in (changed_at, id) order.
+message MemoryReviewItems {
+  repeated MemoryReviewItem items = 1;
+}
+
 // A turn is MessageAccepted, then any number of Delta, ReasoningDelta,
 // ToolCallStarted and ToolCallEnded frames in the order the turn produced them,
 // then one StreamEnd or one Error. A client that renders none of the middle
@@ -130,5 +169,6 @@ message ServerFrame {
     ReasoningDelta reasoning_delta = 16;
     ToolCallStarted tool_call_started = 17;
     ToolCallEnded tool_call_ended = 18;
+    MemoryReviewItems memory_review_items = 19;
   }
 }

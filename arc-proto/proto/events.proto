@@ -137,6 +137,12 @@ message MemoryRecordDeleted {
   string id = 1;
 }
 
+// A review accept (DESIGN.md §5.4): the record was human-confirmed as-is.
+// Durable because reviews are the ground truth precision labels rest on.
+message MemoryRecordReviewed {
+  string record_id = 1;
+}
+
 message MemoryEvent {
   // Writes carry the whole record, never a diff: replay is last write wins.
   oneof event {
@@ -144,6 +150,7 @@ message MemoryEvent {
     MemoryRecordUpdated record_updated = 2;
     MemoryRecordSuperseded record_superseded = 3;
     MemoryRecordDeleted record_deleted = 4;
+    MemoryRecordReviewed record_reviewed = 5;
   }
 }
 

@@ -3,12 +3,13 @@
 
 use arc_proto::v1::{
     ClientFrame, Delta, Error, Event, HistoryMessage, MemoryEvent, MemoryRecord,
-    MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated,
-    MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role,
-    SendMessage, ServerFrame, SessionConsolidated, SessionCreated, SessionEvent, SessionHistory,
-    SessionInfo, SessionList, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted,
-    ToolOutcome, ToolResultRecorded, client_frame, event, memory_event, memory_record,
-    server_frame, session_event,
+    MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded,
+    MemoryRecordUpdated, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
+    MemoryReviewItems, MemoryReviewList, MessageAccepted, MessageAppended, Provenance,
+    ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame, SessionConsolidated,
+    SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList, Source, StreamEnd,
+    ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome, ToolResultRecorded, client_frame,
+    event, memory_event, memory_record, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -217,6 +218,52 @@ fn event_memory_record_deleted_round_trips() {
             id: "m-01".to_string(),
         }),
     ));
+}
+
+#[test]
+fn event_memory_record_reviewed_round_trips() {
+    round_trip(&memory_payload_event(
+        9,
+        Source::User,
+        memory_event::Event::RecordReviewed(MemoryRecordReviewed {
+            record_id: "m-01".to_string(),
+        }),
+    ));
+}
+
+#[test]
+fn client_frame_review_arms_round_trip() {
+    let arms = [
+        client_frame::Msg::MemoryReviewList(MemoryReviewList {
+            since_micros: 1_700_000_000_000_000,
+        }),
+        client_frame::Msg::MemoryReviewAccept(MemoryReviewAccept {
+            record_id: "m-01".to_string(),
+        }),
+        client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+            record_id: "m-01".to_string(),
+        }),
+    ];
+    for arm in arms {
+        round_trip(&ClientFrame {
+            request_id: 7,
+            msg: Some(arm),
+        });
+    }
+}
+
+#[test]
+fn server_frame_review_items_round_trips() {
+    round_trip(&ServerFrame {
+        request_id: 7,
+        msg: Some(server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
+            items: vec![MemoryReviewItem {
+                record: Some(memory_record()),
+                changed_at_micros: 1_700_000_000_000_000,
+                superseded_by: "m-09".to_string(),
+            }],
+        })),
+    });
 }
 
 #[test]
