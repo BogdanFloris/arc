@@ -117,7 +117,6 @@ pub enum Error {
 }
 
 impl Error {
-    #[must_use]
     pub fn http(status: u16, body: &str) -> Self {
         let end = if body.len() <= MAX_BODY_SNIPPET {
             body.len()

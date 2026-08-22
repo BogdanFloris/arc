@@ -66,33 +66,35 @@ pub struct ModelExtractor<P> {
 }
 
 impl<P: Provider> ModelExtractor<P> {
-    #[must_use]
-    pub fn new(provider: Arc<P>, model: impl Into<String>, timeout: Duration) -> Self {
+    pub fn new(provider: Arc<P>, model: &str, timeout: Duration) -> Self {
         Self {
             provider,
-            model: model.into(),
+            model: model.to_owned(),
             timeout,
             prompt: PROMPT_V1.to_owned(),
             seed: None,
         }
     }
 
-    #[must_use]
-    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.prompt = prompt.into();
-        self
-    }
-
-    #[must_use]
-    pub fn with_seed(mut self, seed: u64) -> Self {
-        self.seed = Some(seed);
-        self
+    pub(crate) fn pinned(
+        provider: Arc<P>,
+        model: &str,
+        timeout: Duration,
+        prompt: &str,
+        seed: u64,
+    ) -> Self {
+        Self {
+            provider,
+            model: model.to_owned(),
+            timeout,
+            prompt: prompt.to_owned(),
+            seed: Some(seed),
+        }
     }
 }
 
 // FNV-1a — a session must seed the same way on every replay
-#[must_use]
-pub fn session_seed(session_id: &str) -> u64 {
+pub(crate) fn session_seed(session_id: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in session_id.bytes() {
         hash ^= u64::from(byte);
@@ -501,7 +503,7 @@ mod tests {
              (none yet)"
         );
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         assert_eq!(events.len(), 5);
         assert_eq!(events[3].source, Source::System as i32);
         let Some(event::Payload::Memory(memory)) = &events[3].payload else {
@@ -603,7 +605,7 @@ mod tests {
             "{content}"
         );
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         let Some(event::Payload::Memory(memory)) = &events[events.len() - 2].payload else {
             panic!("expected the supersede before the marker");
         };

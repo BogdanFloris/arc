@@ -1,25 +1,24 @@
 use super::Error;
 
-pub const LEN_SIZE: usize = 4;
+pub(crate) const LEN_SIZE: usize = 4;
 
-pub const CRC_SIZE: usize = 4;
+pub(crate) const CRC_SIZE: usize = 4;
 
-pub const HEADER_SIZE: usize = LEN_SIZE + CRC_SIZE;
+pub(crate) const HEADER_SIZE: usize = LEN_SIZE + CRC_SIZE;
 
-pub const MAX_RECORD_LEN: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_RECORD_LEN: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Header {
+pub(crate) struct Header {
     pub len: u32,
     pub crc: u32,
 }
 
-#[must_use]
-pub fn checksum(payload: &[u8]) -> u32 {
+pub(crate) fn checksum(payload: &[u8]) -> u32 {
     crc32fast::hash(payload)
 }
 
-pub fn encode_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn encode_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
     let len = u32::try_from(payload.len())
         .ok()
         .filter(|len| *len <= MAX_RECORD_LEN)
@@ -32,16 +31,14 @@ pub fn encode_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(record)
 }
 
-#[must_use]
-pub fn decode_header(bytes: &[u8; HEADER_SIZE]) -> Header {
+pub(crate) fn decode_header(bytes: [u8; HEADER_SIZE]) -> Header {
     Header {
         len: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         crc: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
     }
 }
 
-#[must_use]
-pub fn verify(header: &Header, payload: &[u8]) -> bool {
+pub(crate) fn verify(header: Header, payload: &[u8]) -> bool {
     u32::try_from(payload.len()).is_ok_and(|len| len == header.len)
         && checksum(payload) == header.crc
 }
@@ -86,7 +83,7 @@ mod tests {
                 crc: checksum(payload)
             }
         );
-        assert!(verify(&header, &record[HEADER_SIZE..]));
+        assert!(verify(header, &record[HEADER_SIZE..]));
     }
 
     #[test]
@@ -112,7 +109,7 @@ mod tests {
             crc: checksum(payload),
         };
 
-        assert!(!verify(&header, b"orc"));
-        assert!(!verify(&header, b"arch"));
+        assert!(!verify(header, b"orc"));
+        assert!(!verify(header, b"arch"));
     }
 }

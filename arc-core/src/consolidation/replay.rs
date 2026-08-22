@@ -71,7 +71,7 @@ pub struct ChangedSummary {
     pub summary_b: String,
 }
 
-pub use super::extract::session_seed;
+use super::extract::session_seed;
 
 pub async fn run<P: Provider>(
     provider: &Arc<P>,
@@ -121,7 +121,7 @@ async fn run_version<P: Provider>(
     prompt: &str,
     session_filter: &[String],
 ) -> Result<ReplayReport, ReplayError> {
-    let mut projection = Projection::open(":memory:")?;
+    let mut projection = Projection::in_memory()?;
     let mut session_order = Vec::new();
     let mut next_seq = 0_u64;
     for event in events {
@@ -156,9 +156,13 @@ async fn run_version<P: Provider>(
             latest_seq,
             memory_index: projection.memory_index()?,
         };
-        let extractor = ModelExtractor::new(Arc::clone(provider), model, timeout)
-            .with_prompt(prompt)
-            .with_seed(session_seed(&session_id));
+        let extractor = ModelExtractor::pinned(
+            Arc::clone(provider),
+            model,
+            timeout,
+            prompt,
+            session_seed(&session_id),
+        );
         let extracted =
             extractor
                 .extract(&snapshot)
@@ -234,7 +238,6 @@ fn operation(event: &memory_event::Event) -> ReplayOperation {
     )
 }
 
-#[must_use]
 pub fn diff(a: &ReplayReport, b: &ReplayReport) -> ReplayDiff {
     let mut remaining_a: Vec<&ReplayRecord> = a.final_state.iter().collect();
     let mut only_in_b = Vec::new();

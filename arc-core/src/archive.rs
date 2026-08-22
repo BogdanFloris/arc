@@ -41,12 +41,12 @@ pub enum Error {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchReply {
+pub(crate) struct SearchReply {
     pub sessions: Vec<SessionHit>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SessionHit {
+pub(crate) struct SessionHit {
     pub session_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -63,7 +63,7 @@ pub struct SessionHit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProseMessage {
+pub(crate) struct ProseMessage {
     pub seq: i64,
     pub role: String,
     pub content: String,
@@ -72,7 +72,7 @@ pub struct ProseMessage {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ReadReply {
+pub(crate) struct ReadReply {
     pub session_id: String,
     pub messages: Vec<ProseMessage>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -80,14 +80,14 @@ pub struct ReadReply {
 }
 
 #[derive(Debug, Serialize)]
-pub struct EndsReply {
+pub(crate) struct EndsReply {
     pub session_id: String,
     pub first: Vec<ProseMessage>,
     pub last: Vec<ProseMessage>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct MemoryHit {
+pub(crate) struct MemoryHit {
     pub id: String,
     pub namespace: String,
     pub kind: String,
@@ -96,7 +96,7 @@ pub struct MemoryHit {
 }
 
 #[derive(Debug, Serialize)]
-pub struct MemoryRecordReply {
+pub(crate) struct MemoryRecordReply {
     pub id: String,
     pub namespace: String,
     pub kind: String,
@@ -112,7 +112,7 @@ pub struct MemoryRecordReply {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ProvenanceLine {
+pub(crate) struct ProvenanceLine {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<String>,
@@ -123,8 +123,7 @@ pub struct Archive {
 }
 
 impl Archive {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
+    pub fn open(path: &Path) -> Result<Self, Error> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -150,7 +149,7 @@ impl Archive {
             include_tool_results,
         )
     )]
-    pub fn search(
+    pub(crate) fn search(
         &self,
         raw_query: &str,
         include_tool_results: bool,
@@ -245,7 +244,7 @@ impl Archive {
         skip_all,
         fields(session_id = %session_id, shape = "range", rows = tracing::field::Empty)
     )]
-    pub fn read_range(
+    pub(crate) fn read_range(
         &self,
         session_id: &str,
         start_seq: i64,
@@ -289,7 +288,7 @@ impl Archive {
         skip_all,
         fields(session_id = %session_id, shape = "ends")
     )]
-    pub fn ends(&self, session_id: &str) -> Result<Option<EndsReply>, Error> {
+    pub(crate) fn ends(&self, session_id: &str) -> Result<Option<EndsReply>, Error> {
         let conn = self.lock();
         if !session_exists(&conn, session_id)? {
             return Ok(None);
@@ -303,7 +302,7 @@ impl Archive {
     }
 
     #[tracing::instrument(name = "memory.read", skip_all, fields(id = %id))]
-    pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordReply>, Error> {
+    pub(crate) fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordReply>, Error> {
         let row = self
             .lock()
             .query_row(
@@ -337,7 +336,7 @@ impl Archive {
         skip_all,
         fields(query = %query, hits = tracing::field::Empty)
     )]
-    pub fn memory_search(
+    pub(crate) fn memory_search(
         &self,
         query: &str,
         namespace: Option<&str>,
@@ -390,8 +389,7 @@ impl Archive {
     }
 }
 
-#[must_use]
-pub fn sanitize_query(raw: &str) -> String {
+pub(crate) fn sanitize_query(raw: &str) -> String {
     let capped: String = raw.chars().take(MAX_QUERY_CHARS).collect();
     let mut terms: Vec<String> = Vec::new();
     let mut rest = capped.as_str();

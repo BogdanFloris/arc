@@ -30,8 +30,10 @@ pub trait Extractor: Send + Sync {
 #[error("extractor: {0}")]
 pub struct ExtractError(pub String);
 
-pub struct NoopExtractor;
+#[cfg(test)]
+pub(crate) struct NoopExtractor;
 
+#[cfg(test)]
 impl Extractor for NoopExtractor {
     async fn extract(
         &self,
@@ -68,7 +70,6 @@ pub enum Outcome {
     },
 }
 
-#[allow(clippy::implicit_hasher)]
 #[tracing::instrument(
     name = "consolidation.pass",
     skip_all,
@@ -269,7 +270,7 @@ mod tests {
                 records_superseded: 0,
             }
         );
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         assert_eq!(events.len(), 4, "the turn plus exactly one marker");
         let last = events.last().expect("events");
         assert_eq!(last.source, Source::System as i32, "arcd initiated this");
@@ -301,7 +302,7 @@ mod tests {
             .expect("pass");
 
         assert_eq!(outcome, Outcome::NothingDue);
-        assert_eq!(replay_events(&dir).len(), 3, "no marker appended");
+        assert_eq!(replay_events(dir.path()).len(), 3, "no marker appended");
     }
 
     #[tokio::test]
@@ -342,7 +343,7 @@ mod tests {
             .expect("commit");
 
         assert!(!committed, "the stale snapshot must not commit");
-        for event in replay_events(&dir) {
+        for event in replay_events(dir.path()) {
             let Some(event::Payload::Session(session)) = &event.payload else {
                 panic!("a memory event leaked from the discarded pass");
             };
@@ -396,7 +397,7 @@ mod tests {
                 records_superseded: 0,
             }
         );
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         assert_eq!(events.len(), 5);
         let record_event = &events[3];
         assert_eq!(record_event.source, Source::System as i32);
@@ -406,7 +407,7 @@ mod tests {
         );
         assert_eq!(marker(&events[4]).through_seq, 2);
 
-        let mut fresh = Projection::open(":memory:").expect("open");
+        let mut fresh = Projection::in_memory().expect("open");
         for event in &events {
             fresh.apply(event).expect("apply");
         }
@@ -523,7 +524,7 @@ mod tests {
             panic!("got: {err:?}");
         };
         assert_eq!(session_id, reply.session_id);
-        assert_eq!(replay_events(&dir).len(), 3, "log untouched");
+        assert_eq!(replay_events(dir.path()).len(), 3, "log untouched");
     }
 
     #[tokio::test]

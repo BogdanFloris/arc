@@ -17,6 +17,11 @@ license = "MIT"
 pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+cast_precision_loss = "allow"
+implicit_hasher = "allow"
+needless_raw_string_hashes = "allow"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +43,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-tungstenite = "0.30"
 crc32fast = "1"
 tempfile = "3"
+expect-test = "1"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

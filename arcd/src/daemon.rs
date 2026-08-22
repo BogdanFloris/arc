@@ -118,7 +118,7 @@ impl<P: Provider + 'static> Daemon<P> {
             log,
             projection,
             Arc::clone(&provider),
-            config.model(),
+            &config.model(),
             identity,
             registry,
             config.no_think,
@@ -149,7 +149,7 @@ impl<P: Provider + 'static> Daemon<P> {
 
         let consolidation = consolidation_task(
             self.config.consolidation,
-            self.config.model(),
+            &self.config.model(),
             Arc::clone(&self.engine),
             Arc::clone(&self.provider),
         );
@@ -169,7 +169,7 @@ const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
 
 fn consolidation_task<P: Provider + 'static>(
     config: ConsolidationConfig,
-    model: String,
+    model: &str,
     engine: Arc<Mutex<Engine<P>>>,
     provider: Arc<P>,
 ) -> Option<JoinHandle<()>> {
@@ -334,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_foreign_schema_version_index_is_deleted_and_rebuilt() {
         let temp = TempDir::new().expect("temp dir");
-        let dirs = DataDirs::new(temp.path().join("data"));
+        let dirs = DataDirs::new(&temp.path().join("data"));
         dirs.create().expect("create dirs");
 
         let mut log = Log::open(dirs.log()).expect("open log");
@@ -374,13 +374,13 @@ mod tests {
     #[tokio::test]
     async fn the_consolidation_tick_only_runs_when_enabled() {
         let temp = TempDir::new().expect("temp dir");
-        let dirs = DataDirs::new(temp.path().join("data"));
+        let dirs = DataDirs::new(&temp.path().join("data"));
         let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
 
         assert!(
             consolidation_task(
                 Config::default().consolidation,
-                "test-model".to_owned(),
+                "test-model",
                 Arc::clone(&daemon.engine),
                 Arc::clone(&daemon.provider),
             )
@@ -395,7 +395,7 @@ mod tests {
         };
         let task = consolidation_task(
             enabled,
-            "test-model".to_owned(),
+            "test-model",
             Arc::clone(&daemon.engine),
             Arc::clone(&daemon.provider),
         )
@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn three_strikes_skip_the_session_and_the_next_due_proceeds() {
         let temp = TempDir::new().expect("temp dir");
-        let dirs = DataDirs::new(temp.path().join("data"));
+        let dirs = DataDirs::new(&temp.path().join("data"));
         dirs.create().expect("create dirs");
         let mut log = Log::open(dirs.log()).expect("open log");
         seed_idle_session(&mut log, "s-a", 1_000_000);

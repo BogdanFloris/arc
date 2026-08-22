@@ -121,7 +121,6 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 
-    #[must_use]
     pub fn model(&self) -> String {
         if let Some(model) = &self.model {
             return model.clone();

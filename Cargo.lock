@@ -50,6 +50,7 @@ dependencies = [
  "arc-proto",
  "chrono",
  "crossterm",
+ "expect-test",
  "futures",
  "prost-types",
  "ratatui",
@@ -65,6 +66,7 @@ dependencies = [
  "arc-proto",
  "chrono",
  "crc32fast",
+ "expect-test",
  "futures",
  "prost",
  "prost-types",
@@ -106,6 +108,7 @@ dependencies = [
  "anyhow",
  "arc-core",
  "arc-proto",
+ "expect-test",
  "futures",
  "prost",
  "prost-types",
@@ -584,6 +587,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dissimilar"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -627,6 +636,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "expect-test"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63af43ff4431e848fb47472a920f14fa71c24de13255a5692e93d4e90302acb0"
+dependencies = [
+ "dissimilar",
+ "once_cell",
 ]
 
 [[package]]

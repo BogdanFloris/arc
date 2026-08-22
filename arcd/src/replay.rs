@@ -169,6 +169,8 @@ mod tests {
         ReplayOperation, ReplayRecord, ReplayReport, SessionReplay, diff,
     };
 
+    use expect_test::expect;
+
     use super::{diff_lines, report_lines, resolve};
 
     #[test]
@@ -227,33 +229,31 @@ mod tests {
     #[test]
     fn a_report_renders_counts_operations_and_final_state() {
         let (a, _) = reports();
-        assert_eq!(
-            report_lines(&a).join("\n"),
-            "== prompt v1 ==\n\
-             sessions processed: 2\n\
-             s-1:\n  \
-               write fact \"User name\" \u{2014} named Bogdan\n\
-             final state: 1 records\n  \
-               fact/global: User name \u{2014} named Bogdan\n"
-        );
+        expect![[r#"
+            == prompt v1 ==
+            sessions processed: 2
+            s-1:
+              write fact "User name" — named Bogdan
+            final state: 1 records
+              fact/global: User name — named Bogdan
+        "#]]
+        .assert_eq(&report_lines(&a).join("\n"));
     }
 
     #[test]
     fn a_diff_renders_counts_exclusives_and_changed_summaries() {
         let (a, b) = reports();
         let rendered = diff_lines(&a, &b, &diff(&a, &b)).join("\n");
-        assert_eq!(
-            rendered,
-            "== diff v1 -> v2 ==\n\
-             keyed on content (kind + title, case-insensitive); minted ids differ between runs by construction\n\
-             records: v1 1, v2 2\n\
-             only in v1: none\n\
-             only in v2:\n  \
-               preference/global: Storytelling \u{2014} likes big stories\n\
-             changed summaries:\n  \
-               fact \"User name\":\n    \
-                 v1: named Bogdan\n    \
-                 v2: goes by Bogdan"
-        );
+        expect![[r#"
+            == diff v1 -> v2 ==
+            keyed on content (kind + title, case-insensitive); minted ids differ between runs by construction
+            records: v1 1, v2 2
+            only in v1: none
+            only in v2:
+              preference/global: Storytelling — likes big stories
+            changed summaries:
+              fact "User name":
+                v1: named Bogdan
+                v2: goes by Bogdan"#]].assert_eq(&rendered);
     }
 }

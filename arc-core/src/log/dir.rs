@@ -7,7 +7,7 @@ use prost::Message;
 
 use super::{Error, LogReader, SegmentWriter, format};
 
-pub const DEFAULT_MAX_SEGMENT_LEN: u64 = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_SEGMENT_LEN: u64 = 64 * 1024 * 1024;
 
 const SEQ_DIGITS: usize = 20; // u64::MAX is 20 digits, so names sort by seq
 
@@ -15,18 +15,17 @@ const SEGMENT_EXT: &str = ".log";
 
 const HEADER_LEN: u64 = format::HEADER_SIZE as u64;
 
-#[must_use]
-pub fn segment_name(first_seq: u64) -> String {
+pub(crate) fn segment_name(first_seq: u64) -> String {
     segment_file_name(first_seq, 0)
 }
 
-#[must_use]
-pub fn segment_first_seq(path: &Path) -> Option<u64> {
+#[cfg(test)]
+pub(crate) fn segment_first_seq(path: &Path) -> Option<u64> {
     let name = path.file_name().and_then(OsStr::to_str)?;
     parse_segment_file_name(name).map(|(first_seq, _)| first_seq)
 }
 
-pub fn discover_segments(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn discover_segments(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let entries = fs::read_dir(dir).map_err(|source| Error::io(dir, source))?;
 
     let mut found: Vec<(u64, u64, PathBuf)> = Vec::new();
@@ -63,7 +62,7 @@ pub struct Log {
 }
 
 impl Log {
-    pub fn open(dir: impl Into<PathBuf>) -> Result<Self, Error> {
+    pub fn open(dir: &Path) -> Result<Self, Error> {
         Self::open_with_max_segment_len(dir, DEFAULT_MAX_SEGMENT_LEN)
     }
 
@@ -79,11 +78,11 @@ impl Log {
             sealed = tracing::field::Empty,
         )
     )]
-    pub fn open_with_max_segment_len(
-        dir: impl Into<PathBuf>,
+    pub(crate) fn open_with_max_segment_len(
+        dir: &Path,
         max_segment_len: u64,
     ) -> Result<Self, Error> {
-        let dir = dir.into();
+        let dir = dir.to_path_buf();
         let span = tracing::Span::current();
         span.record("dir", tracing::field::display(dir.display()));
 
@@ -136,7 +135,7 @@ impl Log {
 
         Ok(Self {
             dir,
-            writer: SegmentWriter::open(path, point.next_seq)?,
+            writer: SegmentWriter::open(&path, point.next_seq)?,
             current_len,
             max_segment_len,
         })
@@ -177,27 +176,24 @@ impl Log {
         );
         let _entered = span.enter();
 
-        self.writer = SegmentWriter::open(path, first_seq)?;
+        self.writer = SegmentWriter::open(&path, first_seq)?;
         self.current_len = 0;
         Ok(())
     }
 
-    #[must_use]
     pub fn next_seq(&self) -> u64 {
         self.writer.next_seq()
     }
 
-    #[must_use]
     pub fn current_segment(&self) -> &Path {
         self.writer.path()
     }
 
-    #[must_use]
-    pub fn current_segment_len(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn current_segment_len(&self) -> u64 {
         self.current_len
     }
 
-    #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -570,7 +566,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         tear(&dir.path().join(segment_name(0)), 0, 5);
         let mut writer =
-            SegmentWriter::open(dir.path().join(segment_name(4)), 4).expect("open writer");
+            SegmentWriter::open(&dir.path().join(segment_name(4)), 4).expect("open writer");
         writer.append(event("m04")).expect("append");
         drop(writer);
 
@@ -589,7 +585,7 @@ mod tests {
 
         let dir = TempDir::new().expect("temp dir");
         let mut writer =
-            SegmentWriter::open(dir.path().join(segment_name(2)), 2).expect("open writer");
+            SegmentWriter::open(&dir.path().join(segment_name(2)), 2).expect("open writer");
         writer.append(event("m02")).expect("append");
         drop(writer);
 

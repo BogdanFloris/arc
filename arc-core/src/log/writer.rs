@@ -8,15 +8,15 @@ use prost::Message;
 use super::{Error, format};
 
 #[derive(Debug)]
-pub struct SegmentWriter {
+pub(crate) struct SegmentWriter {
     path: PathBuf,
     file: File,
     next_seq: u64,
 }
 
 impl SegmentWriter {
-    pub fn open(path: impl Into<PathBuf>, next_seq: u64) -> Result<Self, Error> {
-        let path = path.into();
+    pub fn open(path: &Path, next_seq: u64) -> Result<Self, Error> {
+        let path = path.to_path_buf();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -66,12 +66,10 @@ impl SegmentWriter {
         Ok(seq)
     }
 
-    #[must_use]
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
 
-    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }

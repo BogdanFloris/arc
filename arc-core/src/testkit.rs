@@ -83,7 +83,7 @@ pub(crate) fn turn(message: &Message) -> (Role, &str) {
 
 pub(crate) fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("open log");
-    let projection = Projection::open(":memory:").expect("open projection");
+    let projection = Projection::in_memory().expect("open projection");
     Engine::new(
         log,
         projection,
@@ -101,7 +101,7 @@ pub(crate) fn engine_with_tools(
     registry: Registry,
 ) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("open log");
-    let projection = Projection::open(":memory:").expect("open projection");
+    let projection = Projection::in_memory().expect("open projection");
     Engine::new(
         log,
         projection,
@@ -119,7 +119,7 @@ pub(crate) fn engine_with_tools_at(
     registry: Registry,
 ) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("open log");
-    let mut projection = Projection::open(dir.path().join("index.db")).expect("open projection");
+    let mut projection = Projection::open(&dir.path().join("index.db")).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     Engine::new(
         log,
@@ -138,7 +138,7 @@ pub(crate) fn reopened_engine(
     registry: Registry,
 ) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("reopen log");
-    let mut projection = Projection::open(":memory:").expect("open projection");
+    let mut projection = Projection::in_memory().expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     Engine::new(
         log,
@@ -228,18 +228,18 @@ pub(crate) fn archive_at(dir: &TempDir) -> Archive {
     let mut projection = Projection::open(&index).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     drop(projection);
-    Archive::open(index).expect("open archive")
+    Archive::open(&index).expect("open archive")
 }
 
-pub(crate) fn replay_events(dir: impl AsRef<std::path::Path>) -> Vec<arc_proto::v1::Event> {
-    let segments = discover_segments(dir.as_ref()).expect("discover");
+pub(crate) fn replay_events(dir: &std::path::Path) -> Vec<arc_proto::v1::Event> {
+    let segments = discover_segments(dir).expect("discover");
     LogReader::new(segments)
         .map(|result| result.expect("replay"))
         .collect()
 }
 
-pub(crate) fn replay_log(dir: impl AsRef<std::path::Path>) -> Vec<session_event::Event> {
-    let segments = discover_segments(dir.as_ref()).expect("discover");
+pub(crate) fn replay_log(dir: &std::path::Path) -> Vec<session_event::Event> {
+    let segments = discover_segments(dir).expect("discover");
     LogReader::new(segments)
         .map(|result| {
             let event = result.expect("replay");
@@ -297,9 +297,9 @@ impl Tool for Canned {
         _ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         let reply = if self.ok {
-            ToolReply::ok(self.content)
+            ToolReply::ok(self.content.to_owned())
         } else {
-            ToolReply::error(self.content)
+            ToolReply::error(self.content.to_owned())
         };
         Box::pin(async move { reply })
     }
@@ -391,7 +391,6 @@ mod tests {
     use crate::provider::{Message, ToolCall};
     use crate::session::EngineEvent;
 
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn a_tool_turn_holds_up_across_the_whole_chain() {
         let provider = ScriptedProvider::scripted(vec![
@@ -427,7 +426,7 @@ mod tests {
             ]
         );
 
-        let logged = replay_log(&dir);
+        let logged = replay_log(dir.path());
         assert_eq!(logged.len(), 5);
         let session_event::Event::SessionCreated(created) = &logged[0] else {
             panic!("expected SessionCreated first, got {:?}", logged[0]);
@@ -455,7 +454,7 @@ mod tests {
             (Role::Assistant as i32, "final text")
         );
 
-        let mut fresh = Projection::open(":memory:").expect("open projection");
+        let mut fresh = Projection::in_memory().expect("open projection");
         let segments = discover_segments(dir.path()).expect("discover");
         let stats = projection::replay(LogReader::new(segments), &mut fresh).expect("replay");
         assert_eq!(stats.applied, 5);

@@ -76,7 +76,6 @@ impl Sidecar {
         })
     }
 
-    #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }

@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use arc_proto::v1::Event;
 use prost::Message;
@@ -8,7 +8,7 @@ use prost::Message;
 use super::{Error, format};
 
 #[derive(Debug)]
-pub struct SegmentReader {
+pub(crate) struct SegmentReader {
     path: PathBuf,
     reader: BufReader<File>,
     payload_buffer: Vec<u8>,
@@ -18,8 +18,8 @@ pub struct SegmentReader {
 }
 
 impl SegmentReader {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, Error> {
-        let path = path.into();
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let path = path.to_path_buf();
         let file = File::open(&path).map_err(|source| Error::io(&path, source))?;
         let file_len = file
             .metadata()
@@ -36,8 +36,7 @@ impl SegmentReader {
         })
     }
 
-    #[must_use]
-    pub fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -77,7 +76,7 @@ impl Iterator for SegmentReader {
             return Some(self.fail(error));
         }
         self.offset += format::HEADER_SIZE as u64;
-        let header = format::decode_header(&header);
+        let header = format::decode_header(header);
 
         if header.len > format::MAX_RECORD_LEN {
             let path = self.path.clone();
@@ -99,7 +98,7 @@ impl Iterator for SegmentReader {
         }
         self.offset += payload_len;
 
-        if !format::verify(&header, &self.payload_buffer) {
+        if !format::verify(header, &self.payload_buffer) {
             let path = self.path.clone();
             return Some(self.fail(Error::Corruption {
                 path,
@@ -129,7 +128,7 @@ impl Iterator for SegmentReader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryPoint {
+pub(crate) struct RecoveryPoint {
     pub path: Option<PathBuf>,
     pub offset: u64,
     pub next_seq: u64,
@@ -144,7 +143,6 @@ pub struct LogReader {
 }
 
 impl LogReader {
-    #[must_use]
     pub fn new(segments: Vec<PathBuf>) -> Self {
         Self {
             segments: segments.into_iter(),
@@ -165,12 +163,11 @@ impl LogReader {
             self.finished = true;
             return Ok(false);
         };
-        self.current_reader = Some(SegmentReader::open(path)?);
+        self.current_reader = Some(SegmentReader::open(&path)?);
         Ok(true)
     }
 
-    #[must_use]
-    pub fn recovery_point(&self) -> RecoveryPoint {
+    pub(crate) fn recovery_point(&self) -> RecoveryPoint {
         RecoveryPoint {
             path: self.current_reader.as_ref().map(|r| r.path.clone()),
             offset: self
@@ -198,7 +195,7 @@ impl Iterator for LogReader {
                     self.finished = true;
                     return None;
                 };
-                match SegmentReader::open(path) {
+                match SegmentReader::open(&path) {
                     Ok(reader) => self.current_reader.insert(reader),
                     Err(error) => return Some(self.fail(error)),
                 }

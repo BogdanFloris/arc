@@ -21,26 +21,24 @@ pub struct ToolReply {
 }
 
 impl ToolReply {
-    #[must_use]
-    pub fn ok(content: impl Into<String>) -> Self {
+    pub fn ok(content: String) -> Self {
         Self {
-            content: content.into(),
+            content,
             ok: true,
             memory_events: Vec::new(),
         }
     }
 
-    #[must_use]
-    pub fn error(content: impl Into<String>) -> Self {
+    pub fn error(content: String) -> Self {
         Self {
-            content: content.into(),
+            content,
             ok: false,
             memory_events: Vec::new(),
         }
     }
 }
 
-pub struct DispatchOutcome {
+pub(crate) struct DispatchOutcome {
     pub content: String,
     pub ok: bool,
     pub truncated: bool,
@@ -67,7 +65,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    #[must_use]
     pub fn new(max_tool_result_bytes: usize) -> Self {
         Registry {
             tools: BTreeMap::new(),
@@ -84,8 +81,7 @@ impl Registry {
         self.tools.insert(name, tool);
     }
 
-    #[must_use]
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
@@ -94,7 +90,7 @@ impl Registry {
         skip_all,
         fields(tool = name, outcome = tracing::field::Empty)
     )]
-    pub async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         name: &str,
         arguments_json: String,
@@ -161,9 +157,9 @@ mod tests {
             _ctx: TurnContext,
         ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
             let reply = if self.ok {
-                ToolReply::ok(self.content)
+                ToolReply::ok(self.content.to_owned())
             } else {
-                ToolReply::error(self.content)
+                ToolReply::error(self.content.to_owned())
             };
             Box::pin(async move { reply })
         }

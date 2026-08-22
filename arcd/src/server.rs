@@ -592,7 +592,7 @@ mod tests {
             for event in events {
                 log.append(event).expect("seed");
             }
-            let mut projection = Projection::open(":memory:").expect("open projection");
+            let mut projection = Projection::in_memory().expect("open projection");
             arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
                 .expect("replay");
             let provider = MockProvider::new(script);
@@ -659,9 +659,9 @@ mod tests {
             _ctx: TurnContext,
         ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
             let reply = if self.ok {
-                ToolReply::ok(self.content)
+                ToolReply::ok(self.content.to_owned())
             } else {
-                ToolReply::error(self.content)
+                ToolReply::error(self.content.to_owned())
             };
             Box::pin(async move { reply })
         }

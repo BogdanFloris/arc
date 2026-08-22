@@ -17,7 +17,6 @@ pub struct MemoryRead {
 }
 
 impl MemoryRead {
-    #[must_use]
     pub fn new(archive: Archive) -> Self {
         Self { archive }
     }
@@ -73,7 +72,6 @@ pub struct MemorySearch {
 }
 
 impl MemorySearch {
-    #[must_use]
     pub fn new(archive: Archive) -> Self {
         Self { archive }
     }
@@ -133,7 +131,8 @@ impl Tool for MemorySearch {
             {
                 Ok(records) if records.is_empty() => ToolReply::ok(
                     "No memory records match. For something from a past conversation, \
-                     search sessions_search before giving up.",
+                     search sessions_search before giving up."
+                        .to_owned(),
                 ),
                 Ok(records) => ToolReply::ok(to_json(&SearchReplyJson { records })),
                 Err(Error::Query { message }) => ToolReply::ok(format!("No results: {message}.")),
@@ -150,7 +149,6 @@ pub struct MemorySupersede {
 }
 
 impl MemorySupersede {
-    #[must_use]
     pub fn new(archive: Archive) -> Self {
         Self { archive }
     }
@@ -467,7 +465,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         assert_eq!(events.len(), 6);
         assert!(matches!(
             session_ev(&events[2]),
@@ -547,7 +545,7 @@ mod tests {
             .send_message(None, "remember this", tx)
             .await
             .expect("send");
-        let id = created_record(&replay_events(&dir)[3]).id.clone();
+        let id = created_record(&replay_events(dir.path())[3]).id.clone();
 
         let tool = MemoryRead::new(archive_at(&dir));
         let read = tool
@@ -595,7 +593,7 @@ mod tests {
             .await
             .expect("second send");
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         let memory_event::Event::RecordSuperseded(superseded) = memory_ev(&events[4]) else {
             panic!(
                 "expected RecordSuperseded before the result, got {:?}",

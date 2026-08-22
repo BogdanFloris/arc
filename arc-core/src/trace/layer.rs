@@ -321,7 +321,6 @@ impl Visit for Fields {
 
     fn record_i64(&mut self, field: &Field, value: i64) {
         if let Some(name) = Self::counter_name(field) {
-            #[allow(clippy::cast_precision_loss)]
             self.counters.push((name.to_owned(), value as f64));
             return;
         }
@@ -337,7 +336,6 @@ impl Visit for Fields {
 
     fn record_u64(&mut self, field: &Field, value: u64) {
         if let Some(name) = Self::counter_name(field) {
-            #[allow(clippy::cast_precision_loss)]
             self.counters.push((name.to_owned(), value as f64));
             return;
         }

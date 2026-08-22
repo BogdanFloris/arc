@@ -21,9 +21,8 @@ pub struct OpenAiCompat {
 }
 
 impl OpenAiCompat {
-    #[must_use]
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        let mut endpoint = endpoint.into();
+    pub fn new(endpoint: &str) -> Self {
+        let mut endpoint = endpoint.to_owned();
         endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
             endpoint,
@@ -35,7 +34,6 @@ impl OpenAiCompat {
         }
     }
 
-    #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
@@ -306,7 +304,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompat::new(server.uri());
+        let provider = OpenAiCompat::new(&server.uri());
         let outcome = match provider.complete(req).await {
             Ok(stream) => Ok(stream.collect().await),
             Err(error) => Err(error),

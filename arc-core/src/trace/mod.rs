@@ -8,6 +8,6 @@ use std::{
 
 pub use layer::PerfettoLayer;
 
-pub fn perfetto(dir: impl AsRef<Path>, process_name: &str) -> io::Result<(PerfettoLayer, PathBuf)> {
-    PerfettoLayer::create(dir.as_ref(), process_name)
+pub fn perfetto(dir: &Path, process_name: &str) -> io::Result<(PerfettoLayer, PathBuf)> {
+    PerfettoLayer::create(dir, process_name)
 }

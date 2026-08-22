@@ -16,5 +16,8 @@ ratatui.workspace = true
 textwrap.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+expect-test.workspace = true
+
 [lints]
 workspace = true

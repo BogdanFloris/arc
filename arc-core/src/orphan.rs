@@ -7,7 +7,7 @@ use crate::log::{self, Log, LogReader};
 use crate::projection::{self, Projection};
 use crate::session::now_ts;
 
-pub const CLOSER_CONTENT: &str = "The daemon restarted before this call's result was recorded; the call may or may not have run.";
+pub(crate) const CLOSER_CONTENT: &str = "The daemon restarted before this call's result was recorded; the call may or may not have run.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanCall {
@@ -25,7 +25,7 @@ pub enum Error {
     Projection(#[from] projection::Error),
 }
 
-pub fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
+pub(crate) fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
     let mut slots: Vec<Option<OrphanCall>> = Vec::new();
     let mut open: HashMap<(String, String), usize> = HashMap::new();
     for read in reader {
@@ -53,7 +53,7 @@ pub fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
     Ok(slots.into_iter().flatten().collect())
 }
 
-pub fn close(
+pub(crate) fn close(
     orphans: &[OrphanCall],
     log: &mut Log,
     projection: &mut Projection,
@@ -182,7 +182,7 @@ mod tests {
     }
 
     fn replayed(log: &Log) -> Projection {
-        let mut projection = Projection::open(":memory:").expect("open projection");
+        let mut projection = Projection::in_memory().expect("open projection");
         projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         projection
     }

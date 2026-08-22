@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::consolidation::SessionSnapshot;
 use crate::log::{self, Log};
 use crate::memory::render_memory_index;
-use crate::projection::{self, DueSession, MessageRow, Projection, ReviewItem, SessionSummary};
+use crate::projection::{self, MessageRow, Projection, ReviewItem, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
@@ -86,7 +86,7 @@ impl<P: Provider> Engine<P> {
         log: Log,
         projection: Projection,
         provider: Arc<P>,
-        model: impl Into<String>,
+        model: &str,
         system: Option<String>,
         registry: Registry,
         no_think: bool,
@@ -95,7 +95,7 @@ impl<P: Provider> Engine<P> {
             log,
             projection,
             provider,
-            model: model.into(),
+            model: model.to_owned(),
             system,
             registry,
             no_think,
@@ -103,7 +103,6 @@ impl<P: Provider> Engine<P> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     #[tracing::instrument(
         level = "info",
         name = "session.send_message",
@@ -409,7 +408,11 @@ impl<P: Provider> Engine<P> {
             .collect())
     }
 
-    pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
+    #[cfg(test)]
+    pub(crate) fn due_for_consolidation(
+        &self,
+        idle_cutoff_micros: i64,
+    ) -> Result<Vec<projection::DueSession>, Error> {
         Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
     }
 
@@ -450,7 +453,7 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    pub fn snapshot_for_consolidation(
+    pub(crate) fn snapshot_for_consolidation(
         &self,
         idle_cutoff_micros: i64,
         skip: &HashSet<String>,
@@ -473,7 +476,7 @@ impl<P: Provider> Engine<P> {
         }))
     }
 
-    pub fn commit_consolidation(
+    pub(crate) fn commit_consolidation(
         &mut self,
         snapshot: &SessionSnapshot,
         events: Vec<memory_event::Event>,
@@ -896,7 +899,7 @@ mod tests {
         assert!(!reply.partial);
         assert_eq!(reply.seq, 2);
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 3);
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
@@ -956,7 +959,7 @@ mod tests {
             .await
             .expect("second send");
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 5, "exactly one SessionCreated");
 
         let requests = provider.requests();
@@ -1014,7 +1017,7 @@ mod tests {
 
         assert!(reply.partial);
         assert_eq!(reply.usage, None);
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial tex");
@@ -1044,7 +1047,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 3, "the partial text was still appended");
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
@@ -1066,7 +1069,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(
             events.len(),
             2,
@@ -1087,7 +1090,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::EmptyReply), "got: {err:?}");
-        assert_eq!(replay_log(&dir).len(), 2);
+        assert_eq!(replay_log(dir.path()).len(), 2);
     }
 
     #[tokio::test]
@@ -1101,7 +1104,7 @@ mod tests {
         let reply = engine.send_message(None, "hi", tx).await.expect("send");
 
         assert!(!reply.partial);
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(appended(&events[2]).content, "nobody watched");
     }
 
@@ -1118,7 +1121,7 @@ mod tests {
             .expect_err("must refuse");
 
         assert!(matches!(err, Error::EmptyMessage), "got: {err:?}");
-        assert_eq!(replay_log(&dir).len(), 0, "log untouched");
+        assert_eq!(replay_log(dir.path()).len(), 0, "log untouched");
         assert!(provider.requests().is_empty(), "provider never called");
     }
 
@@ -1183,7 +1186,7 @@ mod tests {
             })
         );
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 5);
         let user = appended(&events[1]);
         let issued_call = issued(&events[2]);
@@ -1256,7 +1259,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         let first = issued(&events[2]);
         let second = issued(&events[3]);
         assert_eq!((first.index, first.call_id.as_str()), (0, "a"));
@@ -1302,7 +1305,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         let ids: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -1352,7 +1355,7 @@ mod tests {
             .await
             .expect("send after restart");
 
-        let ids: Vec<String> = replay_log(&dir)
+        let ids: Vec<String> = replay_log(dir.path())
             .iter()
             .filter_map(|event| match event {
                 session_event::Event::ToolCallIssued(c) => Some(c.call_id.clone()),
@@ -1567,7 +1570,7 @@ mod tests {
         let reply = engine.send_message(None, "hi", tx).await.expect("send");
         assert!(!reply.partial);
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert_eq!(result.content, "ERROR: nope");
@@ -1594,7 +1597,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 6);
         let step_text = appended(&events[2]);
         assert_eq!(step_text.content, "checking");
@@ -1633,7 +1636,7 @@ mod tests {
             requests[MAX_TOOL_STEPS].tools.is_empty(),
             "the final completion offers no tools"
         );
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(appended(events.last().expect("events")).content, "enough");
         assert!(!reply.partial);
     }
@@ -1656,7 +1659,7 @@ mod tests {
 
         let forwarded = drain(&mut rx);
         assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
     }
@@ -1679,7 +1682,7 @@ mod tests {
 
         engine.send_message(None, "hi", tx).await.expect("send");
 
-        let events = replay_log(&dir);
+        let events = replay_log(dir.path());
         let result = resulted(&events[3]);
         assert!(result.truncated);
         assert_eq!(result.content, "01234567 [truncated]");
@@ -1691,7 +1694,7 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::open(":memory:").expect("open projection");
+        let projection = Projection::in_memory().expect("open projection");
         let mut engine = Engine::new(
             log,
             projection,
@@ -1808,7 +1811,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
         let log = Log::open(dir.path()).expect("open log");
-        let mut projection = Projection::open(":memory:").expect("open projection");
+        let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let mut engine = Engine::new(
             log,
@@ -2089,7 +2092,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
         let log = Log::open(dir.path()).expect("open log");
-        let mut projection = Projection::open(":memory:").expect("open projection");
+        let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let mut engine = Engine::new(
             log,
@@ -2144,7 +2147,7 @@ mod tests {
 
         engine.review_accept("mr-fact").expect("accept");
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         let verdict = events.last().expect("the verdict");
         assert_eq!(
             verdict.source,
@@ -2179,7 +2182,7 @@ mod tests {
 
         engine.review_delete("mr-pref").expect("delete");
 
-        let events = replay_events(&dir);
+        let events = replay_events(dir.path());
         let verdict = events.last().expect("the verdict");
         assert_eq!(verdict.source, Source::User as i32);
         match memory_payload(verdict) {
@@ -2201,7 +2204,7 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
         let mut engine = review_engine(&provider, &dir);
-        let before = replay_events(&dir).len();
+        let before = replay_events(dir.path()).len();
 
         let accept = engine.review_accept("mr-ghost");
         assert!(
@@ -2214,6 +2217,10 @@ mod tests {
             "got: {delete:?}"
         );
 
-        assert_eq!(replay_events(&dir).len(), before, "nothing was appended");
+        assert_eq!(
+            replay_events(dir.path()).len(),
+            before,
+            "nothing was appended"
+        );
     }
 }

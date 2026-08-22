@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use arc_proto::v1::{
-    Event, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
-    MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-    Role, SessionConsolidated, SessionCreated, ToolCallIssued, ToolResultRecorded, event,
-    memory_event, memory_record, session_event,
+    Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
+    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
+    ProvenanceEntry, Role, SessionConsolidated, SessionCreated, SessionEvent, ToolCallIssued,
+    ToolResultRecorded, event, memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
-pub const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -155,7 +155,7 @@ pub struct MemoryIndexEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DueSession {
+pub(crate) struct DueSession {
     pub session_id: String,
     pub latest_seq: u64,
 }
@@ -168,7 +168,7 @@ pub struct ReviewItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MemoryRecordState {
+pub(crate) struct MemoryRecordState {
     pub record: MemoryRecord,
     pub superseded_by: Option<String>,
 }
@@ -240,33 +240,39 @@ pub struct Projection {
     conn: Connection,
 }
 
+fn opened(path: &Path) -> impl Fn(rusqlite::Error) -> Error {
+    let path = path.to_path_buf();
+    move |source| Error::Open {
+        path: path.clone(),
+        source,
+    }
+}
+
 impl Projection {
+    pub fn in_memory() -> Result<Self, Error> {
+        Self::open(Path::new(":memory:"))
+    }
+
     #[tracing::instrument(
         level = "debug",
         name = "projection.open",
         skip_all,
         fields(
-            path = %path.as_ref().display(),
+            path = %path.display(),
             schema_version = SCHEMA_VERSION,
         )
     )]
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let opened = |source| Error::Open {
-            path: path.to_path_buf(),
-            source,
-        };
-
-        let conn = Connection::open(path).map_err(opened)?;
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let conn = Connection::open(path).map_err(opened(path))?;
 
         conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
         })
-        .map_err(opened)?;
+        .map_err(opened(path))?;
         conn.pragma_update(None, "synchronous", "OFF")
-            .map_err(opened)?;
+            .map_err(opened(path))?;
 
-        conn.execute_batch(SCHEMA).map_err(opened)?;
+        conn.execute_batch(SCHEMA).map_err(opened(path))?;
 
         let projection = Self { conn };
         projection.check_schema_version(path)?;
@@ -282,10 +288,7 @@ impl Projection {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|source| Error::Open {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            .map_err(opened(path))?;
 
         match found {
             Some(SCHEMA_VERSION) => Ok(()),
@@ -300,10 +303,7 @@ impl Projection {
                         "INSERT INTO projection_meta (key, value) VALUES (?1, ?2)",
                         (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
                     )
-                    .map_err(|source| Error::Open {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
+                    .map_err(opened(path))?;
                 Ok(())
             }
         }
@@ -318,72 +318,54 @@ impl Projection {
             kind = tracing::field::Empty,
         )
     )]
-    pub fn apply(&mut self, event: &Event) -> Result<(), Error> {
+    pub(crate) fn apply(&mut self, event: &Event) -> Result<(), Error> {
         let Some(payload) = event.payload.as_ref() else {
             return Err(Error::MissingPayload { seq: event.seq });
         };
-        let span = tracing::Span::current();
+        tracing::Span::current().record("kind", event_kind(payload));
 
         let tx = self.conn.transaction()?;
         match payload {
-            event::Payload::Session(session) => match session.event.as_ref() {
-                Some(session_event::Event::SessionCreated(created)) => {
-                    span.record("kind", "session_created");
+            event::Payload::Session(SessionEvent { event: Some(kind) }) => match kind {
+                session_event::Event::SessionCreated(created) => {
                     insert_session(&tx, event, created)?;
                 }
-                Some(session_event::Event::MessageAppended(appended)) => {
-                    span.record("kind", "message_appended");
+                session_event::Event::MessageAppended(appended) => {
                     insert_message(&tx, event, appended)?;
                 }
-                Some(session_event::Event::ToolCallIssued(call)) => {
-                    span.record("kind", "tool_call_issued");
-                    insert_tool_call(&tx, event, call)?;
-                }
-                Some(session_event::Event::ToolResultRecorded(result)) => {
-                    span.record("kind", "tool_result_recorded");
+                session_event::Event::ToolCallIssued(call) => insert_tool_call(&tx, event, call)?,
+                session_event::Event::ToolResultRecorded(result) => {
                     insert_tool_result(&tx, event, result)?;
                 }
-                Some(session_event::Event::SessionConsolidated(consolidated)) => {
-                    span.record("kind", "session_consolidated");
+                session_event::Event::SessionConsolidated(consolidated) => {
                     mark_consolidated(&tx, event, consolidated)?;
                 }
-                None => {
-                    span.record("kind", "unknown");
-                    tracing::warn!(
-                        seq = event.seq,
-                        "session event of an unknown kind; skipping its rows"
-                    );
-                }
             },
-            event::Payload::Memory(memory) => match memory.event.as_ref() {
-                Some(memory_event::Event::RecordCreated(created)) => {
-                    span.record("kind", "memory_record_created");
+            event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
+                memory_event::Event::RecordCreated(created) => {
                     create_memory_record(&tx, event, created)?;
                 }
-                Some(memory_event::Event::RecordUpdated(updated)) => {
-                    span.record("kind", "memory_record_updated");
+                memory_event::Event::RecordUpdated(updated) => {
                     update_memory_record(&tx, event, updated)?;
                 }
-                Some(memory_event::Event::RecordSuperseded(superseded)) => {
-                    span.record("kind", "memory_record_superseded");
+                memory_event::Event::RecordSuperseded(superseded) => {
                     supersede_memory_record(&tx, event, superseded)?;
                 }
-                Some(memory_event::Event::RecordDeleted(deleted)) => {
-                    span.record("kind", "memory_record_deleted");
+                memory_event::Event::RecordDeleted(deleted) => {
                     delete_memory_record(&tx, event, deleted)?;
                 }
-                Some(memory_event::Event::RecordReviewed(reviewed)) => {
-                    span.record("kind", "memory_record_reviewed");
+                memory_event::Event::RecordReviewed(reviewed) => {
                     review_memory_record(&tx, event, reviewed)?;
                 }
-                None => {
-                    span.record("kind", "unknown");
-                    tracing::warn!(
-                        seq = event.seq,
-                        "memory event of an unknown kind; skipping its rows"
-                    );
-                }
             },
+            event::Payload::Session(_) => tracing::warn!(
+                seq = event.seq,
+                "session event of an unknown kind; skipping its rows"
+            ),
+            event::Payload::Memory(_) => tracing::warn!(
+                seq = event.seq,
+                "memory event of an unknown kind; skipping its rows"
+            ),
         }
         set_last_seq(&tx, event.seq)?;
         tx.commit()?;
@@ -391,7 +373,7 @@ impl Projection {
         Ok(())
     }
 
-    pub fn last_seq(&self) -> Result<Option<u64>, Error> {
+    pub(crate) fn last_seq(&self) -> Result<Option<u64>, Error> {
         let stored: Option<i64> = self
             .conn
             .query_row(
@@ -464,7 +446,10 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
+    pub(crate) fn due_for_consolidation(
+        &self,
+        idle_cutoff_micros: i64,
+    ) -> Result<Vec<DueSession>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, MAX(m.seq)
              FROM sessions s JOIN messages m ON m.session_id = s.id
@@ -489,7 +474,7 @@ impl Projection {
         .collect()
     }
 
-    pub fn latest_seq(&self, session_id: &str) -> Result<Option<u64>, Error> {
+    pub(crate) fn latest_seq(&self, session_id: &str) -> Result<Option<u64>, Error> {
         let stored: Option<i64> = self.conn.query_row(
             "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
             [session_id],
@@ -504,7 +489,7 @@ impl Projection {
             .transpose()
     }
 
-    pub fn memory_index(&self) -> Result<Vec<MemoryIndexEntry>, Error> {
+    pub(crate) fn memory_index(&self) -> Result<Vec<MemoryIndexEntry>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, namespace, kind, title, summary FROM memory_records
              WHERE status = ?1 ORDER BY namespace, kind, title, id",
@@ -552,7 +537,7 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
+    pub(crate) fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
         let row = self
             .conn
             .query_row(
@@ -592,6 +577,26 @@ fn bad_column(index: usize, message: &str) -> rusqlite::Error {
         rusqlite::types::Type::Integer,
         message.to_owned().into(),
     )
+}
+
+fn event_kind(payload: &event::Payload) -> &'static str {
+    match payload {
+        event::Payload::Session(SessionEvent { event: Some(kind) }) => match kind {
+            session_event::Event::SessionCreated(_) => "session_created",
+            session_event::Event::MessageAppended(_) => "message_appended",
+            session_event::Event::ToolCallIssued(_) => "tool_call_issued",
+            session_event::Event::ToolResultRecorded(_) => "tool_result_recorded",
+            session_event::Event::SessionConsolidated(_) => "session_consolidated",
+        },
+        event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
+            memory_event::Event::RecordCreated(_) => "memory_record_created",
+            memory_event::Event::RecordUpdated(_) => "memory_record_updated",
+            memory_event::Event::RecordSuperseded(_) => "memory_record_superseded",
+            memory_event::Event::RecordDeleted(_) => "memory_record_deleted",
+            memory_event::Event::RecordReviewed(_) => "memory_record_reviewed",
+        },
+        event::Payload::Session(_) | event::Payload::Memory(_) => "unknown",
+    }
 }
 
 pub(crate) fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
@@ -1181,7 +1186,7 @@ mod tests {
 
     #[test]
     fn open_creates_the_schema() {
-        let projection = Projection::open(":memory:").expect("open");
+        let projection = Projection::in_memory().expect("open");
 
         assert_eq!(table_names(&projection), expected_tables());
         assert_eq!(projection.last_seq().expect("last_seq"), None);
@@ -1209,7 +1214,7 @@ mod tests {
 
     #[test]
     fn projects_a_session_and_a_message() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         projection.apply(&session_created(0)).expect("apply");
         projection
@@ -1280,7 +1285,7 @@ mod tests {
 
     #[test]
     fn last_seq_follows_the_last_applied_event() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         assert_eq!(projection.last_seq().expect("last_seq"), None);
 
         projection.apply(&session_created(7)).expect("apply");
@@ -1294,7 +1299,7 @@ mod tests {
 
     #[test]
     fn an_unknown_event_kind_advances_last_seq_without_writing_rows() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
 
         projection.apply(&unknown_kind(1)).expect("apply");
@@ -1306,7 +1311,7 @@ mod tests {
 
     #[test]
     fn messages_come_back_in_seq_order() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         for seq in 1..=10 {
             projection
@@ -1328,7 +1333,7 @@ mod tests {
 
     #[test]
     fn a_tool_turn_projects_call_and_result_rows() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         let mut asked = message_appended(1, "look this up");
         if let Some(event::Payload::Session(SessionEvent {
@@ -1395,7 +1400,7 @@ mod tests {
         log.append(tool_result(3, "c-a", 99, "cut resul [truncated]", true))
             .expect("append");
 
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         replay(log.reader().expect("reader"), &mut projection).expect("replay");
 
         let rows = projection.messages("s-01").expect("messages");
@@ -1422,7 +1427,7 @@ mod tests {
 
     #[test]
     fn fts_matches_prose_and_results_and_kind_filters_them_apart() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         projection
             .apply(&message_appended(1, "what is a walking skeleton"))
@@ -1487,7 +1492,7 @@ mod tests {
 
     #[test]
     fn sessions_are_ordered_by_start_then_id() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         assert_eq!(projection.sessions().expect("sessions"), []);
 
         for (seq, id, title, at) in [
@@ -1524,7 +1529,7 @@ mod tests {
 
     #[test]
     fn a_session_previews_its_first_user_message() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         assert_eq!(
             projection.sessions().expect("sessions")[0].preview,
@@ -1555,7 +1560,7 @@ mod tests {
 
     #[test]
     fn a_session_reports_when_it_was_last_spoken_in() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         assert_eq!(
             projection.sessions().expect("sessions")[0].last_at,
@@ -1583,7 +1588,7 @@ mod tests {
 
     #[test]
     fn a_session_with_no_title_lists_with_an_empty_one() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(1)))
             .expect("apply");
@@ -1596,7 +1601,7 @@ mod tests {
 
     #[test]
     fn an_unknown_session_and_an_empty_session_are_both_just_empty() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         assert_eq!(projection.messages("s-01").expect("messages"), []);
 
         projection.apply(&session_created(0)).expect("apply");
@@ -1605,7 +1610,7 @@ mod tests {
 
     #[test]
     fn messages_of_other_sessions_stay_out() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         for (seq, session, content) in [
             (1, "s-01", "a"),
@@ -1637,7 +1642,7 @@ mod tests {
 
     #[test]
     fn an_event_without_payload_errors_and_leaves_the_index_usable() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
 
         let empty = Event {
@@ -1664,7 +1669,7 @@ mod tests {
 
     #[test]
     fn applying_the_same_event_twice_fails_and_rolls_back() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         projection
             .apply(&message_appended(1, "hello"))
@@ -1681,7 +1686,7 @@ mod tests {
 
     #[test]
     fn double_applying_a_tool_row_fails_and_rolls_back_its_fts_row() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
         projection
             .apply(&tool_result(
@@ -1741,7 +1746,7 @@ mod tests {
 
     #[test]
     fn a_missing_timestamp_projects_as_null() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let mut event = session_created(0);
         event.ts = None;
 
@@ -1833,8 +1838,8 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = build_log(dir.path());
 
-        let mut first = Projection::open(":memory:").expect("open");
-        let mut second = Projection::open(":memory:").expect("open");
+        let mut first = Projection::in_memory().expect("open");
+        let mut second = Projection::in_memory().expect("open");
         let stats = replay(log.reader().expect("reader"), &mut first).expect("replay");
         assert_eq!(
             stats,
@@ -1855,7 +1860,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = build_log(dir.path());
 
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         replay(log.reader().expect("reader"), &mut projection).expect("first replay");
         let before = dump(&projection);
 
@@ -1878,7 +1883,7 @@ mod tests {
 
         let segments = discover_segments(log.dir()).expect("discover");
         assert!(segments.len() > 1, "the test needs several segments");
-        let mut resumed = Projection::open(":memory:").expect("open");
+        let mut resumed = Projection::in_memory().expect("open");
         let partial =
             replay(LogReader::new(segments[..1].to_vec()), &mut resumed).expect("partial replay");
         assert!(
@@ -1890,7 +1895,7 @@ mod tests {
         assert_eq!(stats.applied + stats.skipped, BUILT_EVENTS);
         assert_eq!(stats.skipped, partial.applied, "resume skips what landed");
 
-        let mut one_shot = Projection::open(":memory:").expect("open");
+        let mut one_shot = Projection::in_memory().expect("open");
         replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
         assert_eq!(dump(&resumed), dump(&one_shot));
     }
@@ -1900,7 +1905,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = build_log(dir.path());
 
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .conn
             .execute(
@@ -1935,7 +1940,7 @@ mod tests {
             }
         );
 
-        let mut one_shot = Projection::open(":memory:").expect("open");
+        let mut one_shot = Projection::in_memory().expect("open");
         replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
         assert_eq!(dump(&projection), dump(&one_shot));
     }
@@ -2021,7 +2026,7 @@ mod tests {
 
     #[test]
     fn a_created_record_reads_back_whole_and_indexed() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let created = record("mr-a", "gruvbox", "the palette");
 
         projection
@@ -2048,7 +2053,7 @@ mod tests {
 
     #[test]
     fn an_update_overwrites_the_whole_record() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "old title", "old summary")))
             .expect("apply");
@@ -2075,7 +2080,7 @@ mod tests {
 
     #[test]
     fn an_update_of_a_missing_record_is_refused() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         let err = projection
             .apply(&mem_updated(0, record("mr-none", "t", "s")))
@@ -2094,7 +2099,7 @@ mod tests {
 
     #[test]
     fn a_supersede_retires_the_old_row_and_lands_the_replacement() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "old address", "lives at X")))
             .expect("apply");
@@ -2129,7 +2134,7 @@ mod tests {
 
     #[test]
     fn a_supersede_reusing_the_id_replaces_the_row_in_place() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "old address", "lives at X")))
             .expect("apply");
@@ -2150,7 +2155,7 @@ mod tests {
 
     #[test]
     fn a_delete_excludes_the_record_entirely() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "t", "s")))
             .expect("apply");
@@ -2167,7 +2172,7 @@ mod tests {
 
     #[test]
     fn deleting_a_superseded_record_removes_it_and_spares_the_replacement() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "old", "s")))
             .expect("apply");
@@ -2186,7 +2191,7 @@ mod tests {
 
     #[test]
     fn a_supersede_of_a_missing_target_still_lands_the_replacement() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         projection
             .apply(&mem_superseded(0, "mr-ghost", record("mr-b", "t", "s")))
@@ -2201,7 +2206,7 @@ mod tests {
 
     #[test]
     fn a_delete_of_an_unknown_record_warns_and_no_ops() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         projection
             .apply(&mem_deleted(0, "mr-ghost"))
@@ -2213,7 +2218,7 @@ mod tests {
 
     #[test]
     fn double_applying_a_create_fails_and_rolls_back() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "t", "s")))
             .expect("apply");
@@ -2229,7 +2234,7 @@ mod tests {
 
     #[test]
     fn double_applying_an_update_fails_and_rolls_back() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "t", "s")))
             .expect("apply");
@@ -2255,7 +2260,7 @@ mod tests {
 
     #[test]
     fn double_applying_a_supersede_fails_and_rolls_back() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "old", "s")))
             .expect("apply");
@@ -2295,7 +2300,7 @@ mod tests {
 
     #[test]
     fn double_applying_a_delete_warns_and_no_ops() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&mem_created(0, record("mr-a", "t", "s")))
             .expect("apply");
@@ -2314,7 +2319,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_and_status_ints_survive_verbatim() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let mut foreign = record("mr-a", "t", "s");
         foreign.kind = 42;
         foreign.status = 9;
@@ -2333,7 +2338,7 @@ mod tests {
 
     #[test]
     fn an_unknown_memory_event_kind_advances_last_seq_without_writing_rows() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         let foreign = Event {
             seq: 0,
@@ -2364,7 +2369,7 @@ mod tests {
             ],
         );
 
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let segments = discover_segments(dir.path()).expect("discover");
         let stats = replay(LogReader::new(segments), &mut projection).expect("replay");
 
@@ -2400,8 +2405,8 @@ mod tests {
             ],
         );
 
-        let mut first = Projection::open(":memory:").expect("open");
-        let mut second = Projection::open(":memory:").expect("open");
+        let mut first = Projection::in_memory().expect("open");
+        let mut second = Projection::in_memory().expect("open");
         let segments = discover_segments(dir.path()).expect("discover");
         replay(LogReader::new(segments.clone()), &mut first).expect("replay");
         replay(LogReader::new(segments), &mut second).expect("replay");
@@ -2490,7 +2495,7 @@ mod tests {
 
     #[test]
     fn a_marker_sets_coverage_and_only_moves_forward() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(100)))
             .expect("apply");
@@ -2522,7 +2527,7 @@ mod tests {
 
     #[test]
     fn due_splits_never_consolidated_covered_and_grown_apart() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-new", "", Some(50)))
             .expect("apply");
@@ -2572,7 +2577,7 @@ mod tests {
 
     #[test]
     fn the_idle_boundary_is_strict() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(50)))
             .expect("apply");
@@ -2596,7 +2601,7 @@ mod tests {
 
     #[test]
     fn tool_result_rows_count_as_activity() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(50)))
             .expect("apply");
@@ -2622,7 +2627,7 @@ mod tests {
 
     #[test]
     fn a_session_with_no_timestamped_rows_is_never_due() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", None))
             .expect("apply");
@@ -2635,7 +2640,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_is_never_due() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(50)))
             .expect("apply");
@@ -2645,7 +2650,7 @@ mod tests {
 
     #[test]
     fn latest_seq_tracks_any_row_kind() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&session_created_as(0, "s-01", "", Some(50)))
             .expect("apply");
@@ -2690,7 +2695,7 @@ mod tests {
 
     #[test]
     fn created_records_enter_the_queue_in_changed_then_id_order() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let created = record("mr-b", "gruvbox", "the palette");
         projection
             .apply(&memory_at(
@@ -2723,7 +2728,7 @@ mod tests {
 
     #[test]
     fn a_review_clears_the_record_and_a_later_change_re_enters_it() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2751,7 +2756,7 @@ mod tests {
 
     #[test]
     fn the_window_boundary_is_inclusive() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2766,7 +2771,7 @@ mod tests {
 
     #[test]
     fn a_supersede_puts_both_rows_in_the_queue() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2816,7 +2821,7 @@ mod tests {
 
     #[test]
     fn a_deleted_record_leaves_the_queue_entirely() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2833,7 +2838,7 @@ mod tests {
 
     #[test]
     fn a_review_of_an_unknown_record_warns_and_no_ops() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
 
         projection
             .apply(&reviewed(0, 100, "mr-ghost"))
@@ -2845,7 +2850,7 @@ mod tests {
 
     #[test]
     fn the_review_stamp_only_moves_forward() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2863,7 +2868,7 @@ mod tests {
 
     #[test]
     fn a_review_with_no_timestamp_is_skipped() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
                 0,
@@ -2885,7 +2890,7 @@ mod tests {
 
     #[test]
     fn a_record_with_no_timestamp_never_enters_the_queue() {
-        let mut projection = Projection::open(":memory:").expect("open");
+        let mut projection = Projection::in_memory().expect("open");
         let mut unstamped = mem_created(0, record("mr-a", "jj", "not git"));
         unstamped.ts = None;
         projection.apply(&unstamped).expect("apply");

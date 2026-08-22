@@ -590,6 +590,7 @@ const SHELL: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     fn lex(line: &str, language: Language) -> Vec<(String, &'static str)> {
         let (spans, _) = highlight(line, language, Carry::None);
@@ -597,6 +598,18 @@ mod tests {
             .into_iter()
             .map(|(text, style)| (text, role(style)))
             .collect()
+    }
+
+    fn lexed(line: &str, language: Language) -> String {
+        named(highlight(line, language, Carry::None).0)
+    }
+
+    fn named(spans: Vec<(String, Style)>) -> String {
+        spans
+            .into_iter()
+            .map(|(text, style)| format!("{} {text:?}", role(style)))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn role(style: Style) -> &'static str {
@@ -619,35 +632,29 @@ mod tests {
 
     #[test]
     fn rust_keywords_types_and_literals() {
-        assert_eq!(
-            lex("pub fn seq(&self) -> u64 {", Language::Rust),
-            [
-                ("pub".to_owned(), "keyword"),
-                (" ".to_owned(), "plain"),
-                ("fn".to_owned(), "keyword"),
-                (" ".to_owned(), "plain"),
-                ("seq".to_owned(), "call"),
-                ("(&".to_owned(), "plain"),
-                ("self".to_owned(), "keyword"),
-                (") -> ".to_owned(), "plain"),
-                ("u64".to_owned(), "type"),
-                (" {".to_owned(), "plain"),
-            ]
-        );
+        expect![[r#"
+            keyword "pub"
+            plain " "
+            keyword "fn"
+            plain " "
+            call "seq"
+            plain "(&"
+            keyword "self"
+            plain ") -> "
+            type "u64"
+            plain " {""#]]
+        .assert_eq(&lexed("pub fn seq(&self) -> u64 {", Language::Rust));
     }
 
     #[test]
     fn strings_numbers_and_comments() {
-        assert_eq!(
-            lex("let n = 42; // count", Language::Rust),
-            [
-                ("let".to_owned(), "keyword"),
-                (" n = ".to_owned(), "plain"),
-                ("42".to_owned(), "number"),
-                ("; ".to_owned(), "plain"),
-                ("// count".to_owned(), "comment"),
-            ]
-        );
+        expect![[r#"
+            keyword "let"
+            plain " n = "
+            number "42"
+            plain "; "
+            comment "// count""#]]
+        .assert_eq(&lexed("let n = 42; // count", Language::Rust));
         assert_eq!(
             lex(r#"m("a\"b", 0xff)"#, Language::Rust),
             [
@@ -664,15 +671,12 @@ mod tests {
 
     #[test]
     fn rust_raw_strings_and_lifetimes() {
-        assert_eq!(
-            lex(r##"let s = r#"a "quoted" b"#;"##, Language::Rust),
-            [
-                ("let".to_owned(), "keyword"),
-                (" s = ".to_owned(), "plain"),
-                (r##"r#"a "quoted" b"#"##.to_owned(), "string"),
-                (";".to_owned(), "plain"),
-            ]
-        );
+        expect![[r##"
+            keyword "let"
+            plain " s = "
+            string "r#\"a \"quoted\" b\"#"
+            plain ";""##]]
+        .assert_eq(&lexed(r##"let s = r#"a "quoted" b"#;"##, Language::Rust));
         assert_eq!(
             lex("fn f<'a>(x: &'a str)", Language::Rust),
             [
@@ -687,14 +691,11 @@ mod tests {
 
     #[test]
     fn an_unterminated_string_colours_to_the_end_of_the_line() {
-        assert_eq!(
-            lex(r#"let s = "half a th"#, Language::Rust),
-            [
-                ("let".to_owned(), "keyword"),
-                (" s = ".to_owned(), "plain"),
-                (r#""half a th"#.to_owned(), "string"),
-            ]
-        );
+        expect![[r#"
+            keyword "let"
+            plain " s = "
+            string "\"half a th""#]]
+        .assert_eq(&lexed(r#"let s = "half a th"#, Language::Rust));
     }
 
     #[test]
@@ -776,57 +777,45 @@ mod tests {
 
     #[test]
     fn python_reads_its_own_keywords() {
-        assert_eq!(
-            lex("def f(x): return None", Language::Python),
-            [
-                ("def".to_owned(), "keyword"),
-                (" ".to_owned(), "plain"),
-                ("f".to_owned(), "call"),
-                ("(x): ".to_owned(), "plain"),
-                ("return".to_owned(), "keyword"),
-                (" ".to_owned(), "plain"),
-                ("None".to_owned(), "number"),
-            ]
-        );
+        expect![[r#"
+            keyword "def"
+            plain " "
+            call "f"
+            plain "(x): "
+            keyword "return"
+            plain " "
+            number "None""#]]
+        .assert_eq(&lexed("def f(x): return None", Language::Python));
     }
 
     #[test]
     fn shell_variables_and_flags() {
-        assert_eq!(
-            lex("ls -la $HOME # list", Language::Shell),
-            [
-                ("ls ".to_owned(), "plain"),
-                ("-la".to_owned(), "keyword"),
-                (" ".to_owned(), "plain"),
-                ("$HOME".to_owned(), "type"),
-                (" ".to_owned(), "plain"),
-                ("# list".to_owned(), "comment"),
-            ]
-        );
-        assert_eq!(
-            lex("echo ${VAR}", Language::Shell),
-            [("echo ".to_owned(), "plain"), ("${VAR}".to_owned(), "type"),]
-        );
+        expect![[r##"
+            plain "ls "
+            keyword "-la"
+            plain " "
+            type "$HOME"
+            plain " "
+            comment "# list""##]]
+        .assert_eq(&lexed("ls -la $HOME # list", Language::Shell));
+        expect![[r#"
+            plain "echo "
+            type "${VAR}""#]]
+        .assert_eq(&lexed("echo ${VAR}", Language::Shell));
     }
 
     #[test]
     fn config_files_get_comments_strings_and_numbers() {
-        assert_eq!(
-            lex("port = 8080 # the sidecar", Language::Config),
-            [
-                ("port = ".to_owned(), "plain"),
-                ("8080".to_owned(), "number"),
-                (" ".to_owned(), "plain"),
-                ("# the sidecar".to_owned(), "comment"),
-            ]
-        );
-        assert_eq!(
-            lex(r#"server = "llama-server""#, Language::Config),
-            [
-                ("server = ".to_owned(), "plain"),
-                (r#""llama-server""#.to_owned(), "string"),
-            ]
-        );
+        expect![[r##"
+            plain "port = "
+            number "8080"
+            plain " "
+            comment "# the sidecar""##]]
+        .assert_eq(&lexed("port = 8080 # the sidecar", Language::Config));
+        expect![[r#"
+            plain "server = "
+            string "\"llama-server\"""#]]
+        .assert_eq(&lexed(r#"server = "llama-server""#, Language::Config));
     }
 
     #[test]
@@ -919,14 +908,11 @@ mod tests {
 
     #[test]
     fn identifiers_with_digits_are_not_numbers() {
-        assert_eq!(
-            lex("let sha256 = 1", Language::Rust),
-            [
-                ("let".to_owned(), "keyword"),
-                (" sha256 = ".to_owned(), "plain"),
-                ("1".to_owned(), "number"),
-            ]
-        );
+        expect![[r#"
+            keyword "let"
+            plain " sha256 = "
+            number "1""#]]
+        .assert_eq(&lexed("let sha256 = 1", Language::Rust));
     }
 
     #[test]

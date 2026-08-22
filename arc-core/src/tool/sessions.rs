@@ -12,7 +12,6 @@ pub struct SessionsSearch {
 }
 
 impl SessionsSearch {
-    #[must_use]
     pub fn new(archive: Archive) -> Self {
         Self { archive }
     }
@@ -71,7 +70,7 @@ impl Tool for SessionsSearch {
                 .archive
                 .search(&args.query, args.include_tool_results, exclude)
             {
-                Ok(reply) if reply.sessions.is_empty() => ToolReply::ok("No results."),
+                Ok(reply) if reply.sessions.is_empty() => ToolReply::ok("No results.".to_owned()),
                 Ok(reply) => ToolReply::ok(to_json(&reply)),
                 Err(Error::Query { message }) => ToolReply::ok(format!(
                     "No results: {message}. Try plain words or \"quoted phrases\"."
@@ -87,7 +86,6 @@ pub struct SessionRead {
 }
 
 impl SessionRead {
-    #[must_use]
     pub fn new(archive: Archive) -> Self {
         Self { archive }
     }
@@ -155,7 +153,8 @@ impl Tool for SessionRead {
             let (Some(start_seq), Some(end_seq)) = (args.start_seq, args.end_seq) else {
                 return ToolReply::error(
                     "ERROR: pass both start_seq and end_seq, or ends: true. \
-                     Whole sessions are not readable in one call.",
+                     Whole sessions are not readable in one call."
+                        .to_owned(),
                 );
             };
             if start_seq > end_seq {
@@ -240,7 +239,7 @@ mod tests {
     }
 
     fn logged_results(dir: &TempDir) -> Vec<ToolResultRecorded> {
-        replay_log(dir)
+        replay_log(dir.path())
             .into_iter()
             .filter_map(|event| match event {
                 session_event::Event::ToolResultRecorded(result) => Some(result),

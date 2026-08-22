@@ -13,9 +13,8 @@ pub struct DataDirs {
 }
 
 impl DataDirs {
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
+    pub fn new(root: &Path) -> Self {
+        let root = root.to_path_buf();
         Self {
             log: root.join("log"),
             secrets: root.join("secrets"),
@@ -42,27 +41,22 @@ impl DataDirs {
         Ok(())
     }
 
-    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    #[must_use]
     pub fn log(&self) -> &Path {
         &self.log
     }
 
-    #[must_use]
     pub fn index(&self) -> &Path {
         &self.index
     }
 
-    #[must_use]
     pub fn traces(&self) -> &Path {
         &self.traces
     }
 
-    #[must_use]
     pub fn identity(&self) -> &Path {
         &self.identity
     }
@@ -75,7 +69,7 @@ mod tests {
 
     #[test]
     fn every_path_hangs_off_the_root() {
-        let dirs = DataDirs::new("/srv/arc");
+        let dirs = DataDirs::new(Path::new("/srv/arc"));
         assert_eq!(dirs.root(), Path::new("/srv/arc"));
         assert_eq!(dirs.log(), Path::new("/srv/arc/log"));
         assert_eq!(dirs.index(), Path::new("/srv/arc/index.db"));
@@ -86,7 +80,7 @@ mod tests {
     #[test]
     fn create_makes_the_tree_and_locks_down_secrets() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let dirs = DataDirs::new(temp.path().join("data"));
+        let dirs = DataDirs::new(&temp.path().join("data"));
 
         dirs.create().expect("create");
         dirs.create().expect("create is idempotent");

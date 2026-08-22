@@ -473,7 +473,6 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
         match event {
             NetEvent::Sessions(sessions) => {

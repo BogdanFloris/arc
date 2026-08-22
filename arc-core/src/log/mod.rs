@@ -1,13 +1,14 @@
 mod dir;
-pub mod format;
+pub(crate) mod format;
 mod reader;
 mod writer;
 
 use std::path::{Path, PathBuf};
 
-pub use dir::{DEFAULT_MAX_SEGMENT_LEN, Log, discover_segments, segment_first_seq, segment_name};
-pub use reader::{LogReader, RecoveryPoint, SegmentReader};
-pub use writer::SegmentWriter;
+pub use dir::Log;
+pub(crate) use dir::discover_segments;
+pub use reader::LogReader;
+pub(crate) use writer::SegmentWriter;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

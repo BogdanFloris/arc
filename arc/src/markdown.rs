@@ -322,6 +322,11 @@ fn split_words(segments: Vec<(String, Style)>) -> Vec<Vec<(String, Style)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
+
+    fn lines(src: &str, width: usize) -> String {
+        text(src, width).join("\n")
+    }
 
     fn text(text: &str, width: usize) -> Vec<String> {
         render(text, width, theme::PLAIN)
@@ -365,8 +370,8 @@ mod tests {
 
     #[test]
     fn unclosed_markup_stays_literal() {
-        assert_eq!(text("half a **thou", 40), ["half a **thou"]);
-        assert_eq!(text("and `code", 40), ["and `code"]);
+        expect!["half a **thou"].assert_eq(&lines("half a **thou", 40));
+        expect!["and `code"].assert_eq(&lines("and `code", 40));
         assert_eq!(
             styles("**bold** then **half", 40)
                 .into_iter()
@@ -388,12 +393,12 @@ mod tests {
 
     #[test]
     fn escaped_markup_renders_literally() {
-        assert_eq!(text(r"a \*not italic\* b", 40), ["a *not italic* b"]);
+        expect!["a *not italic* b"].assert_eq(&lines(r"a \*not italic\* b", 40));
     }
 
     #[test]
     fn headings_lose_their_hashes_and_gain_the_accent() {
-        assert_eq!(text("## Walking skeleton", 40), ["Walking skeleton"]);
+        expect!["Walking skeleton"].assert_eq(&lines("## Walking skeleton", 40));
         assert_eq!(
             styles("## Walking skeleton", 40)[0].1,
             theme::HEADING,
@@ -413,10 +418,11 @@ mod tests {
 
     #[test]
     fn lists_normalise_their_markers_and_hang() {
-        assert_eq!(
-            text("- one\n* two\n+ three", 40),
-            ["- one", "- two", "- three"]
-        );
+        expect![[r#"
+            - one
+            - two
+            - three"#]]
+        .assert_eq(&lines("- one\n* two\n+ three", 40));
         assert_eq!(
             text("1. first item here\n2. second", 14),
             ["1. first item", "   here", "2. second"],
@@ -481,7 +487,7 @@ mod tests {
 
     #[test]
     fn markup_inside_a_code_block_is_not_markup() {
-        assert_eq!(text("```\nlet a = **b;\n```", 40), ["    let a = **b;"]);
+        expect!["    let a = **b;"].assert_eq(&lines("```\nlet a = **b;\n```", 40));
     }
 
     #[test]
@@ -495,13 +501,17 @@ mod tests {
 
     #[test]
     fn a_horizontal_rule_spans_the_width() {
-        assert_eq!(text("---", 8), ["--------"]);
+        expect!["--------"].assert_eq(&lines("---", 8));
         assert_eq!(text("--", 8), ["--"], "two dashes is text; three is a rule");
     }
 
     #[test]
     fn blank_lines_survive_as_paragraph_breaks() {
-        assert_eq!(text("one\n\ntwo", 40), ["one", "", "two"]);
+        expect![[r#"
+            one
+
+            two"#]]
+        .assert_eq(&lines("one\n\ntwo", 40));
     }
 
     #[test]
@@ -515,7 +525,7 @@ mod tests {
 
     #[test]
     fn an_empty_message_renders_nothing_that_panics() {
-        assert_eq!(text("", 40), [""]);
+        expect![[""]].assert_eq(&lines("", 40));
         assert_eq!(text("", 0), [""], "a zero width is clamped, not divided by");
     }
 }

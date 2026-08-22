@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 const DATA: &str = "data";
 
 #[derive(Debug, Default)]
-pub struct FrameDecoder {
+pub(crate) struct FrameDecoder {
     buffer: VecDeque<u8>,
 
     data: String,
@@ -12,7 +12,6 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
-    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
