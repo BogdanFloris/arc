@@ -153,6 +153,19 @@ Live-driving finding (2026-08-21, first exit-criterion check): on "what's my nam
 - Batched log appends with flush checkpoint — only with trace evidence that fsync-per-append is a real cost (DESIGN.md §3, durability policy).
 - Provider routing over local + OpenRouter (DESIGN.md §12) — after Phase 2 usage shows what a router would need to know.
 
+## Phase 2 closed (2026-08-22)
+
+Every task done; both exit criteria verified live on real history (2026-08-21). The full §5.4 loop ran organically on day one: consolidation extracted, the counters measured, `:review` collected the first human verdicts (name accepted, storytelling deleted), and `memory-replay` is armed to regression-test prompt changes. This section is the phase's frozen close; the rename to `TASKS-phase2.md` happens when Phase 3's list is cut.
+
+Carried forward (fold into the next touch or Phase 3's cutting):
+
+- **Prompt v2**, when extraction quality warrants it, has two pinned regression cases: kill storytelling-class one-off inference; never miss an explicit correction ("use less emojis", `c4781d89…`). The review verdicts in the log are its few-shots; `memory-replay --against` is its gate.
+- **Sidecar restart policy** (from Phase 1) — more pressing now that background passes depend on the sidecar.
+- **Token budget watch**: seven tool schemas ≈1.9k tokens + the index block on a 16k context; measure before anything else always-on is added.
+- **Session titling pass** — `sessions.title` still has no writer; hermes says it's search infrastructure and the natural second background task (prior-art §2).
+- **Provider routing** (DESIGN.md §12) — the usage data it was gated on now exists in the traces.
+- Phase 1 leftovers unchanged: `log::Error::Io` field doc; no retention on `data/traces/`; the wire-friction list stays banked for Phase 3.
+
 ## Next session picks up here (banked 2026-08-20)
 
 **Section 4 is done, reviewed, and live** — the whole agentic substrate: registry with the toy `get_time`, the engine tool loop (write-ahead calls, step cap of 8 with a final no-tools completion, `/no_think` per config, summed usage), the startup orphan closer, and tool activity + reasoning on the wire and in the TUI. `arcd` runs on erebor again as the daily driver; watching real tool turns is now possible, which is what sections 5–6 tune against.
