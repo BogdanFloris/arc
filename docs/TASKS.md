@@ -10,5 +10,5 @@ Working agreement, unchanged: Bogdan assigns each task (`bogdan` or `claude`). T
 - **Sidecar restart policy** (from Phase 1) — more pressing now that background passes depend on the sidecar.
 - **Token budget watch**: seven tool schemas ≈1.9k tokens + the always-loaded index on a 16k context; measure before anything else always-on is added.
 - **Session titling pass** — `sessions.title` still has no writer; hermes says titles are search infrastructure and the natural second background task (`prior-art-hermes.md` §2).
-- **Provider routing** (DESIGN.md §12) — the usage data it was gated on now exists in the traces.
+- ~~**Provider routing**~~ — decided 2026-08-22 as static roles (DESIGN.md §6.1, `providers.md`), off the usage data Phase 2 generated. Folds into the Phase 3 cut, not carried.
 - Phase 1 leftovers unchanged: `log::Error::Io` field doc; no retention on `data/traces/`; the wire-friction list (banked in `TASKS-phase1.md`) for the next `wire.proto` evolution.

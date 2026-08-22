@@ -8,7 +8,7 @@ It is one person's daily driver, built in the open. No stability promises, no re
 
 Four priorities, in order: **durability** (one append-only log, everything else rebuildable), **observability** (every LLM call, tool call, and memory write shows up in a Perfetto trace), **speed** (no GC, protobuf on disk and on the wire), **independence** (plain HTTP + SSE behind one provider trait, never vendor SDKs).
 
-**Status:** Phase 1 (walking skeleton) is done and in daily use — local model, linear sessions, streaming TUI. Phase 2 (memory + tool calling) is in progress. Phases are in [DESIGN.md §11](docs/DESIGN.md).
+**Status:** Phase 1 (walking skeleton) and Phase 2 (memory + tool calling) are done and in daily use. Phase 3 — ARC as the harness its own code is written in — is in progress. Phases are in [DESIGN.md §11](docs/DESIGN.md).
 
 ## Running it
 

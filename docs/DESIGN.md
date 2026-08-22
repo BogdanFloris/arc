@@ -10,6 +10,8 @@
 
 ARC is a personal AI assistant: an always-on Rust daemon (`arcd`) with thin clients (TUI, voice, mobile) on a WebSocket. It has durable memory, a stable identity, pi-style branching sessions, and swappable LLM providers. Long term it is the control plane for the machine, cloud tools, and a robotics workbench, where devices appear as MCP servers.
 
+The conversation is small and always available; the work is not. ARC dispatches long-running work — writing a program, flashing a board — to jobs that run against different models with different tool sets, and stays responsive while they do (§4.1). Coding is the first job kind and not a privileged one.
+
 Priorities, in order:
 
 1. **Durability.** Memory and history survive machine, provider, and schema changes. One source of truth; everything else is rebuildable.
@@ -188,13 +190,60 @@ Reads do not go through it. The index runs in WAL mode, so a second connection r
 
 That is why the consolidation pass may re-lock instead of holding: it snapshots, runs the model unlocked, then commits and re-checks that the session has not grown (§5.4).
 
-## 4. Sessions
+## 4. Sessions, jobs, and tools
 
 Sessions are pi-style: a tree, not a list. Forking at any message creates a child with a `parent_session` and `fork_point`. The tree is just parent pointers in the projection. Clients render it; the daemon only stores it.
 
 Branches interact with memory (§5.4): only the main line and branches marked *real* feed consolidation. Abandoned branches stay searchable in the archive but never write distilled memory.
 
 A reply cut mid-stream is appended with `partial = true` — the log records what the user actually saw. Errors go to clients and are never archived as messages.
+
+### 4.1 Jobs
+
+**A job is a child session.** Not a queue and not a new abstraction: the conversation forks, the child gets a different provider role (§6), a different tool set, and its own budget, and the parent holds a pointer to it.
+
+Everything else follows from the tree. A job is searchable, replayable, forkable, and rewindable like any other session, and its transcript lands in the archive (§5.3) with no second storage path.
+
+The reason to separate them at all is size. A conversational turn is small; writing a driver is twenty minutes and a hundred thousand tokens. Run that in the conversation and the context the user talks to drowns in tool output.
+
+Rules:
+
+- **The conversation never blocks.** Dispatch returns a job id immediately and the user keeps talking.
+- **Jobs accept messages while running.** Steering — "no, use GPIO 4" — is a message to the child, not a restart of the parent. Without it the only correction is a rewind, which throws the work away.
+- **Handback is a summary, not a transcript.** The child's full history stays in the archive; the parent receives a short report and the child's session id. The same split as §5.2 against §5.3, for the same reason: the index stays small so the body can be large.
+- **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
+- **A job has a budget**, declared at dispatch and enforced by arcd. A loop that cannot terminate must not be able to drain a month's allowance.
+
+Coding is the first job kind, not a privileged one. A device job (§9) is the same shape with a different tool set.
+
+### 4.2 Workspaces
+
+A session may be bound to a project: `sessions.project` (§5.3) plus a root directory on disk. The binding scopes the workspace tools in §4.3, and every path those tools resolve must stay inside the root.
+
+Unbound sessions are ordinary conversation and get no workspace tools. That is also the token argument — schemas for tools a session cannot use are not loaded into it.
+
+### 4.3 Tools, sources, and approval
+
+One registry, many sources. A tool reaches the model identically whichever source it came from:
+
+- **builtin** — memory and archive (§5.5)
+- **workspace** — `read`, `write`, `edit`, `glob`, `grep`, `bash`; only in a bound session (§4.2)
+- **expert** — `consult_expert` (§6)
+- **mcp** — device servers (§9), later
+
+Sources exist so that Phase 5 devices are a config entry rather than a subsystem. §3.1 already reserves the tool-source field on `ToolCallIssued` for exactly this case: two sources may both offer `read`.
+
+**Sources are session-scoped.** A session declares which it gets. Seven always-loaded schemas already cost real context; loading every source into every session does not survive Phase 5.
+
+**Approval has one shape.** Running `rm -rf` and rotating a servo are the same event: a proposed call, a gate, a durable decision, and an allow-list that is a projection rather than a hand-edited file. Verdicts carry `Event.source = USER`, like §5.4's review verdicts and for the same reason — this is ground truth the log must be able to answer.
+
+Three verdicts: once, for this session, always for this project. A denial carries a reason, returned to the model as an ordinary `ToolOutcome::ERROR` result (§3.1) so the loop adapts instead of stalling.
+
+**Confinement.** Every path resolves to canonical form and is rejected if it escapes the workspace root — `..`, symlinks, and absolute paths are the obvious cases. The check lives in the tool, not the caller.
+
+**Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
+
+**The shell tool answers §3.1's open redaction question.** `bash` is the first tool that can read its own environment, which §3.1 banked for whoever hit it first. The answer: arcd runs workspace tools with a scrubbed environment — no keys, no tokens. A result cannot contain a credential the process never had. Invariant 5 stays a property of what the tool can see, not of a regex applied afterwards.
 
 ## 5. Memory
 
@@ -205,6 +254,17 @@ A reply cut mid-stream is appended with `partial = true` — the log records wha
 One small human-owned file: `data/identity.md`. Who ARC is, how it talks, stable facts about its user. Loaded into context every session, unconditionally. A few KB — small enough that loading it is never a decision.
 
 Identity is exempt from event-sourcing. It is a plain file, versioned in git and backed up beside the log. ARC may propose edits as ordinary session output; the user applies them by editing the file. `IdentityEvent` is reserved in case this changes. v1 never emits it.
+
+**Voice.** The identity file is where ARC's register is defined, and the target is direct without being cold. Four rules, as design intent for whoever writes the file:
+
+- Lead with the answer. The first sentence is the conclusion, not the setup.
+- No enthusiasm scaffolding — no "great question", no exclamation points, no recap of what was just said.
+- Disagree in one sentence, then keep working. State the concern plainly; do not hedge and do not moralise.
+- Warmth lives in brevity and attention, not adjectives. Remembering a detail from Tuesday reads as care; "happy to help" reads as a form letter.
+
+This is close to what `AGENTS.md` already asks of contributors, and deliberately so — one house style, applied to the assistant and to the people working on it.
+
+Identity loads into the **face** role only (§6). The roles that execute jobs have no voice and no personality preamble; paying for one on the bulk of the token spend is waste.
 
 ### 5.2 Distilled tier
 
@@ -279,6 +339,8 @@ Memory access is tools, not silent RAG injection. The model calls:
 
 One pattern throughout: search cheap, read targeted. Lookups appear in traces and debug like any other tool call. Nothing enters context automatically except the identity file and the record index.
 
+These five are the **builtin** source in §4.3's registry. Workspace, expert, and device tools reach the model through the same registry and the same events.
+
 ## 6. Providers
 
 One trait in `arc-core`:
@@ -290,11 +352,47 @@ trait Provider {
 }
 ```
 
-v1's provider is local: a llama.cpp `llama-server` sidecar supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions`, HTTP + SSE, no auth). The same implementation covers vLLM or any OpenAI-compatible server by config. The sidecar releases device memory after an idle window (`--sleep-idle-seconds`), so an always-on daemon holds tens of MiB of VRAM between turns instead of several GiB, and pays about 1.5 s to wake. That is what makes a local default workable on a machine the user also games on.
+### 6.1 Roles
 
-Hosted providers (Anthropic, Gemini) come later behind the same trait, as plain HTTP + SSE (`reqwest` + rustls), never vendor SDKs. Auth is a swappable layer; API keys first. Nothing hosted ships today: the original Google path was removed outright — provider, OAuth flow, `arcd login`, token file — after hidden rate limits made it unreliable and its ToS gray area stopped being worth carrying. `data/secrets/` remains (0700, empty) as the seam for the first keyed provider.
+**A role is a name in config that resolves to a provider and a model.** Four in v1:
 
-Provider choice is per-completion: a global default, optionally overridden per request. Sessions do not own a provider; the log records what actually ran. Tool-calling and system-prompt differences are normalized in `arc-core`, never leaked to clients. Providers are hot-swappable mid-session — by voice, or by the agent picking a cheap model for a subtask.
+| Role | Job | Why it is its own role |
+| --- | --- | --- |
+| **face** | The conversation. Talk, recall, dispatch jobs (§4.1). Loads the identity file and the record index. | Small token volume, high sensitivity to voice and judgment, latency-critical once §7's voice client lands. Needs vision. |
+| **hands** | Job execution. The overwhelming majority of tokens ARC will ever spend. | High volume, mechanical. Cost per *completed task* is the only figure that matters. |
+| **counsel** | Bounded advice — plans, unsticking. Never writes. | Rare, expensive, worth a frontier model precisely because it is rare. |
+| **local** | Consolidation, extraction, classification, and the offline fallback for face. | High volume, low stakes, latency-insensitive, free. |
+
+This is how §12's routing question gets answered without a runtime difficulty classifier: the mapping is static config, and the role label rides every `CompletionRequest` onto its span (§8), so traces attribute spend by role from the first day.
+
+**Local is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. It is also the degraded mode: when the network is gone or a hosted allowance is exhausted, face falls back to local. That is a visible role reassignment, announced in the client, not a silent quality drop.
+
+**A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork.
+
+### 6.2 counsel is a tool, not a provider
+
+`consult_expert` spawns a foreign agent — a CLI subprocess with **read-only** access to the workspace — asks one bounded question, and returns text. It is not a `Provider`, has no `CompletionDelta` stream, and never touches the calling session's prefix.
+
+That last property is the point. Escalating costs one subprocess and one tool-result event; it does not invalidate the face's or the job's cache. And because the expert reads the repository itself rather than being handed a summary, its answer is better than a completion built from a lossy brief.
+
+Two invariants:
+
+- **counsel never writes.** Read-only tools, always. An expert that edits is a second coding agent with a second cost profile, and the whole point of the split is that the expensive model does not do the work that is expensive by volume.
+- **The expert is a command, not a code path.** An argv template, a working directory, and a timeout in config. Swapping one CLI for another is an edit, not a release.
+
+### 6.3 Transport and credentials
+
+The local provider is a llama.cpp `llama-server` sidecar supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions`, HTTP + SSE, no auth). The same implementation covers vLLM or any OpenAI-compatible server by config. The sidecar releases device memory after an idle window (`--sleep-idle-seconds`), so an always-on daemon holds tens of MiB of VRAM between turns instead of several GiB, and pays about 1.5 s to wake. That is what makes a local default workable on a machine the user also games on.
+
+It is also why the same code reaches most hosted options: an OpenAI-compatible endpoint is a base URL, a key, and a model id.
+
+Hosted providers are plain HTTP + SSE (`reqwest` + rustls), never vendor SDKs. Auth is a swappable layer; API keys only. The original Google OAuth path was removed outright — provider, flow, `arcd login`, token file — after hidden rate limits made it unreliable and its ToS gray area stopped being worth carrying. Keys live in `data/secrets/` (0700, excluded from backups), which stops being an empty seam in Phase 3.
+
+Tool-calling and system-prompt differences are normalized in `arc-core`, never leaked to clients. The log records which model actually ran.
+
+### 6.4 The concrete stack is dated
+
+Which model fills each role today, what it costs, what it is metered on, and what would change the answer all live in `docs/providers.md`. That file is expected to churn as plans and prices move. This section defines the seam and should not.
 
 ## 7. Wire protocol and clients
 
@@ -302,15 +400,31 @@ Protobuf over WebSocket (`wire.proto`), served by `arcd` on localhost. Remote ac
 
 The protocol is client-agnostic: subscribe to a session, send a message, fork, receive streamed deltas and tool-call events, query the tree. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state.
 
-- `arc` (TUI): first client, exercises everything — tree navigation, streaming, memory tool visibility. Should use UDS when local, WebSocket when not.
-- `arc-voice`: wake word (openWakeWord or Porcupine), local ASR (whisper.cpp), local or hosted TTS — decide later. A thin client: audio in, text over the socket, audio out. No model logic.
+Three capabilities the protocol needs beyond that, all forced by §4.1 and §6:
+
+- **Images in messages.** The face has vision. A turn may carry a camera frame or a screenshot, and `ToolResultRecorded` may need to return one — §3.1 already reserves structured tool-result content for this.
+- **A modality hint on subscribe.** Without it a voice turn gets the answer the TUI would get: four hundred words of markdown, read aloud. The client declares its modality and the face adapts length. Same identity, shorter sentences.
+- **Server-initiated output.** A job runs for twenty minutes while the user is elsewhere; "this needs approval" and "this is done" have to reach them. Clients subscribe for unsolicited output rather than only answering when addressed. This is also the path ARC speaks first on at all — a contradiction noticed during consolidation, a sidecar down for two days — so it is built general and voice is one subscriber.
+
+Clients:
+
+- `arc` (TUI): first client, exercises everything — tree navigation, streaming, tool visibility, job status, approval prompts. Should use UDS when local, WebSocket when not.
+- `arc-voice`: a thin pipeline — wake word, local ASR, text over this socket, reply text, local TTS. No model logic. Stages sit behind traits like providers do: openWakeWord or Porcupine for the wake word, whisper.cpp for ASR with Silero VAD in front for endpointing, Kokoro for TTS streamed sentence-by-sentence so the first sentence speaks while the model writes the third. Cloud stage backends can slot in later without touching the architecture.
 - Mobile: same protocol over Tailscale. Last, after the protocol has been stable under two other clients.
+
+**Speech-to-speech APIs are rejected.** They would own the conversation loop, and under §4.3 the face is not a chat model — it holds the memory tools, `consult_expert`, job dispatch, and the approval gate. Handing the loop to a vendor means replumbing all of it through their tool protocol, and the log stops being where the conversation happens. That breaks invariants 1 and 2, not merely §7's client-agnosticism. Text on the wire is the only shape that keeps the log authoritative, and it keeps voice provider-independent besides.
+
+**Voice degrades rather than failing.** With a hosted face, a dropped network breaks talking, not just coding. Falling back to the local role (§6.1) is a Phase 4 exit requirement, with the degraded state visible or audible.
+
+ARC's speaking voice is designed separately from its writing voice (§5.1) and is not a stock persona. Phase 4 ships on a stock Kokoro voice named in config; the real voice is chosen later by living with three or four candidates for a day each rather than by demo impressiveness, then pinned under `data/` as clip, engine, version, **and stage config** — rate, pitch, and sentence-split thresholds shape perceived character as much as timbre, and they are the part that silently drifts across engine upgrades.
 
 ## 8. Observability: Perfetto
 
 ARC emits Perfetto protobuf traces of its own operation: a track per session and branch, spans for LLM calls (with token counts as counters), tool calls, memory reads and writes, consolidation passes, and log replays. Traces land in `data/traces/` and open directly in the Perfetto UI.
 
 This is not decoration. It is the debugging surface for the two genuinely hard subsystems — consolidation quality and retrieval behaviour — and it makes latency and token spend measurable from day one. Implementation: a `tracing` subscriber in `arc-core` that renders `TracePacket` protos.
+
+Every LLM span carries its **role** (§6.1), and every job span carries its job id and budget consumption. Cost is metered by role and by completed task, not by request, because that is the figure §6's model choices are actually made against.
 
 ## 9. Robotics (future)
 
@@ -319,6 +433,8 @@ Devices integrate as MCP servers, never as bespoke daemon code: an ESP32 pan-til
 1. The model plans and issues high-level actions only. Firmware enforces joint limits, speeds, and e-stop. The LLM never commands motors directly.
 2. Device MCP servers are separate processes with their own lifecycle. `arcd` treats them like any other tool source.
 
+Both constraints sit on top of machinery Phase 3 already builds. A device is an `mcp` source in §4.3's registry, and a movement request goes through the same approval gate as `bash` — one shape, one event, one allow-list. §3.1's orphan contract already covers the hard case: a durable call with no durable result means the outcome is *unknown*, never failed, because an actuator that moved cannot be un-moved by a retry.
+
 No robotics code lands before Phase 5.
 
 ## 10. Security, backup, and running
@@ -326,7 +442,8 @@ No robotics code lands before Phase 5.
 - **Always-on** means a systemd user unit (`arcd/arcd.service`): starts with the machine, restarts on failure, logs to the journal. `SIGTERM` is a clean stop, and the sidecar dies with it either way because systemd kills the whole control group. Nothing is left holding the GPU.
 - Runtime state lives under `data/`: log, index, identity, traces.
 - Backup is rustic, encrypted at the repository level, covering `data/log/` and `data/identity.md`. `data/index.db` and `data/traces/` are excluded — both are rebuildable.
-- Credentials live in the OS keychain or an encrypted secrets file. Never in the log, never in backups. Nothing holds one today; the local provider has no auth. `data/secrets/` (0700, excluded from backups) is the seam, and keychain integration arrives with the first provider that needs a key.
+- Credentials live in the OS keychain or an encrypted secrets file under `data/secrets/` (0700, excluded from backups). Never in the log, never in backups. Phase 3 is where this stops being an empty seam: face, hands, and counsel all need keys.
+- **Workspace tools run with a scrubbed environment** (§4.3). `bash` is the first thing ARC runs that could read its own process environment, and the answer is that there is nothing there to read — no keys, no tokens. arcd holds credentials; the tools it spawns do not inherit them.
 - The WebSocket binds localhost only. Remote access is Tailscale's problem, by design.
 
 ## 11. Phases
@@ -339,18 +456,22 @@ Each phase ends in something used daily. No phase starts until the previous one 
 
 **Phase 2 — Memory.** *Done 2026-08-22.* `MemoryEvent`, distilled records and the always-loaded index, the five memory and archive tools, FTS5 over messages, explicit `memory_write` plus end-of-session consolidation, `arcd memory-replay` with a versioned prompt, the weekly TUI review, Perfetto spans on every memory operation. Exit criterion: "what do you know about X" and "what did we say about X" both work on real history.
 
-**Phase 3 — Tree + second provider.** Session forking with §4's branch semantics, tree navigation in the TUI, a Gemini provider, per-session provider choice, and `arcd rebuild` proven against the real log. Exit criterion: branching gets used naturally, and a full rebuild matches live state.
+**Phase 3 — Development.** ARC becomes the way its own code gets written, and runs in production. The four roles of §6 with real credentials, the job abstraction (§4.1), workspaces (§4.2), the tool registry with workspace tools and the approval model (§4.3), the three protocol capabilities of §7, notification, and `arcd rebuild` proven against the real log. Installed as a systemd user unit with a data directory that survives a rebuild. Exit criterion: a week of real development done through ARC rather than through another harness, and a full rebuild matching live state.
 
-**Phase 4 — Voice + remote.** `arc-voice` (wake word, local ASR/TTS), the daemon reached from a phone over Tailscale (the mobile client can start as the TUI over SSH), and rustic backup automated. The exit criterion is a restore drill, not a backup existing.
+**Phase 3.5 — Tree.** Session forking with §4's branch semantics, rewind, and tree navigation in the TUI. Split out of Phase 3 and kept immediately after it because rewind is a development feature: recovering from a bad edit path without re-prompting from scratch is what makes a cheap `hands` model affordable. Exit criterion: branching gets used naturally.
 
-**Phase 5 — Hands.** The first device MCP server (ESP32 pan-tilt), device-tool safety conventions, then the arm. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
+**Phase 4 — Voice + remote.** `arc-voice` per §7 — wake word, local ASR, text on the wire, local TTS — the daemon reached from a phone over Tailscale (the mobile client can start as the TUI over SSH), and rustic backup automated. Exit criteria: a restore drill rather than a backup existing, and voice degrading to the local role when the network is gone.
+
+**Phase 5 — Devices.** The first device MCP server (ESP32 pan-tilt) as a source in §4.3's registry, device-tool safety conventions on the approval model already built, then the arm. A wake-word room satellite, if one appears, is a §7 *client* and not a device — same board, different integration path, and conflating them would put a special case in the device layer. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
 
 ## 12. Open questions
 
 Deferred on purpose. Decide when the phase forces it.
 
 - **Consolidation triggering:** idle timeout vs explicit session close vs continuous. The v1 placeholder is a configurable idle timeout, so the pass has something to hang on. Traces judge it. (Phase 2.)
-- **Model routing.** The ambition is our own router, picking the best model per request across local and hosted (OpenRouter). §6's per-completion choice is the seam. Not now: a router needs usage data, and Phase 2 generates it. hermes-agent converged on aux-default = the main model after shipping the opposite, and hangs its whole routing surface off a per-task label at one chokepoint — so the only obligation now is that background requests carry a task name that reaches their spans. (Post-Phase 2.)
+- ~~**Model routing.**~~ **Decided in §6.1**, using the usage data Phase 2 generated: static roles in config, no runtime difficulty classifier, the role label on every span. hermes-agent's per-task label at one chokepoint is the shape that survived. What stays open is narrower — whether roles need per-task sub-labels (consolidation and titling are both `local` today but may want different timeouts and concurrency), and whether the **face** is reliable enough at dispatch to keep that decision on a cheap model, or whether dispatch alone should escalate. Both are answerable from traces once Phase 3 runs.
+- **Compaction and the log.** A long job (§4.1) will exceed any context window, and summarising its own history is a durable decision that changes what the model sees. Replay must reproduce it, so it cannot be an in-memory convenience. Likely a new kind inside `SessionEvent`, recording what was compacted and the prompt version that did it — the same shape as `SessionConsolidated` in §5.4. Decide when the first job hits the limit, not before. (Phase 3.)
+- **Voice stage placement.** With the face hosted, the GPU is free during a voice turn — the sidecar is asleep and consolidation only runs on idle sessions. The Phase 4 plan's "whisper on CPU so the GPU stays free" constraint may no longer apply, which would allow a larger ASR model or GPU-side TTS for faster first audio. Measure in Phase 4 rather than inheriting the assumption. (Phase 4.)
 - **Identity edits in the log.** Revisit if hand-editing becomes a bottleneck.
 - **Embeddings model for sqlite-vec,** local or API. (Phase 4/5.)
 - **Multi-machine beyond backup/restore** (log sync). (Post-v1.)

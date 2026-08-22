@@ -8,7 +8,7 @@ Write and talk in plain English, only as much information as the point needs. Le
 
 ## Current phase
 
-Phase 2 — memory (see `docs/DESIGN.md` §11 for the phase contract, `docs/TASKS.md` for the live task list). Do not implement features from later phases, even if convenient. When a task tempts you toward Phase 3+ scope, build the seam, not the feature.
+Phase 3 — development (see `docs/DESIGN.md` §11 for the phase contract, `docs/TASKS.md` for the live task list). ARC becomes the way its own code gets written: the four provider roles of §6, jobs as child sessions (§4.1), workspaces (§4.2), the tool registry and approval model (§4.3), and running as an installed unit. Do not implement features from later phases, even if convenient. When a task tempts you toward Phase 3.5+ scope — forking, rewind, voice, devices — build the seam, not the feature.
 
 ## Workspace
 
@@ -34,6 +34,8 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 5. **Secrets never touch the log**, backups, traces, or test fixtures.
 6. **Memory is tools, not injection.** Nothing enters model context automatically except the identity file and the distilled-record index.
 7. **Identity file is human-owned.** Code may propose edits in session output; it never writes `data/identity.md`.
+8. **Tools are confined and gated.** Workspace tools resolve every path to canonical form and refuse anything outside the session's project root, and run with a scrubbed environment — arcd holds credentials, spawned tools never inherit them. Approval verdicts are durable events with `source = USER`; the allow-list is a projection, never a hand-edited file. `consult_expert` is read-only, always.
+9. **Sessions are pinned to one provider.** Role is chosen at session or job creation and does not change for its lifetime. A mid-session model swap discards the prompt cache, which is ~96% of the workload.
 
 ## Conventions
 
