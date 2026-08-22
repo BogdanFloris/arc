@@ -126,7 +126,13 @@ Live-driving finding (2026-08-21, first exit-criterion check): on "what's my nam
 |---|------|----------|--------|
 | 7.1 | Idle-timeout trigger in `arcd` (configurable window) → async consolidation pass on the daemon; spans on every decision | claude | done |
 | 7.2 | Extraction pass: versioned consolidation prompt, extract durable facts, merge with existing records, resolve contradictions by superseding (§5.4) | claude | done |
-| 7.3 | `arcd memory-replay`: run a prompt version over historical sessions, diff resulting memory state against another version — the regression suite for prompt changes | — | todo |
+| 7.3 | `arcd memory-replay`: run a prompt version over historical sessions, diff resulting memory state against another version — the regression suite for prompt changes | claude | done |
+
+### 7.x live findings (2026-08-21, first day of consolidation)
+
+- **Backlog drain**: 30 sessions, zero parse failures, zero strikes. 29 correctly extracted nothing; v1 wrote one ungrounded record (a one-off "tell a big story" → "Storytelling Preference") — mild hoarding, left in place as 8.1's first review specimen and v2's few-shot correction.
+- **First replay run exposed sampling variance**: replay-v1 (seeded) caught the genuine "use less emojis" correction in `c4781d89…` that live-v1 (unseeded) missed — and skipped the storytelling record live-v1 wrote. Same prompt; the dice decide at the margin. Prompt v2's regression pair is therefore: kill storytelling-class inference, never miss an explicit correction, keep the name record.
+- **Open, Bogdan's call**: seed live consolidation (`with_seed(session_seed(id))`, one line) so live matches replay and the regression suite tests the exact behavior that runs — at the cost of the dice's accidental diversity.
 
 ## 8. Review + metrics
 
