@@ -1,6 +1,3 @@
-//! Smoke tests for the generated protobuf types: encode/decode round trips,
-//! forward compatibility with additive schema changes, and proto3 defaults.
-
 use arc_proto::v1::{
     ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
     HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
@@ -15,7 +12,6 @@ use arc_proto::v1::{
 use prost::Message;
 use prost_types::Timestamp;
 
-/// Fixed so tests are deterministic; no wall-clock reads anywhere here.
 fn ts() -> Timestamp {
     Timestamp {
         seconds: 1_700_000_000,
@@ -110,7 +106,7 @@ fn session_consolidated_event() -> Event {
                 SessionConsolidated {
                     session_id: "s-01".to_string(),
                     through_seq: 4,
-                    prompt_version: String::new(), // unversioned until 7.2
+                    prompt_version: String::new(),
                 },
             )),
         })),
@@ -272,7 +268,7 @@ fn client_frame_send_message_round_trips() {
     round_trip(&ClientFrame {
         request_id: 7,
         msg: Some(client_frame::Msg::SendMessage(SendMessage {
-            session_id: String::new(), // empty id = create a new session
+            session_id: String::new(),
             content: "hello arc".to_string(),
         })),
     });
@@ -369,23 +365,17 @@ fn server_frame_arms_round_trip() {
     }
 }
 
-/// A reader on an old binary must still decode events written by a newer one.
-/// Simulates that by appending a field this schema version has never seen.
 #[test]
 fn unknown_field_is_skipped() {
     let original = message_appended_event();
     let mut bytes = original.encode_to_vec();
 
-    // Field 100, wire type 2 (length-delimited): key = (100 << 3) | 2 = 802,
-    // encoded as a varint (0xa2 0x06), then the length, then the payload.
     bytes.extend_from_slice(&[0xa2, 0x06, 0x03, 0xde, 0xad, 0xbe]);
 
     let decoded = Event::decode(bytes.as_slice()).expect("decode with unknown field");
     assert_eq!(decoded, original);
 }
 
-/// proto3 has no presence for scalars: an empty payload is a valid message with
-/// every field at its default. The log reader depends on this.
 #[test]
 fn empty_bytes_decode_to_defaults() {
     let decoded = Event::decode(&[][..]).expect("decode empty");

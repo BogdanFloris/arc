@@ -1,19 +1,8 @@
-//! Loading `data/identity.md`
-
 use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
-/// Reads the identity file, distinguishing "absent" from "broken".
-///
-/// - No file → `Ok(None)`. Running without an identity is a supported state;
-///   the caller announces it.
-/// - Whitespace-only → `Ok(None)`. An accidentally emptied file must not send
-///   an empty system prompt as though it meant something.
-/// - Present but unreadable (permissions, invalid UTF-8) → `Err`. A broken
-///   identity file should stop the daemon, not silently produce an ARC with
-///   amnesia.
 pub fn load(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(None),

@@ -1,23 +1,3 @@
-//! The tool registry: what the model may call, and what running a call yields.
-//!
-//! [`Registry`] is the seam between the engine loop (4.2) and individual
-//! tools. The engine offers [`Registry::definitions`] on each completion and
-//! hands each tool call to [`Registry::dispatch`], which returns what the log
-//! records: content, an outcome, a truncation flag.
-//!
-//! Two contract points live here rather than in tools (DESIGN.md §3.1):
-//!
-//! - **A failing tool is a result, not an error.** Unknown names, bad
-//!   arguments, tool-internal failures — all come back as an ERROR outcome
-//!   whose content is text the model reads and reasons about. `dispatch`
-//!   cannot fail.
-//! - **Truncation happens before the event is built.** Results are cut to
-//!   `max_tool_result_bytes` — the real constraint is the model's context,
-//!   not the log's 16 MiB cap — marked in the content, and flagged.
-//!
-//! Tools never produce UNKNOWN: that outcome is written only by the startup
-//! closer for orphaned calls (4.3).
-
 pub mod memory;
 pub mod sessions;
 pub mod time;
@@ -28,23 +8,15 @@ use std::pin::Pin;
 
 use crate::provider::ToolDefinition;
 
-/// The turn a call runs inside, threaded through dispatch so a tool can know
-/// where it is being called from — provenance for memory writes, the
-/// current-session exclusion for `sessions_search`. Tools that need neither
-/// ignore it.
 #[derive(Debug, Clone, Default)]
 pub struct TurnContext {
     pub session_id: String,
     pub turn_id: String,
 }
 
-/// What a tool answered. An error is a reply the model will read, with
-/// `ok: false`; it is not a Rust error.
 pub struct ToolReply {
     pub content: String,
     pub ok: bool,
-    /// Events the engine appends durably before the result that reports them.
-    /// Tools never touch the log or projection themselves (invariant 2).
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
 }
 
@@ -68,24 +40,13 @@ impl ToolReply {
     }
 }
 
-/// What [`Registry::dispatch`] yields: a [`ToolReply`] after the registry's
-/// own policy — truncation, unknown-name handling — has been applied. The
-/// engine builds `ToolResultRecorded` from this and nothing else.
 pub struct DispatchOutcome {
     pub content: String,
-    /// `false` → `TOOL_OUTCOME_ERROR`.
     pub ok: bool,
     pub truncated: bool,
-    /// Passed through from the reply, untouched by truncation.
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
 }
 
-/// One callable tool.
-///
-/// `execute` returns a boxed future because the registry holds tools as trait
-/// objects — the first place dyn dispatch is genuinely needed — and an
-/// `async fn` in a trait is not dyn-compatible. Implementors parse their own
-/// `arguments_json`; a parse failure is an ERROR reply, not a panic.
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn execute(
@@ -95,8 +56,6 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>>;
 }
 
-/// Serializes a reply shape. The shapes are plain structs, so failure is
-/// unreachable; if it happens anyway the model sees an error, not a panic.
 pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|error| format!("ERROR: could not serialize the reply ({error})."))
@@ -116,13 +75,6 @@ impl Registry {
         }
     }
 
-    /// Adds a tool under its definition's name — the one authority for what
-    /// the tool is called, since it is the name the model is offered.
-    ///
-    /// # Panics
-    ///
-    /// In debug builds, on a duplicate name: registration happens once at
-    /// startup, and a silent replacement would hide a wiring bug.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.definition().name;
         debug_assert!(
@@ -132,15 +84,11 @@ impl Registry {
         self.tools.insert(name, tool);
     }
 
-    /// Every registered tool's definition, in name order — `BTreeMap` keeps
-    /// the offering stable across runs, so prompts stay reproducible.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
-    /// Runs the named tool and applies result policy. Infallible by design:
-    /// every failure mode is an ERROR outcome the model can act on.
     #[tracing::instrument(
         name = "tool.dispatch",
         skip_all,
@@ -192,7 +140,6 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
-    /// A tool scripted by construction: fixed name, fixed reply.
     struct Scripted {
         name: &'static str,
         content: &'static str,
@@ -222,7 +169,6 @@ mod tests {
         }
     }
 
-    /// A tool that replies with the arguments it was handed.
     struct Echo;
 
     impl Tool for Echo {
@@ -243,7 +189,6 @@ mod tests {
         }
     }
 
-    /// A tool that replies with the session id it was dispatched under.
     struct WhereAmI;
 
     impl Tool for WhereAmI {
@@ -351,7 +296,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_lands_on_a_char_boundary() {
-        // "é" is two bytes; a cap of 3 falls inside the second one.
         let mut registry = Registry::new(3);
         registry.register(scripted("accents", "ééé", true));
 

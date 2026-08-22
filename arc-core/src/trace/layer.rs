@@ -1,24 +1,3 @@
-//! A `tracing` layer that writes Perfetto track events.
-//!
-//! Shape, and why: ARC's work is async, so a span does not sit on one thread
-//! and thread tracks would show noise instead of work. Every span instance
-//! gets its own Perfetto track instead, parented to its parent span's track,
-//! and the root of a chain hangs under the track for its session. What the UI
-//! draws is then the span tree itself: a session row, a `session.send_message`
-//! under it, an `openai.complete` under that, lasting exactly as long as the
-//! model took.
-//!
-//! Two consequences worth knowing:
-//!
-//! - A span's packets are written when it closes, not when it opens. Fields
-//!   recorded mid-span (`session_id`, token counts, the outcome) are only
-//!   known then, and Perfetto sorts by timestamp rather than by file order,
-//!   so a late write costs nothing. A span that never closes — the daemon is
-//!   killed mid-turn — leaves no slice.
-//! - Fields named `counter.<name>` are not annotations but counter samples,
-//!   drawn as a graph on their own track. That is how token counts get into
-//!   the trace (DESIGN.md §8) without the layer knowing what a token is.
-
 use std::{
     collections::HashMap,
     fmt,
@@ -43,38 +22,22 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 use super::writer::PacketWriter;
 
-/// Prefix that turns a field into a counter sample instead of an annotation.
 const COUNTER_PREFIX: &str = "counter.";
 
-/// Every packet comes from this one writer.
 const SEQUENCE_ID: u32 = 1;
 
-/// The category on every event ARC emits, so a trace holding other producers'
-/// data can still be filtered down to ours.
 const CATEGORY: &str = "arc";
 
-/// Writes span and event data to a Perfetto trace file.
-///
-/// Install it on a `tracing_subscriber` registry; see [`super::perfetto`].
 pub struct PerfettoLayer {
     writer: Mutex<PacketWriter>,
-    /// Set after the first write failure. A trace is disposable, so a broken
-    /// file stops the layer instead of taking the daemon down with it.
     broken: AtomicBool,
     next_uuid: AtomicU64,
     process_track: u64,
-    /// Session id → its track. Sessions outlive spans, so this is the one
-    /// piece of state that accumulates; it is bounded by sessions per run.
     sessions: Mutex<HashMap<String, u64>>,
     counters: Mutex<HashMap<String, u64>>,
 }
 
 impl PerfettoLayer {
-    /// Opens a trace file in `dir` and declares the process track.
-    ///
-    /// # Errors
-    ///
-    /// If `dir` cannot be created or the file cannot be opened.
     pub(super) fn create(dir: &Path, process_name: &str) -> std::io::Result<(Self, PathBuf)> {
         let (writer, path) = PacketWriter::create(dir)?;
         let layer = Self {
@@ -86,9 +49,6 @@ impl PerfettoLayer {
             counters: Mutex::new(HashMap::new()),
         };
 
-        // First packet, before anything refers to a timestamp: it says what
-        // clock those timestamps are in. Without it Perfetto assumes boot
-        // time, fails to convert, and silently drops every event.
         layer.emit(TracePacket {
             clock_snapshot: Some(ClockSnapshot {
                 clocks: vec![clock_snapshot::Clock {
@@ -116,7 +76,6 @@ impl PerfettoLayer {
         Ok((layer, path))
     }
 
-    /// Writes a packet, or gives up on the trace for good.
     fn emit(&self, packet: TracePacket) {
         if self.broken.load(Ordering::Relaxed) {
             return;
@@ -127,8 +86,6 @@ impl PerfettoLayer {
         };
         if let Err(error) = writer.write(packet) {
             self.broken.store(true, Ordering::Relaxed);
-            // Not `tracing::error!`: this is a tracing layer, and reporting
-            // through the subscriber it is part of invites reentrancy.
             eprintln!("perfetto trace stopped: {error}");
         }
     }
@@ -137,7 +94,6 @@ impl PerfettoLayer {
         self.next_uuid.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The track for `session_id`, declared the first time it is asked for.
     fn session_track(&self, session_id: &str) -> u64 {
         let Ok(mut sessions) = self.sessions.lock() else {
             return self.process_track;
@@ -149,8 +105,6 @@ impl PerfettoLayer {
         sessions.insert(session_id.to_owned(), track);
         drop(sessions);
 
-        // A full uuid is too wide for a track label; the head of it is enough
-        // to tell two sessions apart while reading.
         let short: String = session_id.chars().take(8).collect();
         self.emit(TracePacket {
             track_descriptor: Some(TrackDescriptor {
@@ -164,7 +118,6 @@ impl PerfettoLayer {
         track
     }
 
-    /// The counter track called `name`, declared on first use.
     fn counter_track(&self, name: &str) -> u64 {
         let Ok(mut counters) = self.counters.lock() else {
             return self.process_track;
@@ -192,7 +145,6 @@ impl PerfettoLayer {
         track
     }
 
-    /// Draws one sample on each counter named in `fields`.
     fn emit_counters(&self, fields: &Fields, timestamp: u64) {
         for (name, value) in &fields.counters {
             let track = self.counter_track(name);
@@ -237,8 +189,6 @@ where
         let mut fields = Fields::default();
         event.record(&mut fields);
 
-        // An event belongs on the track of the span it happened in — that is
-        // what puts "completion finished" inside the completion's slice.
         let track = ctx
             .event_span(event)
             .and_then(|span| span.extensions().get::<SpanData>().map(|data| data.track))
@@ -247,8 +197,6 @@ where
         let timestamp = now();
         self.emit_counters(&fields, timestamp);
 
-        // Counters have their own drawing; an event that is only counters
-        // would otherwise leave an empty instant behind.
         if fields.annotations.is_empty() && fields.message.is_none() {
             return;
         }
@@ -278,11 +226,6 @@ where
         };
         let ended = now();
 
-        // The span that first names a session opens that session's row —
-        // that is the "track per session" DESIGN.md §8 asks for, and it puts
-        // a turn where you look for it rather than under the connection that
-        // happened to carry it. Everything below stays nested under its
-        // parent, so the span tree survives.
         let session = data.fields.session.as_deref().filter(|session| {
             !span.scope().skip(1).any(|ancestor| {
                 ancestor
@@ -326,10 +269,6 @@ where
             track_event: Some(TrackEvent {
                 r#type: track_event::Type::SliceEnd as i32,
                 track_uuid: Some(data.track),
-                // Annotations ride the closing event: a field recorded during
-                // the span (an outcome, a token count) is not known at the
-                // opening one, and Perfetto shows a slice's arguments from
-                // either end.
                 debug_annotations: data.fields.annotations,
                 ..TrackEvent::default()
             }),
@@ -338,29 +277,21 @@ where
     }
 }
 
-/// What the layer keeps about a live span.
 struct SpanData {
     track: u64,
     started: u64,
     fields: Fields,
 }
 
-/// Fields collected from a span or event, sorted into what they become.
 #[derive(Default)]
 struct Fields {
     annotations: Vec<DebugAnnotation>,
-    /// The `session_id` field, if there was one — the span's track hangs
-    /// under that session.
     session: Option<String>,
-    /// `counter.*` fields, as (track name, value).
     counters: Vec<(String, f64)>,
-    /// The `message` field: an event's text, which names its instant.
     message: Option<String>,
 }
 
 impl Fields {
-    /// Files a field under its counter name, or `None` if it is an ordinary
-    /// one.
     fn counter_name(field: &Field) -> Option<&str> {
         field.name().strip_prefix(COUNTER_PREFIX)
     }
@@ -455,7 +386,6 @@ impl Visit for Fields {
     }
 }
 
-/// A packet with the parts every packet shares.
 fn packet() -> TracePacket {
     TracePacket {
         timestamp: None,
@@ -467,12 +397,6 @@ fn packet() -> TracePacket {
     }
 }
 
-/// Nanoseconds since the Unix epoch — Perfetto's `BUILTIN_CLOCK_REALTIME`.
-///
-/// Wall clock, not monotonic, so a slice in the UI can be matched against a
-/// log event's timestamp. A clock step during a turn would skew that turn's
-/// slice; the alternative is a clock snapshot to correlate domains, which is
-/// more machinery than a personal daemon's traces need.
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -490,7 +414,6 @@ mod tests {
 
     use super::*;
 
-    /// Runs `work` under a layer writing to a fresh trace, and decodes it.
     fn capture(work: impl FnOnce()) -> Trace {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (layer, path) = super::super::perfetto(dir.path(), "test").expect("a trace file");
@@ -498,12 +421,9 @@ mod tests {
         tracing::subscriber::with_default(subscriber, work);
 
         let bytes = std::fs::read(&path).expect("the trace file");
-        // Packets are written one one-packet `Trace` at a time; decoding the
-        // concatenation is the round trip that proves the framing.
         Trace::decode(bytes.as_slice()).expect("a decodable trace")
     }
 
-    /// Every track descriptor in the trace, as (uuid, name, parent).
     fn tracks(trace: &Trace) -> Vec<(u64, String, Option<u64>)> {
         trace
             .packet
@@ -519,7 +439,6 @@ mod tests {
             .collect()
     }
 
-    /// Every track event, as (type, name, track).
     fn events(trace: &Trace) -> Vec<(i32, String, u64)> {
         trace
             .packet
@@ -595,8 +514,6 @@ mod tests {
         let trace = capture(|| {
             let outer = tracing::info_span!("outer", session_id = tracing::field::Empty);
             let entered = outer.enter();
-            // As the session engine does: the id is only known after the span
-            // is open, which is why tracks are decided at close.
             outer.record("session_id", "abcdef0123456789");
             tracing::info_span!("inner").in_scope(|| {});
             drop(entered);
@@ -614,8 +531,6 @@ mod tests {
 
     #[test]
     fn a_session_opens_one_row_however_deep_the_span_that_names_it() {
-        // The shape the daemon actually produces: a connection span, a
-        // request under it, and the session named two levels down.
         let trace = capture(|| {
             tracing::info_span!("client connected").in_scope(|| {
                 tracing::info_span!("server.request").in_scope(|| {

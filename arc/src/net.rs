@@ -1,16 +1,8 @@
-//! The connection task: owns the wire client, runs commands, reports events.
-//!
-//! The task connects lazily — on the first command, and again on the first
-//! command after a failure — so "the daemon was down" is a fault the next
-//! send can heal instead of a fatal state. Commands arrive on a channel and
-//! run one at a time, which is also the daemon's own concurrency model.
-
 use arc_core::client::{Client, Error, TurnEvent};
 use tokio::sync::mpsc;
 
 use crate::app::{Command, NetEvent, ReviewEntry};
 
-/// Runs commands against `url` until the command channel closes.
 pub async fn run(
     url: String,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -35,7 +27,6 @@ pub async fn run(
     }
 }
 
-/// Runs one command, returning the client if the connection is still good.
 async fn handle(
     mut client: Client,
     command: Command,
@@ -75,7 +66,6 @@ async fn list(client: &mut Client, events: &mpsc::UnboundedSender<NetEvent>) -> 
             let _ = events.send(NetEvent::Sessions(sessions));
             Ok(())
         }
-        // The daemon said no to this request; the connection is fine.
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())
@@ -98,7 +88,6 @@ async fn history(
             });
             Ok(())
         }
-        // The daemon said no to this request; the connection is fine.
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())
@@ -117,8 +106,6 @@ async fn review_list(
             let entries = items
                 .into_iter()
                 .filter_map(|item| {
-                    // A record-less item is a newer daemon's shape; skip it
-                    // rather than render an empty row.
                     let record = item.record?;
                     Some(ReviewEntry {
                         id: record.id,
@@ -133,7 +120,6 @@ async fn review_list(
             let _ = events.send(NetEvent::ReviewItems(entries));
             Ok(())
         }
-        // The daemon said no to this request; the connection is fine.
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())
@@ -142,8 +128,6 @@ async fn review_list(
     }
 }
 
-/// A verdict's outcome: silence on success — the pane already dropped the
-/// item — and a fault the rule shows when the daemon said no.
 fn verdict(
     result: Result<(), Error>,
     events: &mpsc::UnboundedSender<NetEvent>,

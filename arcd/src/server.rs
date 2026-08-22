@@ -1,30 +1,3 @@
-//! The `WebSocket` server: `wire.proto` over localhost (DESIGN.md §7).
-//!
-//! One `ClientFrame` per binary message in, one or more `ServerFrame`s out,
-//! `request_id` echoed on every one so a client can correlate. This module
-//! decides nothing about sessions, models, or durability — it translates
-//! between frames and [`Engine`] calls, which is exactly the split the engine's
-//! [`EngineEvent`] was shaped for.
-//!
-//! # Concurrency
-//!
-//! One task per connection, and frames within a connection are handled one at
-//! a time: the read loop does not look at the next message until the current
-//! request has sent its last frame. A client that pipelines two requests gets
-//! them answered in order, which is what the read loop's shape already gives.
-//!
-//! Across connections, the engine's mutex is the serializer. `send_message`
-//! takes `&mut Engine`, so a completion holds the lock for its whole duration
-//! and every other request — a list on another connection included — waits.
-//! That is Phase 1's single-user reality (DESIGN.md §1), not a bug to route
-//! around; when it stops being true, the fix is more than one engine, not a
-//! finer lock.
-//!
-//! # Shutdown
-//!
-//! [`serve`] stops accepting, tells live connections to close, and gives
-//! whatever is still in flight a bounded grace before the process leaves.
-
 use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -49,24 +22,12 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
-/// A connected client, server side.
 type Socket = WebSocketStream<TcpStream>;
 
-/// Engine events buffered between the completion and the socket.
-///
-/// Deep enough that a client reading at any reasonable pace never makes the
-/// model wait, shallow enough that a stalled client stalls its own completion
-/// instead of buffering a whole reply in memory.
 const EVENT_BUFFER: usize = 64;
 
-/// How long [`serve`] waits for in-flight requests after it stops accepting.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// Serves `wire.proto` on `listener` until `shutdown` resolves.
-///
-/// Every connection gets its own task; all of them share `engine`. Returns
-/// once the listener is closed and the live connections have finished or the
-/// grace period has run out.
 pub async fn serve<P: Provider + 'static>(
     listener: TcpListener,
     engine: Arc<Mutex<Engine<P>>>,
@@ -81,8 +42,6 @@ pub async fn serve<P: Provider + 'static>(
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    // Reap first: a daemon that runs for months must not
-                    // accumulate the join handles of every client it ever had.
                     while connections.try_join_next().is_some() {}
                     connections.spawn(connection(
                         stream,
@@ -91,22 +50,16 @@ pub async fn serve<P: Provider + 'static>(
                         closing_rx.clone(),
                     ));
                 }
-                // One refused connection is not a reason to stop serving the
-                // others: log it and keep accepting.
                 Err(error) => warn!(%error, "accepting a connection failed"),
             },
         }
     }
 
     info!(connections = connections.len(), "no longer accepting");
-    // Idle connections take this as their cue. A connection with a completion
-    // in flight sees it when it comes back around to its read loop, which is
-    // what makes the grace below a grace and not a wait.
     let _ = closing.send(true);
     drain(&mut connections).await;
 }
 
-/// Waits out the live connections, bounded by [`SHUTDOWN_GRACE`].
 async fn drain(connections: &mut JoinSet<()>) {
     let expired = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while connections.join_next().await.is_some() {}
@@ -115,11 +68,6 @@ async fn drain(connections: &mut JoinSet<()>) {
     .is_err();
 
     if expired {
-        // Whatever is left is dropped with the set: a completion mid-stream is
-        // abandoned, losing at most the reply text the model had not finished.
-        // That is the shape of loss a crash produces and the log already
-        // tolerates it (DESIGN.md §3, §4) — worth more than an unbounded
-        // shutdown.
         warn!(
             remaining = connections.len(),
             "shutdown grace expired; abandoning connections"
@@ -127,7 +75,6 @@ async fn drain(connections: &mut JoinSet<()>) {
     }
 }
 
-/// One client, from handshake to close.
 #[tracing::instrument(name = "server.connection", skip_all, fields(peer = %peer))]
 async fn connection<P: Provider>(
     stream: TcpStream,
@@ -145,9 +92,6 @@ async fn connection<P: Provider>(
     info!("client connected");
 
     loop {
-        // Cancelling the read at shutdown is safe here in the only way that
-        // matters: the connection is being closed anyway, so a half-read
-        // message has nothing left to be read for.
         let message = tokio::select! {
             () = told_to_close(&mut closing) => {
                 info!("closing an idle connection");
@@ -164,23 +108,17 @@ async fn connection<P: Provider>(
                         break;
                     }
                 }
-                // Past a decode failure the byte stream cannot be trusted —
-                // the same reasoning that fuses the SSE parser. Say so and go.
                 Err(error) => {
                     warn!(%error, "undecodable client frame");
                     refuse(&mut ws, 0).await;
                     break;
                 }
             },
-            // Text is not this protocol. Treating it as a bad frame beats
-            // ignoring it: a client that sent the wrong message type hears
-            // about it instead of waiting forever for a reply.
             Some(Ok(WsMessage::Text(_))) => {
                 warn!("text message on a binary protocol");
                 refuse(&mut ws, 0).await;
                 break;
             }
-            // Pings and pongs are tungstenite's business, not ours.
             Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
             Some(Ok(WsMessage::Close(_))) | None => break,
             Some(Err(error)) => {
@@ -193,19 +131,10 @@ async fn connection<P: Provider>(
     info!("client disconnected");
 }
 
-/// Resolves once [`serve`] has stopped accepting.
-///
-/// A thin wrapper for one reason: `wait_for` hands back a borrow guard that is
-/// not `Send`, and letting it into a `select!` arm would make the whole
-/// connection task unspawnable. Dropping it here keeps that detail local.
 async fn told_to_close(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closing| *closing).await;
 }
 
-/// Handles one client frame, start to finish.
-///
-/// `Break` ends the connection: either the client is gone or it sent something
-/// this protocol has no answer for.
 #[tracing::instrument(
     name = "server.request",
     skip_all,
@@ -235,8 +164,6 @@ async fn request<P: Provider>(
         Some(client_frame::Msg::MemoryReviewDelete(delete)) => {
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
-        // A frame from a newer client, or one that asked for nothing. Either
-        // way this binary cannot answer it, and guessing would be worse.
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
@@ -245,11 +172,6 @@ async fn request<P: Provider>(
     }
 }
 
-/// Drives one completion, streaming its events out as they happen.
-///
-/// The engine is locked for the whole turn — see the module docs — and
-/// released before the closing frame goes out, so the next request waits on
-/// the model rather than on a socket write.
 async fn send_message<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -257,14 +179,9 @@ async fn send_message<P: Provider>(
     send: SendMessage,
 ) -> ControlFlow<()> {
     let (events, rx) = mpsc::channel(EVENT_BUFFER);
-    // An empty session id means "start one" (DESIGN.md §7); the engine names it
-    // and says so in `Accepted`.
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
     let mut engine = engine.lock().await;
-    // `join!`, not `select!`: both halves have to finish. The completion is
-    // what makes the message durable, and the forward loop is the only thing
-    // draining the events it emits.
     let (result, connected) = tokio::join!(
         engine.send_message(session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),
@@ -282,16 +199,9 @@ async fn send_message<P: Provider>(
             error_frame(error_code(&error), &error)
         }
     };
-    // A failed request is the client's problem, not the connection's: the next
-    // frame is read as usual.
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// Forwards engine events to the client until the completion ends.
-///
-/// Returns whether the client is still there. `rx` is dropped on the way out,
-/// so a completion whose client vanished finds a closed channel and runs to
-/// its end unwatched instead of filling the buffer and stalling.
 async fn forward(
     ws: &mut Socket,
     request_id: u64,
@@ -301,8 +211,6 @@ async fn forward(
     while let Some(event) = rx.recv().await {
         let msg = match event {
             EngineEvent::Accepted { session_id: id } => {
-                // For a new session this is the first time anyone knows the
-                // id, and every `Delta` below has to carry it.
                 session_id.clone_from(&id);
                 server_frame::Msg::MessageAccepted(MessageAccepted { session_id: id })
             }
@@ -339,7 +247,6 @@ async fn forward(
     true
 }
 
-/// Answers `ListSessions` from the index.
 async fn list_sessions<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -358,10 +265,6 @@ async fn list_sessions<P: Provider>(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// Answers `MemoryReviewList` from the index.
-///
-/// A read, not a turn: like `fetch_history`, it holds the engine lock only
-/// long enough to query.
 async fn review_list<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -381,7 +284,6 @@ async fn review_list<P: Provider>(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// Records the accept verdict, answering with the protocol's ack or error.
 async fn review_accept<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -392,7 +294,6 @@ async fn review_accept<P: Provider>(
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
-/// Records the delete verdict, answering like `review_accept`.
 async fn review_delete<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -403,9 +304,6 @@ async fn review_delete<P: Provider>(
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
-/// A verdict's closing frame: `MessageAccepted` — the protocol's existing
-/// ack, its `session_id` empty because the request already named the record —
-/// or the error frame.
 fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame::Msg {
     match done {
         Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
@@ -418,7 +316,6 @@ fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame:
     }
 }
 
-/// A projection review row as the wire describes it.
 fn review_item(item: ReviewItem) -> MemoryReviewItem {
     MemoryReviewItem {
         record: Some(item.record),
@@ -427,7 +324,6 @@ fn review_item(item: ReviewItem) -> MemoryReviewItem {
     }
 }
 
-/// Tells the client its bytes were not a frame, then closes.
 async fn refuse(ws: &mut Socket, request_id: u64) {
     send_frame(
         ws,
@@ -438,10 +334,6 @@ async fn refuse(ws: &mut Socket, request_id: u64) {
     let _ = ws.close(None).await;
 }
 
-/// Encodes one server frame and writes it.
-///
-/// Returns whether the client is still there. A write failure is not an error
-/// to report — there is no one left to report it to.
 async fn send_frame(ws: &mut Socket, request_id: u64, msg: server_frame::Msg) -> bool {
     let frame = ServerFrame {
         request_id,
@@ -456,10 +348,7 @@ async fn send_frame(ws: &mut Socket, request_id: u64, msg: server_frame::Msg) ->
     }
 }
 
-/// The closing frame of a successful turn.
 fn stream_end(reply: &Reply) -> server_frame::Msg {
-    // No usage means the stream was cut before the model billed anything;
-    // zeros say that as plainly as the wire can.
     let usage = reply.usage.unwrap_or_default();
     server_frame::Msg::StreamEnd(StreamEnd {
         session_id: reply.session_id.clone(),
@@ -469,10 +358,6 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
     })
 }
 
-/// Answers one session's history from the projection.
-///
-/// A read, not a turn: it takes the engine lock only long enough to query, so
-/// a client opening an old session does not wait behind a completion.
 async fn fetch_history<P: Provider>(
     ws: &mut Socket,
     engine: &Mutex<Engine<P>>,
@@ -482,8 +367,6 @@ async fn fetch_history<P: Provider>(
     let read = engine.lock().await.transcript(session_id);
     let msg = match read {
         Ok(entries) => {
-            // `messages` is superseded by `entries` (prose only, as before)
-            // and still filled so a client that predates entries renders.
             let messages = entries
                 .iter()
                 .filter_map(|entry| match entry.entry.as_ref() {
@@ -505,7 +388,6 @@ async fn fetch_history<P: Provider>(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// An `Error` frame with a stable code and a human-readable message.
 fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
     server_frame::Msg::Error(WireError {
         code: code.to_owned(),
@@ -513,22 +395,16 @@ fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
     })
 }
 
-/// The wire code for a session error.
-///
-/// Codes are the client's contract — `snake_case`, stable, and matched on. The
-/// message beside them is for a person and may change freely.
 fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
         SessionError::UnknownRecord { .. } => "unknown_record",
         SessionError::Provider(_) => "provider",
-        // Durable state is in doubt and no client can do anything about it.
         SessionError::Log(_) | SessionError::Projection(_) => "internal",
     }
 }
 
-/// The frame kind, for the request span.
 fn kind(frame: &ClientFrame) -> &'static str {
     match frame.msg {
         Some(client_frame::Msg::SendMessage(_)) => "send_message",
@@ -541,7 +417,6 @@ fn kind(frame: &ClientFrame) -> &'static str {
     }
 }
 
-/// A projection row as the wire describes a session.
 fn session_info(summary: &SessionSummary) -> SessionInfo {
     SessionInfo {
         id: summary.id.clone(),
@@ -552,21 +427,13 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
     }
 }
 
-/// Microseconds since the Unix epoch back to a protobuf timestamp.
-///
-/// The projection stores microseconds — one sortable integer column — and the
-/// wire speaks `Timestamp`; this is the only place the two meet. Euclidean
-/// division keeps `nanos` non-negative for pre-epoch values, which protobuf
-/// requires and a plain remainder would get wrong.
 fn timestamp(micros: i64) -> Timestamp {
     Timestamp {
         seconds: micros.div_euclid(1_000_000),
-        // Always in 0..1_000_000_000, so the conversion cannot fail.
         nanos: i32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or(0),
     }
 }
 
-/// "The client is still there" as the read loop's control flow.
 fn flow(connected: bool) -> ControlFlow<()> {
     if connected {
         ControlFlow::Continue(())
@@ -602,8 +469,6 @@ mod tests {
 
     use super::*;
 
-    /// Longest any assertion waits on the socket. Generous enough never to fire
-    /// on a loaded machine, short enough that a hang fails instead of hanging.
     const PATIENCE: Duration = Duration::from_secs(5);
 
     fn usage() -> Usage {
@@ -613,18 +478,11 @@ mod tests {
         }
     }
 
-    /// What the mock provider does with a request.
     enum Script {
-        /// Reply `re: <the last user message>`, then `Done`. Ties every reply
-        /// to the request that caused it, which is what makes concurrent
-        /// clients checkable.
         Echo,
-        /// Yield exactly these items, one entry per call.
         Canned(VecDeque<Vec<Result<CompletionDelta, ProviderError>>>),
     }
 
-    /// A provider with no network: it answers from [`Script`] and keeps every
-    /// request it was given.
     struct MockProvider {
         script: StdMutex<Script>,
         captured: StdMutex<Vec<CompletionRequest>>,
@@ -681,8 +539,6 @@ mod tests {
         }
     }
 
-    /// A running server over a temporary log, plus the handles to inspect and
-    /// stop it.
     struct Harness {
         addr: SocketAddr,
         provider: Arc<MockProvider>,
@@ -691,15 +547,11 @@ mod tests {
         _dir: TempDir,
     }
 
-    /// When the seeded memory records changed, as the projection will report
-    /// it back in `changed_at_micros`.
     const SEEDED_AT_MICROS: i64 = 1_700_000_000_000_000;
 
-    /// A `MemoryRecordCreated` for the review tests' seed, stamped at
-    /// [`SEEDED_AT_MICROS`] so the records sit in every review window.
     fn seeded_record(id: &str, title: &str) -> Event {
         Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: Some(Timestamp {
                 seconds: SEEDED_AT_MICROS / 1_000_000,
                 nanos: 0,
@@ -732,9 +584,6 @@ mod tests {
             Self::with_seed(script, registry, Vec::new()).await
         }
 
-        /// [`with_tools`](Self::with_tools) over a log pre-seeded with
-        /// `events`, replayed into the projection — how the review tests get
-        /// memory records without driving a tool turn.
         async fn with_seed(script: Script, registry: Registry, events: Vec<Event>) -> Self {
             let dir = TempDir::new().expect("temp dir");
             let mut log = Log::open(dir.path()).expect("open log");
@@ -778,7 +627,6 @@ mod tests {
             ws
         }
 
-        /// Signals shutdown and waits for the server to come back.
         async fn stop(&mut self) {
             let _ = self.shutdown.take().expect("not stopped twice").send(());
             tokio::time::timeout(PATIENCE, &mut self.server)
@@ -788,7 +636,6 @@ mod tests {
         }
     }
 
-    /// A test tool with a fixed reply.
     struct Canned {
         name: &'static str,
         content: &'static str,
@@ -837,7 +684,6 @@ mod tests {
         })
     }
 
-    /// The next raw message, or `None` if the server closed the connection.
     async fn next_message(ws: &mut Client) -> Option<WsMessage> {
         tokio::time::timeout(PATIENCE, ws.next())
             .await
@@ -852,9 +698,6 @@ mod tests {
         }
     }
 
-    /// Reads one whole turn: `MessageAccepted`, every `Delta`, the closing
-    /// frame. Returns the session id, the joined delta text, and the last
-    /// frame's message.
     async fn turn(ws: &mut Client, request_id: u64) -> (String, String, server_frame::Msg) {
         let accepted = next_frame(ws).await;
         assert_eq!(accepted.request_id, request_id, "request_id is echoed");
@@ -964,8 +807,6 @@ mod tests {
         assert_eq!(again, session_id, "the same session, not a new one");
         assert!(!ended(closing).partial);
 
-        // The second completion saw the first exchange: the log grew and the
-        // history came back out of it.
         let requests = harness.provider.requests();
         assert_eq!(requests.len(), 2);
         let turns: Vec<(Role, &str)> = requests[1]
@@ -1010,7 +851,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// What a client needs to reopen an old session and see what was said.
     #[tokio::test]
     async fn history_returns_the_whole_conversation_in_order() {
         let mut harness = Harness::start(Script::Echo).await;
@@ -1050,7 +890,6 @@ mod tests {
             "an all-prose session's entries mirror its messages"
         );
 
-        // A read, not a turn: the connection is good for the next request.
         let empty = history(&mut ws, 4, "no-such-session").await;
         assert!(
             empty.messages.is_empty() && empty.entries.is_empty(),
@@ -1060,7 +899,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// The picker labels rows with this, so it has to be the opening line.
     #[tokio::test]
     async fn listed_sessions_preview_their_first_user_message() {
         let mut harness = Harness::start(Script::Echo).await;
@@ -1095,7 +933,6 @@ mod tests {
         assert_eq!(error.code, "empty_message");
         assert!(!error.msg.is_empty(), "the code comes with an explanation");
 
-        // Same connection, next request: unaffected.
         send(&mut ws, 2, say("", "hello")).await;
         let (_, text, closing) = turn(&mut ws, 2).await;
         assert_eq!(text, "re: hello");
@@ -1122,8 +959,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// The engine's reasoning and tool activity reach the client as their
-    /// wire frames, in the order the turn produced them.
     #[tokio::test]
     async fn reasoning_and_tool_activity_are_forwarded_in_turn_order() {
         let script = Script::Canned(VecDeque::from([
@@ -1204,8 +1039,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// A reopened tool turn's history carries its call and result entries in
-    /// seq order, beside the prose-only `messages` an old client reads.
     #[tokio::test]
     async fn history_carries_tool_entries_alongside_prose_messages() {
         let script = Script::Canned(VecDeque::from([
@@ -1244,7 +1077,6 @@ mod tests {
             Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
             other => panic!("expected MessageAccepted first, got {other:?}"),
         };
-        // Drain the turn's middle frames; `turn` would stop at the first one.
         loop {
             if let Some(server_frame::Msg::StreamEnd(_)) = next_frame(&mut ws).await.msg {
                 break;
@@ -1299,8 +1131,6 @@ mod tests {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
 
-        // Field 1 as a length-delimited value with an absurd length: not a
-        // ClientFrame under any schema version.
         ws.send(WsMessage::binary(vec![0x0a, 0xff, 0xff]))
             .await
             .expect("send");
@@ -1343,8 +1173,6 @@ mod tests {
         let mut first = harness.connect().await;
         let mut second = harness.connect().await;
 
-        // Both requests are in flight before either is read: the engine's
-        // mutex, not the client, decides the order they run in.
         send(&mut first, 1, say("", "alpha")).await;
         send(&mut second, 2, say("", "beta")).await;
 
@@ -1357,7 +1185,6 @@ mod tests {
         assert!(!ended(alpha_end).partial);
         assert!(!ended(beta_end).partial);
 
-        // Both landed in the log, and each completion saw only its own turn.
         let sessions = list(&mut first, 3).await;
         assert_eq!(sessions.len(), 2);
         for request in harness.provider.requests() {
@@ -1368,7 +1195,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// Asks for the review queue and returns its items.
     async fn review_list(
         ws: &mut Client,
         request_id: u64,
@@ -1420,7 +1246,6 @@ mod tests {
             "both records, whole, in (changed_at, id) order"
         );
 
-        // A window past the seed is empty — since_micros reaches the query.
         assert_eq!(review_list(&mut ws, 2, SEEDED_AT_MICROS + 1).await, []);
 
         send(
@@ -1475,8 +1300,6 @@ mod tests {
         );
         assert_eq!(review_list(&mut ws, 2, 0).await, [], "the record is gone");
 
-        // Deleted means unknown now; the error rides the connection, which
-        // survives for the next request.
         send(
             &mut ws,
             3,
@@ -1500,7 +1323,6 @@ mod tests {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
 
-        // One completed request, then nothing in flight.
         send(&mut ws, 1, say("", "hello")).await;
         turn(&mut ws, 1).await;
 

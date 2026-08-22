@@ -1,19 +1,3 @@
-//! Read-only queries over the projection index: the archive tools' query
-//! layer (DESIGN.md §5.5 — search cheap, read targeted).
-//!
-//! [`Archive`] owns its own read-only connection to `index.db`; it never
-//! touches [`crate::projection::Projection`]'s write connection. The engine
-//! commits every event before dispatching tools, so a mid-turn read here sees
-//! the turn so far. No LLM anywhere in this path: every shape returns actual
-//! rows from the index.
-//!
-//! The query sanitizer and the return shapes follow hermes-agent's
-//! production-tested policy (`docs/prior-art-hermes.md` §2): protect quoted
-//! phrases, quote terms the tokenizer would split, trim dangling operators,
-//! and still catch the FTS syntax error at the execute site — a query FTS
-//! cannot parse must surface as an answer naming the problem, never as a
-//! silently empty result.
-
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -26,184 +10,119 @@ use serde::Serialize;
 use crate::memory::kind_name;
 use crate::projection::{KIND_MESSAGE, bad_json_column, links_from_json, provenance_from_json};
 
-/// Longest raw query the sanitizer looks at; the rest is dropped.
 const MAX_QUERY_CHARS: usize = 256;
 
-/// Raw FTS hits fetched before the per-session dedupe.
 const OVERFETCH: usize = 50;
 
-/// Session slots a search returns after the dedupe.
 const MAX_SESSIONS: usize = 5;
 
-/// Per-message char budget in hydrated context and bookends.
 const MESSAGE_BUDGET_CHARS: usize = 300;
 
-/// Prose messages either side of the anchor in the hydrated window.
 const WINDOW_RADIUS: usize = 2;
 
-/// Messages per bookend: a session's opening and closing few.
 const BOOKEND_LEN: usize = 2;
 
-/// Prose rows a range read returns before it clips.
 const MAX_RANGE_ROWS: usize = 50;
 
-/// Everything that can go wrong in the archive query layer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The index file could not be opened read-only.
     #[error("archive index {path}: {source}")]
     Open {
-        /// Index file the open was against.
         path: PathBuf,
-        /// Underlying failure.
         #[source]
         source: rusqlite::Error,
     },
 
-    /// FTS could not parse the query, even sanitized. Callers answer "no
-    /// results, and here is why" — this is a property of the query, not of
-    /// the index.
     #[error("the query could not be parsed: {message}")]
-    Query {
-        /// What FTS objected to.
-        message: String,
-    },
+    Query { message: String },
 
-    /// A statement against the index failed.
     #[error("archive index: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// What a search returns: up to [`MAX_SESSIONS`] sessions, best BM25 hit
-/// first, the top one hydrated.
 #[derive(Debug, Serialize)]
 pub struct SearchReply {
-    /// One slot per session, best hit first.
     pub sessions: Vec<SessionHit>,
 }
 
-/// One session a search matched, anchored at its best-ranked hit.
 #[derive(Debug, Serialize)]
 pub struct SessionHit {
-    /// The session, as `session_read` wants it.
     pub session_id: String,
-    /// Session title, omitted while nothing writes titles.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
-    /// When the session started, RFC 3339 UTC. Omitted if the event carried
-    /// no timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
-    /// FTS snippet around the match.
     pub snippet: String,
-    /// Seq of the matched row — the range anchor for `session_read`.
     pub anchor_seq: i64,
-    /// Top hit only: prose messages around the anchor.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ProseMessage>,
-    /// Top hit only: the session's opening messages (the goal), minus any
-    /// already in `context`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub first: Vec<ProseMessage>,
-    /// Top hit only: the session's closing messages (the resolution), minus
-    /// any already in `context` or `first`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub last: Vec<ProseMessage>,
 }
 
-/// One prose message, as the model reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProseMessage {
-    /// Log seq: what ranges are addressed by.
     pub seq: i64,
-    /// `user` / `assistant` / `system`, or `role_<n>` for a value this build
-    /// does not know.
     pub role: String,
-    /// The message text, budget-clipped where the shape says so.
     pub content: String,
-    /// The reply was cut before the model finished. Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
 }
 
-/// What a range read returns.
 #[derive(Debug, Serialize)]
 pub struct ReadReply {
-    /// The session read.
     pub session_id: String,
-    /// Prose rows in the requested seq range, in order.
     pub messages: Vec<ProseMessage>,
-    /// The range held more than [`MAX_RANGE_ROWS`] prose rows and was cut.
-    /// Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub clipped: bool,
 }
 
-/// What an ends read returns: bookends only.
 #[derive(Debug, Serialize)]
 pub struct EndsReply {
-    /// The session read.
     pub session_id: String,
-    /// The session's first user/assistant messages.
     pub first: Vec<ProseMessage>,
-    /// The session's last user/assistant messages, minus any in `first`.
     pub last: Vec<ProseMessage>,
 }
 
-/// One memory record a search matched: the index row, never the body —
-/// read stays targeted via `memory_read`.
 #[derive(Debug, Serialize)]
 pub struct MemoryHit {
     pub id: String,
     pub namespace: String,
-    /// Lowercase kind name.
     pub kind: String,
     pub title: String,
     pub summary: String,
 }
 
-/// A whole memory record, as `memory_read` shows it.
 #[derive(Debug, Serialize)]
 pub struct MemoryRecordReply {
     pub id: String,
     pub namespace: String,
-    /// Lowercase kind name.
     pub kind: String,
     pub title: String,
     pub summary: String,
     pub body: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
-    /// Where the record was learned (DESIGN.md §5.2: provenance answers
-    /// "where did you learn that").
     pub provenance: Vec<ProvenanceLine>,
-    /// `active` or `superseded`.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
 }
 
-/// One provenance entry: a session and when it taught the record.
 #[derive(Debug, Serialize)]
 pub struct ProvenanceLine {
     pub session_id: String,
-    /// RFC 3339 UTC; omitted if the entry carried no timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<String>,
 }
 
-/// A read-only view of the projection index.
 pub struct Archive {
     conn: Mutex<Connection>,
 }
 
 impl Archive {
-    /// Opens `path` read-only. The file must already exist — the projection
-    /// writes it, this layer never does.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Open`] if the file cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(
@@ -221,20 +140,6 @@ impl Archive {
         })
     }
 
-    /// FTS search over the archive: overfetch raw hits, dedupe to one slot
-    /// per session keeping its best BM25 hit, hydrate the top session with a
-    /// context window and bookends.
-    ///
-    /// Prose rows only by default; `include_tool_results` lifts the kind
-    /// filter so tool output is searched too. `exclude_session` drops one
-    /// session's rows — the caller's own, whose just-appended question would
-    /// otherwise claim the top slot (noted at 5.2 review).
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Query`] if nothing searchable survives sanitization, or FTS
-    ///   still rejects the sanitized query.
-    /// - [`Error::Sqlite`] for any other index failure.
     #[tracing::instrument(
         name = "archive.search",
         skip_all,
@@ -287,9 +192,6 @@ impl Archive {
                 },
             )
             .map_err(into_query_error)?;
-        // The MATCH string is parsed at the first step, so the syntax error
-        // for a query the sanitizer let through lands here — caught, per
-        // hermes policy, not trusted to be impossible.
         let mut hits = Vec::new();
         for hit in mapped {
             hits.push(hit.map_err(into_query_error)?);
@@ -324,9 +226,6 @@ impl Archive {
             }
         }
 
-        // Hydrating only the top hit: one call from hit to goal-and-
-        // resolution, without five sessions' worth of context in an 8k
-        // window.
         if let Some(top) = sessions.first_mut() {
             let context = prose_window(&conn, &top.session_id, top.anchor_seq)?;
             let (mut first, mut last) = bookends(&conn, &top.session_id)?;
@@ -341,12 +240,6 @@ impl Archive {
         Ok(SearchReply { sessions })
     }
 
-    /// Prose rows of one session in a seq range, in order, capped at
-    /// [`MAX_RANGE_ROWS`]. `None` means no such session.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read.
     #[tracing::instrument(
         name = "archive.read",
         skip_all,
@@ -391,12 +284,6 @@ impl Archive {
         }))
     }
 
-    /// A session's bookends: its first and last [`BOOKEND_LEN`]
-    /// user/assistant messages. `None` means no such session.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read.
     #[tracing::instrument(
         name = "archive.read",
         skip_all,
@@ -415,14 +302,6 @@ impl Archive {
         }))
     }
 
-    /// One memory record, whole, whatever its status — a SUPERSEDED record is
-    /// still readable. `None` for an id the projection does not hold; DELETED
-    /// records read as absent.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or holds `links` or
-    /// `provenance` JSON this build cannot decode.
     #[tracing::instrument(name = "memory.read", skip_all, fields(id = %id))]
     pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordReply>, Error> {
         let row = self
@@ -453,17 +332,6 @@ impl Archive {
         Ok(row)
     }
 
-    /// Case-insensitive substring search over ACTIVE memory records: every
-    /// whitespace-separated word must match title, summary, or body. Ordered
-    /// like the always-loaded index, bodies never returned.
-    ///
-    /// LIKE over tens of records by design; earn an FTS index only if records
-    /// ever number thousands.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Query`] if the query holds no searchable words.
-    /// - [`Error::Sqlite`] if the index cannot be read.
     #[tracing::instrument(
         name = "memory.search",
         skip_all,
@@ -517,20 +385,11 @@ impl Archive {
         Ok(hits)
     }
 
-    /// The connection, poisoned or not: a read-only handle has no state a
-    /// panicked holder could have half-written.
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Makes raw model text safe for FTS5 `MATCH` — hermes policy in full.
-///
-/// Cap length; protect `"quoted phrases"` with a linear scan; keep purely
-/// alphanumeric words bare; wrap anything else in quotes so `my-app.config.ts`
-/// matches as a phrase instead of tokenizer-split AND-terms (quoting also
-/// neutralizes the whole FTS5 special-char class); drop tokens with nothing
-/// searchable in them; trim dangling `AND`/`OR`/`NOT`.
 #[must_use]
 pub fn sanitize_query(raw: &str) -> String {
     let capped: String = raw.chars().take(MAX_QUERY_CHARS).collect();
@@ -543,7 +402,6 @@ pub fn sanitize_query(raw: &str) -> String {
         };
         push_bare_terms(&mut terms, &rest[..open]);
         let after = &rest[open + 1..];
-        // An unterminated quote runs to the end: the user meant a phrase.
         let (phrase, tail) = after
             .find('"')
             .map_or((after, ""), |close| (&after[..close], &after[close + 1..]));
@@ -561,7 +419,6 @@ pub fn sanitize_query(raw: &str) -> String {
     terms.join(" ")
 }
 
-/// Sanitizes one unquoted stretch into `terms`.
 fn push_bare_terms(terms: &mut Vec<String>, text: &str) {
     for token in text.split_whitespace() {
         if !token.chars().any(char::is_alphanumeric) {
@@ -575,14 +432,10 @@ fn push_bare_terms(terms: &mut Vec<String>, text: &str) {
     }
 }
 
-/// FTS5 boolean operators, which are only valid between terms.
 fn is_operator(term: &str) -> bool {
     matches!(term, "AND" | "OR" | "NOT")
 }
 
-/// Wraps an error from executing a `MATCH` query. FTS5 parse failures become
-/// [`Error::Query`] — a fact about the query — while anything else stays a
-/// real index error.
 fn into_query_error(source: rusqlite::Error) -> Error {
     let text = source.to_string();
     if text.contains("fts5") {
@@ -592,7 +445,6 @@ fn into_query_error(source: rusqlite::Error) -> Error {
     }
 }
 
-/// Whether `sessions` has a row for `id`.
 fn session_exists(conn: &Connection, id: &str) -> Result<bool, Error> {
     Ok(conn
         .query_row("SELECT 1 FROM sessions WHERE id = ?1", [id], |_| Ok(()))
@@ -600,7 +452,6 @@ fn session_exists(conn: &Connection, id: &str) -> Result<bool, Error> {
         .is_some())
 }
 
-/// Maps a `(seq, role, content, partial)` row.
 fn prose_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProseMessage> {
     Ok(ProseMessage {
         seq: row.get(0)?,
@@ -610,8 +461,6 @@ fn prose_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProseMessage> {
     })
 }
 
-/// Prose messages around the anchor: up to [`WINDOW_RADIUS`] each side, the
-/// anchor row included when it is prose. Budget-clipped.
 fn prose_window(
     conn: &Connection,
     session_id: &str,
@@ -652,9 +501,6 @@ fn prose_window(
     Ok(window.into_iter().map(clip_message).collect())
 }
 
-/// A session's first and last [`BOOKEND_LEN`] user/assistant messages,
-/// budget-clipped, the overlap removed from `last` — a short session's goal
-/// and resolution are the same messages once, not twice.
 fn bookends(
     conn: &Connection,
     session_id: &str,
@@ -696,7 +542,6 @@ fn bookends(
     ))
 }
 
-/// Applies the per-message char budget, with an explicit marker.
 fn clip_message(mut message: ProseMessage) -> ProseMessage {
     if message.content.chars().count() > MESSAGE_BUDGET_CHARS {
         let cut: String = message.content.chars().take(MESSAGE_BUDGET_CHARS).collect();
@@ -705,7 +550,6 @@ fn clip_message(mut message: ProseMessage) -> ProseMessage {
     message
 }
 
-/// Wraps a word for LIKE: `%word%`, its `%`/`_`/`\` metacharacters escaped.
 fn like_pattern(word: &str) -> String {
     let mut pattern = String::with_capacity(word.len() + 2);
     pattern.push('%');
@@ -719,7 +563,6 @@ fn like_pattern(word: &str) -> String {
     pattern
 }
 
-/// Status name for a raw status integer; unknown ints render as `status_<n>`.
 fn status_name(status: i32) -> String {
     use arc_proto::v1::memory_record::Status;
     match Status::try_from(status) {
@@ -729,8 +572,6 @@ fn status_name(status: i32) -> String {
     }
 }
 
-/// The provenance column as `memory_read` shows it: session ids with RFC 3339
-/// timestamps. NULL (absent) reads as empty.
 fn provenance_lines(json: Option<&str>) -> Result<Vec<ProvenanceLine>, serde_json::Error> {
     Ok(provenance_from_json(json)?
         .map(|provenance| {
@@ -751,7 +592,6 @@ fn provenance_lines(json: Option<&str>) -> Result<Vec<ProvenanceLine>, serde_jso
         .unwrap_or_default())
 }
 
-/// Speaker name for a raw role integer.
 fn role_name(role: i64) -> String {
     match i32::try_from(role).map(Role::try_from) {
         Ok(Ok(Role::System)) => "system".to_owned(),
@@ -761,12 +601,10 @@ fn role_name(role: i64) -> String {
     }
 }
 
-/// Microseconds since the epoch as RFC 3339 UTC, or `None` if out of range.
 fn format_micros(micros: i64) -> Option<String> {
     DateTime::from_timestamp_micros(micros).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
-/// A row-count cap as the signed integer `LIMIT` binds.
 fn limit(n: usize) -> i64 {
     i64::try_from(n).expect("row caps are small constants")
 }
@@ -815,8 +653,6 @@ mod tests {
         })
     }
 
-    /// An archive over a projection built by replaying a seeded log — the
-    /// production shape, minus the daemon.
     fn archive_over(events: Vec<session_event::Event>) -> (TempDir, Archive) {
         let dir = TempDir::new().expect("temp dir");
         testkit::seed_log(&dir, events);
@@ -829,10 +665,6 @@ mod tests {
         (dir, archive)
     }
 
-    // --- sanitizer ---
-
-    /// Hermes's measured failure list is the mandatory fixture set; the
-    /// expected outputs pin the policy, not just "does not crash".
     #[test]
     fn the_sanitizer_rewrites_the_fixture_set() {
         for (raw, cleaned) in [
@@ -861,8 +693,6 @@ mod tests {
         assert!(cleaned.chars().count() <= 256, "{}", cleaned.len());
     }
 
-    /// Every fixture executes against real FTS5 and finds its seeded row —
-    /// the errors hermes measured, closed end to end.
     #[test]
     fn every_fixture_query_executes_and_matches() {
         let (_dir, archive) = archive_over(vec![
@@ -889,9 +719,6 @@ mod tests {
         }
     }
 
-    /// The sanitizer is not trusted alone: a query that still breaks FTS —
-    /// doubled interior operators survive sanitization — comes back as
-    /// [`Error::Query`] naming the problem, never a swallowed empty.
     #[test]
     fn an_unparseable_query_is_a_query_error_not_an_empty_result() {
         let (_dir, archive) = archive_over(vec![
@@ -909,8 +736,6 @@ mod tests {
             .expect_err("nothing searchable must be a query error");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
     }
-
-    // --- search shape ---
 
     #[test]
     fn search_dedupes_to_one_slot_per_session_and_caps_at_five() {
@@ -954,7 +779,6 @@ mod tests {
         for i in 0..4 {
             events.push(said("s-long", Role::User, &format!("warmup question {i}")));
         }
-        // Term-heavy so BM25 ranks this row above the aside, deterministically.
         events.push(said(
             "s-long",
             Role::Assistant,
@@ -972,7 +796,6 @@ mod tests {
         let top = &reply.sessions[0];
         assert_eq!(top.session_id, "s-long");
         assert_eq!(top.title, "a long talk");
-        // Seqs: created=0, warmups 1..=4, answer=5, wind-downs 6..=9.
         assert_eq!(top.anchor_seq, 5);
         let context_seqs: Vec<i64> = top.context.iter().map(|m| m.seq).collect();
         assert_eq!(
@@ -1038,8 +861,6 @@ mod tests {
             reply.sessions[0].anchor_seq, 2,
             "anchored at the result row"
         );
-        // The hydrated window is prose only, so the model gets the human
-        // frame around the machine hit.
         assert_eq!(
             reply.sessions[0]
                 .context
@@ -1049,8 +870,6 @@ mod tests {
             [1]
         );
     }
-
-    // --- range read and ends ---
 
     #[test]
     fn read_range_returns_prose_rows_in_order_unclipped() {
@@ -1138,8 +957,6 @@ mod tests {
         );
     }
 
-    // --- the distilled tier: memory_search and memory_record ---
-
     fn record(id: &str, namespace: &str, title: &str, summary: &str, body: &str) -> MemoryRecord {
         MemoryRecord {
             id: id.to_owned(),
@@ -1160,7 +977,6 @@ mod tests {
         })
     }
 
-    /// An archive over a replayed log of memory events.
     fn memory_archive_over(events: Vec<memory_event::Event>) -> (TempDir, Archive) {
         let dir = TempDir::new().expect("temp dir");
         testkit::seed_memory_log(&dir, events);
@@ -1194,7 +1010,6 @@ mod tests {
             assert_eq!(hits[0].kind, "fact");
             assert_eq!(hits[0].summary, "the palette everywhere");
         }
-        // Every word must match: one hit each alone, none together.
         assert!(
             archive
                 .memory_search("gruvbox vulkan1", None)

@@ -1,11 +1,3 @@
-//! The integration-test spine: a scripted provider driving the real engine
-//! over a real log and projection.
-//!
-//! Everything here is promoted from `session.rs`'s tests so the archive and
-//! memory tiers can assert across the whole chain — engine events, log bytes,
-//! replayed projection, rebuilt transcript — without re-growing their own
-//! harness. Test-only: the module exists behind `#[cfg(test)]` in `lib.rs`.
-
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
@@ -27,8 +19,6 @@ use crate::provider::{
 use crate::session::{Engine, EngineEvent};
 use crate::tool::{Registry, Tool, ToolReply, TurnContext};
 
-/// A scripted provider: each `complete` call captures its request and
-/// yields the next script entry.
 pub(crate) struct ScriptedProvider {
     script: Mutex<VecDeque<Vec<Result<CompletionDelta, ProviderError>>>>,
     captured: Mutex<Vec<CompletionRequest>>,
@@ -84,8 +74,6 @@ pub(crate) fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderErro
     ]
 }
 
-/// The role and text of a history message. Everything this engine sends is
-/// text; a tool message here is a bug in the test.
 pub(crate) fn turn(message: &Message) -> (Role, &str) {
     match message {
         Message::Text { role, content } => (*role, content.as_str()),
@@ -93,7 +81,6 @@ pub(crate) fn turn(message: &Message) -> (Role, &str) {
     }
 }
 
-/// An engine over a fresh log and in-memory index.
 pub(crate) fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::open(":memory:").expect("open projection");
@@ -108,8 +95,6 @@ pub(crate) fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<
     )
 }
 
-/// An engine whose model may call tools, with `/no_think` off so system
-/// prompt assertions stay simple.
 pub(crate) fn engine_with_tools(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
@@ -128,9 +113,6 @@ pub(crate) fn engine_with_tools(
     )
 }
 
-/// [`engine_with_tools`], but with the projection at `dir/index.db`, caught
-/// up to the log first. The file-backed shape the archive tools need: their
-/// read-only connections cannot see a `:memory:` projection.
 pub(crate) fn engine_with_tools_at(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
@@ -150,9 +132,6 @@ pub(crate) fn engine_with_tools_at(
     )
 }
 
-/// An engine reopened over `dir`'s existing log with a fresh projection
-/// replayed from its bytes — the way a restarted daemon starts. Drop the
-/// previous engine first; two writers on one log is not a thing.
 pub(crate) fn reopened_engine(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
@@ -172,8 +151,6 @@ pub(crate) fn reopened_engine(
     )
 }
 
-/// Appends raw session events to `dir`'s log, for histories a live engine
-/// cannot produce — results in completion order, foreign roles, orphans.
 pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
     seed_log_payloads(
         dir,
@@ -188,7 +165,6 @@ pub(crate) fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
     );
 }
 
-/// [`seed_log`] for the distilled tier: appends raw memory events.
 pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     seed_log_payloads(
         dir,
@@ -203,14 +179,11 @@ pub(crate) fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     );
 }
 
-/// [`seed_memory_log`] with every event stamped `at_micros` — review
-/// bookkeeping is time-keyed, so its tests seed a clock the plain seeders
-/// deliberately leave out.
 pub(crate) fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>, at_micros: i64) {
     let mut log = Log::open(dir.path()).expect("open log");
     for event in events {
         log.append(arc_proto::v1::Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: Some(prost_types::Timestamp {
                 seconds: at_micros / 1_000_000,
                 nanos: i32::try_from((at_micros % 1_000_000) * 1_000).expect("in range"),
@@ -224,13 +197,11 @@ pub(crate) fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>
     }
 }
 
-/// The general form of the seeders: whole payloads, so a test can interleave
-/// session and memory events in one log.
 pub(crate) fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {
     let mut log = Log::open(dir.path()).expect("open log");
     for payload in payloads {
         log.append(arc_proto::v1::Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: None,
             source: arc_proto::v1::Source::System as i32,
             payload: Some(payload),
@@ -251,9 +222,6 @@ pub(crate) fn drain(rx: &mut mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
     events
 }
 
-/// An archive over `dir`'s log, the daemon's way: the projection at
-/// `dir/index.db` is opened (and replayed) first, then the read-only
-/// connection.
 pub(crate) fn archive_at(dir: &TempDir) -> Archive {
     let log = Log::open(dir.path()).expect("open log");
     let index = dir.path().join("index.db");
@@ -263,8 +231,6 @@ pub(crate) fn archive_at(dir: &TempDir) -> Archive {
     Archive::open(index).expect("open archive")
 }
 
-/// Every whole event in `dir`'s log — payload arm, source, seq — for tests
-/// that assert across session and memory events at once.
 pub(crate) fn replay_events(dir: impl AsRef<std::path::Path>) -> Vec<arc_proto::v1::Event> {
     let segments = discover_segments(dir.as_ref()).expect("discover");
     LogReader::new(segments)
@@ -272,7 +238,6 @@ pub(crate) fn replay_events(dir: impl AsRef<std::path::Path>) -> Vec<arc_proto::
         .collect()
 }
 
-/// Every event in `dir`'s log, replayed through the real reader.
 pub(crate) fn replay_log(dir: impl AsRef<std::path::Path>) -> Vec<session_event::Event> {
     let segments = discover_segments(dir.as_ref()).expect("discover");
     LogReader::new(segments)
@@ -311,7 +276,6 @@ pub(crate) fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResu
     }
 }
 
-/// A test tool with a fixed reply.
 pub(crate) struct Canned {
     pub(crate) name: &'static str,
     pub(crate) content: &'static str,
@@ -341,7 +305,6 @@ impl Tool for Canned {
     }
 }
 
-/// A registry of [`Canned`] tools: `(name, reply, ok)` each.
 pub(crate) fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
     let mut registry = Registry::new(512);
     for &(name, content, ok) in entries {
@@ -350,9 +313,6 @@ pub(crate) fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry 
     registry
 }
 
-/// Captures spans into a Perfetto trace across `.await`s — the async sibling
-/// of the trace layer's own test capture. Start before the spans open,
-/// `finish` after the work completes (spans write at close).
 pub(crate) struct TraceCapture {
     _dir: TempDir,
     path: PathBuf,
@@ -373,7 +333,6 @@ impl TraceCapture {
         }
     }
 
-    /// Stops capturing and decodes everything the layer wrote.
     pub(crate) fn finish(self) -> arc_proto::perfetto::Trace {
         use prost::Message as _;
         let Self { _dir, path, guard } = self;
@@ -383,9 +342,6 @@ impl TraceCapture {
     }
 }
 
-/// Every sample on the counter track named `name`, in packet order — empty
-/// when the track was never declared, which is how "no traffic emits
-/// nothing" is asserted.
 pub(crate) fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) -> Vec<f64> {
     let Some(uuid) = trace
         .packet
@@ -435,11 +391,6 @@ mod tests {
     use crate::provider::{Message, ToolCall};
     use crate::session::EngineEvent;
 
-    /// The template for the archive- and memory-tier tests: one tool turn,
-    /// asserted across the whole chain — engine events, log bytes, a fresh
-    /// projection replay, and the rebuilt provider transcript.
-    // One turn across the whole chain is the template's point; splitting it
-    // would hide the chain.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn a_tool_turn_holds_up_across_the_whole_chain() {
@@ -457,7 +408,6 @@ mod tests {
             .await
             .expect("send");
 
-        // (a) the engine's event stream saw the call, its result, the text.
         assert_eq!(
             drain(&mut rx),
             [
@@ -477,7 +427,6 @@ mod tests {
             ]
         );
 
-        // (b) the log replays through the real reader to the expected sequence.
         let logged = replay_log(&dir);
         assert_eq!(logged.len(), 5);
         let session_event::Event::SessionCreated(created) = &logged[0] else {
@@ -506,8 +455,6 @@ mod tests {
             (Role::Assistant as i32, "final text")
         );
 
-        // (c) a fresh projection replayed from those bytes holds every row,
-        // tool rows included, typed and in seq order.
         let mut fresh = Projection::open(":memory:").expect("open projection");
         let segments = discover_segments(dir.path()).expect("discover");
         let stats = projection::replay(LogReader::new(segments), &mut fresh).expect("replay");
@@ -548,9 +495,6 @@ mod tests {
             ]
         );
 
-        // (d) the rebuilt provider transcript — observed as the next turn's
-        // request — carries the whole tool step back to the model: the call,
-        // its result, and the ids unchanged (DESIGN.md §3.1).
         let (tx, _rx) = channel();
         engine
             .send_message(Some(&reply.session_id), "again", tx)

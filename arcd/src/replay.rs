@@ -1,11 +1,3 @@
-//! `arcd memory-replay` — DESIGN.md §5.4's tuning loop: re-run prompt
-//! versions over the real log, read-only, and print the reports and diff.
-//!
-//! The model comes from wherever it already is: the configured llama
-//! endpoint if it answers a health probe (a running `arcd run` keeps owning
-//! it), otherwise a sidecar started exactly as `run` starts one and stopped
-//! when the replay ends.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,12 +11,6 @@ use crate::config::{Config, ProviderChoice};
 use crate::dirs::DataDirs;
 use crate::llama::Sidecar;
 
-/// The whole subcommand: resolve versions, find a model, run, print.
-///
-/// # Errors
-///
-/// An unknown version, a sidecar that would not start, or whatever the
-/// replay core refused on.
 pub async fn run(
     config: Config,
     dirs: DataDirs,
@@ -39,7 +25,6 @@ pub async fn run(
     let model = config.model();
     let timeout = Duration::from_secs(config.consolidation.timeout_seconds);
 
-    // Single-variant today; a second provider must revisit this endpoint.
     let ProviderChoice::Local = config.provider;
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
     let sidecar = if probe(&endpoint).await {
@@ -55,7 +40,6 @@ pub async fn run(
     ));
 
     let outcome = replay::run(&provider, &model, timeout, dirs.log(), &versions, sessions).await;
-    // A sidecar this command started dies with it, whichever way it went.
     if let Some(sidecar) = sidecar {
         sidecar.stop().await;
     }
@@ -72,8 +56,6 @@ pub async fn run(
     Ok(())
 }
 
-/// The registry lookup: a version's prompt text, or an error naming the
-/// known versions.
 fn resolve(version: &str) -> Result<(&'static str, &'static str)> {
     KNOWN_VERSIONS
         .iter()
@@ -88,8 +70,6 @@ fn resolve(version: &str) -> Result<(&'static str, &'static str)> {
         })
 }
 
-/// One cheap GET on `/health`: a server that answers 200 is usable, and
-/// whoever started it keeps owning it.
 async fn probe(endpoint: &str) -> bool {
     let Ok(http) = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -103,8 +83,6 @@ async fn probe(endpoint: &str) -> bool {
     }
 }
 
-/// One version's report: sessions processed, nonzero operation lists, then
-/// the final state.
 fn report_lines(report: &ReplayReport) -> Vec<String> {
     let mut lines = vec![
         format!("== prompt {} ==", report.version),
@@ -130,7 +108,6 @@ fn report_lines(report: &ReplayReport) -> Vec<String> {
     lines
 }
 
-/// The diff between two runs' final states.
 fn diff_lines(a: &ReplayReport, b: &ReplayReport, diff: &ReplayDiff) -> Vec<String> {
     let mut lines = vec![
         format!("== diff {} -> {} ==", a.version, b.version),
@@ -246,8 +223,6 @@ mod tests {
         (a, b)
     }
 
-    /// The report format, pinned: sessions processed, nonzero operations as
-    /// `op kind "title" — summary`, records as `kind/namespace: title — summary`.
     #[test]
     fn a_report_renders_counts_operations_and_final_state() {
         let (a, _) = reports();

@@ -1,19 +1,3 @@
-//! Model-backed extraction (DESIGN.md §5.4): the versioned consolidation
-//! prompt, the transcript rendering, and the reject-not-truncate validation
-//! of what the model answers.
-//!
-//! [`ModelExtractor`] runs one completion on the same provider the engine
-//! uses — the banked "consolidation uses the same local model" decision —
-//! with its own system prompt, no tools, and thinking left on: extraction is
-//! judgment, and 7.3's replay is the instrument that will say whether
-//! thinking earns its latency (docs/prior-art-hermes.md §3).
-//!
-//! Validation is all-or-nothing (hermes §3): any operation that fails —
-//! unparseable JSON, unknown op or kind, an empty required field, a
-//! supersede of a record the snapshot's index does not hold — fails the
-//! whole extraction, and the pass appends nothing. A partial batch is never
-//! best-guessed into the distilled tier.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,14 +11,8 @@ use crate::projection::MessageRow;
 use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop};
 use crate::tool::memory::{mint_record, parse_kind};
 
-/// The version string [`PROMPT_V1`] travels under: it lands in the
-/// `SessionConsolidated` marker, and 7.3's replay diffs by it.
 pub const PROMPT_VERSION_V1: &str = "v1";
 
-/// The consolidation prompt, distilled from hermes' production curation
-/// policy (docs/prior-art-hermes.md §1). Never edit this text: a prompt
-/// change is a new constant and a new version string, so old markers keep
-/// naming exactly what ran.
 pub const PROMPT_V1: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
 Two questions decide what to extract: what did the user reveal about
 themselves, and what did they express about how ARC should operate?
@@ -73,20 +51,12 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
 
-/// Every prompt version this build can run, for 7.3's replay: a new prompt
-/// is a new entry here, never an edit to an old one.
 pub const KNOWN_VERSIONS: &[(&str, &str)] = &[(PROMPT_VERSION_V1, PROMPT_V1)];
 
-/// Longest rendered transcript, in chars. The tail is kept — the most
-/// recent turns — behind an explicit truncation head-line. User messages
-/// are windowed, never paraphrased (hermes' micro-compaction lesson).
 const TRANSCRIPT_BUDGET: usize = 24_000;
 
-/// Longest tool-line payload (arguments or result) kept, in chars: the
-/// model needs the conversation, not tool dumps.
 const TOOL_SNIPPET: usize = 200;
 
-/// The 7.2 extractor: one completion per pass, on the engine's own provider.
 pub struct ModelExtractor<P> {
     provider: Arc<P>,
     model: String,
@@ -96,8 +66,6 @@ pub struct ModelExtractor<P> {
 }
 
 impl<P: Provider> ModelExtractor<P> {
-    /// `timeout` bounds the whole model call — consolidation's own generous
-    /// dial, never the interactive one (hermes §3).
     #[must_use]
     pub fn new(provider: Arc<P>, model: impl Into<String>, timeout: Duration) -> Self {
         Self {
@@ -109,16 +77,12 @@ impl<P: Provider> ModelExtractor<P> {
         }
     }
 
-    /// Replay's prompt dial (task 7.3): run under this prompt text instead
-    /// of [`PROMPT_V1`]. The live pass never calls this.
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.prompt = prompt.into();
         self
     }
 
-    /// Pins the sampler explicitly; without it every extraction runs under
-    /// [`session_seed`], so the live pass and replay match by default.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
@@ -126,10 +90,6 @@ impl<P: Provider> ModelExtractor<P> {
     }
 }
 
-/// The seed one session's extraction runs under — the same for the live pass
-/// and for every replay version, so replay tests the exact behavior that
-/// runs (decided 2026-08-22). FNV-1a rather than the std hasher: this value
-/// must be stable across builds.
 #[must_use]
 pub fn session_seed(session_id: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -141,8 +101,6 @@ pub fn session_seed(session_id: &str) -> u64 {
 }
 
 impl<P: Provider> ModelExtractor<P> {
-    /// Runs the completion and concatenates its text, rejecting every shape
-    /// that is not "prose then a clean end of turn".
     async fn completion_text(&self, request: CompletionRequest) -> Result<String, ExtractError> {
         let mut stream = self
             .provider
@@ -154,8 +112,6 @@ impl<P: Provider> ModelExtractor<P> {
         while let Some(item) = stream.next().await {
             match item.map_err(|error| ExtractError(format!("stream failed: {error}")))? {
                 CompletionDelta::Text(chunk) => text.push_str(&chunk),
-                // Thinking is where the judgment happens; only the answer
-                // after it is parsed.
                 CompletionDelta::Reasoning(_) => {}
                 CompletionDelta::ToolCall(call) => {
                     return Err(ExtractError(format!(
@@ -204,8 +160,6 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
                 content: render_input(session),
             }],
             tools: Vec::new(),
-            // Seeded per session unless the caller pinned one: the live pass
-            // and a replay of the same version produce the same extraction.
             seed: Some(
                 self.seed
                     .unwrap_or_else(|| session_seed(&session.session_id)),
@@ -228,8 +182,6 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
     }
 }
 
-/// The extractor's whole input: the windowed transcript, then the memory
-/// index — its only view of what already exists.
 fn render_input(session: &SessionSnapshot) -> String {
     let lines: Vec<String> = session.rows.iter().map(render_row).collect();
     let index = if session.memory_index.is_empty() {
@@ -248,8 +200,6 @@ fn render_input(session: &SessionSnapshot) -> String {
     )
 }
 
-/// One transcript line per row: prose verbatim, tool traffic as compact
-/// one-liners.
 fn render_row(row: &MessageRow) -> String {
     match row {
         MessageRow::Message { role, content, .. } => {
@@ -273,7 +223,6 @@ fn role_name(role: i32) -> String {
     }
 }
 
-/// One line, capped at [`TOOL_SNIPPET`] chars, elision marked.
 fn snippet(text: &str) -> String {
     let flat: String = text
         .chars()
@@ -287,8 +236,6 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// Joins the lines, keeping the most recent whole lines that fit
-/// [`TRANSCRIPT_BUDGET`] behind an explicit truncation head-line.
 fn windowed(lines: &[String]) -> String {
     let total: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
     if total.saturating_sub(1) <= TRANSCRIPT_BUDGET {
@@ -304,7 +251,6 @@ fn windowed(lines: &[String]) -> String {
         kept += cost;
         start -= 1;
     }
-    // Never window down to nothing: an oversized single line goes whole.
     let start = start.min(lines.len() - 1);
     format!(
         "[transcript truncated: {start} earlier lines elided, the most recent follow]\n{}",
@@ -312,8 +258,6 @@ fn windowed(lines: &[String]) -> String {
     )
 }
 
-/// One operation as the model wrote it. Strict serde: an unknown field
-/// anywhere rejects the whole batch.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOperation {
@@ -328,14 +272,12 @@ struct RawOperation {
     links: Vec<String>,
 }
 
-/// The output contract's envelope.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Extraction {
     operations: Vec<RawOperation>,
 }
 
-/// Strips reasoning residue and fencing, then parses the strict contract.
 fn parse_operations(text: &str) -> Result<Vec<RawOperation>, ExtractError> {
     let json = strip_residue(text);
     let extraction: Extraction = serde_json::from_str(json)
@@ -343,13 +285,9 @@ fn parse_operations(text: &str) -> Result<Vec<RawOperation>, ExtractError> {
     Ok(extraction.operations)
 }
 
-/// Removes a terminated `<think>` block and a surrounding markdown fence.
-/// Whatever remains must parse whole — reject, never truncate (hermes §3).
 fn strip_residue(text: &str) -> &str {
     let mut rest = text.trim();
     if let Some(after) = rest.strip_prefix("<think>") {
-        // An unterminated block means the model never stopped thinking; the
-        // parse below rejects what is left.
         rest = after
             .split_once("</think>")
             .map_or(after, |(_, tail)| tail)
@@ -364,8 +302,6 @@ fn strip_residue(text: &str) -> &str {
     rest.trim()
 }
 
-/// One validated operation becomes one memory event, minted exactly like a
-/// `memory_write` — fresh `mr-` id, ACTIVE, provenance naming the session.
 fn to_event(
     op: RawOperation,
     session: &SessionSnapshot,
@@ -415,8 +351,6 @@ fn to_event(
             let Some(id) = id else {
                 return Err(ExtractError("a supersede without an id".to_owned()));
             };
-            // The replacement inherits the retired record's namespace: a
-            // supersede corrects a record, it does not move it.
             let Some(target) = session.memory_index.iter().find(|entry| entry.id == id) else {
                 return Err(ExtractError(format!("supersede of unknown record {id:?}")));
             };
@@ -459,7 +393,6 @@ mod tests {
 
     const ALL_IDLE: i64 = i64::MAX;
 
-    /// A scripted extraction turn: thinking first, then the answer text.
     fn extraction_reply(json: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
         vec![
             Ok(CompletionDelta::Reasoning("weighing durability".to_owned())),
@@ -496,8 +429,6 @@ mod tests {
         }
     }
 
-    /// Extraction against a one-shot scripted stream, straight through the
-    /// trait — the harness for every validation case.
     async fn extract_from(
         script: Vec<Result<CompletionDelta, ProviderError>>,
         index: Vec<MemoryIndexEntry>,
@@ -511,11 +442,6 @@ mod tests {
         "title":"Terse replies","summary":"User prefers short answers",
         "body":"User prefers short answers in chat.","links":[]}]}"#;
 
-    // --- the pass end to end, scripted ---
-
-    /// The whole 7.2 chain: a scripted extraction turns a real session into
-    /// a record and a marker in the log, provenance correct, and the next
-    /// turn's index carries the new record.
     #[tokio::test]
     async fn a_scripted_extraction_lands_records_marker_and_next_index() {
         let provider = ScriptedProvider::scripted(vec![
@@ -558,8 +484,6 @@ mod tests {
             }
         );
 
-        // The extraction request: its own prompt, no tools, thinking left on
-        // (no /no_think anywhere), the rendered transcript then the index.
         let request = &provider.requests()[1];
         assert_eq!(request.system.as_deref(), Some(PROMPT_V1));
         assert!(request.tools.is_empty());
@@ -576,8 +500,6 @@ mod tests {
              (none yet)"
         );
 
-        // The record, durable before the marker, sourced SYSTEM, minted like
-        // a memory_write: mr- id, ACTIVE, provenance naming the session.
         let events = replay_events(&dir);
         assert_eq!(events.len(), 5);
         assert_eq!(events[3].source, Source::System as i32);
@@ -605,7 +527,6 @@ mod tests {
         assert_eq!(marker.prompt_version, "v1");
         assert_eq!(marker.through_seq, 2);
 
-        // The next turn's always-loaded index carries the extracted record.
         let (tx, _rx) = channel();
         engine
             .lock()
@@ -618,8 +539,6 @@ mod tests {
         assert!(system.contains("User prefers short answers"), "{system}");
     }
 
-    /// A supersede op retires the named record and mints the replacement in
-    /// the retired record's namespace.
     #[tokio::test]
     async fn a_supersede_op_retires_the_indexed_record() {
         let dir = TempDir::new().expect("temp dir");
@@ -674,7 +593,6 @@ mod tests {
         .expect("pass");
         assert!(matches!(outcome, Outcome::Consolidated { records: 1, .. }));
 
-        // The snapshot's index reached the model as its merge context.
         let input = provider.requests()[1].messages.clone();
         let [Message::Text { content, .. }] = input.as_slice() else {
             panic!("expected one message");
@@ -700,10 +618,6 @@ mod tests {
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
     }
 
-    // --- validation: reject, never truncate ---
-
-    /// Every rejection path fails the whole extraction with a message naming
-    /// the problem; nothing is ever best-guessed into a partial batch.
     #[tokio::test]
     async fn every_bad_batch_is_rejected_whole() {
         let cases: &[(&str, &str)] = &[
@@ -749,7 +663,6 @@ mod tests {
             );
         }
 
-        // One bad operation poisons the good one beside it.
         let mixed = r#"{"operations":[
             {"op":"write","kind":"preference","title":"t","summary":"s","body":"b"},
             {"op":"supersede","id":"mr-ghost","kind":"fact","title":"t","summary":"s","body":"b"}]}"#;
@@ -759,8 +672,6 @@ mod tests {
         assert!(err.0.contains("unknown record"), "{}", err.0);
     }
 
-    /// Reasoning residue and fencing are stripped; the strict JSON after
-    /// them still parses, and an empty list is a valid nothing-to-save.
     #[tokio::test]
     async fn residue_is_stripped_and_an_empty_list_extracts_nothing() {
         for text in [
@@ -791,8 +702,6 @@ mod tests {
         assert!(err.0.contains("no tools offered"), "{}", err.0);
     }
 
-    /// A provider that never answers: the timeout dial turns a hang into an
-    /// `ExtractError` instead of a wedged pass.
     struct Stalled;
 
     impl Provider for Stalled {
@@ -818,8 +727,6 @@ mod tests {
             .expect_err("must time out");
         assert!(err.0.contains("timed out"), "{}", err.0);
     }
-
-    // --- rendering ---
 
     #[tokio::test]
     async fn tool_rows_render_as_one_capped_line_each() {
@@ -872,8 +779,6 @@ mod tests {
         assert_eq!(snippet("{\"q\":1}"), "{\"q\":1}");
     }
 
-    /// The budget keeps the tail: recent lines survive verbatim behind an
-    /// explicit truncation head-line, old lines drop whole.
     #[test]
     fn a_long_transcript_is_windowed_to_its_tail() {
         let lines: Vec<String> = (0..600)
@@ -901,12 +806,6 @@ mod tests {
         assert_eq!(windowed(&lines), "user: hi\nassistant: hello");
     }
 
-    // --- the prompt is pinned ---
-
-    /// `PROMPT_V1` verbatim. A prompt change is a NEW constant and a NEW
-    /// version string (v2, ...), never an edit to this text: the marker's
-    /// `prompt_version` must keep naming exactly what ran, and 7.3's replay
-    /// diffs by it.
     #[test]
     fn prompt_v1_is_pinned() {
         assert_eq!(PROMPT_VERSION_V1, "v1");

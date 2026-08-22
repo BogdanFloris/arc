@@ -1,45 +1,16 @@
-//! Markdown for the transcript: text in, wrapped styled lines out.
-//!
-//! Hand-rolled and line-oriented, for two reasons. It has to render *partial*
-//! input — a reply is drawn on every delta, so half the document is a half-
-//! written sentence with an unclosed `**` in it — and a line-oriented pass
-//! degrades into plain text there instead of reflowing the screen when the
-//! closing marker finally arrives. And the ASCII-minimal look (6.1) wants
-//! headings and quotes carried by color and weight, not by drawn boxes, so
-//! most of what a full parser gives us would go unused.
-//!
-//! Supported: ATX headings, fenced code, blockquotes, horizontal rules,
-//! bullet and ordered lists, and inline `**bold**`, `*italic*`, `` `code` ``.
-//!
-//! Underscores are deliberately *not* emphasis. `_` shows up inside
-//! identifiers far more often than it opens an italic in a chat about this
-//! codebase, and `snake_case_names` rendering as italics is a worse failure
-//! than `_this_` staying literal.
-
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use textwrap::core::display_width;
 
 use crate::{syntax, theme};
 
-/// How far continuation lines sit in from the first line of a block. Two
-/// columns: enough to read as "still the same paragraph", not so much that a
-/// wrapped reply looks nested.
 const CONTINUATION: &str = "  ";
 
-/// Code block contents, in from the surrounding text.
 const CODE_INDENT: &str = "    ";
 
-/// Renders `text` as markdown, wrapped to `width` columns.
-///
-/// `base` styles anything the markup does not claim — the caller's voice for
-/// this block (plain for a message, dim for an error's detail).
 pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let width = width.max(8);
     let mut out = Vec::new();
-    // `Some` while inside a fence: the language its info string named, and
-    // whatever the last line left open. Both reset at every fence, so a
-    // half-streamed block cannot leak its state into the next one.
     let mut fenced: Option<(syntax::Language, syntax::Carry)> = None;
 
     let lines: Vec<&str> = text.split('\n').collect();
@@ -47,8 +18,6 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         if let Some(info) = fence_info(raw) {
             fenced = match fenced {
                 Some(_) => None,
-                // An untagged fence gets its language sniffed from the block
-                // it opens, which means looking ahead to the closing fence.
                 None if info.trim().is_empty() => {
                     Some((syntax::sniff(block_after(&lines, at)), syntax::Carry::None))
                 }
@@ -66,9 +35,6 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         } else if let Some(rule) = horizontal_rule(line, width) {
             out.push(rule);
         } else if let Some(rest) = heading(line) {
-            // Level shows as weight and color, not as indentation: a reply's
-            // top heading may be `#` or `###` depending on nothing, and
-            // indenting by the absolute level would stagger equals.
             wrap_into(
                 &mut out,
                 inline(rest, theme::HEADING),
@@ -83,8 +49,6 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
             };
             wrap_into(&mut out, inline(rest, theme::QUOTE), width, gutter);
         } else if let Some((marker, rest)) = list_item(line) {
-            // Hanging indent: continuation lines align with the text, not the
-            // bullet, so the marker column stays a clean vertical edge.
             let hanging = " ".repeat(display_width(&marker));
             let mut spans = vec![(marker, theme::MARKER)];
             spans.extend(inline(rest, base));
@@ -114,12 +78,6 @@ pub fn render(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     out
 }
 
-/// The lines of the block opened at `at`, up to its closing fence.
-///
-/// An unclosed block runs to the end of the text — which is every block, half
-/// the time, since a reply is drawn while it is still streaming. Sniffing what
-/// has arrived so far is the point: the language is settled from the first few
-/// lines and does not flicker as the rest lands.
 fn block_after<'a>(lines: &'a [&'a str], at: usize) -> &'a [&'a str] {
     let body = &lines[at + 1..];
     let end = body
@@ -129,7 +87,6 @@ fn block_after<'a>(lines: &'a [&'a str], at: usize) -> &'a [&'a str] {
     &body[..end]
 }
 
-/// A ```` ``` ```` or `~~~` fence, and the info string after it.
 fn fence_info(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     trimmed
@@ -137,13 +94,6 @@ fn fence_info(line: &str) -> Option<&str> {
         .or_else(|| trimmed.strip_prefix("~~~"))
 }
 
-/// A fenced line, highlighted and indented. Returns what it leaves open for
-/// the next line of the block.
-///
-/// Hard-wrapped at the display width rather than word-wrapped: code means what
-/// its columns say, and dropping the overflow off the right edge would hide it
-/// entirely. The wrap splits styled spans, so a long string keeps its colour
-/// across the break.
 fn push_code(
     out: &mut Vec<Line<'static>>,
     raw: &str,
@@ -179,7 +129,6 @@ fn push_code(
     carry
 }
 
-/// `---`, `***` or `___` alone on a line, drawn as a dim rule.
 fn horizontal_rule(line: &str, width: usize) -> Option<Line<'static>> {
     let trimmed = line.trim();
     let marker = trimmed.chars().next()?;
@@ -189,7 +138,6 @@ fn horizontal_rule(line: &str, width: usize) -> Option<Line<'static>> {
     is_rule.then(|| Line::styled("-".repeat(width), theme::DIM))
 }
 
-/// `## Heading` — the text after the hashes.
 fn heading(line: &str) -> Option<&str> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if hashes == 0 || hashes > 6 {
@@ -199,17 +147,11 @@ fn heading(line: &str) -> Option<&str> {
     Some(rest.trim_start())
 }
 
-/// `> quoted` — the text after the marker.
 fn blockquote(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix('>')?;
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
-/// `- item` or `3. item` — the marker to draw, and the text after it.
-///
-/// The marker keeps the source's leading whitespace, so nested lists stay
-/// nested; bullets are normalised to `-` so a document that mixes `*` and `+`
-/// still renders as one list.
 fn list_item(line: &str) -> Option<(String, &str)> {
     let indent = line.len() - line.trim_start().len();
     let body = &line[indent..];
@@ -232,10 +174,6 @@ fn list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
-/// Splits one line into styled segments on its inline markup.
-///
-/// Unclosed markup is left as literal text — the half-typed `**` at the end of
-/// a streaming reply must not turn the rest of the message bold.
 fn inline(line: &str, base: Style) -> Vec<(String, Style)> {
     let mut out: Vec<(String, Style)> = Vec::new();
     let mut plain = String::new();
@@ -268,21 +206,14 @@ fn inline(line: &str, base: Style) -> Vec<(String, Style)> {
     out
 }
 
-/// A backslash-escaped markup character, as the literal it stands for.
 fn escape(rest: &str) -> Option<char> {
     let after = rest.strip_prefix('\\')?;
     let c = after.chars().next()?;
     matches!(c, '*' | '`' | '_' | '\\' | '#' | '>' | '-').then_some(c)
 }
 
-/// The text between a matched pair of `mark`s, and the bytes the whole span
-/// took. `None` when the pair does not close on this line, or closes on
-/// nothing (`****` is not empty bold, it is four asterisks).
 fn delimited<'a>(rest: &'a str, mark: &str) -> Option<(&'a str, usize)> {
     let after = rest.strip_prefix(mark)?;
-    // `*` must not swallow the `**` case; the caller tries the longer mark
-    // first, so anything still starting with the mark here is a run, not a
-    // delimiter.
     if after.starts_with(mark) {
         return None;
     }
@@ -290,19 +221,12 @@ fn delimited<'a>(rest: &'a str, mark: &str) -> Option<(&'a str, usize)> {
     (end > 0).then(|| (&after[..end], mark.len() * 2 + end))
 }
 
-/// Moves the pending plain run into `out`.
 fn flush(out: &mut Vec<(String, Style)>, plain: &mut String, base: Style) {
     if !plain.is_empty() {
         out.push((std::mem::take(plain), base));
     }
 }
 
-/// What sits at the left of a wrapped block: the first line's prefix, every
-/// later line's prefix, and the style both are drawn in.
-///
-/// The prefixes are spans in their own right rather than leading spaces in the
-/// text, because [`split_words`] eats whitespace — and because a blockquote's
-/// `|` gutter has to carry a color.
 #[derive(Clone, Copy)]
 struct Indent<'a> {
     initial: &'a str,
@@ -311,7 +235,6 @@ struct Indent<'a> {
 }
 
 impl Indent<'_> {
-    /// Flush left, both lines.
     fn none() -> Self {
         Self {
             initial: "",
@@ -321,10 +244,6 @@ impl Indent<'_> {
     }
 }
 
-/// Greedily wraps styled segments to `width`, appending the lines to `out`.
-///
-/// Wrapping happens across segments, not within them: `**two words**` breaks
-/// between its words and both halves stay bold.
 fn wrap_into(
     out: &mut Vec<Line<'static>>,
     segments: Vec<(String, Style)>,
@@ -371,10 +290,6 @@ fn wrap_into(
     }
 }
 
-/// Groups segments into whitespace-free words, each a run of styled pieces.
-///
-/// A word can span segments — `**bo**ld` is one word in two styles — so the
-/// grouping is by whitespace in the concatenated text, not by segment.
 fn split_words(segments: Vec<(String, Style)>) -> Vec<Vec<(String, Style)>> {
     let mut words = Vec::new();
     let mut current: Vec<(String, Style)> = Vec::new();
@@ -408,8 +323,6 @@ fn split_words(segments: Vec<(String, Style)>) -> Vec<Vec<(String, Style)>> {
 mod tests {
     use super::*;
 
-    /// The rendered text, one string per line — what the eye sees, ignoring
-    /// style.
     fn text(text: &str, width: usize) -> Vec<String> {
         render(text, width, theme::PLAIN)
             .iter()
@@ -417,7 +330,6 @@ mod tests {
             .collect()
     }
 
-    /// The styles applied across one rendered line, span by span.
     fn styles(text: &str, width: usize) -> Vec<(String, Style)> {
         render(text, width, theme::PLAIN)
             .into_iter()
@@ -451,7 +363,6 @@ mod tests {
         );
     }
 
-    /// The streaming case: every delta redraws, so most frames end mid-markup.
     #[test]
     fn unclosed_markup_stays_literal() {
         assert_eq!(text("half a **thou", 40), ["half a **thou"]);
@@ -536,8 +447,6 @@ mod tests {
         );
     }
 
-    /// An untagged fence is the common case from a small local model, so the
-    /// language has to come from the block itself.
     #[test]
     fn an_untagged_block_is_highlighted_by_what_is_in_it() {
         let reply = "Here it is:\n\n```\ndef example():\n    return 1\n```";
@@ -555,8 +464,6 @@ mod tests {
         );
     }
 
-    /// The tag wins even when the content disagrees: the author said what it
-    /// is, and second-guessing them is how a highlighter earns distrust.
     #[test]
     fn a_tagged_block_is_not_sniffed() {
         let lines = render("```text\ndef example():\n```", 40, theme::PLAIN);

@@ -1,40 +1,3 @@
-//! The session engine: the conversation loop over log, projection, and provider.
-//!
-//! [`Engine`] owns the only write path a conversation has. One call to
-//! [`Engine::send_message`] is: make the user's message durable, drive the model,
-//! make the reply durable. The log is the source of truth at every step.
-//!
-//! # How a completion ends
-//!
-//! The three stream endings map to log by one rule: the log records what the user
-//! saw and errors are reported, never archived as messages (DESIGN.md §4).
-//!
-//! - `Done` seen → the reply is appended whole, `partial: false`.
-//! - Stream cut after text → the text is appended with `partial: true`.
-//! - An error, or a cut before any text → nothing model-side is appended; the
-//!   user's message and the session stay in the log, and the error goes to
-//!   the caller.
-//!
-//! # The tool loop
-//!
-//! A turn is one or more completions. A completion that stops for tool calls
-//! appends every `ToolCallIssued` before dispatching any of them — §3.1's
-//! write-ahead rule, which is what makes the log's silence meaningful — then
-//! appends a `ToolResultRecorded` per call and completes again over the grown
-//! transcript, until the model ends its turn with text. After
-//! [`MAX_TOOL_STEPS`] tool steps the final completion offers no tools, so a
-//! looping model is forced to prose instead of becoming the user's problem.
-//!
-//! # Streaming to callers
-//!
-//! [`EngineEvent`]s mirror the wire protocol event for event, so the daemon's
-//! socket layer is a translator, not a decision-maker. `Accepted` is sent
-//! before the provider is called: the caller learns its session id even if
-//! the model fails instantly, because by then the message is already durable.
-//! A closed channel means the client went away — the completion is driven to
-//! its end and appended regardless; durability does not depend on anyone
-//! watching.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,57 +21,37 @@ use crate::provider::{
 };
 use crate::tool::{Registry, TurnContext};
 
-/// Most tool steps one turn may take. The completion after the last step
-/// offers no tools, forcing prose grounded in whatever results arrived
-/// (banked 2026-08-17).
 const MAX_TOOL_STEPS: usize = 8;
 
-/// The conversation loop, generic over the model backend so tests drive it
-/// with a scripted provider and no network.
-///
-/// `&mut self` on [`send_message`](Engine::send_message): one completion
-/// at a time per engine. The daemon serializes callers around it.
 pub struct Engine<P> {
     log: Log,
     projection: Projection,
     provider: Arc<P>,
     model: String,
-    /// The identity file's content, when there is one (DESIGN.md §5.1).
     system: Option<String>,
     registry: Registry,
-    /// Append `/no_think` to interactive turns
     no_think: bool,
-    /// Call ids this process has logged, per session
     issued_call_ids: HashMap<String, HashSet<String>>,
 }
 
-/// What the engine reports to its caller while a message is in flight.
-///
-/// Mirrors the wire protocol: `Accepted` → `MessageAccepted`, `Delta` →
-/// `Delta`; the returned [`Reply`] carries what `StreamEnd` needs, and a
-/// returned error is the `Error` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
     Accepted {
         session_id: String,
     },
     Delta(String),
-    /// A chunk of the model's thinking
     Reasoning(String),
-    /// A call is durable and about to run; mirrors `ToolCallStarted`.
     ToolCallStarted {
         call_id: String,
         index: u32,
         name: String,
     },
-    /// The call's result is durable; mirrors `ToolCallEnded`.
     ToolCallEnded {
         call_id: String,
         outcome: ToolOutcome,
     },
 }
 
-/// The outcome of one [`Engine::send_message`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub session_id: String,
@@ -117,47 +60,28 @@ pub struct Reply {
     pub partial: bool,
 }
 
-/// Everything one conversation turn can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Appending to the event log failed. Durable state is in doubt; the
-    /// caller should treat this as fatal.
     #[error("session log append: {0}")]
     Log(#[from] log::Error),
 
-    /// The index refused an event the log accepted — log and projection are
-    /// out of step, which is a bug, not a runtime condition.
     #[error("session projection: {0}")]
     Projection(#[from] projection::Error),
 
-    /// The provider failed, eagerly or mid-stream. Any text that arrived
-    /// first is already in the log, marked partial.
     #[error("session provider: {0}")]
     Provider(#[from] provider::Error),
 
-    /// A whitespace-only message. Nothing was appended.
     #[error("refusing to send an empty message")]
     EmptyMessage,
 
-    /// A review verdict named a record the projection does not hold. Nothing
-    /// was appended; the daemon maps this to a wire error frame.
     #[error("no memory record {id} to review")]
-    UnknownRecord {
-        /// The id the verdict carried.
-        id: String,
-    },
+    UnknownRecord { id: String },
 
-    /// The stream ended before the first token. No assistant message was
-    /// appended: there was nothing seen to record.
     #[error("the model produced no reply")]
     EmptyReply,
 }
 
 impl<P: Provider> Engine<P> {
-    /// An engine over an open log and its index.
-    ///
-    /// `system` is the identity file's content when present; it rides every
-    /// completion as the system prompt.
     pub fn new(
         log: Log,
         projection: Projection,
@@ -179,22 +103,6 @@ impl<P: Provider> Engine<P> {
         }
     }
 
-    /// One conversation turn: durably append the user's message (creating the
-    /// session when `session_id` is `None`), drive the model, durably append
-    /// what came back.
-    ///
-    /// Progress is reported on `events` — [`EngineEvent::Accepted`] first,
-    /// then each text chunk. A closed channel is not an error: the completion
-    /// is driven to its end and appended regardless.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::EmptyMessage`] for whitespace-only content; nothing appended.
-    /// - [`Error::Log`] / [`Error::Projection`] if durability fails; fatal.
-    /// - [`Error::Provider`] if the model call fails. Text that arrived before
-    ///   a mid-stream failure is appended with `partial: true` first.
-    /// - [`Error::EmptyReply`] if the stream ended before the first token.
-    // One turn is one function; splitting it would hide the loop's shape.
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(
         level = "info",
@@ -254,23 +162,17 @@ impl<P: Provider> Engine<P> {
             }),
         )?;
 
-        // Durable from here on: tell the caller where its message lives.
         let _ = events
             .send(EngineEvent::Accepted {
                 session_id: session_id.clone(),
             })
             .await;
 
-        // History includes the message just appended; from here the turn's
-        // transcript grows in memory as the loop appends durable events.
         let (mut transcript, system) = self.open_turn(&session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
         let mut memory = MemoryCounters::default();
 
-        // Terminal arms break so the turn's memory counters are recorded
-        // exactly once; a `?` escape (durability, eager provider failure)
-        // skips them, which an aggregate metric tolerates.
         let reply = loop {
             let last_step = steps >= MAX_TOOL_STEPS;
             let request = self.completion_request(system.clone(), transcript.clone(), last_step);
@@ -280,9 +182,6 @@ impl<P: Provider> Engine<P> {
                 .await?;
 
             match ending {
-                // A tool-call stop with nothing runnable — no calls delivered,
-                // or the cap already spent — falls through to the end-turn arm:
-                // there is nothing to run, so whatever text arrived is the reply.
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
                     steps += 1;
                     span.record("tool_steps", steps);
@@ -324,9 +223,6 @@ impl<P: Provider> Engine<P> {
                     });
                 }
                 Ending::Failed(error) => {
-                    // The text seen so far is appended before the error is
-                    // surfaced. An append failure takes precedence, because a
-                    // durability problem outranks a provider problem.
                     if !text.is_empty() {
                         let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
                         span.record("assistant_seq", seq);
@@ -340,11 +236,6 @@ impl<P: Provider> Engine<P> {
         reply
     }
 
-    /// Drives one completion to its end: text and reasoning forwarded as they
-    /// arrive, calls collected whole, usage summed into the turn's total.
-    // `&mut self` for the future's `Send` bound, not for mutation: a shared
-    // borrow held across an await would demand `Engine: Sync`, and the
-    // projection's SQLite connection is not.
     async fn run_completion(
         &mut self,
         request: CompletionRequest,
@@ -364,8 +255,6 @@ impl<P: Provider> Engine<P> {
                     let _ = events.send(EngineEvent::Reasoning(chunk)).await;
                 }
                 Some(Ok(CompletionDelta::ToolCall(call))) => calls.push(call),
-                // The stream contract says `Done` is the last item; trusting
-                // it saves a poll that could only return `None`.
                 Some(Ok(CompletionDelta::Done { usage, stop })) => {
                     let total = total_usage.get_or_insert(Usage::default());
                     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -379,7 +268,6 @@ impl<P: Provider> Engine<P> {
         Ok((ending, text, calls))
     }
 
-    /// One tool step
     #[allow(clippy::too_many_arguments)]
     async fn tool_step(
         &mut self,
@@ -391,7 +279,6 @@ impl<P: Provider> Engine<P> {
         memory: &mut MemoryCounters,
         events: &mpsc::Sender<EngineEvent>,
     ) -> Result<(), Error> {
-        // Step text is rare.
         if !text.is_empty() {
             self.record(
                 Source::Model,
@@ -410,9 +297,6 @@ impl<P: Provider> Engine<P> {
         }
 
         calls.sort_unstable_by_key(|call| call.index);
-        // an id the provider left empty, or one this
-        // session has already logged, is replaced with a created one,
-        // the log then records the id that was actually used, everywhere.
         let seen = self
             .issued_call_ids
             .entry(session_id.to_owned())
@@ -424,8 +308,6 @@ impl<P: Provider> Engine<P> {
             seen.insert(call.id.clone());
         }
 
-        // Write-ahead: the whole step's calls are durable before any of them
-        // runs. Nothing ran that is not on disk.
         for call in &calls {
             self.record(
                 Source::Model,
@@ -463,8 +345,6 @@ impl<P: Provider> Engine<P> {
                 ToolOutcome::Error
             };
             memory.observe_call(&call.name, &call.arguments, &dispatched.content);
-            // A write tool's events go durable before the result that says
-            // "saved" — the report must follow the write it reports.
             for memory_event in dispatched.memory_events {
                 memory.observe_event(&memory_event);
                 self.record_memory(Source::Model, memory_event)?;
@@ -496,9 +376,6 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    /// The system prompt as sent: identity file, then the turn's memory
-    /// index block, then `/no_think` — each only when present, `/no_think`
-    /// always last.
     fn system_prompt(&self, memory_index: Option<&str>) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &self.system {
@@ -517,33 +394,10 @@ impl<P: Provider> Engine<P> {
         (!prompt.is_empty()).then_some(prompt)
     }
 
-    /// Every session, oldest first (see [`Projection::sessions`]).
-    ///
-    /// The engine is the façade over durable state: callers above it — the
-    /// daemon's socket layer — never reach past it to the log or the index.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Projection`] if the index cannot be read.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         Ok(self.projection.sessions()?)
     }
 
-    /// One session's rows as a client renders them, oldest first, in the
-    /// wire's `HistoryEntry` shape: prose, tool calls, tool results.
-    ///
-    /// Unlike the private rebuild, this keeps every role — and every raw
-    /// outcome integer — verbatim: a client showing a transcript should not
-    /// silently drop a message the provider vocabulary happens not to cover,
-    /// and readers treat an unrecognized outcome as UNKNOWN (DESIGN.md §3.1).
-    ///
-    /// An unknown id reads as a session with nothing in it — the projection
-    /// has no row to distinguish "never existed" from "never spoken in", and
-    /// the difference does not change what a client renders.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Projection`] if the index cannot be read.
     pub fn transcript(&self, session_id: &str) -> Result<Vec<HistoryEntry>, Error> {
         Ok(self
             .projection
@@ -553,36 +407,14 @@ impl<P: Provider> Engine<P> {
             .collect())
     }
 
-    /// Sessions due for consolidation (see
-    /// [`Projection::due_for_consolidation`]) — the engine is the façade over
-    /// durable state, here as everywhere.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Projection`] if the index cannot be read.
     pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
         Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
     }
 
-    /// The review queue (see [`Projection::review_items`]): records changed
-    /// at or after `since_micros` and not reviewed since their last change.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Projection`] if the index cannot be read.
     pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
         Ok(self.projection.review_items(since_micros)?)
     }
 
-    /// The accept verdict (DESIGN.md §5.4): appends a `MemoryRecordReviewed`
-    /// with [`Source::User`] — durable, because reviews are the ground truth
-    /// the precision labels rest on.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::UnknownRecord`] if the projection does not hold `record_id`;
-    ///   nothing is appended.
-    /// - [`Error::Log`] / [`Error::Projection`] if durability fails; fatal.
     #[tracing::instrument(name = "session.review_accept", skip(self), fields(record_id))]
     pub fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
         self.reviewable(record_id)?;
@@ -595,14 +427,6 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    /// The delete verdict (DESIGN.md §5.4): appends a `MemoryRecordDeleted`
-    /// with [`Source::User`], excluding the record entirely.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::UnknownRecord`] if the projection does not hold `record_id`;
-    ///   nothing is appended.
-    /// - [`Error::Log`] / [`Error::Projection`] if durability fails; fatal.
     #[tracing::instrument(name = "session.review_delete", skip(self), fields(record_id))]
     pub fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
         self.reviewable(record_id)?;
@@ -615,8 +439,6 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    /// Refuses a verdict for a record the projection does not hold, before
-    /// anything touches the log.
     fn reviewable(&self, record_id: &str) -> Result<(), Error> {
         if self.projection.memory_record(record_id)?.is_none() {
             return Err(Error::UnknownRecord {
@@ -626,17 +448,6 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    /// Step 1 of the consolidation pass (DESIGN.md §5.4), under the caller's
-    /// lock: the first due session outside `skip`, with its rows, its last
-    /// seq, and the ACTIVE memory index — the extractor's entire view of
-    /// existing memory, read in the same locked step. `None` when nothing is
-    /// due. One session at a time is v1's concurrency bound; `skip` is the
-    /// caller's strike list, so a forever-failing session yields the slot to
-    /// the next due one.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Projection`] if the index cannot be read.
     pub fn snapshot_for_consolidation(
         &self,
         idle_cutoff_micros: i64,
@@ -660,20 +471,6 @@ impl<P: Provider> Engine<P> {
         }))
     }
 
-    /// Step 3 of the consolidation pass, back under the caller's lock:
-    /// re-checks the session against the snapshot, then appends the
-    /// extractor's events and the coverage marker. Returns `false` — a race,
-    /// not an error — when the session grew since the snapshot: the pass is
-    /// discarded whole and a later idle timeout re-runs it over the longer
-    /// history.
-    ///
-    /// Everything appends with [`Source::System`]: arcd initiated these
-    /// writes, not the user's turn (§5.4 amendment).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Log`] / [`Error::Projection`] if an append fails; durability
-    /// is in doubt and the caller should treat this as fatal for the pass.
     pub fn commit_consolidation(
         &mut self,
         snapshot: &SessionSnapshot,
@@ -704,14 +501,9 @@ impl<P: Provider> Engine<P> {
         Ok(true)
     }
 
-    /// Appends one event to the log and applies it to the index, as a pair.
-    ///
-    /// The log stamps the seq; the same event, seq included, then goes into
-    /// the projection so both stay in lockstep. Replay remains the cold-start
-    /// path only.
     fn record(&mut self, source: Source, payload: session_event::Event) -> Result<u64, Error> {
         let mut event = Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: Some(now_ts()),
             source: source as i32,
             payload: Some(event::Payload::Session(SessionEvent {
@@ -724,15 +516,13 @@ impl<P: Provider> Engine<P> {
         Ok(seq)
     }
 
-    /// [`Engine::record`] for the memory arm: appends one `MemoryEvent` and
-    /// applies it, so a mid-turn `Archive` read sees the write.
     fn record_memory(
         &mut self,
         source: Source,
         payload: memory_event::Event,
     ) -> Result<u64, Error> {
         let mut event = Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: Some(now_ts()),
             source: source as i32,
             payload: Some(event::Payload::Memory(MemoryEvent {
@@ -745,7 +535,6 @@ impl<P: Provider> Engine<P> {
         Ok(seq)
     }
 
-    /// Appends the model's reply.
     fn append_reply(
         &mut self,
         session_id: &str,
@@ -765,11 +554,6 @@ impl<P: Provider> Engine<P> {
         )
     }
 
-    /// The transcript a turn starts from and the turn's one system prompt,
-    /// read once: the rows rebuild the provider messages and seed the
-    /// session's collision set; the memory index is snapshotted here and
-    /// holds through the turn's completions, so mid-turn memory writes reach
-    /// disk, not the live prompt (DESIGN.md §5.2).
     fn open_turn(&mut self, session_id: &str) -> Result<(Vec<Message>, Option<String>), Error> {
         let rows = self.projection.messages(session_id)?;
         self.seed_call_ids(session_id, &rows);
@@ -778,9 +562,6 @@ impl<P: Provider> Engine<P> {
         Ok((rebuild_transcript(&rows), system))
     }
 
-    /// One step's completion request. After the last allowed tool step no
-    /// tools are offered, so the model can only answer in prose. Interactive
-    /// turns never pin a seed; that dial is replay's (task 7.3).
     fn completion_request(
         &self,
         system: Option<String>,
@@ -800,12 +581,6 @@ impl<P: Provider> Engine<P> {
         }
     }
 
-    /// Seeds the session's collision set from its projected call rows.
-    ///
-    /// The in-process set forgets everything at a restart; the log does not.
-    /// Without this, a provider id that collides with a call an earlier
-    /// daemon run logged would slip past `tool_step`'s check and put the
-    /// same string on two calls of one session (DESIGN.md §3.1).
     fn seed_call_ids(&mut self, session_id: &str, rows: &[MessageRow]) {
         self.issued_call_ids
             .entry(session_id.to_owned())
@@ -820,9 +595,6 @@ impl<P: Provider> Engine<P> {
     }
 }
 
-/// One projected row as the wire's `HistoryEntry`: a direct mapping — role
-/// and outcome integers pass through raw, arguments and result content stay
-/// off the wire (display needs the name and the outcome, nothing more).
 fn history_entry(row: MessageRow) -> HistoryEntry {
     let entry = match row {
         MessageRow::Message {
@@ -852,23 +624,7 @@ fn history_entry(row: MessageRow) -> HistoryEntry {
     HistoryEntry { entry: Some(entry) }
 }
 
-/// The provider transcript a session's projected rows imply (DESIGN.md §3.1).
-///
-/// Prose becomes [`Message::Text`]. A step — consecutive call rows of one
-/// turn, §3.1's grouping rule — becomes one [`Message::ToolCalls`], followed
-/// by its results sorted by the `call_index` of the call each one closes, not
-/// completion order. Results are paired by `call_id` alone, never adjacency:
-/// the orphan closer lands at the log tail, possibly far from its call.
-///
-/// Anomalies are skipped with a warning, never a panic, matching the engine's
-/// tolerance for foreign logs: an unmappable role, a result no call claimed,
-/// and a call with no result — legitimate only before arcd's orphan closer
-/// has run, and this reader appends no repair (§3.1: only arcd at startup
-/// may). A skipped call keeps the transcript valid: every call the provider
-/// sees has a result answering it.
 fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
-    // Results first, keyed by call id, so a step finds its answers wherever
-    // they landed in the log. First result wins; the log never holds two.
     let mut results: HashMap<&str, &str> = HashMap::new();
     let mut issued: HashSet<&str> = HashSet::new();
     for row in rows {
@@ -903,7 +659,6 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
             MessageRow::ToolCall {
                 turn_id: step_turn, ..
             } => {
-                // One step: this turn's consecutive call rows.
                 let mut step = Vec::new();
                 while let Some(MessageRow::ToolCall {
                     call_id,
@@ -948,7 +703,6 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                 }
             }
             MessageRow::ToolResult { call_id, .. } => {
-                // Emitted beside its step above; alone it answers nothing.
                 if !issued.contains(call_id.as_str()) {
                     tracing::warn!(%call_id, "skipping a tool result no call claimed");
                 }
@@ -959,11 +713,8 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
     messages
 }
 
-/// One turn's memory-traffic counters (DESIGN.md §5.4), fed by the tool loop
-/// and recorded on the turn's span at its end.
 #[derive(Debug, Default)]
 struct MemoryCounters {
-    /// Record ids surfaced by this turn's `memory_search` replies.
     surfaced: HashSet<String>,
     searches: u64,
     search_hits: u64,
@@ -972,7 +723,6 @@ struct MemoryCounters {
     records_superseded: u64,
 }
 
-/// The one part of a `memory_search` reply the counters read.
 #[derive(serde::Deserialize)]
 struct SearchReplyIds {
     records: Vec<SearchReplyId>,
@@ -983,22 +733,16 @@ struct SearchReplyId {
     id: String,
 }
 
-/// The one part of a `memory_read` call the counters read.
 #[derive(serde::Deserialize)]
 struct ReadArgsId {
     id: String,
 }
 
 impl MemoryCounters {
-    /// Retrieval hit rate is a proxy: a `memory_read` whose id appeared in an
-    /// earlier `memory_search` reply this turn counts as the search being
-    /// used. Known undercount — the model can act on a summary straight from
-    /// the search reply without ever reading the body.
     fn observe_call(&mut self, name: &str, arguments_json: &str, result_content: &str) {
         match name {
             "memory_search" => {
                 self.searches += 1;
-                // The no-match reply is prose, not JSON: not a hit.
                 let Ok(reply) = serde_json::from_str::<SearchReplyIds>(result_content) else {
                     return;
                 };
@@ -1019,7 +763,6 @@ impl MemoryCounters {
         }
     }
 
-    /// Counts a memory event a tool asked the engine to append.
     fn observe_event(&mut self, event: &memory_event::Event) {
         match event {
             memory_event::Event::RecordCreated(_) => self.records_created += 1,
@@ -1028,9 +771,6 @@ impl MemoryCounters {
         }
     }
 
-    /// Absent means "no memory traffic": zeros land only where a denominator
-    /// exists — never on turns that touched no memory (§5.4). Rates are for
-    /// analysis time; a ratio in a trace would hide its sample size.
     fn record_on(&self, span: &tracing::Span) {
         if self.searches > 0 {
             span.record("counter.memory_searches", self.searches);
@@ -1046,17 +786,12 @@ impl MemoryCounters {
     }
 }
 
-/// How one completion of the loop ended; see the module docs.
 enum Ending {
     Done(Stop),
     Cut,
     Failed(provider::Error),
 }
 
-/// The current wall clock as a protobuf timestamp.
-///
-/// Clock-reading lives with the writers — the engine and the orphan closer —
-/// because the log deliberately stamps nothing but seq.
 pub(crate) fn now_ts() -> Timestamp {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1091,8 +826,6 @@ mod tests {
         turn, usage,
     };
     use crate::tool::Registry;
-
-    // --- seed events, for histories a live engine cannot produce ---
 
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
@@ -1135,7 +868,6 @@ mod tests {
         })
     }
 
-    /// A prose `HistoryEntry`, as `transcript` returns it.
     fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
         HistoryEntry {
             entry: Some(history_entry::Entry::Message(HistoryMessage {
@@ -1182,7 +914,6 @@ mod tests {
         assert_eq!(assistant.content, "hello there");
         assert!(!assistant.partial);
 
-        // The projection kept pace without a replay.
         assert_eq!(engine.projection.last_seq().expect("last_seq"), Some(2));
         assert_eq!(
             engine
@@ -1193,7 +924,6 @@ mod tests {
             2
         );
 
-        // Channel saw Accepted first, then the delta.
         let events = drain(&mut rx);
         assert_eq!(
             events,
@@ -1260,8 +990,6 @@ mod tests {
             .expect("second send");
 
         let listed = engine.sessions().expect("sessions");
-        // Both were created inside the same second, so their relative order is
-        // whatever the tie-break says; membership is what this asserts.
         let mut ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
         ids.sort_unstable();
         let mut expected = vec![first.session_id.as_str(), second.session_id.as_str()];
@@ -1289,8 +1017,6 @@ mod tests {
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial tex");
 
-        // The flag reaches clients too: a reopened session can tell a cut
-        // reply from a whole one.
         assert_eq!(
             engine.transcript(&reply.session_id).expect("transcript"),
             [
@@ -1400,8 +1126,6 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let mut engine = engine(&provider, &dir);
 
-        // A message from a newer schema, planted through the engine's own
-        // log-and-index pair so both stay consistent.
         engine
             .record(
                 Source::System,
@@ -1449,7 +1173,6 @@ mod tests {
 
         let reply = engine.send_message(None, "hi", tx).await.expect("send");
 
-        // Two completions billed; the reply sums them.
         assert_eq!(
             reply.usage,
             Some(Usage {
@@ -1478,7 +1201,6 @@ mod tests {
         assert!(!result.truncated);
         assert_eq!(assistant.content, "answer");
 
-        // The second completion saw the calls and their results, in order.
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         assert!(!requests[1].tools.is_empty(), "tools stay offered");
@@ -1495,7 +1217,6 @@ mod tests {
             }
         );
 
-        // The caller watched the whole turn.
         assert_eq!(
             drain(&mut rx),
             [
@@ -1518,7 +1239,6 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_calls_are_written_ahead_and_answered_in_index_order() {
-        // The provider delivers index 1 first; the log and transcript sort it.
         let provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call("b", 1, "beta", "{}")),
@@ -1535,7 +1255,6 @@ mod tests {
         engine.send_message(None, "hi", tx).await.expect("send");
 
         let events = replay_log(&dir);
-        // Both calls durable before either result: the write-ahead rule.
         let first = issued(&events[2]);
         let second = issued(&events[3]);
         assert_eq!((first.index, first.call_id.as_str()), (0, "a"));
@@ -1598,7 +1317,6 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), 3, "ids are unique across the session");
 
-        // Every result names the id the log recorded, minted or not.
         let result_ids: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -1609,8 +1327,6 @@ mod tests {
         assert_eq!(result_ids, [ids[0], ids[1], ids[2]]);
     }
 
-    /// The in-process collision set dies with the daemon; the log does not.
-    /// A reopened engine must reject an id an earlier run already logged.
     #[tokio::test]
     async fn a_reopened_engine_still_rejects_logged_call_ids() {
         let provider = ScriptedProvider::scripted(vec![
@@ -1647,9 +1363,6 @@ mod tests {
         assert!(!ids[1].is_empty());
     }
 
-    /// The log records results in completion order; the rebuilt transcript
-    /// sorts them by the index of the call each closes (DESIGN.md §3.1) —
-    /// the replay side of the `index 1 first` engine test.
     #[tokio::test]
     async fn completion_order_results_rebuild_sorted_by_call_index() {
         let dir = TempDir::new().expect("temp dir");
@@ -1660,7 +1373,6 @@ mod tests {
                 seeded_message(Role::User, "question"),
                 seeded_call("a", 0),
                 seeded_call("b", 1),
-                // b finished first; the log says so.
                 seeded_result("b", "B"),
                 seeded_result("a", "A"),
             ],
@@ -1699,9 +1411,6 @@ mod tests {
         );
     }
 
-    /// A call the orphan closer has not reached and a result no call claims
-    /// are both skipped with a warning: the transcript stays valid and the
-    /// turn goes on.
     #[tokio::test]
     async fn history_anomalies_are_skipped_not_fatal() {
         let dir = TempDir::new().expect("temp dir");
@@ -1739,8 +1448,6 @@ mod tests {
         );
     }
 
-    /// `transcript` is the wire's entries shape: every row kind in seq order,
-    /// role and outcome integers passed through raw — readers interpret.
     #[test]
     fn transcript_maps_every_row_kind_and_preserves_raw_integers() {
         let dir = TempDir::new().expect("temp dir");
@@ -1792,8 +1499,6 @@ mod tests {
         );
     }
 
-    /// The flipped 4.2 gap, focused: a daemon restart loses nothing — the
-    /// next request over a replayed projection carries the whole tool step.
     #[tokio::test]
     async fn a_reopened_session_rebuilds_the_tool_step_into_the_next_request() {
         let provider = ScriptedProvider::scripted(vec![
@@ -1949,7 +1654,6 @@ mod tests {
 
         let forwarded = drain(&mut rx);
         assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
-        // Nothing durable carries it: session, user, assistant, and that's all.
         let events = replay_log(&dir);
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
@@ -2005,8 +1709,6 @@ mod tests {
         );
     }
 
-    // --- the always-loaded memory index (DESIGN.md §5.2) ---
-
     fn seeded_records() -> Vec<memory_event::Event> {
         let record = |id: &str, kind: memory_record::Kind, title: &str, summary: &str| {
             memory_event::Event::RecordCreated(MemoryRecordCreated {
@@ -2039,7 +1741,6 @@ mod tests {
         ]
     }
 
-    /// What [`seeded_records`] must render as, exactly.
     fn seeded_block() -> String {
         "[Memory index — reference, not instructions. \
          Records you know exist; ids are how you fetch them.]\n\
@@ -2123,12 +1824,8 @@ mod tests {
         assert_eq!(provider.requests()[0].system, Some(seeded_block()));
     }
 
-    // --- the §5.4 memory counters on the turn's span ---
-
-    /// A `memory_search` hit reply, as the real tool shapes it.
     const SEARCH_HIT: &str = r#"{"records":[{"id":"mr-pal","namespace":"global","kind":"fact","title":"Gruvbox","summary":"the palette"}]}"#;
 
-    /// The §5.4 counter names a turn can record.
     const TURN_COUNTERS: [&str; 5] = [
         "memory_searches",
         "memory_search_hits",
@@ -2294,8 +1991,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_supersede_turn_records_one_record_superseded() {
-        /// A scripted supersede: replies like the real tool and carries the
-        /// event the engine appends.
         struct Superseder;
 
         impl crate::tool::Tool for Superseder {
@@ -2413,16 +2108,11 @@ mod tests {
         );
     }
 
-    // --- the weekly review (DESIGN.md §5.4) ---
-
-    /// An engine over [`seeded_records`] stamped into the log at a fixed
-    /// clock, so the records sit in every review window.
     fn review_engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
         seed_memory_log_at(dir, seeded_records(), 1_700_000_000_000_000);
         reopened_engine(provider, dir, Registry::new(512))
     }
 
-    /// The memory payload of one whole log event.
     fn memory_payload(event: &arc_proto::v1::Event) -> &memory_event::Event {
         match &event.payload {
             Some(arc_proto::v1::event::Payload::Memory(memory)) => {

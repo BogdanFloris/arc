@@ -1,10 +1,3 @@
-//! The archive tools: `sessions_search` and `session_read` (DESIGN.md §5.5).
-//!
-//! Thin argument parsers over [`crate::archive::Archive`] — the queries, the
-//! sanitizer, and the return shapes all live there. Descriptions and schemas
-//! are prompt text for a small model on a small context: one sentence on when
-//! to use each, nothing else.
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -14,7 +7,6 @@ use super::{Tool, ToolReply, TurnContext, to_json};
 use crate::archive::{Archive, Error};
 use crate::provider::ToolDefinition;
 
-/// `sessions_search`: find past conversations.
 pub struct SessionsSearch {
     archive: Archive,
 }
@@ -74,8 +66,6 @@ impl Tool for SessionsSearch {
                     ));
                 }
             };
-            // The current session stays out: the just-appended question
-            // contains the search terms and would claim the top slot.
             let exclude = (!ctx.session_id.is_empty()).then_some(ctx.session_id.as_str());
             match self
                 .archive
@@ -83,8 +73,6 @@ impl Tool for SessionsSearch {
             {
                 Ok(reply) if reply.sessions.is_empty() => ToolReply::ok("No results."),
                 Ok(reply) => ToolReply::ok(to_json(&reply)),
-                // A query FTS cannot parse is an answer naming the problem,
-                // never a swallowed empty (hermes policy).
                 Err(Error::Query { message }) => ToolReply::ok(format!(
                     "No results: {message}. Try plain words or \"quoted phrases\"."
                 )),
@@ -94,7 +82,6 @@ impl Tool for SessionsSearch {
     }
 }
 
-/// `session_read`: pull exact past context by session and range.
 pub struct SessionRead {
     archive: Archive,
 }
@@ -252,7 +239,6 @@ mod tests {
         registry
     }
 
-    /// Tool results the live turn recorded, in log order.
     fn logged_results(dir: &TempDir) -> Vec<ToolResultRecorded> {
         replay_log(dir)
             .into_iter()
@@ -263,11 +249,6 @@ mod tests {
             .collect()
     }
 
-    // --- live engine over a seeded multi-session archive ---
-
-    /// The exit criterion in miniature: a scripted turn searches real
-    /// history and the recorded result carries the answer — session id,
-    /// snippet text, and the anchor to read further from.
     #[tokio::test]
     async fn a_live_search_turn_answers_from_the_snippet() {
         let dir = TempDir::new().expect("temp dir");
@@ -312,9 +293,6 @@ mod tests {
         assert!(!content.contains("s-deploy"), "{content}");
     }
 
-    /// The 5.2-review fix, live: the searching session's own just-appended
-    /// question matches the query, but the current session never appears in
-    /// its own results — only real history does.
     #[tokio::test]
     async fn a_live_search_never_returns_the_searching_session() {
         let dir = TempDir::new().expect("temp dir");
@@ -351,9 +329,6 @@ mod tests {
         );
     }
 
-    /// The §3.1 default, live: a matching tool-result row is invisible until
-    /// `include_tool_results` lifts the filter — and the miss is an explicit
-    /// "No results.", not an error.
     #[tokio::test]
     async fn the_default_filter_hides_tool_output_until_lifted() {
         let dir = TempDir::new().expect("temp dir");
@@ -390,7 +365,6 @@ mod tests {
             .await
             .expect("send");
 
-        // Three results in the log: the seeded one, then the live turn's two.
         let results = logged_results(&dir);
         assert_eq!(results.len(), 3);
         let results = &results[1..];
@@ -408,8 +382,6 @@ mod tests {
         );
     }
 
-    /// One hermes fixture end to end through the live engine; the full set
-    /// is pinned in `archive`'s tests.
     #[tokio::test]
     async fn a_fixture_query_survives_the_live_path() {
         let dir = TempDir::new().expect("temp dir");
@@ -445,8 +417,6 @@ mod tests {
             results[0].content
         );
     }
-
-    // --- argument handling, straight through the Tool trait ---
 
     fn seeded_dir() -> TempDir {
         let dir = TempDir::new().expect("temp dir");

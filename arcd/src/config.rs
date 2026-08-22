@@ -1,102 +1,53 @@
-//! The config file: `arc.toml`, every field optional.
-//!
-//! ```toml
-//! data_dir = "data"
-//! provider = "local"           # the only choice today
-//! model    = "qwen3-8b"        # default: the model file's stem, see [`Config::model`]
-//! bind     = "127.0.0.1:8787"
-//!
-//! [llama]                      # the local sidecar, when provider = "local"
-//! server     = "llama-server"
-//! model_file = "data/models/Qwen3-8B-Q4_K_M.gguf"
-//! port       = 8080
-//! device     = "RTX 5070"      # pin by name; resolved to an index at start
-//! args       = ["-ngl", "99"]
-//!
-//! [consolidation]              # the idle-timeout pass (DESIGN.md §5.4)
-//! enabled         = false      # flipping it live is a deliberate deploy step
-//! idle_seconds    = 1800
-//! timeout_seconds = 300
-//! ```
-
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-/// Directory all runtime state hangs off (DESIGN.md §10).
 const DEFAULT_DATA_DIR: &str = "data";
 
-/// Localhost, per DESIGN.md §7: the socket never leaves the machine
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
-/// The `llama-server` binary, resolved from `PATH` when not a path.
 const DEFAULT_LLAMA_SERVER: &str = "llama-server";
 
-/// Where `just model` puts the default local model.
 const DEFAULT_MODEL_FILE: &str = "data/models/Qwen3-8B-Q4_K_M.gguf";
 
-/// The sidecar's port on localhost.
 const DEFAULT_LLAMA_PORT: u16 = 8080;
 
-/// Longest tool result the registry keeps
 const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 
-/// How long a session must sit untouched before consolidation covers it.
 const DEFAULT_IDLE_SECONDS: u64 = 1800;
 
-/// How long one extraction may hold the model. Generous on purpose:
-/// background summarization-class work gets its own dial, never the
-/// interactive path's (docs/prior-art-hermes.md §3).
 const DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS: u64 = 300;
 
-/// The resolved daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
-    /// Root of the runtime state tree. Relative paths resolve against the
-    /// working directory, which for a hand-started daemon is the repo root.
     pub data_dir: PathBuf,
 
-    /// Which backend answers completions. Only `local` for now; the enum
-    /// stays so the next provider is a new variant, not a new config shape.
     pub provider: ProviderChoice,
 
-    /// Model name for completions. `None` resolves per provider — see
-    /// [`Config::model`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
-    /// Address the `WebSocket` server binds.
     pub bind: SocketAddr,
 
-    /// The local sidecar, read only when `provider = "local"`.
     pub llama: LlamaConfig,
 
-    /// The maximum amount of content bytes for a tool result.
     pub max_tool_result_bytes: usize,
 
-    /// Append `/no_think` to interactive turns' system prompt
     pub no_think: bool,
 
-    /// The idle-timeout consolidation pass (DESIGN.md §5.4).
     pub consolidation: ConsolidationConfig,
 }
 
-/// The consolidation trigger's dials — its own section, hermes-style:
-/// background work never borrows the interactive path's config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConsolidationConfig {
-    /// Off by default in code: flipping it in the live `arc.toml` is a
-    /// deliberate deploy step, not a build side effect.
     pub enabled: bool,
 
-    /// How long a session must sit untouched before a pass covers it.
     pub idle_seconds: u64,
 
-    /// How long one extraction may hold the model before the pass fails.
     pub timeout_seconds: u64,
 }
 
@@ -110,40 +61,24 @@ impl Default for ConsolidationConfig {
     }
 }
 
-/// Which provider implementation the daemon runs with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderChoice {
-    /// The llama.cpp sidecar, spoken to as an OpenAI-compatible endpoint.
     Local,
 }
 
-/// The `llama-server` sidecar `arcd` supervises.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LlamaConfig {
-    /// The binary to spawn. A bare name is resolved from `PATH`.
     pub server: PathBuf,
 
-    /// The GGUF to load. The default is where `just model` downloads to.
     pub model_file: PathBuf,
 
-    /// Port the sidecar listens on, always on 127.0.0.1.
     pub port: u16,
 
-    /// Pin the model to the device whose `--list-devices` name contains this
-    /// string, case-insensitive, resolved at every start. Names survive
-    /// reboots; backend indexes do not (2026-08-20: Vulkan order flipped and
-    /// the model silently landed on the iGPU). No match refuses startup.
-    /// Unset, the server picks its own devices. Do not also pass `--device`
-    /// in `args`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
 
-    /// Extra `llama-server` arguments, passed through verbatim — GPU offload
-    /// (`-ngl`), context size (`-c`), `MoE` offload (`--n-cpu-moe`), whatever
-    /// the model wants. A passthrough rather than named fields, because
-    /// llama.cpp's flag surface changes faster than this config should.
     pub args: Vec<String>,
 }
 
@@ -175,13 +110,6 @@ impl Default for LlamaConfig {
 }
 
 impl Config {
-    /// Loads the config at `path`, or the defaults if there is no file there.
-    ///
-    /// # Errors
-    ///
-    /// If the file exists but cannot be read, is not TOML, holds a key this
-    /// build does not know, or holds a value of the wrong shape — an
-    /// unparseable `bind` included.
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -193,12 +121,6 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 
-    /// The model name completions run as: what the engine records in the log
-    /// and what goes in the request.
-    ///
-    /// Unset, it resolves to the model file's stem, so the log names the
-    /// weights that actually answered (`llama-server` serves one model and
-    /// ignores the name, but the log should not).
     #[must_use]
     pub fn model(&self) -> String {
         if let Some(model) = &self.model {

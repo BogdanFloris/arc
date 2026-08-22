@@ -1,25 +1,3 @@
-//! Orphaned tool calls: detection, and the startup repair.
-//!
-//! The engine appends every `ToolCallIssued` before dispatching it, so a
-//! daemon that dies mid-step leaves a durable call with no durable result.
-//! The bytes cannot say whether the tool ran: the outcome is unknown, and the
-//! call must be neither silently re-dispatched nor silently dropped.
-//!
-//! [`scan`] reads a log and returns the calls still open at its end. Only
-//! arcd at startup may act on that list — an in-flight call in a live daemon
-//! is byte-identical on disk to an abandoned one, so "orphaned" is the log
-//! plus the fact that nobody is running. Every other reader treats an open
-//! call as unknown-outcome and appends nothing; that is why the repair is an
-//! appended event rather than something each reader synthesizes.
-//!
-//! [`close`] is the repair: one `ToolResultRecorded { outcome: UNKNOWN }` per
-//! orphan, carrying [`CLOSER_CONTENT`], appended to the log and applied to
-//! the projection in lockstep the same way `Engine::record` keeps them. The
-//! next replay is then clean, and every call in a rebuilt transcript has an
-//! answer. The closer lands at the log tail, possibly long after its call —
-//! correlation is by `call_id`, never adjacency. arcd does not re-drive the
-//! model afterward; the turn resumes on the next user message.
-
 use std::collections::HashMap;
 
 use arc_proto::v1::{Event, SessionEvent, Source, ToolOutcome, ToolResultRecorded};
@@ -29,10 +7,8 @@ use crate::log::{self, Log, LogReader};
 use crate::projection::{self, Projection};
 use crate::session::now_ts;
 
-/// What a closer says. Fixed so tests can pin it and readers can trust it.
 pub const CLOSER_CONTENT: &str = "The daemon restarted before this call's result was recorded; the call may or may not have run.";
 
-/// A durable call with no durable result: everything a closer needs to name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanCall {
     pub session_id: String,
@@ -40,33 +16,15 @@ pub struct OrphanCall {
     pub call_id: String,
 }
 
-/// Everything the orphan pass can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Reading the log during the scan, or appending a closer, failed.
-    /// Durable state is not in a known condition; a daemon must not start.
     #[error("orphan pass log: {0}")]
     Log(#[from] log::Error),
 
-    /// The index refused a closer the log accepted — log and projection are
-    /// out of step, which is a bug, not a runtime condition.
     #[error("orphan pass projection: {0}")]
     Projection(#[from] projection::Error),
 }
 
-/// Replays `reader` and returns the calls still open at the end of the log,
-/// in log order.
-///
-/// A call is open from its `ToolCallIssued` until a `ToolResultRecorded`
-/// names its `call_id`. Tracking is by `(session_id, call_id)` — `call_id`
-/// is unique per session, not globally — and by id only, never adjacency:
-/// events from other turns and sessions between a call and its result change
-/// nothing.
-///
-/// # Errors
-///
-/// [`log::Error`] if the log cannot be read to its end. A partial scan says
-/// nothing about what is open, so nothing is returned.
 pub fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
     let mut slots: Vec<Option<OrphanCall>> = Vec::new();
     let mut open: HashMap<(String, String), usize> = HashMap::new();
@@ -95,20 +53,6 @@ pub fn scan(reader: LogReader) -> Result<Vec<OrphanCall>, log::Error> {
     Ok(slots.into_iter().flatten().collect())
 }
 
-/// Appends one UNKNOWN closer per orphan and applies each to the projection,
-/// keeping log and index in lockstep (log stamps seq, then the projection
-/// applies).
-///
-/// The closer copies the call's `session_id`, `turn_id`, and `call_id`, says
-/// [`CLOSER_CONTENT`], and carries `Event.source = SYSTEM`: arcd concluded
-/// this, not the tool.
-///
-/// # Errors
-///
-/// [`Error::Log`] if an append fails, [`Error::Projection`] if the index
-/// refuses what the log accepted. Closers appended before the failure are
-/// durable and stay; the pass is idempotent, so running it again closes only
-/// what remains.
 pub fn close(
     orphans: &[OrphanCall],
     log: &mut Log,
@@ -116,7 +60,7 @@ pub fn close(
 ) -> Result<(), Error> {
     for orphan in orphans {
         let mut event = Event {
-            seq: 0, // added by the log
+            seq: 0,
             ts: Some(now_ts()),
             source: Source::System as i32,
             payload: Some(event::Payload::Session(SessionEvent {
@@ -139,12 +83,6 @@ pub fn close(
     Ok(())
 }
 
-/// The whole startup pass: [`scan`], then [`close`], returning what was
-/// closed. Zero orphans is the common case and costs one span, not silence.
-///
-/// # Errors
-///
-/// See [`scan`] and [`close`].
 #[tracing::instrument(
     level = "info",
     name = "orphan.close_pass",
@@ -235,7 +173,6 @@ mod tests {
         }
     }
 
-    /// A log holding `events`, appended in order.
     fn log_with(dir: &TempDir, events: Vec<Event>) -> Log {
         let mut log = Log::open(dir.path()).expect("open log");
         for event in events {
@@ -244,7 +181,6 @@ mod tests {
         log
     }
 
-    /// A projection caught up with `log`, the way the daemon starts.
     fn replayed(log: &Log) -> Projection {
         let mut projection = Projection::open(":memory:").expect("open projection");
         projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
@@ -297,7 +233,6 @@ mod tests {
         assert_eq!(result.content, CLOSER_CONTENT);
         assert!(!result.truncated);
 
-        // The projection kept pace: the closer went through apply, not replay.
         assert_eq!(
             projection.last_seq().expect("last_seq"),
             Some(last.seq),
@@ -314,7 +249,6 @@ mod tests {
         let closed = close_orphans(reader, &mut log, &mut projection).expect("close pass");
         assert_eq!(closed.len(), 1);
 
-        // The next startup: reopen the log, scan again.
         drop(log);
         let mut log = Log::open(dir.path()).expect("reopen log");
         let mut projection = replayed(&log);

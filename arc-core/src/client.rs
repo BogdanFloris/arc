@@ -1,14 +1,3 @@
-//! The client side of `wire.proto` (DESIGN.md §7).
-//!
-//! One request in flight at a time: the daemon answers in order, and a
-//! [`Turn`] borrows the client mutably, so correlation is a check, not a
-//! demultiplexer — every answer frame must echo the id of the one request
-//! outstanding. Anything else is a protocol violation and the connection
-//! is not worth trusting past it.
-//!
-//! Clients hold no durable state (DESIGN.md §7): everything here is a view
-//! over the wire, safe to drop and reconnect.
-
 use arc_proto::v1::{
     ClientFrame, FetchHistory, ListSessions, MemoryReviewAccept, MemoryReviewDelete,
     MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame, SessionHistory, SessionInfo,
@@ -21,102 +10,53 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite};
 use tracing::warn;
 
-/// A client-side failure.
-///
-/// [`Error::Server`] is the daemon saying no to one request — the connection
-/// survives it. Every other variant means the connection is over or cannot be
-/// trusted; drop the client and reconnect.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Connecting to the daemon failed.
     #[error("connecting to the daemon failed: {0}")]
     Connect(#[source] tungstenite::Error),
-    /// The connection failed mid-use.
     #[error("the connection failed: {0}")]
     Transport(#[source] tungstenite::Error),
-    /// The daemon closed the connection.
     #[error("the daemon closed the connection")]
     Closed,
-    /// The daemon answered a request with an error frame.
     #[error("the daemon refused the request ({code}): {msg}")]
-    Server {
-        /// The stable `snake_case` code — the part to match on.
-        code: String,
-        /// The human-readable explanation beside it.
-        msg: String,
-    },
-    /// The daemon sent something the protocol has no place for.
+    Server { code: String, msg: String },
     #[error("protocol violation: {0}")]
     Protocol(String),
 }
 
-/// One event of a completion turn, in the order the wire defines: one
-/// `Accepted`; any number of `Delta`, `Reasoning`, and tool-activity events;
-/// then exactly one `End` or `Failed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
-    /// The daemon accepted the message and named the session.
     Accepted {
-        /// The session's id — for a new session, the first time anyone knows it.
         session_id: String,
     },
-    /// A piece of the model's reply.
     Delta(String),
-    /// A piece of the model's thinking. Never durable: what is not rendered
-    /// live is gone.
     Reasoning(String),
-    /// A tool call is durable and about to run.
     ToolCallStarted {
-        /// Pairs this with its `ToolCallEnded` — a step can run calls in
-        /// parallel, so adjacency pairs nothing.
         call_id: String,
-        /// The call's order within its step, dense from 0.
         index: u32,
-        /// The tool's name; the `Ended` half does not repeat it.
         name: String,
     },
-    /// The call finished.
     ToolCallEnded {
-        /// The id its `ToolCallStarted` carried.
         call_id: String,
-        /// The wire's `ToolOutcome`, raw: match the known values and treat
-        /// the rest as unknown (DESIGN.md §3.1), the renderer's call to make.
         outcome: i32,
     },
-    /// The turn finished; the reply is durable.
     End {
-        /// Prompt tokens billed; 0 if the provider reported no usage.
         input_tokens: u32,
-        /// Reply tokens billed; 0 if the provider reported no usage.
         output_tokens: u32,
-        /// The reply was cut before the model finished; the deltas are what
-        /// got logged.
         partial: bool,
     },
-    /// The turn failed. The connection survives; send the next request.
     Failed {
-        /// The stable `snake_case` code — the part to match on.
         code: String,
-        /// The human-readable explanation beside it.
         msg: String,
     },
 }
 
-/// A connection to the daemon, speaking `wire.proto`.
 pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    /// The id of the last request sent; incremented before each send, so the
-    /// first request is 1 and 0 (the unsolicited marker) is never used.
     request_id: u64,
 }
 
 impl Client {
-    /// Connects to a daemon at `url` (e.g. `ws://127.0.0.1:8787`).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Connect`] if the daemon cannot be reached or the handshake
-    /// fails.
     #[tracing::instrument(name = "client.connect", skip_all, fields(url))]
     pub async fn connect(url: &str) -> Result<Self, Error> {
         let (ws, _) = tokio_tungstenite::connect_async(url)
@@ -125,12 +65,6 @@ impl Client {
         Ok(Self { ws, request_id: 0 })
     }
 
-    /// Asks the daemon for its sessions, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Server`] if the daemon refused the request; any other variant
-    /// means the connection is unusable.
     #[tracing::instrument(name = "client.list_sessions", skip_all)]
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>, Error> {
         let id = self
@@ -146,18 +80,6 @@ impl Client {
         }
     }
 
-    /// Asks the daemon for one session's history, oldest first — both wire
-    /// shapes, so a caller can render `entries` and fall back to the
-    /// prose-only `messages` of an old daemon.
-    ///
-    /// The whole history, unpaginated — see `FetchHistory` in `wire.proto`.
-    /// An unknown session id is not an error: it answers with no rows, the
-    /// same as a session nobody has spoken in.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Server`] if the daemon refused the request; any other variant
-    /// means the connection is unusable.
     #[tracing::instrument(name = "client.fetch_history", skip_all, fields(session_id))]
     pub async fn fetch_history(&mut self, session_id: &str) -> Result<SessionHistory, Error> {
         let id = self
@@ -175,13 +97,6 @@ impl Client {
         }
     }
 
-    /// Asks the daemon for the review queue (DESIGN.md §5.4): records changed
-    /// at or after `since_micros` and not reviewed since their last change.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Server`] if the daemon refused the request; any other variant
-    /// means the connection is unusable.
     #[tracing::instrument(name = "client.review_items", skip_all, fields(since_micros))]
     pub async fn review_items(
         &mut self,
@@ -202,13 +117,6 @@ impl Client {
         }
     }
 
-    /// Records the accept verdict for `record_id` — durable as a
-    /// `MemoryRecordReviewed` event on the daemon's log.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Server`] if the daemon refused the verdict (an unknown record
-    /// id included); any other variant means the connection is unusable.
     #[tracing::instrument(name = "client.review_accept", skip_all, fields(record_id))]
     pub async fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
         let id = self
@@ -219,13 +127,6 @@ impl Client {
         self.verdict_ack(id).await
     }
 
-    /// Records the delete verdict for `record_id` — durable as a
-    /// `MemoryRecordDeleted` event on the daemon's log.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Server`] if the daemon refused the verdict (an unknown record
-    /// id included); any other variant means the connection is unusable.
     #[tracing::instrument(name = "client.review_delete", skip_all, fields(record_id))]
     pub async fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
         let id = self
@@ -236,7 +137,6 @@ impl Client {
         self.verdict_ack(id).await
     }
 
-    /// Reads a verdict's closing frame: the protocol's ack, or its error.
     async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
         match self.answer(id).await? {
             server_frame::Msg::MessageAccepted(_) => Ok(()),
@@ -248,16 +148,6 @@ impl Client {
         }
     }
 
-    /// Sends a user message and returns the turn to read its events from.
-    ///
-    /// `session_id: None` starts a new session; the daemon names it in the
-    /// turn's [`TurnEvent::Accepted`]. The turn borrows the client — read it
-    /// to its end before the next request.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Transport`] if the message could not be written; a refused
-    /// request surfaces later, as the turn's [`TurnEvent::Failed`].
     #[tracing::instrument(name = "client.send_message", skip_all)]
     pub async fn send_message(
         &mut self,
@@ -277,7 +167,6 @@ impl Client {
         })
     }
 
-    /// Sends one request frame and returns the id to correlate its answers on.
     async fn send(&mut self, msg: client_frame::Msg) -> Result<u64, Error> {
         self.request_id += 1;
         let frame = ClientFrame {
@@ -291,11 +180,6 @@ impl Client {
         Ok(self.request_id)
     }
 
-    /// The next answer frame for request `id`.
-    ///
-    /// A frame with any other id — including 0, the daemon's "no id could be
-    /// recovered" — has no legitimate cause while `id` is the one request in
-    /// flight, so it is a protocol error, not something to wait past.
     async fn answer(&mut self, id: u64) -> Result<server_frame::Msg, Error> {
         let frame = self.next_frame().await?;
         if frame.request_id != id {
@@ -309,7 +193,6 @@ impl Client {
             .ok_or_else(|| Error::Protocol("a server frame with no message".to_owned()))
     }
 
-    /// The next decoded server frame, skipping the transport's own chatter.
     async fn next_frame(&mut self) -> Result<ServerFrame, Error> {
         loop {
             match self.ws.next().await {
@@ -318,13 +201,11 @@ impl Client {
                         Error::Protocol(format!("undecodable server frame: {error}"))
                     });
                 }
-                // Text is not this protocol — the server never sends it.
                 Some(Ok(WsMessage::Text(_))) => {
                     return Err(Error::Protocol(
                         "text message on a binary protocol".to_owned(),
                     ));
                 }
-                // Pings and pongs are tungstenite's business, not ours.
                 Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
                 Some(Ok(WsMessage::Close(_))) | None => return Err(Error::Closed),
                 Some(Err(error)) => {
@@ -336,10 +217,6 @@ impl Client {
     }
 }
 
-/// One completion turn being read off the wire.
-///
-/// Yields events until the closing frame ([`TurnEvent::End`] or
-/// [`TurnEvent::Failed`]), then `None`.
 pub struct Turn<'c> {
     client: &'c mut Client,
     request_id: u64,
@@ -347,12 +224,6 @@ pub struct Turn<'c> {
 }
 
 impl Turn<'_> {
-    /// The next event of the turn, or `None` once it has closed.
-    ///
-    /// # Errors
-    ///
-    /// Any error means the connection is unusable mid-turn; what was already
-    /// streamed is all the client will see of the reply.
     pub async fn next(&mut self) -> Result<Option<TurnEvent>, Error> {
         if self.done {
             return Ok(None);
@@ -397,7 +268,6 @@ impl Turn<'_> {
     }
 }
 
-/// A protocol error for a frame that answered the wrong question.
 fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
     let got = match got {
         server_frame::Msg::SessionList(_) => "SessionList",
@@ -428,11 +298,8 @@ mod tests {
 
     use super::*;
 
-    /// Longest any assertion waits. Generous enough never to fire on a loaded
-    /// machine, short enough that a hang fails instead of hanging.
     const PATIENCE: Duration = Duration::from_secs(5);
 
-    /// One scripted answer: `request_id: None` echoes the client's.
     struct Answer {
         request_id: Option<u64>,
         msg: server_frame::Msg,
@@ -481,9 +348,6 @@ mod tests {
         })
     }
 
-    /// A server that answers each client frame with the next script entry,
-    /// then closes. Returns the URL to connect to and the handle that yields
-    /// every frame the client sent.
     async fn server(script: Vec<Vec<Answer>>) -> (String, JoinHandle<Vec<ClientFrame>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("ws://{}", listener.local_addr().expect("local addr"));
@@ -588,8 +452,6 @@ mod tests {
         }
     }
 
-    /// A verdict's closing frame is the protocol's ack, or the error the
-    /// connection survives.
     #[tokio::test]
     async fn a_review_verdict_acks_and_a_refusal_is_a_server_error() {
         let ack = || accepted("");
@@ -662,7 +524,6 @@ mod tests {
         );
         assert_eq!(turn.next().await.expect("closed"), None, "the turn is over");
 
-        // An empty session id on the wire is how "start a session" is said.
         let frames = received(handle).await;
         match &frames[0].msg {
             Some(client_frame::Msg::SendMessage(send)) => {
@@ -784,8 +645,6 @@ mod tests {
             turn.next().await,
             Ok(Some(TurnEvent::Accepted { .. }))
         ));
-        // The script is exhausted: the server closes instead of finishing the
-        // turn.
         assert!(matches!(turn.next().await, Err(Error::Closed)));
     }
 

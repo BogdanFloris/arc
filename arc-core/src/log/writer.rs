@@ -1,5 +1,3 @@
-//! Append-only writer for a single log segment file.
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,22 +7,6 @@ use prost::Message;
 
 use super::{Error, format};
 
-/// Appends framed events to one segment file.
-///
-/// The writer owns the sequence numbering: [`append`](SegmentWriter::append)
-/// stamps `seq` from an internal counter and ignores whatever the caller left in
-/// the event, so a wrong `seq` cannot reach the log. The counter starts at the
-/// `next_seq` given to [`open`](SegmentWriter::open); recovering that value from
-/// an existing segment needs the reader, so it is a constructor parameter for
-/// now.
-///
-/// Each append is one `write_all` of one contiguous record followed by an
-/// `fsync`. Durability beats throughput here; batching is a later optimisation
-/// and needs trace data to justify it.
-///
-/// The file is opened in append mode, so every write lands at the end of the
-/// file regardless of any other handle. This type never seeks, truncates, or
-/// rewrites.
 #[derive(Debug)]
 pub struct SegmentWriter {
     path: PathBuf,
@@ -33,22 +15,6 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    /// Opens the segment at `path`, creating it if absent, and positions writes
-    /// at the end of whatever is already there.
-    ///
-    /// `next_seq` is the sequence number the next appended event gets. Nothing
-    /// here validates it against the file's existing contents — that needs the
-    /// reader, and startup composition lands with it. Passing a value that does
-    /// not follow the last record in the file produces a log with a gap or a
-    /// duplicate.
-    ///
-    /// `path` is a parameter rather than a derived name because segment naming
-    /// and rollover are the caller's business.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Io`] if the file cannot be opened or created, or if the parent
-    /// directory entry cannot be flushed to disk.
     pub fn open(path: impl Into<PathBuf>, next_seq: u64) -> Result<Self, Error> {
         let path = path.into();
         let file = OpenOptions::new()
@@ -57,9 +23,6 @@ impl SegmentWriter {
             .open(&path)
             .map_err(|source| Error::io(&path, source))?;
 
-        // Creating the file only dirties the parent directory; without this
-        // fsync a crash can lose the directory entry and with it every record
-        // we then wrote into the file.
         sync_parent_dir(&path)?;
 
         Ok(Self {
@@ -69,22 +32,6 @@ impl SegmentWriter {
         })
     }
 
-    /// Stamps `event.seq` from the internal counter, appends it as one framed
-    /// record, fsyncs, and returns the sequence number it was written under.
-    ///
-    /// Any `seq` already set on `event` is overwritten. `ts` is the caller's to
-    /// fill; the log does not read the clock.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::MissingPayload`] if `event.payload` is `None`. Nothing is
-    ///   written and no sequence number is consumed.
-    /// - [`Error::RecordTooLarge`] if the encoded event overflows the length
-    ///   prefix. Nothing is written and no sequence number is consumed.
-    /// - [`Error::Io`] if the write or the fsync fails. A record whose write
-    ///   succeeded has consumed its sequence number even if the fsync then
-    ///   failed, so the counter still advances; treat the writer as failed and
-    ///   rebuild it from the file rather than retrying the append.
     #[tracing::instrument(
         level = "debug",
         name = "log.append",
@@ -111,8 +58,6 @@ impl SegmentWriter {
         self.file
             .write_all(&record)
             .map_err(|source| Error::io(&self.path, source))?;
-        // The bytes are in the file from here on, so the sequence number is
-        // spent whether or not the fsync below reports success.
         self.next_seq += 1;
         self.file
             .sync_all()
@@ -121,21 +66,17 @@ impl SegmentWriter {
         Ok(seq)
     }
 
-    /// Sequence number the next append will stamp.
     #[must_use]
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
 
-    /// Segment file being written.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
-/// Flushes the directory entry for `path` so a freshly created segment survives
-/// a crash.
 fn sync_parent_dir(path: &Path) -> Result<(), Error> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -162,7 +103,6 @@ mod tests {
         dir.path().join("000001.log")
     }
 
-    /// An event with `seq` deliberately wrong, to prove the writer stamps it.
     fn event(content: &str) -> Event {
         Event {
             seq: 999,
@@ -180,8 +120,6 @@ mod tests {
         }
     }
 
-    /// Parses a segment by hand, straight off the framing spec — no reader
-    /// exists yet, and the point is to check the bytes independently.
     fn parse_records(path: &Path) -> Vec<(u32, u32, Vec<u8>)> {
         let bytes = fs::read(path).expect("read segment");
         let mut records = Vec::new();
@@ -226,8 +164,6 @@ mod tests {
             assert_eq!(decoded, expected);
         }
 
-        // The framing accounts for every byte in the file: nothing padded,
-        // nothing left over.
         let framed: usize = records
             .iter()
             .map(|(_, _, payload)| format::HEADER_SIZE + payload.len())
@@ -276,7 +212,6 @@ mod tests {
 
         assert!(matches!(err, Error::MissingPayload));
         assert_eq!(fs::read(&path).expect("read segment"), before);
-        // The rejected event burned no sequence number.
         assert_eq!(writer.next_seq(), 2);
         assert_eq!(writer.append(event("second")).expect("append"), 2);
     }
@@ -289,8 +224,6 @@ mod tests {
         writer.append(event("first")).expect("append");
         let before = fs::read(&path).expect("read segment");
 
-        // One byte of content over the cap is enough: the encoded event is
-        // larger than its content.
         let huge = event(&"x".repeat(format::MAX_RECORD_LEN as usize + 1));
         let err = writer
             .append(huge)
@@ -298,7 +231,6 @@ mod tests {
 
         assert!(matches!(err, Error::RecordTooLarge { .. }), "got: {err:?}");
         assert_eq!(fs::read(&path).expect("read segment"), before);
-        // The rejected event burned no sequence number.
         assert_eq!(writer.next_seq(), 2);
         assert_eq!(writer.append(event("second")).expect("append"), 2);
     }

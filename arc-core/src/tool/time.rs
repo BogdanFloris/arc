@@ -1,6 +1,3 @@
-//! The toy tool from the 1.1 spike, kept as the seam's proof and the manual
-//! smoke test until the memory tools land (5.2/6.3).
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -9,8 +6,6 @@ use chrono::Local;
 use super::{Tool, ToolReply, TurnContext};
 use crate::provider::ToolDefinition;
 
-/// Answers with the current local date and time. Takes no arguments and
-/// ignores whatever it is handed — there is nothing to get wrong.
 pub struct GetTime;
 
 impl Tool for GetTime {
@@ -49,7 +44,6 @@ mod tests {
             .await;
         assert!(outcome.ok);
         assert!(!outcome.truncated);
-        // The year is the one stable substring; everything else moves.
         let year = Local::now().format("%Y").to_string();
         assert!(outcome.content.starts_with(&year), "{}", outcome.content);
     }

@@ -8,57 +8,37 @@ import "events.proto";
 message SendMessage {
   string session_id = 1;
   string content = 2;
-  // 3, 4 reserved for provider/model override
 }
 
 message SessionInfo {
   string id = 1;
   string title = 2;
   google.protobuf.Timestamp started_at = 3;
-  // The session's first user message, verbatim and untruncated — a stand-in
-  // label so a picker has something to show. Distinct from `title`, which
-  // stays empty until Phase 2 generates one. Empty if the session has no
-  // user message yet.
   string preview = 4;
-  // When the session was last spoken in, either side. Unset for a session
-  // with no messages, where `started_at` is the only time there is. This is
-  // what a picker orders by: what you were last doing, not what you started
-  // first.
   google.protobuf.Timestamp last_at = 5;
 }
 
 message ListSessions {}
 
-// Ask for a session's messages. Phase 1 answers with the whole history:
-// unpaginated, like ListSessions. Paging is a wire question (DESIGN.md §7)
-// and gets answered when a real session makes it one.
 message FetchHistory {
   string session_id = 1;
-  reserved 2; // a paging cursor, when it is needed
+  reserved 2;
 }
 
-// Ask for the review queue (DESIGN.md §5.4): records changed at or after
-// `since_micros` (microseconds since the Unix epoch) and not reviewed since
-// their last change. Answered with MemoryReviewItems or Error.
 message MemoryReviewList {
   int64 since_micros = 1;
 }
 
-// The accept verdict for one record. Answered with the protocol's existing
-// ack, MessageAccepted (its session_id empty — the request already names the
-// record), or Error.
 message MemoryReviewAccept {
   string record_id = 1;
 }
 
-// The delete verdict for one record — the one destructive verdict. Answered
-// like MemoryReviewAccept.
 message MemoryReviewDelete {
   string record_id = 1;
 }
 
 message ClientFrame {
-  uint64 request_id = 1; // client-chosen, echoed back
+  uint64 request_id = 1;
   oneof msg {
     SendMessage send_message = 11;
     ListSessions list_sessions = 12;
@@ -78,38 +58,30 @@ message Delta {
   string text = 2;
 }
 
-// The model's thinking, delta by delta, the way Delta carries its text. Never
-// durable (DESIGN.md §3.1): a client that missed it live cannot fetch it back.
 message ReasoningDelta {
   string session_id = 1;
   string text = 2;
 }
 
-// A named tool call started. `call_id` is the log's id for the call and is what
-// pairs this with its ToolCallEnded — a step can run calls in parallel, so
-// adjacency pairs nothing. `index` is the order within the step, dense from 0.
 message ToolCallStarted {
   string session_id = 1;
   string call_id = 2;
   uint32 index = 3;
   string name = 4;
-  reserved 5; // the call's arguments, if a client ever renders them
+  reserved 5;
 }
 
-// The call `call_id` finished. No tool name: ToolCallStarted carried it, and a
-// second copy is a second thing that can be wrong.
 message ToolCallEnded {
   string session_id = 1;
   string call_id = 2;
   ToolOutcome outcome = 3;
-  reserved 4; // a preview of the result, if a client ever renders one
+  reserved 4;
 }
 
 message StreamEnd {
   string session_id = 1;
   uint32 input_tokens = 2;
   uint32 output_tokens = 3;
-  // Reply was cut before the model finished; the deltas are what the user saw.
   bool partial = 4;
 }
 
@@ -122,31 +94,23 @@ message SessionList {
   repeated SessionInfo sessions = 1;
 }
 
-// One past message, as the projection has it.
 message HistoryMessage {
   Role role = 1;
   string content = 2;
-  // Reply was cut before the model finished; content is what the user saw.
   bool partial = 3;
 }
 
-// A tool call in a past turn. Name and id only: display needs no arguments,
-// and they stay off the wire until something renders them (additive later).
 message HistoryToolCall {
   string call_id = 1;
   string name = 2;
 }
 
-// The result closing `call_id`. Outcome only, no content — same rule.
 message HistoryToolResult {
   string call_id = 1;
   ToolOutcome outcome = 2;
-  // The registry cut the result before recording it.
   bool truncated = 3;
 }
 
-// One transcript row of a reopened session, in the session's seq order —
-// what rebuilds the display a live turn left behind (DESIGN.md §3.1).
 message HistoryEntry {
   oneof entry {
     HistoryMessage message = 1;
@@ -157,38 +121,22 @@ message HistoryEntry {
 
 message SessionHistory {
   string session_id = 1;
-  // Prose only. Superseded by `entries`; still filled so a client that
-  // predates entries keeps rendering.
   repeated HistoryMessage messages = 2;
-  // Every row kind, in seq order. Empty means an old daemon; clients fall
-  // back to `messages`.
   repeated HistoryEntry entries = 3;
 }
 
-// One record awaiting a verdict, whole — a review pane renders from this
-// alone, and `fix` needs the id and title to prefill from.
 message MemoryReviewItem {
   MemoryRecord record = 1;
-  // When the record last changed (created/updated/superseded), microseconds
-  // since the Unix epoch.
   int64 changed_at_micros = 2;
-  // Id of the replacement when the record is superseded; empty otherwise.
   string superseded_by = 3;
 }
 
-// The review queue, in (changed_at, id) order.
 message MemoryReviewItems {
   repeated MemoryReviewItem items = 1;
 }
 
-// A turn is MessageAccepted, then any number of Delta, ReasoningDelta,
-// ToolCallStarted and ToolCallEnded frames in the order the turn produced them,
-// then one StreamEnd or one Error. A client that renders none of the middle
-// frames still sees a whole turn: skipping arms it does not render is what
-// keeps this protocol additive. (An arm a binary predates decodes as an empty
-// msg — the wire shares §3 rule 3's ships-together boundary.)
 message ServerFrame {
-  uint64 request_id = 1; // 0 = unsolicited
+  uint64 request_id = 1;
   oneof msg {
     SessionList session_list = 10;
     MessageAccepted message_accepted = 11;

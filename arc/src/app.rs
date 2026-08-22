@@ -1,136 +1,104 @@
-//! The TUI's state and how keys and daemon events change it.
-//!
-//! Everything here is synchronous and side-effect-free: handlers mutate the
-//! state and return the [`Command`] to hand the connection task, if any. That
-//! split is what makes the transitions testable without a terminal or a
-//! daemon.
-//!
-//! Keys are modal, vim-style: insert mode types into the input line, normal
-//! mode moves and edits it (`h l 0 $ w b`, `i I a A`, `x D dd`) and scrolls
-//! the transcript (`j k`, `ctrl-d/u`, `G`, `gg`), `:` takes commands (`:q`,
-//! `:review`).
-//! `ctrl-o` toggles the last thought trace from either mode. The app starts
-//! in insert — a chat's first act is typing.
-
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use arc_proto::v1::{HistoryEntry, HistoryMessage, Role, SessionInfo, ToolOutcome, history_entry};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Lines a half-page scroll moves: `ctrl-d`, `ctrl-u`, and the page keys.
 pub const PAGE: usize = 10;
 
-/// How far back the review window reaches: 7 days, §5.4's weekly cadence.
 const REVIEW_WINDOW_MICROS: i64 = 7 * 24 * 3_600 * 1_000_000;
 
-/// What the connection task is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Ask the daemon for its sessions.
     List,
-    /// Ask the daemon for one session's past messages.
-    History { session_id: String },
-    /// Send one user message; `None` starts a new session.
+    History {
+        session_id: String,
+    },
     Send {
         session_id: Option<String>,
         content: String,
     },
-    /// Ask the daemon for the review queue since `since_micros`.
-    ReviewList { since_micros: i64 },
-    /// Record the accept verdict for one record.
-    ReviewAccept { record_id: String },
-    /// Record the delete verdict for one record.
-    ReviewDelete { record_id: String },
+    ReviewList {
+        since_micros: i64,
+    },
+    ReviewAccept {
+        record_id: String,
+    },
+    ReviewDelete {
+        record_id: String,
+    },
 }
 
-/// What the connection task reports back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetEvent {
-    /// The daemon answered `ListSessions`.
     Sessions(Vec<SessionInfo>),
-    /// The daemon answered `FetchHistory` for `session_id`. `entries` is the
-    /// whole transcript, tool rows included; `messages` is the prose-only
-    /// fallback an old daemon fills instead.
     History {
         session_id: String,
         messages: Vec<HistoryMessage>,
         entries: Vec<HistoryEntry>,
     },
-    /// The daemon accepted the message and named the session.
-    Accepted { session_id: String },
-    /// A piece of the model's reply.
+    Accepted {
+        session_id: String,
+    },
     Delta(String),
-    /// A piece of the model's thinking.
     Reasoning(String),
-    /// A tool call is running.
-    ToolStarted { call_id: String, name: String },
-    /// The call finished; `outcome` is the wire's `ToolOutcome`, raw.
-    ToolEnded { call_id: String, outcome: i32 },
-    /// The turn finished.
-    End { partial: bool },
-    /// The turn (or a list request) failed; the connection survives.
-    Failed { code: String, msg: String },
-    /// The connection is gone; the next command will try to reconnect.
-    Disconnected { reason: String },
-    /// The daemon answered `ReviewList`.
+    ToolStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolEnded {
+        call_id: String,
+        outcome: i32,
+    },
+    End {
+        partial: bool,
+    },
+    Failed {
+        code: String,
+        msg: String,
+    },
+    Disconnected {
+        reason: String,
+    },
     ReviewItems(Vec<ReviewEntry>),
 }
 
-/// One record awaiting a verdict, as the review pane shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewEntry {
-    /// Record id — what the verdict commands and the fix prefill carry.
     pub id: String,
-    /// Raw `MemoryRecord.Kind` integer; the renderer names it.
     pub kind: i32,
     pub namespace: String,
     pub title: String,
     pub summary: String,
-    /// The record was superseded; the pane tags it.
     pub superseded: bool,
 }
 
-/// The review pane's state, open on `:review`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
-    /// The queue, in the daemon's `(changed_at, id)` order.
     pub items: Vec<ReviewEntry>,
-    /// Selected row.
     pub selected: usize,
-    /// The daemon has answered; before that the pane says "loading".
     pub loaded: bool,
-    /// `d` pressed once — the next `d` deletes, anything else cancels.
     pub pending_delete: bool,
 }
 
-/// One block of the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    /// The user's words, shown the moment they are sent or queued.
     You(String),
-    /// A model reply, streamed into place.
-    Arc { text: String, partial: bool },
-    /// A fault, inline where it happened: error code + explanation.
-    Fault { code: String, msg: String },
-    /// A dim aside from the client itself (e.g. "history not shown").
+    Arc {
+        text: String,
+        partial: bool,
+    },
+    Fault {
+        code: String,
+        msg: String,
+    },
     Note(String),
-    /// The model's thinking, folded to a one-line trace; `ctrl-o` opens it.
-    ///
-    /// Streams into `text` while live (`done: false`), then freezes once the
-    /// reply, a tool call, or the turn's end arrives. The words live only in
-    /// this running app's transcript state — reasoning is never durable
-    /// (DESIGN.md §3.1), so a reopened session shows no thought blocks at
-    /// all. Client memory here is not storage.
     Thought {
         text: String,
         seconds: u64,
         done: bool,
         open: bool,
     },
-    /// A tool call where it happened: running until its `ToolEnded` names an
-    /// outcome. A reopened session rebuilds these from its history entries,
-    /// closing a call whose result never arrived as unknown.
     Tool {
         call_id: String,
         name: String,
@@ -138,7 +106,6 @@ pub enum Block {
     },
 }
 
-/// What the status rule says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Idle,
@@ -146,44 +113,28 @@ pub enum Status {
     Disconnected,
 }
 
-/// The vim mode the input line is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Insert,
-    /// A `:` command is being typed.
     Cmd,
 }
 
-/// The whole TUI state.
 pub struct App {
     pub transcript: Vec<Block>,
     pub input: String,
-    /// Byte offset of the cursor in `input`, always on a char boundary.
     pub cursor: usize,
     pub mode: Mode,
-    /// The `:` line being typed, without the colon.
     pub cmd: String,
-    /// A pending operator/prefix key in normal mode (`d` of `dd`, `g` of `gg`).
     pending: Option<char>,
-    /// The session new messages go to; `None` means the next send starts one.
     pub session_id: Option<String>,
-    /// The daemon's sessions, oldest first, as `ListSessions` returns them.
     pub sessions: Vec<SessionInfo>,
-    /// Selected picker row when the picker is open. Row 0 is "new session";
-    /// row `i + 1` is `sessions` newest-first.
     pub picker: Option<usize>,
-    /// The review pane, when `:review` opened it.
     pub review: Option<Review>,
     pub status: Status,
-    /// The last error code, shown on the rule until the next send.
     pub last_error: Option<String>,
-    /// Messages typed while a turn was streaming, sent in order after it.
     pub queued: VecDeque<String>,
-    /// When the live thought block started, for its folded line's clock.
     thinking_since: Option<Instant>,
-    /// How many wrapped lines the view is scrolled up from the bottom. May
-    /// overshoot; drawing clamps it to the transcript's real height.
     pub scroll_back: usize,
     pub quit: bool,
 }
@@ -210,17 +161,6 @@ impl App {
         }
     }
 
-    /// Scrolls the transcript by `lines`, or moves the open modal's selection.
-    ///
-    /// Every scroll gesture lands here — `ctrl-d/u` and the page keys. When
-    /// the review pane or the picker is open it takes the gesture instead:
-    /// scrolling the transcript behind a modal reads as the wrong thing
-    /// moving.
-    ///
-    /// There is deliberately no mouse wheel. Reporting it means asking the
-    /// terminal for mouse motion, and a terminal that reports motion stops
-    /// doing its own text selection — which broke selecting text out of the
-    /// pane far worse than the wheel was worth.
     pub fn on_scroll(&mut self, up: bool, lines: usize) {
         if let Some(review) = self.review.as_mut() {
             review.pending_delete = false;
@@ -247,10 +187,7 @@ impl App {
         };
     }
 
-    /// Handles one key press.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
-        // Page keys are not text, so they scroll from any mode — including
-        // mid-sentence in insert.
         match key.code {
             KeyCode::PageUp => {
                 self.on_scroll(true, PAGE);
@@ -278,11 +215,9 @@ impl App {
         }
     }
 
-    /// Control chords, any mode.
     fn on_control(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Char('c') => self.quit = true,
-            // Half-page scrolls; drawing clamps the overshoot.
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
             KeyCode::Char('o') => self.toggle_thought(),
@@ -295,12 +230,10 @@ impl App {
         None
     }
 
-    /// Insert mode: type, or leave.
     fn on_insert(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
-                // Vim lands on the char just typed, not after it.
                 self.cursor_left();
                 self.clamp_normal();
             }
@@ -329,7 +262,6 @@ impl App {
         None
     }
 
-    /// Normal mode: motions, edits, scrolls.
     fn on_normal(&mut self, code: KeyCode) -> Option<Command> {
         if let Some(pending) = self.pending.take() {
             match (pending, code) {
@@ -386,14 +318,12 @@ impl App {
         None
     }
 
-    /// The `:` line.
     fn on_cmd(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char(c) => self.cmd.push(c),
             KeyCode::Backspace => {
                 if self.cmd.pop().is_none() {
-                    // Backspace past the colon leaves the line, like vim.
                     self.mode = Mode::Normal;
                 }
             }
@@ -402,7 +332,6 @@ impl App {
                 match self.cmd.as_str() {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
-                    // Vim's "not an editor command", verbatim.
                     _ => self.last_error = Some("E492".to_owned()),
                 }
             }
@@ -411,8 +340,6 @@ impl App {
         None
     }
 
-    /// `:review`: opens the pane and asks the daemon for the last 7 days'
-    /// queue (DESIGN.md §5.4).
     fn open_review(&mut self) -> Command {
         self.review = Some(Review {
             items: Vec::new(),
@@ -425,9 +352,6 @@ impl App {
         }
     }
 
-    /// Keys while the review pane is open. Verdicts leave the pane's state
-    /// immediately — the daemon's answer only matters if it says no, which
-    /// lands as a `Failed` on the rule.
     fn on_review_key(&mut self, code: KeyCode) -> Option<Command> {
         let review = self.review.as_mut().expect("review is open");
         let last = review.items.len().saturating_sub(1);
@@ -446,8 +370,6 @@ impl App {
                 return Self::take_verdict(review)
                     .map(|record_id| Command::ReviewAccept { record_id });
             }
-            // Deletion is the one destructive verdict: the first `d` arms it,
-            // only a second in a row fires.
             KeyCode::Char('d') if review.pending_delete => {
                 review.pending_delete = false;
                 return Self::take_verdict(review)
@@ -457,8 +379,6 @@ impl App {
                 review.pending_delete = !review.items.is_empty();
             }
             KeyCode::Char('f') => {
-                // Fix routes through chat (§5.4): prefill a supersede
-                // instruction for the user to finish, never edit in the pane.
                 if let Some(entry) = review.items.get(review.selected) {
                     self.input = format!("fix memory {}: {} — ", entry.id, entry.title);
                     self.cursor = self.input.len();
@@ -471,8 +391,6 @@ impl App {
         None
     }
 
-    /// Removes the selected entry — the verdict is cast, the item leaves the
-    /// list — and hands back its id.
     fn take_verdict(review: &mut Review) -> Option<String> {
         if review.items.is_empty() {
             return None;
@@ -482,10 +400,9 @@ impl App {
         Some(entry.id)
     }
 
-    /// Keys while the picker is open.
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
         let selected = self.picker.expect("picker is open");
-        let last = self.sessions.len(); // rows: 0 = new, 1..=len = sessions
+        let last = self.sessions.len();
         match code {
             KeyCode::Esc => self.picker = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -504,52 +421,33 @@ impl App {
         None
     }
 
-    /// Opens the picker — not mid-stream: the in-flight turn would keep
-    /// rendering into whatever session the view switched to. Not under the
-    /// review pane either: two modals is one too many.
     fn open_picker(&mut self) {
         if self.status != Status::Streaming && self.review.is_none() {
             self.picker = Some(0);
         }
     }
 
-    /// The session behind picker row `row`, `None` for the "new session" row.
-    ///
-    /// Rows are ordered by [`Self::by_recency`].
     pub fn picker_session(&self, row: usize) -> Option<&SessionInfo> {
         let order = self.by_recency();
         row.checked_sub(1).and_then(|i| order.get(i).copied())
     }
 
-    /// Sessions as the picker shows them: last spoken in first.
-    ///
-    /// The daemon answers in a stable order — oldest first, by when each was
-    /// created — because that is the order a log replays in. What you want to
-    /// reopen is what you were last doing, which is a different question, so
-    /// the client asks it here. Sessions with nothing said in them fall back
-    /// to when they started, and ties break on id so the list never shuffles
-    /// between draws.
     pub fn by_recency(&self) -> Vec<&SessionInfo> {
         let mut order: Vec<&SessionInfo> = self.sessions.iter().collect();
         order.sort_by(|a, b| activity(b).cmp(&activity(a)).then_with(|| a.id.cmp(&b.id)));
         order
     }
 
-    /// Switches the view to `session_id` (`None` = a fresh one), asking the
-    /// daemon for its history if it has any.
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
         self.scroll_back = 0;
         self.last_error = None;
         let session_id = session_id?;
-        // Say the transcript is on its way rather than showing an old session
-        // as empty; the answer replaces this note wholesale.
         self.transcript.push(Block::Note("loading".to_owned()));
         Some(Command::History { session_id })
     }
 
-    /// Enter on the input line, either mode.
     fn submit(&mut self) -> Option<Command> {
         let content = self.input.trim().to_owned();
         if content.is_empty() {
@@ -566,7 +464,6 @@ impl App {
         Some(self.send(content))
     }
 
-    /// Starts a turn for `content` against the current session.
     fn send(&mut self, content: String) -> Command {
         self.status = Status::Streaming;
         self.last_error = None;
@@ -576,8 +473,6 @@ impl App {
         }
     }
 
-    /// Handles one event from the connection task.
-    // One event, one arm; splitting the match would hide the protocol's shape.
     #[allow(clippy::too_many_lines)]
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
         match event {
@@ -590,11 +485,8 @@ impl App {
                 messages,
                 entries,
             } => {
-                // Switching sessions twice in a row leaves an answer for the
-                // one we left in flight; it must not land in this transcript.
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
                     self.transcript = if entries.is_empty() {
-                        // An old daemon fills only the prose-only field.
                         messages.into_iter().filter_map(prose_block).collect()
                     } else {
                         history_blocks(entries)
@@ -604,9 +496,6 @@ impl App {
                 None
             }
             NetEvent::Accepted { session_id } => {
-                // A turn that named a session the picker has never seen means
-                // the list is stale; refresh it once the turn is done (the
-                // daemon serializes, so the list waits its turn anyway).
                 let created = self.session_id.is_none();
                 self.session_id = Some(session_id);
                 self.transcript.push(Block::Arc {
@@ -620,8 +509,6 @@ impl App {
                 if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
                     reply.push_str(&text);
                 } else {
-                    // The turn's first text after a thought or tool line — or,
-                    // healing, a delta that arrived with no block at all.
                     self.transcript.push(Block::Arc {
                         text,
                         partial: false,
@@ -638,13 +525,8 @@ impl App {
                 }) = self.transcript.last_mut()
                 {
                     thinking.push_str(&text);
-                    // Deltas arrive continuously while the model thinks, so
-                    // updating here is what makes the folded clock tick.
                     *seconds = Self::thought_seconds(self.thinking_since);
                 } else {
-                    // The thinking streams where the reply will appear, so the
-                    // reply block `Accepted` opened moves out of the way until
-                    // the first delta re-creates it below.
                     self.pop_empty_reply();
                     self.thinking_since = Some(Instant::now());
                     self.transcript.push(Block::Thought {
@@ -667,7 +549,6 @@ impl App {
                 None
             }
             NetEvent::ToolEnded { call_id, outcome } => {
-                // By call_id, never adjacency: a step can run calls in parallel.
                 let ended = self.transcript.iter_mut().rev().find(
                     |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
                 );
@@ -685,16 +566,12 @@ impl App {
             }
             NetEvent::Failed { code, msg } => {
                 self.finalize_thinking();
-                // A turn that failed before any delta leaves an empty reply
-                // block; the fault replaces it rather than trailing it.
                 self.pop_empty_reply();
                 self.last_error = Some(code.clone());
                 self.transcript.push(Block::Fault { code, msg });
                 self.turn_over(Status::Idle)
             }
             NetEvent::ReviewItems(items) => {
-                // The pane may already be closed; a late answer has nowhere
-                // to land, like a stale history.
                 if let Some(review) = self.review.as_mut() {
                     review.items = items;
                     review.selected = 0;
@@ -709,22 +586,17 @@ impl App {
                     code: "disconnected".to_owned(),
                     msg: reason,
                 });
-                // Queued messages stay queued: sending the next one is what
-                // makes the connection task try to reconnect.
                 self.turn_over(Status::Disconnected)
             }
         }
     }
 
-    /// Closes the current turn and starts the next queued one, if any.
     fn turn_over(&mut self, status: Status) -> Option<Command> {
         self.status = status;
         let next = self.queued.pop_front()?;
         Some(self.send(next))
     }
 
-    /// Marks a live thought block done, freezing its clock. The words and the
-    /// open state stay — only the streaming stops.
     fn finalize_thinking(&mut self) {
         let since = self.thinking_since.take();
         if let Some(Block::Thought { seconds, done, .. }) = self.transcript.last_mut() {
@@ -735,17 +607,10 @@ impl App {
         }
     }
 
-    /// Whole seconds a thought has run, with a 1s floor so the trace line
-    /// never says 0s.
     fn thought_seconds(since: Option<Instant>) -> u64 {
         since.map_or(0, |since| since.elapsed().as_secs()).max(1)
     }
 
-    /// `ctrl-o`: folds or unfolds every thought trace, from any mode.
-    ///
-    /// All of them at once, like vim's `zi`: any open → all close, none open
-    /// → all open. One global state means the key never needs a target, so
-    /// scrolling cannot change what it does. No thought block, no-op.
     fn toggle_thought(&mut self) {
         let any_open = self
             .transcript
@@ -758,8 +623,6 @@ impl App {
         }
     }
 
-    /// Drops the reply block if it is still empty, so a line that belongs
-    /// before the reply is not rendered after its `arc` label.
     fn pop_empty_reply(&mut self) {
         if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty()) {
             self.transcript.pop();
@@ -772,14 +635,12 @@ impl App {
         }
     }
 
-    /// Moves right, but never past `limit`.
     fn cursor_right(&mut self, limit: usize) {
         if let Some(c) = self.input[self.cursor..].chars().next() {
             self.cursor = (self.cursor + c.len_utf8()).min(limit);
         }
     }
 
-    /// Where normal mode's `$` lands: on the last char, not past it.
     fn last_char_start(&self) -> usize {
         self.input
             .char_indices()
@@ -787,12 +648,10 @@ impl App {
             .map_or(0, |(at, _)| at)
     }
 
-    /// Keeps a normal-mode cursor on a char, vim-style.
     fn clamp_normal(&mut self) {
         self.cursor = self.cursor.min(self.last_char_start());
     }
 
-    /// `w`: the start of the next whitespace-delimited word.
     fn next_word_start(&self) -> usize {
         let rest = &self.input[self.cursor..];
         let after_word = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -803,21 +662,17 @@ impl App {
         word.unwrap_or_else(|| self.last_char_start())
     }
 
-    /// `b`: the start of the previous word.
     fn prev_word_start(&self) -> usize {
         let before = &self.input[..self.cursor];
         let trimmed = before.trim_end();
         trimmed.rfind(char::is_whitespace).map_or(0, |at| at + 1)
     }
 
-    /// The char ending at the cursor, as `(start_offset, char)`.
     fn char_before_cursor(&self) -> Option<(usize, char)> {
         self.input[..self.cursor].char_indices().next_back()
     }
 }
 
-/// The transcript's word for a wire `ToolOutcome`. A value this build does
-/// not know renders as unknown, not a guess (DESIGN.md §3.1).
 fn outcome_label(outcome: i32) -> &'static str {
     match ToolOutcome::try_from(outcome) {
         Ok(ToolOutcome::Ok) => "ok",
@@ -826,8 +681,6 @@ fn outcome_label(outcome: i32) -> &'static str {
     }
 }
 
-/// When a session was last touched, for ordering: its last message, or when
-/// it started if nothing has been said in it.
 fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
     session
         .last_at
@@ -835,12 +688,6 @@ fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
         .map(|ts| (ts.seconds, ts.nanos))
 }
 
-/// One past message as a transcript block.
-///
-/// Roles this build has no rendering for — a system message, or a value from
-/// a newer schema — are dropped rather than guessed at: the daemon never puts
-/// them in a session's history today, and inventing a speaker label for one
-/// would be worse than its absence.
 fn prose_block(message: HistoryMessage) -> Option<Block> {
     match Role::try_from(message.role) {
         Ok(Role::User) => Some(Block::You(message.content)),
@@ -852,9 +699,6 @@ fn prose_block(message: HistoryMessage) -> Option<Block> {
     }
 }
 
-/// A reopened session's transcript: the block sequence a live turn leaves
-/// behind once it collapses, minus thought traces — reasoning is never
-/// durable (DESIGN.md §3.1), so none are faked here.
 fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
     let mut blocks = Vec::new();
     for entry in entries {
@@ -868,7 +712,6 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                 outcome: None,
             }),
             Some(history_entry::Entry::ToolResult(result)) => {
-                // By call_id, never adjacency — the live path's rule.
                 let ended = blocks.iter_mut().rev().find(
                     |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
                 );
@@ -876,12 +719,9 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                     *outcome = Some(outcome_label(result.outcome));
                 }
             }
-            // An entry kind from a newer daemon has no rendering to guess at.
             None => {}
         }
     }
-    // A call no entry closed is not still running — nothing is. Its outcome
-    // is unknown, the reading DESIGN.md §3.1 attaches to a missing result.
     for block in &mut blocks {
         if let Block::Tool {
             outcome: outcome @ None,
@@ -914,7 +754,6 @@ mod tests {
         }
     }
 
-    /// Feed normal-mode keys (the app starts in insert).
     fn normal(app: &mut App, keys: &str) {
         app.on_key(key(KeyCode::Esc));
         for c in keys.chars() {
@@ -1078,8 +917,6 @@ mod tests {
         );
     }
 
-    /// A turn cut mid-thought still finalizes: a live thought block must not
-    /// outlive its turn.
     #[test]
     fn reasoning_finalizes_on_end_when_no_text_ever_came() {
         let mut app = App::new();
@@ -1246,7 +1083,6 @@ mod tests {
             );
         }
 
-        // Mixed state closes everything: any open → all close.
         if let Block::Thought { open, .. } = &mut app.transcript[1] {
             *open = false;
         }
@@ -1277,8 +1113,6 @@ mod tests {
             name: "beta".to_owned(),
         });
 
-        // The second call ends first: its line resolves, the other keeps
-        // running — call_id pairs them, not adjacency.
         app.on_net(NetEvent::ToolEnded {
             call_id: "b".to_owned(),
             outcome: ToolOutcome::Ok as i32,
@@ -1498,7 +1332,6 @@ mod tests {
         app.on_scroll(false, PAGE);
         assert_eq!(app.scroll_back, 0, "scrolling down at the bottom stays put");
 
-        // Insert mode: the page keys are not text, so they still scroll.
         typed(&mut app, "half a sentence");
         assert_eq!(app.on_key(key(KeyCode::PageUp)), None);
         assert_eq!(app.scroll_back, PAGE);
@@ -1509,10 +1342,6 @@ mod tests {
         assert_eq!(app.scroll_back, 0);
     }
 
-    /// A modal takes the gesture: scrolling what is behind it would move the
-    /// wrong thing.
-    /// What you reopen is what you were last doing, which is not what you
-    /// started most recently.
     #[test]
     fn the_picker_orders_sessions_by_last_activity() {
         fn at(id: &str, started: i64, last: Option<i64>) -> SessionInfo {
@@ -1530,10 +1359,8 @@ mod tests {
 
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![
-            // Opened first, but spoken in most recently.
             at("old-but-active", 100, Some(900)),
             at("newer-but-stale", 500, Some(600)),
-            // Never spoken in: falls back to when it started.
             at("empty", 700, None),
         ]));
 
@@ -1670,8 +1497,6 @@ mod tests {
         );
     }
 
-    /// A reopened tool turn shows exactly what the live one left behind once
-    /// it collapsed — minus the thought trace, which is never durable.
     #[test]
     fn a_reopened_tool_turn_matches_the_blocks_a_live_one_leaves() {
         let mut live = App::new();
@@ -1707,8 +1532,6 @@ mod tests {
         assert_eq!(reopened.transcript, live.transcript);
     }
 
-    /// The two shapes a call reads as unknown on reopen: an outcome this
-    /// build does not recognize, and a call no entry ever closed.
     #[test]
     fn unrecognized_and_missing_history_outcomes_read_unknown() {
         let mut app = App::new();
@@ -1740,7 +1563,6 @@ mod tests {
         );
     }
 
-    /// An old daemon fills only `messages`; the transcript still renders.
     #[test]
     fn history_without_entries_falls_back_to_prose_messages() {
         let mut app = App::new();
@@ -1766,7 +1588,6 @@ mod tests {
         );
     }
 
-    /// Switching twice leaves the first answer in flight behind the second.
     #[test]
     fn history_for_a_session_already_left_is_dropped() {
         let mut app = App::new();
@@ -1817,12 +1638,10 @@ mod tests {
         assert!(app.quit);
     }
 
-    // --- the review pane (DESIGN.md §5.4) ---
-
     fn entry(id: &str, title: &str) -> ReviewEntry {
         ReviewEntry {
             id: id.to_owned(),
-            kind: 4, // KIND_FACT
+            kind: 4,
             namespace: "global".to_owned(),
             title: title.to_owned(),
             summary: "a summary".to_owned(),
@@ -1830,7 +1649,6 @@ mod tests {
         }
     }
 
-    /// An app with the review pane open and `entries` already answered.
     fn reviewing(entries: Vec<ReviewEntry>) -> App {
         let mut app = App::new();
         normal(&mut app, ":review");
@@ -1867,7 +1685,6 @@ mod tests {
         assert_eq!(review.items, [entry("mr-1", "one")]);
         assert_eq!(review.selected, 0);
 
-        // Close, then a late answer: nowhere to land, like a stale history.
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.review, None);
         app.on_net(NetEvent::ReviewItems(vec![entry("mr-2", "two")]));
@@ -1921,7 +1738,6 @@ mod tests {
         );
         assert!(app.review.as_ref().expect("open").pending_delete);
 
-        // Moving disarms: the second d must confirm the row it armed on.
         app.on_key(key(KeyCode::Char('j')));
         assert!(!app.review.as_ref().expect("open").pending_delete);
         assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);

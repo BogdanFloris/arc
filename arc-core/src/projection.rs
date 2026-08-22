@@ -1,24 +1,3 @@
-//! The `SQLite` projection: the archive tier of memory, derived from the log.
-//!
-//! [`Projection`] turns events into rows in `data/index.db` (DESIGN.md §5.3).
-//! It is a projection in the strict sense (DESIGN.md §3, rule 2): the log is the
-//! truth, this file is disposable, and deleting it costs a replay and nothing
-//! else. Nothing writes these tables except [`Projection::apply`].
-//!
-//! This module is the storage mechanism, not the replay driver. [`apply`] is
-//! deliberately mechanical — it writes the rows one event implies and moves
-//! `last_seq`, in one transaction. It does not check that events arrive in
-//! order, skip events it has already seen, or decide when a rebuild is needed.
-//! Those are the driver's policy, and the driver reads [`Projection::last_seq`]
-//! to make them.
-//!
-//! Enum fields (`role`) are stored as their raw protobuf integers, values this
-//! binary does not know included: the projection preserves, clients interpret.
-//! Timestamps become microseconds since the Unix epoch, one lossless-enough
-//! integer column instead of a seconds/nanos pair.
-//!
-//! [`apply`]: Projection::apply
-
 use std::path::{Path, PathBuf};
 
 use arc_proto::v1::{
@@ -32,66 +11,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::log;
 
-/// Layout version of the tables this module creates.
-///
-/// Bumped whenever the DDL below changes shape. A database written by a
-/// different version is not migrated — it is rejected by
-/// [`Projection::open`] so the caller can delete it and re-project the log,
-/// which is cheaper and more honest than a migration path for a file that is
-/// already reproducible.
-///
-/// 2: tool-call and tool-result rows joined `messages`, with FTS5.
-/// 3: `memory_records` joined — the distilled tier's state table (§5.2).
-/// 4: `sessions.consolidated_through` joined — consolidation coverage (§5.4).
-/// 5: `memory_records.changed_at` and `.reviewed_at` — review bookkeeping (§5.4).
 pub const SCHEMA_VERSION: u32 = 5;
 
-/// `projection_meta` key holding the seq of the last applied event.
 const LAST_SEQ_KEY: &str = "last_seq";
 
-/// `projection_meta` key holding [`SCHEMA_VERSION`].
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-/// The tables, exactly as DESIGN.md §5.3 describes them.
-///
-/// `parent_session`, `fork_point` and `project` exist and stay NULL: forking is
-/// Phase 3 and projects are Phase 2, but the columns cost nothing now and
-/// adding them later would be a schema bump for no reason.
-///
-/// `messages.seq` is the log's sequence number, so it is globally unique and
-/// makes the natural primary key: it ties every row back to the record that
-/// produced it and turns a double-applied event into a constraint failure
-/// rather than a duplicate row — on every row kind, tool rows included.
-///
-/// `messages` holds prose, tool calls and tool results in one table, told
-/// apart by `kind` with per-kind nullable columns (DESIGN.md §3.1, "what the
-/// projection will need"): one seq-ordered query rebuilds a session, and FTS
-/// row-tagging is a join, not a union. `content` is the prose of a message,
-/// the text of a result, and empty for a call — arguments are not indexed.
-///
-/// `messages_fts` is an external-content FTS5 table over `content`, rowid tied
-/// to `seq`. It is written by explicit statements inside [`Projection::apply`]'s
-/// transaction, never by triggers, so replay stays visible and deterministic.
-///
-/// `sessions.consolidated_through` is consolidation coverage (DESIGN.md §5.4):
-/// the `through_seq` of the session's latest `SessionConsolidated`, NULL until
-/// a pass has finished the session. Derived state like everything else here —
-/// "what is due" is a query over it, never daemon memory.
-///
-/// `memory_records` is the distilled tier's current state (DESIGN.md §5.2):
-/// one row per record, keyed by `id` and mutated by replay — records are
-/// mutable state, so seq-as-PK does not apply here. `last_event_seq` is what
-/// keeps double-apply failing anyway: created is a plain INSERT (a duplicate
-/// id violates the PK), and every mutation guards on `last_event_seq <
-/// event.seq`, treating zero affected rows as an error. `links` and
-/// `provenance` are JSON text — nothing queries inside them yet, and the file
-/// is disposable. `provenance` NULL means the field was absent, not empty.
-///
-/// `changed_at` and `reviewed_at` are review bookkeeping (DESIGN.md §5.4):
-/// the `Event.ts` micros of the record's last create/update/supersede, and of
-/// its last `MemoryRecordReviewed`. The review queue is the rows where
-/// `changed_at` is in the window and not covered by `reviewed_at` — an
-/// accepted record leaves it, a later change re-enters it.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
@@ -151,234 +76,116 @@ CREATE TABLE IF NOT EXISTS projection_meta (
 );
 ";
 
-/// `messages.kind` for a prose row. Crate-visible: the archive query layer
-/// filters on it, and a second definition would be a second authority.
 pub(crate) const KIND_MESSAGE: i64 = 0;
 
-/// `messages.kind` for a `ToolCallIssued` row.
 const KIND_TOOL_CALL: i64 = 1;
 
-/// `messages.kind` for a `ToolResultRecorded` row.
 const KIND_TOOL_RESULT: i64 = 2;
 
-/// Everything that can go wrong in the `SQLite` projection.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The index file could not be opened, or its schema could not be created.
     #[error("projection index {path}: {source}")]
     Open {
-        /// Index file the operation was against.
         path: PathBuf,
-        /// Underlying failure.
         #[source]
         source: rusqlite::Error,
     },
 
-    /// The index was written by a different [`SCHEMA_VERSION`]. The file is
-    /// disposable: delete it and replay the log rather than migrating it.
     #[error("projection index {path}: schema version {found}, this build writes {expected}")]
     SchemaVersion {
-        /// Index file that was rejected.
         path: PathBuf,
-        /// Version recorded in the file.
         found: u32,
-        /// Version this build writes.
         expected: u32,
     },
 
-    /// An `Event` arrived with no `payload` set. The log refuses to write these
-    /// and its reader treats one on disk as corruption; the projection agrees
-    /// rather than quietly projecting nothing.
     #[error("event {seq} has no payload; refusing to project")]
-    MissingPayload {
-        /// Sequence number of the offending event.
-        seq: u64,
-    },
+    MissingPayload { seq: u64 },
 
-    /// A sequence number that does not fit `SQLite`'s signed 64-bit integers, or
-    /// one that came back from the index negative. Neither is reachable from a
-    /// log this build wrote — 2^63 events is not a number of events — so one
-    /// means a hand-edited or foreign index.
     #[error("sequence number {seq} is out of range for the index")]
-    SeqOutOfRange {
-        /// The offending value, in whichever direction it went out of range.
-        seq: i128,
-    },
+    SeqOutOfRange { seq: i128 },
 
-    /// A memory event's guarded write touched zero rows: its target record is
-    /// missing, or already carries this seq or a later one. Either way the
-    /// event was fed out of order or twice — the driver's failure, surfaced
-    /// loudly like a duplicate `messages` seq.
     #[error("memory event {seq}: record {id} is missing or not older than the event")]
-    StaleMemoryEvent {
-        /// Sequence number of the refused event.
-        seq: u64,
-        /// Id of the record the event targeted.
-        id: String,
-    },
+    StaleMemoryEvent { seq: u64, id: String },
 
-    /// A statement against the index failed. A constraint violation here means
-    /// the same event was applied twice — see [`Projection::apply`].
     #[error("projection index: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// One row of [`Projection::sessions`]: what a client needs to list a session
-/// before opening it.
-///
-/// `started_at` stays in the projection's own unit — microseconds since the
-/// Unix epoch — because that is what the column holds. Callers that speak
-/// protobuf convert at their boundary; nothing in this layer does clock
-/// formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
-    /// Session id, as `SessionCreated` set it.
     pub id: String,
-    /// Session title. Empty until something names the session.
     pub title: String,
-    /// When the session was created, or `None` if its event carried no
-    /// timestamp.
     pub started_at: Option<i64>,
-    /// The session's first user message, verbatim. Empty if nobody has spoken
-    /// in it yet. A label for pickers — not a title, which stays empty until
-    /// something generates one.
     pub preview: String,
-    /// When the session was last spoken in, either side, or `None` if nothing
-    /// has been said in it. What recency means for a session: `started_at` is
-    /// when it was opened, which is not when you last used it.
     pub last_at: Option<i64>,
 }
 
-/// One row of [`Projection::messages`]: a session's transcript in the shapes
-/// of `provider::Message`, not a struct of per-kind options.
-///
-/// `role` and `outcome` stay raw protobuf integers, unknown values included —
-/// the module convention: the projection preserves, readers interpret (and
-/// treat an unrecognized outcome as UNKNOWN, per DESIGN.md §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageRow {
-    /// Prose one side said.
     Message {
-        /// Speaker, as `MessageAppended` carried it.
         role: i32,
-        /// The turn's text, verbatim.
         content: String,
-        /// The reply was cut before the model finished.
         partial: bool,
-        /// The turn this row belongs to. Empty on Phase 1 rows, which reads
-        /// as "one message, one turn" (DESIGN.md §3.1).
         turn_id: String,
     },
-    /// A tool call the model issued.
     ToolCall {
-        /// The call's id, unique within its session.
         call_id: String,
-        /// Position within its step, dense from 0.
         call_index: u32,
-        /// The tool asked for.
         name: String,
-        /// The arguments, one complete JSON object, verbatim.
         arguments_json: String,
-        /// The turn this row belongs to.
         turn_id: String,
     },
-    /// What the tool answered, addressed to `call_id`.
     ToolResult {
-        /// The call this closes.
         call_id: String,
-        /// Raw `ToolOutcome` integer.
         outcome: i32,
-        /// What the model was shown, verbatim.
         content: String,
-        /// The registry cut the result before recording it.
         truncated: bool,
-        /// The turn this row belongs to.
         turn_id: String,
     },
 }
 
-/// One row of [`Projection::memory_index`]: what the always-loaded index of
-/// ACTIVE records carries (DESIGN.md §5.2) — everything but the body.
-///
-/// `kind` stays a raw protobuf integer — the module convention: the
-/// projection preserves, readers interpret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryIndexEntry {
-    /// Record id.
     pub id: String,
-    /// "global" or a project id.
     pub namespace: String,
-    /// Raw `MemoryRecord.Kind` integer.
     pub kind: i32,
-    /// Record title.
     pub title: String,
-    /// The one-line summary.
     pub summary: String,
 }
 
-/// One row of [`Projection::due_for_consolidation`]: a session the pass
-/// should cover, and how far its events go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueSession {
-    /// Session id.
     pub session_id: String,
-    /// Seq of the session's latest event — what the pass will read through.
     pub latest_seq: u64,
 }
 
-/// One row of [`Projection::review_items`]: a record awaiting a verdict
-/// (DESIGN.md §5.4), whole, with the review bookkeeping a pane shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewItem {
-    /// The record as last written; raw enum integers preserved.
     pub record: MemoryRecord,
-    /// When the record last changed, microseconds since the Unix epoch.
     pub changed_at: i64,
-    /// Id of the record that superseded this one, if one did.
     pub superseded_by: Option<String>,
 }
 
-/// What [`Projection::memory_record`] returns: the record as last written,
-/// plus where replay says it went.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecordState {
-    /// The record, rebuilt from columns; raw enum integers preserved.
     pub record: MemoryRecord,
-    /// Id of the record that superseded this one, if one did.
     pub superseded_by: Option<String>,
 }
 
-/// What a [`replay`] pass did: how many events it applied and how many it
-/// skipped as already projected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayStats {
-    /// Events applied to the index by this pass.
     pub applied: u64,
-    /// Events skipped because the index already held them.
     pub skipped: u64,
 }
 
-/// A [`replay`] failure: either side of the composition can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
-    /// The projection refused or failed to apply an event. The index keeps
-    /// everything committed before the failing event; a later replay resumes
-    /// from there.
     #[error("projection error: {source}")]
     Projection { source: Error },
-    /// The log could not be read — replay stops at the last applied event.
     #[error("log error: {source}")]
     Log { source: log::Error },
 }
 
-/// Replay is used to turn a log directory into an up-to-date index
-///
-/// Resumes from `Projection::last_seq()`
-///
-/// # Errors
-///
-/// - [`ReplayError::Projection`] for a projection error
-/// - [`ReplayError::Log`] for a log reader error
 #[tracing::instrument(
     level = "debug",
     name = "projection.replay",
@@ -427,33 +234,12 @@ pub fn replay(
     Ok(stats)
 }
 
-/// The `SQLite` index over the event log.
-///
-/// Open it with [`open`](Projection::open), feed it events in log order with
-/// [`apply`](Projection::apply), and ask [`last_seq`](Projection::last_seq)
-/// where the projection got to.
-///
-/// I/O is synchronous, like the log layer: the caller decides how to schedule
-/// blocking work.
 #[derive(Debug)]
 pub struct Projection {
     conn: Connection,
 }
 
 impl Projection {
-    /// Opens the index at `path`, creating the file and the schema if either is
-    /// absent.
-    ///
-    /// Creating the schema is idempotent, so opening an existing index is the
-    /// same call. `path` goes straight to `SQLite`, so `:memory:` opens a private
-    /// in-memory index — what the tests use.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Open`] if the file cannot be opened or the schema cannot be
-    ///   created.
-    /// - [`Error::SchemaVersion`] if the index was written by a build with a
-    ///   different [`SCHEMA_VERSION`]. Delete the file and re-project.
     #[tracing::instrument(
         level = "debug",
         name = "projection.open",
@@ -472,15 +258,6 @@ impl Projection {
 
         let conn = Connection::open(path).map_err(opened)?;
 
-        // Durability here is worthless — the log is the truth and a damaged
-        // index is deleted and rebuilt, never repaired — while rebuild speed is
-        // the whole cost of that policy. So: never fsync, and keep the rollback
-        // journal out of the way of the replay.
-        //
-        // WAL also lets readers (the daemon answering a client while the
-        // projection is catching up) run against the index without blocking on
-        // the writer. It is a no-op for `:memory:`, which reports back its own
-        // journal mode; the pragma is a query, not an assertion.
         conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
         })
@@ -495,8 +272,6 @@ impl Projection {
         Ok(projection)
     }
 
-    /// Records [`SCHEMA_VERSION`] in a fresh index, or refuses one written by a
-    /// different version.
     fn check_schema_version(&self, path: &Path) -> Result<(), Error> {
         let found: Option<u32> = self
             .conn
@@ -533,35 +308,6 @@ impl Projection {
         }
     }
 
-    /// Applies one event: writes the rows it implies and sets `last_seq` to its
-    /// sequence number, in one transaction. Either both land or neither does.
-    ///
-    /// Mechanical by design. Events are applied exactly as handed over, in the
-    /// order handed over; ordering, resumption and rebuild policy belong to the
-    /// replay driver above this type. Two consequences worth knowing:
-    ///
-    /// - Applying the same event twice is a primary-key violation, surfaced as
-    ///   [`Error::Sqlite`]. That is the point of keying `messages` by log seq: a
-    ///   driver that lost its place fails loudly instead of silently
-    ///   duplicating history.
-    /// - `last_seq` follows the last event applied, whatever it was. Feed
-    ///   events out of order and it will say so.
-    ///
-    /// An event whose kind this build does not know — a `SessionEvent` or
-    /// `MemoryEvent` oneof arm from a newer schema — writes no rows but still
-    /// advances `last_seq`,
-    /// with a warning. An old binary must be able to replay a newer log to its
-    /// end; stalling on the first unknown event would be worse than skipping
-    /// it, and the log still holds everything that was skipped.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::MissingPayload`] if `event.payload` is `None`. Nothing is
-    ///   written and no transaction is opened.
-    /// - [`Error::Sqlite`] if a statement fails, or [`Error::SeqOutOfRange`] if
-    ///   `event.seq` does not fit a signed 64-bit integer. Either way the
-    ///   transaction is rolled back and the index keeps the state it had before
-    ///   the call.
     #[tracing::instrument(
         level = "debug",
         name = "projection.apply",
@@ -572,8 +318,6 @@ impl Projection {
         )
     )]
     pub fn apply(&mut self, event: &Event) -> Result<(), Error> {
-        // Checked before the transaction opens: a rejected event must leave the
-        // connection exactly as it found it.
         let Some(payload) = event.payload.as_ref() else {
             return Err(Error::MissingPayload { seq: event.seq });
         };
@@ -646,16 +390,6 @@ impl Projection {
         Ok(())
     }
 
-    /// Sequence number of the last event [`apply`](Projection::apply) accepted,
-    /// or `None` if nothing has been applied yet.
-    ///
-    /// This is where a replay resumes from. `None` means an empty index, which
-    /// is indistinguishable from a deleted one — that is the intent.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or
-    /// [`Error::SeqOutOfRange`] if the stored value is negative.
     pub fn last_seq(&self) -> Result<Option<u64>, Error> {
         let stored: Option<i64> = self
             .conn
@@ -674,24 +408,7 @@ impl Projection {
             .transpose()
     }
 
-    /// Every session in the index, oldest first.
-    ///
-    /// Ordered by `started_at`, then by `id` to break ties — two sessions
-    /// created inside the same microsecond still come back in a fixed order,
-    /// so the list a client renders does not shuffle between calls. A session
-    /// whose event carried no timestamp sorts first, where `SQLite` puts NULL.
-    ///
-    /// The whole table, unpaginated: Phase 1 has one user and a session count
-    /// a person could scroll. Paging is a wire-protocol question (DESIGN.md
-    /// §7) and gets answered when the number of sessions makes it one.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read.
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
-        // The subqueries ride along rather than costing a query per session:
-        // `messages_by_session` makes each one an index seek. Both consider
-        // only prose rows — a tool result is not a thing anyone said.
         let mut stmt = self.conn.prepare(
             "SELECT s.id, coalesce(s.title, ''), s.started_at,
                     coalesce((SELECT m.content FROM messages m
@@ -713,14 +430,6 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The conversation history of one session: every row kind, in seq order.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or holds a row this
-    /// build cannot type — a `kind` it does not know, or a `call_index` no
-    /// provider produces. Neither is reachable from an index this build
-    /// wrote, so one means a hand-edited or foreign file.
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT kind, role, content, partial, turn_id,
@@ -754,23 +463,6 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Sessions due for consolidation (DESIGN.md §5.4): idle past the cutoff
-    /// and holding events past their latest marker.
-    ///
-    /// Idle means the session's last `messages` row — any kind: a tool result
-    /// is activity — has `ts` strictly older than `idle_cutoff_micros`. Due on
-    /// top of idle means its latest seq exceeds `consolidated_through`, NULL
-    /// reading as never consolidated. A session whose rows all lack a
-    /// timestamp is never due: its idleness is unknowable, and the engine
-    /// stamps every event it writes.
-    ///
-    /// Ordered longest-idle first, id as the tie-break, so the pass drains a
-    /// backlog deterministically.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or
-    /// [`Error::SeqOutOfRange`] if a stored seq comes back negative.
     pub fn due_for_consolidation(&self, idle_cutoff_micros: i64) -> Result<Vec<DueSession>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, MAX(m.seq)
@@ -796,14 +488,6 @@ impl Projection {
         .collect()
     }
 
-    /// Seq of a session's latest `messages` row, any kind, or `None` for a
-    /// session with no rows. The consolidation pass re-checks this under the
-    /// lock: a changed value means the session spoke while the pass ran.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or
-    /// [`Error::SeqOutOfRange`] if the stored value is negative.
     pub fn latest_seq(&self, session_id: &str) -> Result<Option<u64>, Error> {
         let stored: Option<i64> = self.conn.query_row(
             "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
@@ -819,15 +503,6 @@ impl Projection {
             .transpose()
     }
 
-    /// The always-loaded index of the distilled tier: every ACTIVE record,
-    /// bodies excluded (DESIGN.md §5.2).
-    ///
-    /// Ordered namespace → kind → title → id, so the index a session is
-    /// primed with does not shuffle between calls.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read.
     pub fn memory_index(&self) -> Result<Vec<MemoryIndexEntry>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, namespace, kind, title, summary FROM memory_records
@@ -845,19 +520,6 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The review queue (DESIGN.md §5.4): records changed at or after
-    /// `since_micros` and not reviewed since their last change, any status —
-    /// deleted rows are already gone from the table, which is the exclusion.
-    ///
-    /// Ordered `(changed_at, id)` so the queue never shuffles between calls.
-    /// A row whose events carried no timestamp has `changed_at` NULL and
-    /// never enters the queue: its window position is unknowable, and the
-    /// engine stamps every event it writes.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or holds JSON this
-    /// build cannot decode — see [`Projection::memory_record`].
     pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, namespace, title, summary, body, links, provenance,
@@ -889,15 +551,6 @@ impl Projection {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// One record, whole, whatever its status — a SUPERSEDED record is still
-    /// readable ("you used to live at X"). `None` for an id the projection
-    /// does not hold, deleted ones included: DELETED excludes entirely.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Sqlite`] if the index cannot be read, or holds `links` or
-    /// `provenance` JSON this build cannot decode — not reachable from an
-    /// index this build wrote, so one means a hand-edited or foreign file.
     pub fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
         let row = self
             .conn
@@ -932,8 +585,6 @@ impl Projection {
     }
 }
 
-/// A row value this build cannot type, as the `rusqlite` error the row mapper
-/// must speak.
 fn bad_column(index: usize, message: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
@@ -942,7 +593,6 @@ fn bad_column(index: usize, message: &str) -> rusqlite::Error {
     )
 }
 
-/// [`bad_column`], for a JSON text column that would not decode.
 pub(crate) fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
@@ -951,10 +601,6 @@ pub(crate) fn bad_json_column(index: usize, source: &serde_json::Error) -> rusql
     )
 }
 
-/// Writes the `sessions` row for a `SessionCreated`.
-///
-/// `provider` and `model` are on the event but have no column: the archive
-/// indexes what sessions are searched by, and the log answers the rest.
 fn insert_session(
     tx: &Transaction<'_>,
     event: &Event,
@@ -972,11 +618,6 @@ fn insert_session(
     Ok(())
 }
 
-/// Applies a `SessionConsolidated`: moves the session's coverage marker.
-///
-/// Monotonic — the marker only moves forward. A marker at or behind the
-/// current one, or for a session the projection never held, is skipped with a
-/// warning: both are foreign-log shapes, not replay failures.
 fn mark_consolidated(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1002,7 +643,6 @@ fn mark_consolidated(
     Ok(())
 }
 
-/// Writes the `messages` row for a `MessageAppended`, and its FTS row.
 fn insert_message(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1016,7 +656,6 @@ fn insert_message(
             seq_param(event.seq)?,
             KIND_MESSAGE,
             &appended.turn_id,
-            // Raw enum integer, unknown values included.
             appended.role,
             &appended.content,
             appended.partial,
@@ -1026,10 +665,6 @@ fn insert_message(
     index_content(tx, event.seq, &appended.content)
 }
 
-/// Writes the `messages` row for a `ToolCallIssued`.
-///
-/// No FTS row: `content` is empty for a call, and arguments are deliberately
-/// not indexed (DESIGN.md §3.1) — the call is findable by name.
 fn insert_tool_call(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1055,8 +690,6 @@ fn insert_tool_call(
     Ok(())
 }
 
-/// Writes the `messages` row for a `ToolResultRecorded`, and its FTS row —
-/// result text is searchable, tagged by `kind` through the join.
 fn insert_tool_result(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1073,7 +706,6 @@ fn insert_tool_result(
             &result.turn_id,
             &result.content,
             &result.call_id,
-            // Raw enum integer, unknown values included.
             result.outcome,
             result.truncated,
             epoch_micros(event.ts.as_ref()),
@@ -1082,10 +714,6 @@ fn insert_tool_result(
     index_content(tx, event.seq, &result.content)
 }
 
-/// Adds one row's content to the FTS index, inside the caller's transaction.
-///
-/// Explicit statement, not a trigger: replay stays visible and deterministic,
-/// and the write path stays this module's inserts and nothing else.
 fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
@@ -1094,11 +722,6 @@ fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Er
     Ok(())
 }
 
-/// Writes the `memory_records` row for a `MemoryRecordCreated`.
-///
-/// A plain INSERT on purpose: a duplicate id is a constraint failure, the
-/// state-table twin of `messages`' double-apply property. Status lands as
-/// carried — sending ACTIVE is the writer's job.
 fn create_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1115,7 +738,6 @@ fn create_memory_record(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11)",
         rusqlite::params![
             &record.id,
-            // Raw enum integers, unknown values included — here and below.
             record.kind,
             &record.namespace,
             &record.title,
@@ -1131,9 +753,6 @@ fn create_memory_record(
     Ok(())
 }
 
-/// Overwrites the whole `memory_records` row for a `MemoryRecordUpdated` —
-/// writes carry the whole record, never a diff, so replay is last write wins.
-/// `superseded_by` clears with the overwrite; `created_seq` stays.
 fn update_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1172,12 +791,6 @@ fn update_memory_record(
     Ok(())
 }
 
-/// Applies a `MemoryRecordSuperseded`: marks the old row SUPERSEDED, pointed
-/// at its replacement, then upserts the replacement.
-///
-/// When the replacement reuses the superseded id, the row is simply replaced
-/// with the new content — the log keeps the history in that case, the
-/// projection doesn't.
 fn supersede_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1207,8 +820,6 @@ fn supersede_memory_record(
                     id: superseded.superseded_id.clone(),
                 });
             }
-            // A foreign log can supersede a record this projection never
-            // held; the replacement still lands.
             tracing::warn!(
                 seq = event.seq,
                 id = %superseded.superseded_id,
@@ -1219,9 +830,6 @@ fn supersede_memory_record(
     upsert_memory_record(tx, event, record)
 }
 
-/// Inserts a supersede's replacement, or overwrites the row its id already
-/// holds. `created_seq` survives an overwrite; `superseded_by` does not —
-/// whatever the row was, it is now the fresh replacement.
 fn upsert_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1263,8 +871,6 @@ fn upsert_memory_record(
     Ok(())
 }
 
-/// Applies a `MemoryRecordDeleted`: removes the row outright, whatever its
-/// status was — §5.2's purge, the one path that excludes a record entirely.
 fn delete_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1281,7 +887,6 @@ fn delete_memory_record(
                 id: deleted.id.clone(),
             });
         }
-        // A foreign log can delete a record this projection never held.
         tracing::warn!(
             seq = event.seq,
             id = %deleted.id,
@@ -1291,13 +896,6 @@ fn delete_memory_record(
     Ok(())
 }
 
-/// Applies a `MemoryRecordReviewed`: stamps the record's `reviewed_at`.
-///
-/// Monotonic — the stamp only moves forward, so a foreign log's out-of-order
-/// review cannot un-review a later verdict. An unknown record id, a stale
-/// stamp, or a review with no timestamp is skipped with a warning: all are
-/// foreign-log shapes, not replay failures (the tolerance
-/// [`mark_consolidated`] set).
 fn review_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1326,8 +924,6 @@ fn review_memory_record(
     Ok(())
 }
 
-/// Whether `memory_records` holds `id` — what tells a stale guarded write
-/// (an error) apart from a missing target (a warning).
 fn memory_record_exists(tx: &Transaction<'_>, id: &str) -> Result<bool, Error> {
     let found: Option<i64> = tx
         .query_row("SELECT 1 FROM memory_records WHERE id = ?1", [id], |row| {
@@ -1337,8 +933,6 @@ fn memory_record_exists(tx: &Transaction<'_>, id: &str) -> Result<bool, Error> {
     Ok(found.is_some())
 }
 
-/// A memory event whose oneof arm is known but whose record field is absent.
-/// Skipped like an unknown kind: a foreign log must not fail wholesale.
 fn skip_recordless(seq: u64, kind: &str) {
     tracing::warn!(
         seq,
@@ -1347,16 +941,12 @@ fn skip_recordless(seq: u64, kind: &str) {
     );
 }
 
-/// The private JSON shape of one `provenance` entry. Prost types do not speak
-/// serde, and the column format is this module's business alone.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProvenanceEntryJson {
     session_id: String,
     ts: Option<TimestampJson>,
 }
 
-/// A protobuf timestamp kept whole — provenance must rebuild verbatim, so it
-/// skips the lossy `epoch_micros` flattening the `messages` columns use.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TimestampJson {
     seconds: i64,
@@ -1371,8 +961,6 @@ pub(crate) fn links_from_json(json: &str) -> Result<Vec<String>, serde_json::Err
     serde_json::from_str(json)
 }
 
-/// Provenance as the JSON its column holds. Absent stays absent (NULL), so
-/// presence round-trips.
 fn provenance_json(provenance: Option<&Provenance>) -> Option<String> {
     let entries: Vec<ProvenanceEntryJson> = provenance?
         .entries
@@ -1407,7 +995,6 @@ pub(crate) fn provenance_from_json(
     }))
 }
 
-/// Points `last_seq` at `seq`.
 fn set_last_seq(tx: &Transaction<'_>, seq: u64) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO projection_meta (key, value) VALUES (?1, ?2)
@@ -1417,23 +1004,12 @@ fn set_last_seq(tx: &Transaction<'_>, seq: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Converts a log sequence number to the signed integer `SQLite` stores.
 fn seq_param(seq: u64) -> Result<i64, Error> {
     i64::try_from(seq).map_err(|_| Error::SeqOutOfRange {
         seq: i128::from(seq),
     })
 }
 
-/// Flattens a protobuf timestamp to microseconds since the Unix epoch.
-///
-/// Sub-microsecond precision is dropped; nothing in this system times anything
-/// that finely, and one integer column sorts and ranges without a compound key.
-/// An absent timestamp stays absent (NULL).
-///
-/// Saturating rather than failing: a timestamp far enough out to overflow (past
-/// year 294 247) is already nonsense, and refusing to project a whole log over
-/// one bad clock reading would be the worse failure. It clamps, keeping the row
-/// and its ordering.
 fn epoch_micros(ts: Option<&Timestamp>) -> Option<i64> {
     let ts = ts?;
     Some(
@@ -1463,7 +1039,6 @@ mod tests {
     };
     use crate::log::{Log, LogReader, discover_segments};
 
-    /// 2023-11-14T22:13:20.123456789Z, chosen so the nanos truncate visibly.
     const TS_SECONDS: i64 = 1_700_000_000;
     const TS_NANOS: i32 = 123_456_789;
     const TS_MICROS: i64 = 1_700_000_000_123_456;
@@ -1508,7 +1083,6 @@ mod tests {
         }
     }
 
-    /// A `ToolCallIssued` in session `s-01`, turn `t-01`.
     fn tool_call(seq: u64, call_id: &str, index: u32, arguments: &str) -> Event {
         Event {
             seq,
@@ -1527,8 +1101,6 @@ mod tests {
         }
     }
 
-    /// A `ToolResultRecorded` in session `s-01`, turn `t-01`. `outcome` stays
-    /// a raw integer so tests can feed values this build does not know.
     fn tool_result(seq: u64, call_id: &str, outcome: i32, content: &str, truncated: bool) -> Event {
         Event {
             seq,
@@ -1549,9 +1121,6 @@ mod tests {
         }
     }
 
-    /// An event this build cannot interpret: the payload is a session event,
-    /// but no oneof arm is set — what a newer schema's event kind decodes to
-    /// here.
     fn unknown_kind(seq: u64) -> Event {
         Event {
             seq,
@@ -1561,8 +1130,6 @@ mod tests {
         }
     }
 
-    /// A whole `sessions` row, so an assertion covers every column — including
-    /// the ones that must still be NULL.
     #[derive(Debug, PartialEq)]
     struct SessionRow {
         id: String,
@@ -1584,10 +1151,6 @@ mod tests {
             .expect("rows")
     }
 
-    /// Every table [`SCHEMA`](super::SCHEMA) creates. `messages_fts` being
-    /// here is the proof the bundled `rusqlite` build ships FTS5 — creating
-    /// the virtual table would fail without it. The `messages_fts_*` rows are
-    /// its shadow tables (external content, so no `_content`).
     fn expected_tables() -> Vec<String> {
         [
             "memory_records",
@@ -1636,7 +1199,6 @@ mod tests {
         assert_eq!(row_count(&projection, "sessions"), 1);
         assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
 
-        // The reopened index is still writable, and picks up where it left off.
         projection
             .apply(&message_appended(1, "hello"))
             .expect("apply");
@@ -1674,12 +1236,10 @@ mod tests {
             session,
             SessionRow {
                 id: "s-01".to_string(),
-                // Phase 3 columns exist and stay empty.
                 parent_session: None,
                 fork_point: None,
                 project: None,
                 title: Some("first light".to_string()),
-                // Sub-microsecond precision is dropped, the rest survives.
                 started_at: Some(TS_MICROS),
             }
         );
@@ -1764,8 +1324,6 @@ mod tests {
         }
     }
 
-    /// One tool turn's rows, typed: the columns DESIGN.md §3.1 says the
-    /// projection needs, kind by kind.
     #[test]
     fn a_tool_turn_projects_call_and_result_rows() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -1818,9 +1376,6 @@ mod tests {
         );
     }
 
-    /// The flags and the raw outcome integer must survive a log-in →
-    /// state-out replay, unknown enum values included: the projection
-    /// preserves, readers interpret.
     #[test]
     fn partial_truncated_and_unknown_outcomes_survive_replay() {
         let dir = TempDir::new().expect("temp dir");
@@ -1835,7 +1390,6 @@ mod tests {
         }
         log.append(cut).expect("append");
         log.append(tool_call(2, "c-a", 0, "{}")).expect("append");
-        // Outcome 99 is from a newer schema; it must come back verbatim.
         log.append(tool_result(3, "c-a", 99, "cut resul [truncated]", true))
             .expect("append");
 
@@ -1864,9 +1418,6 @@ mod tests {
         );
     }
 
-    /// FTS finds prose and result text, and the `kind` join is what excludes
-    /// result rows — the filter `sessions_search` will default to (§3.1's
-    /// open FTS question, proven answerable here).
     #[test]
     fn fts_matches_prose_and_results_and_kind_filters_them_apart() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -1916,7 +1467,6 @@ mod tests {
         );
     }
 
-    /// A `SessionCreated` with its own id, title, and creation second.
     fn session_created_as(seq: u64, id: &str, title: &str, at: Option<i64>) -> Event {
         Event {
             seq,
@@ -1938,7 +1488,6 @@ mod tests {
         let mut projection = Projection::open(":memory:").expect("open");
         assert_eq!(projection.sessions().expect("sessions"), []);
 
-        // Applied in neither id order nor time order, and two share a start.
         for (seq, id, title, at) in [
             (0, "s-c", "third", Some(300)),
             (1, "s-b", "second", Some(200)),
@@ -1971,9 +1520,6 @@ mod tests {
         assert_eq!(sessions[0].started_at, None);
     }
 
-    /// The picker labels sessions by their opening line, so the preview must
-    /// be the *first user* message — not the first message (which can be the
-    /// model, healing a torn turn) and not the last.
     #[test]
     fn a_session_previews_its_first_user_message() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2005,8 +1551,6 @@ mod tests {
         );
     }
 
-    /// Recency is the last message, not the first: a session opened days ago
-    /// and spoken in a minute ago is a recent session.
     #[test]
     fn a_session_reports_when_it_was_last_spoken_in() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2017,8 +1561,6 @@ mod tests {
             "a session nobody has spoken in has no last message"
         );
 
-        // `message_appended` stamps every event with the same fixed clock, so
-        // move the second one forward by hand to make the MAX meaningful.
         projection
             .apply(&message_appended(1, "first"))
             .expect("apply");
@@ -2063,7 +1605,6 @@ mod tests {
     fn messages_of_other_sessions_stay_out() {
         let mut projection = Projection::open(":memory:").expect("open");
         projection.apply(&session_created(0)).expect("apply");
-        // Two sessions interleaved by seq: only s-01's rows may come back.
         for (seq, session, content) in [
             (1, "s-01", "a"),
             (2, "s-02", "x"),
@@ -2111,7 +1652,6 @@ mod tests {
             "got: {err:?}"
         );
 
-        // No half-open transaction: the next apply commits normally.
         assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
         projection
             .apply(&message_appended(1, "hello"))
@@ -2133,13 +1673,10 @@ mod tests {
             .expect_err("a duplicate seq must violate the primary key");
         assert!(matches!(err, Error::Sqlite(_)), "got: {err:?}");
 
-        // Rolled back whole: no second row, and last_seq is untouched.
         assert_eq!(row_count(&projection, "messages"), 1);
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
-    /// Seq is the primary key on tool rows too, and the rollback covers the
-    /// FTS insert that rides in the same transaction.
     #[test]
     fn double_applying_a_tool_row_fails_and_rolls_back_its_fts_row() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2178,8 +1715,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
-    /// Version 1 is what a pre-tool-rows daemon left behind; open must
-    /// refuse it (arcd then deletes the file and re-projects).
     #[test]
     fn an_index_from_another_schema_version_is_refused() {
         let dir = TempDir::new().expect("temp dir");
@@ -2219,11 +1754,6 @@ mod tests {
         assert_eq!(started_at, None);
     }
 
-    // --- replay driver ---
-
-    /// A log directory with one session, three messages, and a tool exchange
-    /// (seqs 0..=5). The tiny segment cap forces several segments, so replay
-    /// always crosses segment boundaries in these tests.
     fn build_log(dir: &Path) -> Log {
         let mut log = Log::open_with_max_segment_len(dir, 64).expect("open log");
         log.append(session_created(0)).expect("append");
@@ -2243,11 +1773,8 @@ mod tests {
         log
     }
 
-    /// How many events [`build_log`] holds.
     const BUILT_EVENTS: u64 = 6;
 
-    /// Every user-visible row in the index, in deterministic order. Two
-    /// projections are the same state exactly when their dumps are equal.
     fn dump(projection: &Projection) -> Vec<String> {
         let mut rows = Vec::new();
         let mut stmt = projection
@@ -2347,7 +1874,6 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = build_log(dir.path());
 
-        // Replay only the first segment, as if the daemon crashed mid-rebuild.
         let segments = discover_segments(log.dir()).expect("discover");
         assert!(segments.len() > 1, "the test needs several segments");
         let mut resumed = Projection::open(":memory:").expect("open");
@@ -2358,12 +1884,10 @@ mod tests {
             "the partial replay must be partial"
         );
 
-        // Resuming over the full log completes it...
         let stats = replay(log.reader().expect("reader"), &mut resumed).expect("resume");
         assert_eq!(stats.applied + stats.skipped, BUILT_EVENTS);
         assert_eq!(stats.skipped, partial.applied, "resume skips what landed");
 
-        // ...to exactly the state a one-shot replay produces.
         let mut one_shot = Projection::open(":memory:").expect("open");
         replay(log.reader().expect("reader"), &mut one_shot).expect("one-shot replay");
         assert_eq!(dump(&resumed), dump(&one_shot));
@@ -2374,8 +1898,6 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = build_log(dir.path());
 
-        // Sabotage: a hand-inserted row already occupies seq 2, so replay
-        // applies 0 and 1, then hits a primary-key violation.
         let mut projection = Projection::open(":memory:").expect("open");
         projection
             .conn
@@ -2398,7 +1920,6 @@ mod tests {
             "everything before the failure stays committed"
         );
 
-        // Clear the sabotage; the next replay resumes past 1 and completes.
         projection
             .conn
             .execute("DELETE FROM messages WHERE seq = 2", [])
@@ -2417,10 +1938,6 @@ mod tests {
         assert_eq!(dump(&projection), dump(&one_shot));
     }
 
-    // --- memory records ---
-
-    /// An ACTIVE record with a full provenance entry, so round-trips cover
-    /// every field — the timestamp's nanos included.
     fn record(id: &str, title: &str, summary: &str) -> MemoryRecord {
         MemoryRecord {
             id: id.to_string(),
@@ -2484,8 +2001,6 @@ mod tests {
         )
     }
 
-    /// The `memory_event::Event` inside one of the constructors above, in the
-    /// shape `testkit::seed_memory_log` seeds.
     fn memory_payload(event: Event) -> memory_event::Event {
         match event.payload {
             Some(event::Payload::Memory(MemoryEvent { event: Some(inner) })) => inner,
@@ -2493,7 +2008,6 @@ mod tests {
         }
     }
 
-    /// The ids [`Projection::memory_index`] lists, in its order.
     fn index_ids(projection: &Projection) -> Vec<String> {
         projection
             .memory_index()
@@ -2611,8 +2125,6 @@ mod tests {
         assert_eq!(new.superseded_by, None);
     }
 
-    /// The proto allows the replacement to reuse the superseded id; the row
-    /// is then simply replaced — the log keeps the history, not the table.
     #[test]
     fn a_supersede_reusing_the_id_replaces_the_row_in_place() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2651,8 +2163,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
-    /// §5.2's purge applies whatever the status was: deleting a SUPERSEDED
-    /// record removes the history row and leaves its replacement alone.
     #[test]
     fn deleting_a_superseded_record_removes_it_and_spares_the_replacement() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2672,8 +2182,6 @@ mod tests {
         assert_eq!(index_ids(&projection), ["mr-b"]);
     }
 
-    /// A foreign log can supersede a record this log never created; the
-    /// replacement must still land (with a warning), not fail the replay.
     #[test]
     fn a_supersede_of_a_missing_target_still_lands_the_replacement() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2689,8 +2197,6 @@ mod tests {
         assert_eq!(index_ids(&projection), ["mr-b"]);
     }
 
-    /// Same replay-safety rule for the other anomaly: deleting what the
-    /// projection never held warns, no-ops, and advances `last_seq`.
     #[test]
     fn a_delete_of_an_unknown_record_warns_and_no_ops() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2755,7 +2261,6 @@ mod tests {
             .apply(&mem_superseded(1, "mr-a", record("mr-b", "new", "s")))
             .expect("apply");
 
-        // Distinct ids: the old row's guard refuses first.
         let err = projection
             .apply(&mem_superseded(1, "mr-a", record("mr-b", "newer", "s")))
             .expect_err("the seq guard must refuse a replayed supersede");
@@ -2764,7 +2269,6 @@ mod tests {
             "got: {err:?}"
         );
 
-        // Same id: the upsert's own guard refuses.
         projection
             .apply(&mem_superseded(2, "mr-b", record("mr-b", "renewed", "s")))
             .expect("apply");
@@ -2787,9 +2291,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(2));
     }
 
-    /// Delete's double-apply is indistinguishable from the unknown-id
-    /// anomaly — the row is gone either way — so it takes the anomaly path:
-    /// warn and no-op, never a spurious resurrection or failure.
     #[test]
     fn double_applying_a_delete_warns_and_no_ops() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2809,9 +2310,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
-    /// Enum integers this build does not know come back verbatim — the
-    /// projection preserves, readers interpret — and an unknown status is
-    /// simply not ACTIVE, so it stays out of the index.
     #[test]
     fn unknown_kind_and_status_ints_survive_verbatim() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -2847,9 +2345,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
     }
 
-    /// One log, both tiers: session and memory events interleaved project
-    /// into their own tables without crosstalk — seeded through the testkit,
-    /// so the seeder is exercised where the memory tests live.
     #[test]
     fn a_mixed_log_projects_both_tiers() {
         let dir = TempDir::new().expect("temp dir");
@@ -2923,9 +2418,6 @@ mod tests {
         assert_eq!(index_ids(&first), ["mr-b"]);
     }
 
-    // --- consolidation coverage (DESIGN.md §5.4) ---
-
-    /// A prose row in `session_id` stamped `at_seconds`, or unstamped.
     fn message_in(seq: u64, session_id: &str, at_seconds: Option<i64>) -> Event {
         Event {
             seq,
@@ -2943,7 +2435,6 @@ mod tests {
         }
     }
 
-    /// A tool-result row in `session_id` stamped `at_seconds`.
     fn result_in(seq: u64, session_id: &str, at_seconds: i64) -> Event {
         Event {
             seq,
@@ -3008,7 +2499,6 @@ mod tests {
             .expect("apply");
         assert_eq!(coverage(&projection, "s-01"), Some(5));
 
-        // Backward and repeated markers are skipped, never applied.
         projection
             .apply(&consolidated(2, "s-01", 3))
             .expect("apply");
@@ -3022,8 +2512,6 @@ mod tests {
             .expect("apply");
         assert_eq!(coverage(&projection, "s-01"), Some(8));
 
-        // A marker for a session this projection never held warns, no-ops,
-        // and still advances last_seq.
         projection
             .apply(&consolidated(5, "s-ghost", 2))
             .expect("apply");
@@ -3033,8 +2521,6 @@ mod tests {
     #[test]
     fn due_splits_never_consolidated_covered_and_grown_apart() {
         let mut projection = Projection::open(":memory:").expect("open");
-        // Three idle sessions: never consolidated, fully covered, and one
-        // that grew past its marker.
         projection
             .apply(&session_created_as(0, "s-new", "", Some(50)))
             .expect("apply");
@@ -3067,7 +2553,6 @@ mod tests {
             .due_for_consolidation(1_000_000_000)
             .expect("due");
 
-        // Longest idle first; the covered session stays out.
         assert_eq!(
             due,
             [
@@ -3083,8 +2568,6 @@ mod tests {
         );
     }
 
-    /// Idle means strictly older than the cutoff: a session whose last event
-    /// sits exactly on the cutoff has not been idle for the window yet.
     #[test]
     fn the_idle_boundary_is_strict() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -3109,8 +2592,6 @@ mod tests {
         );
     }
 
-    /// A tool result is activity: it holds the idle clock like prose does,
-    /// and its seq is what the pass must read through.
     #[test]
     fn tool_result_rows_count_as_activity() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -3137,8 +2618,6 @@ mod tests {
         );
     }
 
-    /// No timestamps means idleness is unknowable; the engine stamps every
-    /// event it writes, so this shape only comes from a foreign log.
     #[test]
     fn a_session_with_no_timestamped_rows_is_never_due() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -3152,7 +2631,6 @@ mod tests {
         assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
     }
 
-    /// A session nobody has spoken in has nothing to consolidate.
     #[test]
     fn an_empty_session_is_never_due() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -3180,10 +2658,6 @@ mod tests {
         assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(2));
     }
 
-    // --- review bookkeeping ---
-
-    /// A memory event at an explicit time — the review queue is about when
-    /// things happened, so these tests set each event's clock.
     fn memory_at(seq: u64, at_micros: i64, event: memory_event::Event) -> Event {
         let mut wrapped = memory(seq, event);
         wrapped.ts = Some(Timestamp {
@@ -3203,7 +2677,6 @@ mod tests {
         )
     }
 
-    /// The ids [`Projection::review_items`] lists, in its order.
     fn review_ids(projection: &Projection, since: i64) -> Vec<String> {
         projection
             .review_items(since)
@@ -3299,7 +2772,6 @@ mod tests {
                 memory_payload(mem_created(0, record("mr-old", "address", "lives at X"))),
             ))
             .expect("apply");
-        // Accepted once; the supersede must bring it back.
         projection
             .apply(&reviewed(1, 150, "mr-old"))
             .expect("apply");
@@ -3369,8 +2841,6 @@ mod tests {
         assert_eq!(row_count(&projection, "memory_records"), 0);
     }
 
-    /// An out-of-order review from a foreign log must not un-review a later
-    /// verdict.
     #[test]
     fn the_review_stamp_only_moves_forward() {
         let mut projection = Projection::open(":memory:").expect("open");
@@ -3383,8 +2853,6 @@ mod tests {
             .expect("apply");
         projection.apply(&reviewed(1, 500, "mr-a")).expect("apply");
 
-        // Earlier clock, later seq: skipped. Were it applied, reviewed_at
-        // (300) would fall behind changed_at (400) and re-open the record.
         projection.apply(&reviewed(2, 300, "mr-a")).expect("apply");
 
         assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
@@ -3413,8 +2881,6 @@ mod tests {
         );
     }
 
-    /// A record whose events carried no clock has no window position: it
-    /// never enters the queue rather than sorting somewhere arbitrary.
     #[test]
     fn a_record_with_no_timestamp_never_enters_the_queue() {
         let mut projection = Projection::open(":memory:").expect("open");

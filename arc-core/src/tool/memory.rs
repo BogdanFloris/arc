@@ -1,14 +1,3 @@
-//! The distilled-tier tools: `memory_read`, `memory_search`, `memory_write`,
-//! `memory_supersede` (DESIGN.md §5.5).
-//!
-//! Reads are thin argument parsers over [`crate::archive::Archive`]. Writes
-//! return events on the reply for the engine to append — no tool here holds a
-//! write handle to anything durable (invariant 2). The `memory_write`
-//! description carries the WHEN/SKIP write policy; that channel, not injected
-//! reminders, is where hermes got the most leverage per token
-//! (`docs/prior-art-hermes.md` §1). Write replies are deliberately terse and
-//! never echo the saved record — echoing caused observed re-save thrash.
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -23,7 +12,6 @@ use crate::archive::{Archive, Error, MemoryHit};
 use crate::provider::ToolDefinition;
 use crate::session::now_ts;
 
-/// `memory_read`: fetch one record whole.
 pub struct MemoryRead {
     archive: Archive,
 }
@@ -80,7 +68,6 @@ impl Tool for MemoryRead {
     }
 }
 
-/// `memory_search`: find records by words in title, summary, or body.
 pub struct MemorySearch {
     archive: Archive,
 }
@@ -98,7 +85,6 @@ struct SearchArgs {
     namespace: Option<String>,
 }
 
-/// The search reply shape: compact rows, never bodies.
 #[derive(serde::Serialize)]
 struct SearchReplyJson {
     records: Vec<MemoryHit>,
@@ -157,10 +143,8 @@ impl Tool for MemorySearch {
     }
 }
 
-/// `memory_write`: mint a new ACTIVE record as an event for the engine.
 pub struct MemoryWrite;
 
-/// `memory_supersede`: retire a record and mint its replacement.
 pub struct MemorySupersede {
     archive: Archive,
 }
@@ -172,7 +156,6 @@ impl MemorySupersede {
     }
 }
 
-/// The record fields both write tools take.
 #[derive(Deserialize)]
 struct RecordArgs {
     kind: String,
@@ -191,7 +174,6 @@ struct SupersedeArgs {
     record: RecordArgs,
 }
 
-/// The record fields' JSON schema, shared by both write tools.
 fn record_properties() -> serde_json::Value {
     serde_json::json!({
         "kind": {
@@ -265,7 +247,6 @@ impl Tool for MemoryWrite {
 
 impl Tool for MemorySupersede {
     fn definition(&self) -> ToolDefinition {
-        // id, then the same record fields as memory_write.
         let mut properties = serde_json::Map::new();
         properties.insert(
             "id".to_owned(),
@@ -302,8 +283,6 @@ impl Tool for MemorySupersede {
                     ));
                 }
             };
-            // Validated here so the projection never sees a supersede of a
-            // record it does not hold.
             match self.archive.memory_record(&args.id) {
                 Ok(Some(_)) => {}
                 Ok(None) => return unknown_record(&args.id),
@@ -330,8 +309,6 @@ impl Tool for MemorySupersede {
     }
 }
 
-/// Validates the record fields and mints the record: fresh id, ACTIVE, one
-/// provenance entry naming the calling session.
 fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, ToolReply> {
     let Some(kind) = parse_kind(&args.kind) else {
         return Err(ToolReply::error(format!(
@@ -362,7 +339,6 @@ fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, Too
     ))
 }
 
-/// The five kind names every write surface accepts, or `None`.
 pub(crate) fn parse_kind(name: &str) -> Option<memory_record::Kind> {
     match name {
         "person" => Some(memory_record::Kind::Person),
@@ -374,9 +350,6 @@ pub(crate) fn parse_kind(name: &str) -> Option<memory_record::Kind> {
     }
 }
 
-/// Mints an ACTIVE record: fresh `mr-` id, one provenance entry naming the
-/// writing session at now. The one definition of record assembly — the write
-/// tools and the consolidation extractor both go through it.
 pub(crate) fn mint_record(
     kind: memory_record::Kind,
     namespace: Option<String>,
@@ -475,11 +448,6 @@ mod tests {
         })
     }
 
-    // --- the write path, live through the engine ---
-
-    /// The exit criterion's write half: a scripted `memory_write` turn puts
-    /// `MemoryRecordCreated` in the log *before* the result that reports it,
-    /// sourced MODEL, with provenance naming the turn's session.
     #[tokio::test]
     async fn a_write_turn_appends_the_record_before_its_result() {
         let dir = TempDir::new().expect("temp dir");
@@ -506,7 +474,6 @@ mod tests {
             session_event::Event::ToolCallIssued(_)
         ));
 
-        // The record, durable before its result, sourced MODEL.
         let record = created_record(&events[3]);
         assert_eq!(events[3].source, Source::Model as i32);
         assert!(record.id.starts_with("mr-"), "{}", record.id);
@@ -518,7 +485,6 @@ mod tests {
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
         assert!(provenance.entries[0].ts.is_some());
 
-        // The result follows and says only "Saved" — never the record.
         let session_event::Event::ToolResultRecorded(result) = session_ev(&events[4]) else {
             panic!("expected the result after the write, got {:?}", events[4]);
         };
@@ -655,11 +621,6 @@ mod tests {
         );
     }
 
-    // --- the tools straight through the trait ---
-
-    /// Invariant 2 at the tool boundary: a write tool holds no durable
-    /// handle — its whole effect is events on the reply, which only the
-    /// engine makes durable.
     #[tokio::test]
     async fn a_write_reply_is_events_not_writes() {
         let reply = MemoryWrite

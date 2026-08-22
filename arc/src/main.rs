@@ -1,9 +1,3 @@
-//! `arc` — the TUI client (DESIGN.md §7).
-//!
-//! Rendering and keys only: the wire lives in `arc_core::client`, driven by
-//! the connection task in [`net`], and every state transition is [`app`]'s.
-//! The loop below just moves events between the three and draws.
-
 mod app;
 mod markdown;
 mod net;
@@ -21,8 +15,6 @@ use tokio::sync::mpsc;
 
 use crate::app::{App, Command, Mode};
 
-/// Where the daemon listens unless `--addr` says otherwise (arcd's default
-/// bind).
 const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
 
 const USAGE: &str = "\
@@ -53,10 +45,6 @@ async fn main() -> Result<()> {
     result
 }
 
-/// `arc [--addr ws://host:port]` — anything else is refused, not guessed at.
-///
-/// `Ok(None)` means the args asked for help: print it and exit 0, because a
-/// backtrace is not an answer to `--help`.
 fn url_from_args() -> Result<Option<String>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -73,7 +61,6 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
     tokio::spawn(net::run(url, command_rx, event_tx));
 
     let mut app = App::new();
-    // Populate the picker and prove the daemon is there, in one request.
     let _ = commands.send(Command::List);
 
     let mut keys = EventStream::new();
@@ -86,21 +73,17 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
         let command = tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
-                // Resizes and the rest redraw on the next pass.
                 Some(Ok(_)) => None,
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
             },
             event = events.recv() => match event {
                 Some(event) => app.on_net(event),
-                // The connection task is gone; nothing more will ever arrive.
                 None => anyhow::bail!("the connection task died"),
             },
         };
 
         if let Some(command) = command {
-            // The task only stops when the command channel closes, and we
-            // hold the sender.
             commands.send(command).expect("connection task alive");
         }
         if app.mode != cursor {
@@ -111,7 +94,6 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
     Ok(())
 }
 
-/// A bar while typing, a block in normal mode — the shape vim trained.
 fn set_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Insert | Mode::Cmd => SetCursorStyle::SteadyBar,

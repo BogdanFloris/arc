@@ -1,52 +1,30 @@
-//! Command line parsing, by hand.
-//!
-//! The surface is three subcommands and a handful of flags, and it is meant
-//! to stay that size: a daemon is configured by its config file, not by
-//! flags. Parsing it by hand keeps the dependency out and the error
-//! messages ours.
-
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// What the user asked `arcd` to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Run the daemon. The default when no subcommand is given.
     Run,
-    /// Re-run consolidation prompt versions over the log and report
-    /// (DESIGN.md §5.4, tuning loop).
     MemoryReplay {
-        /// Prompt version to replay.
         prompt: String,
-        /// Second version to run and diff against, when given.
         against: Option<String>,
-        /// Sessions to replay; empty means all.
         sessions: Vec<String>,
     },
 }
 
-/// A parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
-    /// Subcommand to dispatch.
     pub command: Command,
-    /// Config file to read. Missing on disk is not an error (see [`crate::config`]).
     pub config: PathBuf,
 }
 
-/// What [`parse`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
-    /// Dispatch this.
     Run(Cli),
-    /// `--help`: print [`USAGE`] to stdout and exit 0.
     Help,
 }
 
-/// Config file used when `--config` is absent.
 pub const DEFAULT_CONFIG: &str = "data/arc.toml";
 
-/// Printed on `--help`, and on stderr for anything unparseable.
 pub const USAGE: &str = "\
 usage: arcd run [--config <path>]
        arcd memory-replay --prompt <version> [--against <version>]
@@ -64,21 +42,12 @@ options:
   --session <id>        limit the replay to this session; repeatable (memory-replay only)
   -h, --help            print this message";
 
-/// Which subcommand word was seen, before its flags are validated.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Name {
     Run,
     MemoryReplay,
 }
 
-/// Parses `args`, argv[0] included.
-///
-/// # Errors
-///
-/// A message for stderr whenever the arguments are not a command line this
-/// understands: an unknown subcommand, an unknown flag, a second subcommand,
-/// a flag with nothing after it, a replay flag without `memory-replay`. The
-/// caller pairs it with [`USAGE`] and exits 2.
 pub fn parse<I, S>(args: I) -> Result<Parsed, String>
 where
     I: IntoIterator<Item = S>,

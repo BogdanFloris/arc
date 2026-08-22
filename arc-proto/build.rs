@@ -5,7 +5,6 @@ fn main() -> std::io::Result<()> {
         "proto/events.proto",
         "proto/memory.proto",
         "proto/wire.proto",
-        // Not ours: a subset of Perfetto's schema, in its own package.
         "proto/perfetto.proto",
     ];
 
@@ -15,7 +14,6 @@ fn main() -> std::io::Result<()> {
 
     prost_build::compile_protos(&protos, &["proto"])?;
 
-    // prost emits nothing for a package with no messages; keep the include! in lib.rs valid.
     let generated = PathBuf::from(env::var("OUT_DIR").unwrap()).join("arc.v1.rs");
     if !generated.exists() {
         fs::write(&generated, "")?;
