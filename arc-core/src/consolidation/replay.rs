@@ -128,18 +128,7 @@ pub struct ChangedSummary {
     pub summary_b: String,
 }
 
-/// The seed one session's extraction runs under — the same under every
-/// version, so the diff isolates the prompt. FNV-1a rather than the std
-/// hasher: this value must be stable across builds.
-#[must_use]
-pub fn session_seed(session_id: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in session_id.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
-}
+pub use super::extract::session_seed;
 
 /// Runs every version in `versions` — `(version, prompt)` pairs — over the
 /// log at `log_dir`, one full pass each. `session_filter` empty means all

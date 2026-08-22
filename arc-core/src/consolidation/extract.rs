@@ -117,14 +117,30 @@ impl<P: Provider> ModelExtractor<P> {
         self
     }
 
-    /// Replay's determinism dial: pin the sampler so run-to-run differences
-    /// are attributable to the prompt. The live pass leaves it unset.
+    /// Pins the sampler explicitly; without it every extraction runs under
+    /// [`session_seed`], so the live pass and replay match by default.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
+}
 
+/// The seed one session's extraction runs under — the same for the live pass
+/// and for every replay version, so replay tests the exact behavior that
+/// runs (decided 2026-08-22). FNV-1a rather than the std hasher: this value
+/// must be stable across builds.
+#[must_use]
+pub fn session_seed(session_id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in session_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+impl<P: Provider> ModelExtractor<P> {
     /// Runs the completion and concatenates its text, rejecting every shape
     /// that is not "prose then a clean end of turn".
     async fn completion_text(&self, request: CompletionRequest) -> Result<String, ExtractError> {
@@ -188,7 +204,12 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
                 content: render_input(session),
             }],
             tools: Vec::new(),
-            seed: self.seed,
+            // Seeded per session unless the caller pinned one: the live pass
+            // and a replay of the same version produce the same extraction.
+            seed: Some(
+                self.seed
+                    .unwrap_or_else(|| session_seed(&session.session_id)),
+            ),
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
