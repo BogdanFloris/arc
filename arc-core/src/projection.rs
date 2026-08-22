@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::log;
 
+// bump on any SCHEMA change; the daemon deletes the index and replays
 pub const SCHEMA_VERSION: u32 = 5;
 
 const LAST_SEQ_KEY: &str = "last_seq";
@@ -714,6 +715,7 @@ fn insert_tool_result(
     index_content(tx, event.seq, &result.content)
 }
 
+// content= tables have no triggers, so FTS rows go in by hand
 fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",

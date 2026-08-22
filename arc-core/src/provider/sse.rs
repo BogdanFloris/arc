@@ -49,6 +49,7 @@ impl FrameDecoder {
 
     fn field(&mut self, line: &str) {
         let (name, value) = match line.find(':') {
+            // a line starting with ':' is a comment, not a field
             Some(0) => return,
             Some(colon) => {
                 let value = &line[colon + 1..];

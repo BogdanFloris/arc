@@ -30,6 +30,7 @@ impl PacketWriter {
     }
 
     pub(super) fn write(&mut self, packet: TracePacket) -> io::Result<()> {
+        // concatenated one-packet traces decode as a single trace
         let trace = Trace {
             packet: vec![packet],
         };

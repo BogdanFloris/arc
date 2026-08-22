@@ -41,6 +41,12 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 - Errors: `thiserror` for library errors in arc-core, `anyhow` at binary edges.
 - Async: tokio throughout; no other runtimes.
 - Instrumentation: every LLM call, tool call, memory operation, and consolidation pass gets `tracing` spans (these become Perfetto traces). If you add a subsystem, instrument it in the same change, not later.
+- Comments are rare and load-bearing. Default to none; the code says what it does. Write one only when the code cannot:
+  - an external rule you can't see from here (an SSE framing quirk, what SQLite's `content=` tables do, fsync ordering);
+  - a constant whose consequence lives in another file (bumping this rebuilds the index; 20 digits is what makes names sort);
+  - a line that looks wrong and isn't (dropping this sender *is* the kill signal; this empty loop reaps tasks).
+
+  One line above the code, under ten words, plain English. Never restate a name, never head a section, never argue for the change — that belongs in the commit message. Tests, `thiserror` messages, and generated code document themselves.
 - Tests live with the code; projection logic must have replay tests (log in → state out, deterministic).
 - Runtime state under `data/` (gitignored). Never write outside it at runtime.
 

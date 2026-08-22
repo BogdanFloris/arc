@@ -188,6 +188,7 @@ fn consolidation_task<P: Provider + 'static>(
     );
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(CONSOLIDATION_TICK);
+        // a slow pass must not make the missed ticks fire back to back
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut strikes = Strikes::default();
         loop {

@@ -155,6 +155,7 @@ async fn pass<P: Provider, E: Extractor>(
         .filter(|event| matches!(event, memory_event::Event::RecordSuperseded(_)))
         .count();
 
+    // re-locked, not held: extraction can take minutes
     let committed = engine
         .lock()
         .await

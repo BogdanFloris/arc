@@ -15,6 +15,7 @@ fn main() -> std::io::Result<()> {
     prost_build::compile_protos(&protos, &["proto"])?;
 
     let generated = PathBuf::from(env::var("OUT_DIR").unwrap()).join("arc.v1.rs");
+    // prost writes no file for an empty package; include! still needs one
     if !generated.exists() {
         fs::write(&generated, "")?;
     }

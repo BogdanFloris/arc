@@ -27,6 +27,7 @@ impl OpenAiCompat {
         endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
             endpoint,
+            // no pooling: a stale keep-alive kills the tool loop's second call
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
                 .build()

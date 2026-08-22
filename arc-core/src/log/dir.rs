@@ -9,7 +9,7 @@ use super::{Error, LogReader, SegmentWriter, format};
 
 pub const DEFAULT_MAX_SEGMENT_LEN: u64 = 64 * 1024 * 1024;
 
-const SEQ_DIGITS: usize = 20;
+const SEQ_DIGITS: usize = 20; // u64::MAX is 20 digits, so names sort by seq
 
 const SEGMENT_EXT: &str = ".log";
 

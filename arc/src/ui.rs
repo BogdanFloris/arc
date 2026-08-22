@@ -73,6 +73,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let end = lines.len() - app.scroll_back;
     let start = end.saturating_sub(height);
+    // pad the top so a short transcript still sits on the bottom
     let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
     visible.extend_from_slice(&lines[start..end]);
     frame.render_widget(Paragraph::new(visible), area);

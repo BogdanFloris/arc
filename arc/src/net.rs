@@ -55,6 +55,7 @@ async fn handle(
             let _ = events.send(NetEvent::Disconnected {
                 reason: error.to_string(),
             });
+            // dropping the client forces a reconnect on the next command
             None
         }
     }

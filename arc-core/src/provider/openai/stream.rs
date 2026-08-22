@@ -104,6 +104,7 @@ impl Parser {
             .map(|(index, building)| building.finish(index).map(CompletionDelta::ToolCall))
             .collect::<Result<_, _>>()?;
 
+        // some endpoints say "stop" while still emitting tool calls
         self.stop = Some(if reason == TOOL_CALLS || !calls.is_empty() {
             Stop::ToolCalls
         } else {

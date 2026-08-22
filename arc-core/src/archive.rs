@@ -12,7 +12,7 @@ use crate::projection::{KIND_MESSAGE, bad_json_column, links_from_json, provenan
 
 const MAX_QUERY_CHARS: usize = 256;
 
-const OVERFETCH: usize = 50;
+const OVERFETCH: usize = 50; // hits collapse per session, so fetch extra
 
 const MAX_SESSIONS: usize = 5;
 
@@ -484,6 +484,7 @@ fn prose_window(
     for row in mapped {
         window.push(row?);
     }
+    // walked backwards from the anchor; flip it to reading order
     window.reverse();
 
     let mut stmt = conn.prepare(

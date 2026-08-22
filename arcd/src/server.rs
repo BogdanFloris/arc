@@ -42,6 +42,7 @@ pub async fn serve<P: Provider + 'static>(
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
+                    // reap finished connections so the set can't grow forever
                     while connections.try_join_next().is_some() {}
                     connections.spawn(connection(
                         stream,
@@ -182,6 +183,7 @@ async fn send_message<P: Provider>(
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
     let mut engine = engine.lock().await;
+    // forward has to run alongside the engine or the event channel fills
     let (result, connected) = tokio::join!(
         engine.send_message(session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),

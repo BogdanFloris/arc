@@ -90,6 +90,7 @@ impl<P: Provider> ModelExtractor<P> {
     }
 }
 
+// FNV-1a — a session must seed the same way on every replay
 #[must_use]
 pub fn session_seed(session_id: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;

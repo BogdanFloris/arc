@@ -174,6 +174,7 @@ impl<P: Provider> Engine<P> {
         let mut memory = MemoryCounters::default();
 
         let reply = loop {
+            // the last step offers no tools, so the model has to answer
             let last_step = steps >= MAX_TOOL_STEPS;
             let request = self.completion_request(system.clone(), transcript.clone(), last_step);
 
@@ -301,6 +302,7 @@ impl<P: Provider> Engine<P> {
             .issued_call_ids
             .entry(session_id.to_owned())
             .or_default();
+        // models sometimes omit or repeat call ids; the log needs them unique
         for call in &mut calls {
             if call.id.is_empty() || seen.contains(&call.id) {
                 call.id = uuid::Uuid::new_v4().to_string();

@@ -77,6 +77,7 @@ impl SegmentWriter {
     }
 }
 
+// the file isn't durable until its parent directory is synced too
 fn sync_parent_dir(path: &Path) -> Result<(), Error> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,

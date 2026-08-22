@@ -25,6 +25,7 @@ pub async fn run(
     let model = config.model();
     let timeout = Duration::from_secs(config.consolidation.timeout_seconds);
 
+    // irrefutable today; a second provider must break this line
     let ProviderChoice::Local = config.provider;
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
     let sidecar = if probe(&endpoint).await {

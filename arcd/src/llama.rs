@@ -82,6 +82,7 @@ impl Sidecar {
     }
 
     pub async fn stop(mut self) {
+        // dropping the sender is the kill signal
         self.kill.take();
         if let Err(error) = (&mut self.monitor).await {
             warn!(%error, "the sidecar monitor task failed");
