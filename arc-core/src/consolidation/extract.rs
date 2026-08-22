@@ -553,6 +553,8 @@ mod tests {
                 session_id: reply.session_id.clone(),
                 through_seq: 2,
                 records: 1,
+                records_created: 1,
+                records_superseded: 0,
             }
         );
 

@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -326,6 +327,61 @@ pub(crate) fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry 
         registry.register(Box::new(Canned { name, content, ok }));
     }
     registry
+}
+
+/// Captures spans into a Perfetto trace across `.await`s — the async sibling
+/// of the trace layer's own test capture. Start before the spans open,
+/// `finish` after the work completes (spans write at close).
+pub(crate) struct TraceCapture {
+    _dir: TempDir,
+    path: PathBuf,
+    guard: tracing::subscriber::DefaultGuard,
+}
+
+impl TraceCapture {
+    pub(crate) fn start() -> Self {
+        use tracing_subscriber::prelude::*;
+        let dir = TempDir::new().expect("trace dir");
+        let (layer, path) = crate::trace::perfetto(dir.path(), "test").expect("trace file");
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            _dir: dir,
+            path,
+            guard,
+        }
+    }
+
+    /// Stops capturing and decodes everything the layer wrote.
+    pub(crate) fn finish(self) -> arc_proto::perfetto::Trace {
+        use prost::Message as _;
+        let Self { _dir, path, guard } = self;
+        drop(guard);
+        let bytes = std::fs::read(&path).expect("trace file");
+        arc_proto::perfetto::Trace::decode(bytes.as_slice()).expect("decodable trace")
+    }
+}
+
+/// Every sample on the counter track named `name`, in packet order — empty
+/// when the track was never declared, which is how "no traffic emits
+/// nothing" is asserted.
+pub(crate) fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) -> Vec<f64> {
+    let Some(uuid) = trace
+        .packet
+        .iter()
+        .filter_map(|packet| packet.track_descriptor.as_ref())
+        .find(|track| track.counter.is_some() && track.name == name)
+        .and_then(|track| track.uuid)
+    else {
+        return Vec::new();
+    };
+    trace
+        .packet
+        .iter()
+        .filter_map(|packet| packet.track_event.as_ref())
+        .filter(|event| event.track_uuid == Some(uuid))
+        .filter_map(|event| event.double_counter_value)
+        .collect()
 }
 
 pub(crate) fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {

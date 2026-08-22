@@ -113,6 +113,10 @@ pub enum Outcome {
         through_seq: u64,
         /// Extractor events appended before the marker.
         records: usize,
+        /// The `records` split by kind: `RecordCreated` events appended.
+        records_created: usize,
+        /// `RecordSuperseded` events appended.
+        records_superseded: usize,
     },
     /// The session spoke while the extractor ran; the pass was discarded
     /// whole and the log holds nothing from it.
@@ -146,6 +150,8 @@ pub enum Outcome {
         through_seq = tracing::field::Empty,
         records = tracing::field::Empty,
         outcome = tracing::field::Empty,
+        counter.records_created = tracing::field::Empty,
+        counter.records_superseded = tracing::field::Empty,
     )
 )]
 pub async fn run_pass<P: Provider, E: Extractor>(
@@ -165,10 +171,20 @@ pub async fn run_pass<P: Provider, E: Extractor>(
             session_id,
             through_seq,
             records,
+            records_created,
+            records_superseded,
         }) => {
             span.record("session_id", session_id.as_str());
             span.record("through_seq", through_seq);
             span.record("records", records);
+            // A pass that appended nothing emits no counters: absent means
+            // "no records", so zero-yield passes stay off the counter tracks.
+            if *records_created > 0 {
+                span.record("counter.records_created", records_created);
+            }
+            if *records_superseded > 0 {
+                span.record("counter.records_superseded", records_superseded);
+            }
             span.record("outcome", "consolidated");
         }
         Ok(Outcome::Raced { session_id }) => {
@@ -208,6 +224,14 @@ async fn pass<P: Provider, E: Extractor>(
             source,
         })?;
     let records = events.len();
+    let records_created = events
+        .iter()
+        .filter(|event| matches!(event, memory_event::Event::RecordCreated(_)))
+        .count();
+    let records_superseded = events
+        .iter()
+        .filter(|event| matches!(event, memory_event::Event::RecordSuperseded(_)))
+        .count();
 
     // Step 3 — under the lock again: commit only if the session stayed idle.
     let committed = engine
@@ -219,6 +243,8 @@ async fn pass<P: Provider, E: Extractor>(
             session_id: snapshot.session_id,
             through_seq: snapshot.latest_seq,
             records,
+            records_created,
+            records_superseded,
         }
     } else {
         Outcome::Raced {
@@ -232,15 +258,17 @@ mod tests {
     use std::collections::HashSet;
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, Source, event, memory_event, memory_record,
-        session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Source, event, memory_event,
+        memory_record, session_event,
     };
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     use super::{ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, run_pass};
     use crate::projection::Projection;
-    use crate::testkit::{ScriptedProvider, channel, done_reply, engine, replay_events};
+    use crate::testkit::{
+        ScriptedProvider, TraceCapture, channel, counter_samples, done_reply, engine, replay_events,
+    };
 
     /// A cutoff after any clock this test run reads: every session is idle.
     const ALL_IDLE: i64 = i64::MAX;
@@ -320,6 +348,8 @@ mod tests {
                 session_id: reply.session_id.clone(),
                 through_seq: 2,
                 records: 0,
+                records_created: 0,
+                records_superseded: 0,
             }
         );
         let events = replay_events(&dir);
@@ -454,6 +484,8 @@ mod tests {
                 session_id: reply.session_id.clone(),
                 through_seq: 2,
                 records: 1,
+                records_created: 1,
+                records_superseded: 0,
             }
         );
         let events = replay_events(&dir);
@@ -483,6 +515,89 @@ mod tests {
             [],
             "replayed coverage keeps the session out"
         );
+    }
+
+    /// The §5.4 write counters: a pass that creates one record and
+    /// supersedes another shows both, split by kind, on its span.
+    #[tokio::test]
+    async fn a_create_and_a_supersede_show_both_counters() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let engine = Mutex::new(engine(&provider, &dir));
+        let (tx, _rx) = channel();
+        engine
+            .lock()
+            .await
+            .send_message(None, "hi", tx)
+            .await
+            .expect("send");
+
+        let extractor = Scripted(vec![
+            created_record("mr-x"),
+            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                superseded_id: "mr-x".to_owned(),
+                record: Some(MemoryRecord {
+                    id: "mr-y".to_owned(),
+                    kind: memory_record::Kind::Fact as i32,
+                    namespace: "global".to_owned(),
+                    title: "corrected".to_owned(),
+                    summary: "the corrected fact".to_owned(),
+                    body: "the corrected body".to_owned(),
+                    links: Vec::new(),
+                    provenance: None,
+                    status: memory_record::Status::Active as i32,
+                }),
+            }),
+        ]);
+        let capture = TraceCapture::start();
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+        let trace = capture.finish();
+
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Consolidated {
+                    records: 2,
+                    records_created: 1,
+                    records_superseded: 1,
+                    ..
+                }
+            ),
+            "got: {outcome:?}"
+        );
+        assert_eq!(counter_samples(&trace, "records_created"), [1.0]);
+        assert_eq!(counter_samples(&trace, "records_superseded"), [1.0]);
+    }
+
+    /// A pass that appends nothing stays off the counter tracks: absent
+    /// means "no records", not zero.
+    #[tokio::test]
+    async fn a_zero_yield_pass_emits_no_counters() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let engine = Mutex::new(engine(&provider, &dir));
+        let (tx, _rx) = channel();
+        engine
+            .lock()
+            .await
+            .send_message(None, "hi", tx)
+            .await
+            .expect("send");
+
+        let capture = TraceCapture::start();
+        run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+        let trace = capture.finish();
+
+        for name in ["records_created", "records_superseded"] {
+            assert!(
+                counter_samples(&trace, name).is_empty(),
+                "{name} must be absent on a zero-yield pass"
+            );
+        }
     }
 
     #[tokio::test]

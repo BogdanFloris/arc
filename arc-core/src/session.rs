@@ -185,6 +185,8 @@ impl<P: Provider> Engine<P> {
     /// - [`Error::Provider`] if the model call fails. Text that arrived before
     ///   a mid-stream failure is appended with `partial: true` first.
     /// - [`Error::EmptyReply`] if the stream ended before the first token.
+    // One turn is one function; splitting it would hide the loop's shape.
+    #[allow(clippy::too_many_lines)]
     #[tracing::instrument(
         level = "info",
         name = "session.send_message",
@@ -196,6 +198,11 @@ impl<P: Provider> Engine<P> {
             outcome = tracing::field::Empty,
             assistant_seq = tracing::field::Empty,
             tool_steps = tracing::field::Empty,
+            counter.memory_searches = tracing::field::Empty,
+            counter.memory_search_hits = tracing::field::Empty,
+            counter.memory_reads_from_search = tracing::field::Empty,
+            counter.records_created = tracing::field::Empty,
+            counter.records_superseded = tracing::field::Empty,
         )
     )]
     pub async fn send_message(
@@ -250,8 +257,12 @@ impl<P: Provider> Engine<P> {
         let (mut transcript, system) = self.open_turn(&session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
+        let mut memory = MemoryCounters::default();
 
-        loop {
+        // Terminal arms break so the turn's memory counters are recorded
+        // exactly once; a `?` escape (durability, eager provider failure)
+        // skips them, which an aggregate metric tolerates.
+        let reply = loop {
             let last_step = steps >= MAX_TOOL_STEPS;
             let request = self.completion_request(system.clone(), transcript.clone(), last_step);
 
@@ -266,14 +277,22 @@ impl<P: Provider> Engine<P> {
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
                     steps += 1;
                     span.record("tool_steps", steps);
-                    self.tool_step(&session_id, &turn_id, text, calls, &mut transcript, &events)
-                        .await?;
+                    self.tool_step(
+                        &session_id,
+                        &turn_id,
+                        text,
+                        calls,
+                        &mut transcript,
+                        &mut memory,
+                        &events,
+                    )
+                    .await?;
                 }
                 Ending::Done(_) => {
                     let seq = self.append_reply(&session_id, &turn_id, &text, false)?;
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
-                    return Ok(Reply {
+                    break Ok(Reply {
                         session_id,
                         seq,
                         usage: total_usage,
@@ -282,13 +301,13 @@ impl<P: Provider> Engine<P> {
                 }
                 Ending::Cut if text.is_empty() => {
                     span.record("outcome", "error");
-                    return Err(Error::EmptyReply);
+                    break Err(Error::EmptyReply);
                 }
                 Ending::Cut => {
                     let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
                     span.record("outcome", "partial");
                     span.record("assistant_seq", seq);
-                    return Ok(Reply {
+                    break Ok(Reply {
                         session_id,
                         seq,
                         usage: None,
@@ -304,10 +323,12 @@ impl<P: Provider> Engine<P> {
                         span.record("assistant_seq", seq);
                     }
                     span.record("outcome", "error");
-                    return Err(error.into());
+                    break Err(error.into());
                 }
             }
-        }
+        };
+        memory.record_on(&span);
+        reply
     }
 
     /// Drives one completion to its end: text and reasoning forwarded as they
@@ -350,6 +371,7 @@ impl<P: Provider> Engine<P> {
     }
 
     /// One tool step
+    #[allow(clippy::too_many_arguments)]
     async fn tool_step(
         &mut self,
         session_id: &str,
@@ -357,6 +379,7 @@ impl<P: Provider> Engine<P> {
         text: String,
         mut calls: Vec<ToolCall>,
         transcript: &mut Vec<Message>,
+        memory: &mut MemoryCounters,
         events: &mpsc::Sender<EngineEvent>,
     ) -> Result<(), Error> {
         // Step text is rare.
@@ -430,9 +453,11 @@ impl<P: Provider> Engine<P> {
             } else {
                 ToolOutcome::Error
             };
+            memory.observe_call(&call.name, &call.arguments, &dispatched.content);
             // A write tool's events go durable before the result that says
             // "saved" — the report must follow the write it reports.
             for memory_event in dispatched.memory_events {
+                memory.observe_event(&memory_event);
                 self.record_memory(Source::Model, memory_event)?;
             }
             self.record(
@@ -839,6 +864,93 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
     messages
 }
 
+/// One turn's memory-traffic counters (DESIGN.md §5.4), fed by the tool loop
+/// and recorded on the turn's span at its end.
+#[derive(Debug, Default)]
+struct MemoryCounters {
+    /// Record ids surfaced by this turn's `memory_search` replies.
+    surfaced: HashSet<String>,
+    searches: u64,
+    search_hits: u64,
+    reads_from_search: u64,
+    records_created: u64,
+    records_superseded: u64,
+}
+
+/// The one part of a `memory_search` reply the counters read.
+#[derive(serde::Deserialize)]
+struct SearchReplyIds {
+    records: Vec<SearchReplyId>,
+}
+
+#[derive(serde::Deserialize)]
+struct SearchReplyId {
+    id: String,
+}
+
+/// The one part of a `memory_read` call the counters read.
+#[derive(serde::Deserialize)]
+struct ReadArgsId {
+    id: String,
+}
+
+impl MemoryCounters {
+    /// Retrieval hit rate is a proxy: a `memory_read` whose id appeared in an
+    /// earlier `memory_search` reply this turn counts as the search being
+    /// used. Known undercount — the model can act on a summary straight from
+    /// the search reply without ever reading the body.
+    fn observe_call(&mut self, name: &str, arguments_json: &str, result_content: &str) {
+        match name {
+            "memory_search" => {
+                self.searches += 1;
+                // The no-match reply is prose, not JSON: not a hit.
+                let Ok(reply) = serde_json::from_str::<SearchReplyIds>(result_content) else {
+                    return;
+                };
+                if !reply.records.is_empty() {
+                    self.search_hits += 1;
+                }
+                self.surfaced
+                    .extend(reply.records.into_iter().map(|record| record.id));
+            }
+            "memory_read" => {
+                if let Ok(args) = serde_json::from_str::<ReadArgsId>(arguments_json) {
+                    if self.surfaced.contains(&args.id) {
+                        self.reads_from_search += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Counts a memory event a tool asked the engine to append.
+    fn observe_event(&mut self, event: &memory_event::Event) {
+        match event {
+            memory_event::Event::RecordCreated(_) => self.records_created += 1,
+            memory_event::Event::RecordSuperseded(_) => self.records_superseded += 1,
+            _ => {}
+        }
+    }
+
+    /// Absent means "no memory traffic": zeros land only where a denominator
+    /// exists — never on turns that touched no memory (§5.4). Rates are for
+    /// analysis time; a ratio in a trace would hide its sample size.
+    fn record_on(&self, span: &tracing::Span) {
+        if self.searches > 0 {
+            span.record("counter.memory_searches", self.searches);
+            span.record("counter.memory_search_hits", self.search_hits);
+            span.record("counter.memory_reads_from_search", self.reads_from_search);
+        }
+        if self.records_created > 0 {
+            span.record("counter.records_created", self.records_created);
+        }
+        if self.records_superseded > 0 {
+            span.record("counter.records_superseded", self.records_superseded);
+        }
+    }
+}
+
 /// How one completion of the loop ended; see the module docs.
 enum Ending {
     Done(Stop),
@@ -865,21 +977,21 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, Role, Source, ToolOutcome, memory_event, memory_record,
-        session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Role, Source, ToolOutcome,
+        memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
-    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS};
+    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters};
     use crate::log::Log;
     use crate::projection::Projection;
     use crate::provider::{
         CompletionDelta, Error as ProviderError, Message, Stop, ToolCall, Usage,
     };
     use crate::testkit::{
-        Canned, ScriptedProvider, appended, call, channel, done_reply, drain, engine,
-        engine_with_tools, issued, reopened_engine, replay_log, resulted, seed_log,
-        seed_memory_log, tool_stop, tools, turn, usage,
+        Canned, ScriptedProvider, TraceCapture, appended, call, channel, counter_samples,
+        done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_log,
+        resulted, seed_log, seed_memory_log, tool_stop, tools, turn, usage,
     };
     use crate::tool::Registry;
 
@@ -1848,6 +1960,269 @@ mod tests {
         engine.send_message(None, "hi", tx).await.expect("send");
 
         assert_eq!(provider.requests()[0].system, Some(seeded_block()));
+    }
+
+    // --- the §5.4 memory counters on the turn's span ---
+
+    /// A `memory_search` hit reply, as the real tool shapes it.
+    const SEARCH_HIT: &str = r#"{"records":[{"id":"mr-pal","namespace":"global","kind":"fact","title":"Gruvbox","summary":"the palette"}]}"#;
+
+    /// The §5.4 counter names a turn can record.
+    const TURN_COUNTERS: [&str; 5] = [
+        "memory_searches",
+        "memory_search_hits",
+        "memory_reads_from_search",
+        "records_created",
+        "records_superseded",
+    ];
+
+    #[test]
+    fn memory_counters_follow_search_and_read() {
+        let mut counters = MemoryCounters::default();
+        counters.observe_call(
+            "memory_search",
+            r#"{"query":"palette"}"#,
+            r#"{"records":[{"id":"mr-1"},{"id":"mr-2"}]}"#,
+        );
+        counters.observe_call(
+            "memory_search",
+            r#"{"query":"nothing"}"#,
+            "No memory records match. For something from a past conversation, \
+             search sessions_search before giving up.",
+        );
+        counters.observe_call("memory_read", r#"{"id":"mr-1"}"#, "the body");
+        counters.observe_call(
+            "memory_read",
+            r#"{"id":"mr-ghost"}"#,
+            "ERROR: no such record",
+        );
+        counters.observe_call("sessions_search", r#"{"query":"x"}"#, "unrelated");
+
+        assert_eq!(counters.searches, 2);
+        assert_eq!(
+            counters.search_hits, 1,
+            "the prose no-match reply is not a hit"
+        );
+        assert_eq!(
+            counters.reads_from_search, 1,
+            "only the read of a surfaced id counts"
+        );
+        assert_eq!(counters.records_created, 0);
+        assert_eq!(counters.records_superseded, 0);
+    }
+
+    #[test]
+    fn memory_counters_split_events_by_kind() {
+        let mut counters = MemoryCounters::default();
+        counters.observe_event(&memory_event::Event::RecordCreated(MemoryRecordCreated {
+            record: None,
+        }));
+        counters.observe_event(&memory_event::Event::RecordSuperseded(
+            MemoryRecordSuperseded {
+                superseded_id: "mr-old".to_owned(),
+                record: None,
+            },
+        ));
+
+        assert_eq!(counters.records_created, 1);
+        assert_eq!(counters.records_superseded, 1);
+        assert_eq!(counters.searches, 0);
+    }
+
+    #[tokio::test]
+    async fn a_search_then_read_turn_records_the_retrieval_counters() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "memory_search", r#"{"query":"palette"}"#)),
+                Ok(tool_stop()),
+            ],
+            vec![
+                Ok(call("c2", 0, "memory_read", r#"{"id":"mr-pal"}"#)),
+                Ok(tool_stop()),
+            ],
+            done_reply("gruvbox"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let registry = tools(&[
+            ("memory_search", SEARCH_HIT, true),
+            ("memory_read", "the full body", true),
+        ]);
+        let mut engine = engine_with_tools(&provider, &dir, registry);
+
+        let capture = TraceCapture::start();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(None, "what palette?", tx)
+            .await
+            .expect("send");
+        let trace = capture.finish();
+
+        assert_eq!(counter_samples(&trace, "memory_searches"), [1.0]);
+        assert_eq!(counter_samples(&trace, "memory_search_hits"), [1.0]);
+        assert_eq!(counter_samples(&trace, "memory_reads_from_search"), [1.0]);
+        assert!(
+            counter_samples(&trace, "records_created").is_empty(),
+            "no writes, no write counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_without_a_read_records_zero_reads_from_search() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "memory_search", r#"{"query":"palette"}"#)),
+                Ok(tool_stop()),
+            ],
+            done_reply("answered from the summary"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(
+            &provider,
+            &dir,
+            tools(&[("memory_search", SEARCH_HIT, true)]),
+        );
+
+        let capture = TraceCapture::start();
+        let (tx, _rx) = channel();
+        engine.send_message(None, "hm", tx).await.expect("send");
+        let trace = capture.finish();
+
+        assert_eq!(counter_samples(&trace, "memory_searches"), [1.0]);
+        assert_eq!(counter_samples(&trace, "memory_search_hits"), [1.0]);
+        assert_eq!(
+            counter_samples(&trace, "memory_reads_from_search"),
+            [0.0],
+            "a searched turn records its zero — the denominator exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_write_turn_records_one_record_created() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "memory_write",
+                    r#"{"kind":"preference","title":"Terse replies",
+                        "summary":"prefers short answers","body":"Prefers short answers."}"#,
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("saved"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::memory::MemoryWrite));
+        let mut engine = engine_with_tools(&provider, &dir, registry);
+
+        let capture = TraceCapture::start();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(None, "remember this", tx)
+            .await
+            .expect("send");
+        let trace = capture.finish();
+
+        assert_eq!(counter_samples(&trace, "records_created"), [1.0]);
+        assert!(
+            counter_samples(&trace, "memory_searches").is_empty(),
+            "no retrieval traffic, no retrieval counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supersede_turn_records_one_record_superseded() {
+        /// A scripted supersede: replies like the real tool and carries the
+        /// event the engine appends.
+        struct Superseder;
+
+        impl crate::tool::Tool for Superseder {
+            fn definition(&self) -> crate::provider::ToolDefinition {
+                crate::provider::ToolDefinition {
+                    name: "memory_supersede".to_owned(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                _arguments_json: String,
+                _ctx: crate::tool::TurnContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::tool::ToolReply> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    crate::tool::ToolReply {
+                        content: "Superseded mr-pref with mr-new.".to_owned(),
+                        ok: true,
+                        memory_events: vec![memory_event::Event::RecordSuperseded(
+                            MemoryRecordSuperseded {
+                                superseded_id: "mr-pref".to_owned(),
+                                record: Some(MemoryRecord {
+                                    id: "mr-new".to_owned(),
+                                    kind: memory_record::Kind::Preference as i32,
+                                    namespace: "global".to_owned(),
+                                    title: "Terse replies".to_owned(),
+                                    summary: "still prefers short answers".to_owned(),
+                                    body: "Still prefers short answers.".to_owned(),
+                                    links: Vec::new(),
+                                    provenance: None,
+                                    status: memory_record::Status::Active as i32,
+                                }),
+                            },
+                        )],
+                    }
+                })
+            }
+        }
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "memory_supersede", r#"{"id":"mr-pref"}"#)),
+                Ok(tool_stop()),
+            ],
+            done_reply("updated"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Superseder));
+        let mut engine = reopened_engine(&provider, &dir, registry);
+
+        let capture = TraceCapture::start();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(None, "that changed", tx)
+            .await
+            .expect("send");
+        let trace = capture.finish();
+
+        assert_eq!(counter_samples(&trace, "records_superseded"), [1.0]);
+        assert!(counter_samples(&trace, "records_created").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_memory_traffic_records_no_counters() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
+            done_reply("plain answer"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found", true)]));
+
+        let capture = TraceCapture::start();
+        let (tx, _rx) = channel();
+        engine.send_message(None, "hi", tx).await.expect("send");
+        let trace = capture.finish();
+
+        for name in TURN_COUNTERS {
+            assert!(
+                counter_samples(&trace, name).is_empty(),
+                "{name} must be absent on a memory-free turn"
+            );
+        }
     }
 
     #[tokio::test]
