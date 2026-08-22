@@ -27,7 +27,7 @@ The stable shape, per DESIGN.md §6.1. Which model fills each slot is §3.
 | --- | --- | --- |
 | **face** | Conversation, recall, job dispatch. Identity file + record index. | Latency, voice, vision, judgment. Volume is small. |
 | **hands** | Job execution. Almost all tokens. | Cost per completed task. Nothing else comes close. |
-| **counsel** | Plans and unsticking. Read-only, bounded. | Capability. It is rare enough to be worth the best available. |
+| **counsel** | Plans, reviews, and unsticking. Read-only, bounded. | Capability. Called a few times per job, not per turn. |
 | **local** | Consolidation, extraction, offline fallback for face. | Free and resident. Latency-insensitive. |
 
 ---
@@ -39,7 +39,7 @@ The stable shape, per DESIGN.md §6.1. Which model fills each slot is §3.
 | **face** | Gemini 3.7 Flash | Direct API key | ~$10 |
 | **hands** | DeepSeek V4 Pro, via OpenCode Go | Go subscription | $10 (plan) |
 | ↳ escalation | GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
-| **counsel** | Opus / Fable via `claude -p`, read-only tools | Claude Pro | $20 |
+| **counsel** | Opus via `claude -p`, read-only tools, for both `plan` and `review`. Degrades to Sonnet only under budget pressure | Claude Pro | $20 |
 | **local** | Qwen3-8B Q4_K_M on the RTX 5070 | llama.cpp sidecar | $0 |
 | **reserve** | Prepaid Zen credit for Go spillover | — | ~$10 |
 | | | | **~$50** |
@@ -90,7 +90,13 @@ The mechanics that decide behaviour, as distinct from the marketing.
 
 Everything else on the plan is 0-day retention today. DeepSeek's zero-retention agreement is dated — see §7.
 
-**Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory. First-party CLI, which is the sanctioned path. Pro's limits are materially tighter than Max's, and counsel shares that pool with nothing else now that ARC is the only harness — which is the point of making it rare and bounded.
+**Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory. First-party CLI, which is the sanctioned path.
+
+A coding job costs one `plan` plus up to *N* `review` invocations, so counsel consumption scales with jobs times rounds rather than with conversation. That sounds like more than it is: each invocation is a short read-only run over a few files, far smaller than the interactive Opus/Sonnet sessions that already fit comfortably inside Pro for a full day of coding. Treat it as a thing to measure, not a thing to design around.
+
+**Both modes run on Opus.** Review benefits from the strongest available model as much as planning does — finding the real bug is the whole job — so there is no reason to spend the difference on a cheaper reviewer while headroom exists.
+
+Sonnet is the second rung of counsel's ladder (DESIGN.md §6.1), entered at roughly 70% of the window's allowance and left when the window resets. Whether that threshold is *measurable* is open: it needs visibility into Pro consumption that `claude -p` may not expose. Spike 1.2 settles it. If no usage signal exists, the degrade becomes reactive — stay on Opus until a rate-limit signal appears, then Sonnet for the rest of the window — which is the same ladder with a different trigger.
 
 **Gemini direct key.** Metered per token, no plan. Cached input is 90% off the base rate, which matters because the face's prefix — identity file plus record index plus recent history — is the most stable prefix in the system.
 
@@ -134,6 +140,8 @@ Events, not a schedule. Three are already dated:
 - **2026-08-31 — Sonnet 5 introductory pricing ends** ($2/$10 → $3/$15). Only matters if the face moves to Sonnet.
 - **2027-01-01 — Gemini Flash prices double.** Re-price the face; Flash-Lite and Haiku 4.5 are the alternatives.
 
+Counsel rate-limiting is a trigger rather than a prediction: if a job ever stalls on it, retune the round bound and severity gate, or split counsel by mode, before moving anything else.
+
 Otherwise: any provider ToS or pricing change, Go leaving beta or changing its caps, a GLM-5.5-class release, a GPU upgrade (a 24 GB card makes a local `hands` tier worth re-testing), the first month of real trace data, and the first time Go's monthly cap is actually hit.
 
 ---
@@ -147,6 +155,7 @@ The implementation obligations that follow. These are Phase 3 work.
 - **Prefix stability for the face.** Identity file and record index render first and byte-identically; anything volatile goes after them. A timestamp near the front of the prompt silently costs the entire cache discount.
 - **A failover chain that distinguishes credit exhaustion from rate limiting.** A 402 at Go's cap is not a retryable 429. Exhaustion falls through to spillover credit if enabled, then to the `local` role, and says so in the client.
 - **Per-job budgets**, declared at dispatch and enforced by arcd (DESIGN.md §4.1).
-- **The expert as an argv template** — command, working directory, timeout — with read-only enforcement a property of how it is invoked.
+- **The expert as an argv template** — command, working directory, timeout — with read-only enforcement a property of how it is invoked, and one template per mode (`plan`, `review`).
+- **A bounded review loop**: a configured maximum number of rounds, a severity gate deciding which comments justify another round, and honest termination — done-with-unresolved is a reportable outcome, not a failure to hide (DESIGN.md §6.2).
 - **An allow-list of permitted models** per role, so a lineup change fails closed.
 - **Cost accounting per completed task**, not per request, since that is the figure §3 is chosen on.

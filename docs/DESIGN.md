@@ -214,7 +214,13 @@ Rules:
 - **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
 - **A job has a budget**, declared at dispatch and enforced by arcd. A loop that cannot terminate must not be able to drain a month's allowance.
 
+**A job runs in its own process**, not inside `arcd`. `bash` in the daemon's address space is a blast radius the always-on process should not carry, and a runaway loop should not be able to take the conversation down with it. The worker talks to the same `Store` (§3.2) and appends the same events; what it does not share is a fate.
+
+**Dispatch is an ordinary tool call with a late result.** The model calls the dispatch tool, `ToolCallIssued` is appended, the worker starts, and the turn ends. Minutes later the job's summary lands as that call's `ToolResultRecorded`, which opens the next turn. Nothing new is needed for the asynchrony — §3.1's contract already covers it, including the crash case: a durable dispatch with no durable result is an orphan, and its outcome is *unknown*, never failed.
+
 Coding is the first job kind, not a privileged one. A device job (§9) is the same shape with a different tool set.
+
+Its internal shape is fixed and lives in the worker, not in a prompt: **plan → implement → review → fix → review**, with counsel (§6.2) supplying plan and review, `hands` supplying implement and fix, and the loop bounded. Every step is an ordinary event in the child session, so the whole cycle is replayable and traceable, and the parent sees one summary at the end. A job that runs out of rounds with blocking comments left says so rather than reporting success.
 
 ### 4.2 Workspaces
 
@@ -358,14 +364,22 @@ trait Provider {
 
 | Role | Job | Why it is its own role |
 | --- | --- | --- |
-| **face** | The conversation. Talk, recall, dispatch jobs (§4.1). Loads the identity file and the record index. | Small token volume, high sensitivity to voice and judgment, latency-critical once §7's voice client lands. Needs vision. |
+| **face** | The conversation. Talk, recall, dispatch jobs (§4.1). Loads the identity file and the record index; §5.1 defines its register. | Small token volume, high sensitivity to voice and judgment, latency-critical once §7's voice client lands. Needs vision. |
 | **hands** | Job execution. The overwhelming majority of tokens ARC will ever spend. | High volume, mechanical. Cost per *completed task* is the only figure that matters. |
 | **counsel** | Bounded advice — plans, unsticking. Never writes. | Rare, expensive, worth a frontier model precisely because it is rare. |
 | **local** | Consolidation, extraction, classification, and the offline fallback for face. | High volume, low stakes, latency-insensitive, free. |
 
 This is how §12's routing question gets answered without a runtime difficulty classifier: the mapping is static config, and the role label rides every `CompletionRequest` onto its span (§8), so traces attribute spend by role from the first day.
 
-**Local is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. It is also the degraded mode: when the network is gone or a hosted allowance is exhausted, face falls back to local. That is a visible role reassignment, announced in the client, not a silent quality drop.
+**A role resolves to an ordered ladder, not a single model.** The first rung is what the role uses when nothing is wrong; each lower rung is what it degrades to under a named condition — an allowance crossing a threshold, an allowance exhausted, the network gone. `face` degrades to `local`. `counsel` degrades from Opus to Sonnet under budget pressure and no further, because advice from a weak model is worse than no advice.
+
+Three properties make this safe rather than a silent quality drop:
+
+- **The ladder is the allow-list.** A role can only ever run a model named on one of its rungs, so a provider adding a model — or changing which one an alias points at — cannot route work somewhere unvetted. It fails closed.
+- **Degrading is visible.** The client says which rung is live and why. A user who cannot tell that answers got cheaper cannot judge them.
+- **Rungs recover.** A threshold-triggered degrade lifts when the window resets. Degraded is a state, not a latch.
+
+**Local is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. It is also the bottom rung of `face`'s ladder, which is what lets ARC keep talking with the network down.
 
 **A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork.
 
@@ -375,10 +389,15 @@ This is how §12's routing question gets answered without a runtime difficulty c
 
 That last property is the point. Escalating costs one subprocess and one tool-result event; it does not invalidate the face's or the job's cache. And because the expert reads the repository itself rather than being handed a summary, its answer is better than a completion built from a lossy brief.
 
-Two invariants:
+**Two modes, one mechanism.** `plan` is asked before work starts and returns an approach. `review` is asked after a change and returns comments. Both read the repository themselves, both are read-only, and both are the same subprocess with a different prompt.
+
+**counsel is called from inside a job, not only from the face.** The coding job's loop is plan, implement, review, fix, review — all of it inside the child session (§4.1). The conversation sees one dispatch and one summary. Putting the review cycle in the face instead would pay for the whole transcript twice and would put "is this comment worth another round" on the model least suited to judging it.
+
+Three invariants:
 
 - **counsel never writes.** Read-only tools, always. An expert that edits is a second coding agent with a second cost profile, and the whole point of the split is that the expensive model does not do the work that is expensive by volume.
 - **The expert is a command, not a code path.** An argv template, a working directory, and a timeout in config. Swapping one CLI for another is an edit, not a release.
+- **Review loops are bounded and terminate honestly.** "Loop until no comments" does not terminate on its own — a reviewer asked for comments will find some, and the last few rounds trade real money for taste. So: a configured maximum number of rounds, and only comments the reviewer marks *blocking* trigger another implement round. Non-blocking comments ride along in the handback for a human to judge. If the bound is reached with blocking comments outstanding, the job reports done-with-unresolved and names them. It never reports success it did not reach.
 
 ### 6.3 Transport and credentials
 
