@@ -7,6 +7,7 @@ use std::time::Duration;
 use arc_core::projection::{Reader, ReviewItem, SessionSummary};
 use arc_core::provider::Provider;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
+use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, Delta, Error as WireError, MemoryReviewItem, MemoryReviewItems, MessageAccepted,
     ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd,
@@ -292,7 +293,7 @@ async fn review_accept<P: Provider>(
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
-    let done = engine.lock().await.review_accept(record_id);
+    let done = engine.lock().await.store_mut().review_accept(record_id);
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
@@ -302,19 +303,26 @@ async fn review_delete<P: Provider>(
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
-    let done = engine.lock().await.review_delete(record_id);
+    let done = engine.lock().await.store_mut().review_delete(record_id);
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
-fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame::Msg {
+fn verdict_msg(done: Result<(), StoreError>, record_id: &str) -> server_frame::Msg {
     match done {
         Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
             session_id: String::new(),
         }),
         Err(error) => {
             warn!(%error, record_id, "review verdict failed");
-            error_frame(error_code(&error), &error)
+            error_frame(store_error_code(&error), &error)
         }
+    }
+}
+
+fn store_error_code(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::UnknownRecord { .. } => "unknown_record",
+        _ => "internal",
     }
 }
 
@@ -391,9 +399,8 @@ fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
-        SessionError::UnknownRecord { .. } => "unknown_record",
         SessionError::Provider(_) => "provider",
-        SessionError::Log(_) | SessionError::Projection(_) => "internal",
+        SessionError::Store(_) | SessionError::Projection(_) => "internal",
     }
 }
 

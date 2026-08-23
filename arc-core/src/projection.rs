@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -399,6 +400,17 @@ impl Projection {
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
         messages(&self.conn, session_id)
+    }
+
+    pub fn call_ids(&self, session_id: &str) -> Result<HashSet<String>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT call_id FROM messages
+             WHERE session_id = ?1 AND kind = ?2 AND call_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, KIND_TOOL_CALL], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
     pub(crate) fn due_for_consolidation(

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::{Tool, ToolReply, TurnContext, to_json};
 use crate::archive::{Archive, Error, MemoryHit};
 use crate::provider::ToolDefinition;
-use crate::session::now_ts;
+use crate::store::now_ts;
 
 pub struct MemoryRead {
     archive: Arc<Archive>,

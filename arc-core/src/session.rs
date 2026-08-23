@@ -1,25 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
-    MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, MessageAppended, Role,
-    SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued, ToolOutcome,
-    ToolResultRecorded,
+    MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
+    ToolOutcome, ToolResultRecorded,
 };
 use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
-use prost_types::Timestamp;
+
 use tokio::sync::mpsc;
 
-use crate::consolidation::SessionSnapshot;
-use crate::log::{self};
 use crate::memory::render_memory_index;
 use crate::projection::{self, MessageRow, SessionSummary};
 use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
 };
-use crate::store::{self, Store};
+use crate::store::{self, Store, now_ts};
 use crate::tool::{Registry, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
@@ -31,7 +27,6 @@ pub struct Engine<P> {
     system: Option<String>,
     registry: Registry,
     no_think: bool,
-    issued_call_ids: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +57,8 @@ pub struct Reply {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("session log append: {0}")]
-    Log(#[from] log::Error),
+    #[error("session store: {0}")]
+    Store(#[from] store::Error),
 
     #[error("session projection: {0}")]
     Projection(#[from] projection::Error),
@@ -74,20 +69,8 @@ pub enum Error {
     #[error("refusing to send an empty message")]
     EmptyMessage,
 
-    #[error("no memory record {id} to review")]
-    UnknownRecord { id: String },
-
     #[error("the model produced no reply")]
     EmptyReply,
-}
-
-impl From<store::Error> for Error {
-    fn from(error: store::Error) -> Self {
-        match error {
-            store::Error::Log(error) => Self::Log(error),
-            store::Error::Projection(error) => Self::Projection(error),
-        }
-    }
 }
 
 impl<P: Provider> Engine<P> {
@@ -106,7 +89,6 @@ impl<P: Provider> Engine<P> {
             system,
             registry,
             no_think,
-            issued_call_ids: HashMap::new(),
         }
     }
 
@@ -304,11 +286,8 @@ impl<P: Provider> Engine<P> {
         }
 
         calls.sort_unstable_by_key(|call| call.index);
-        let seen = self
-            .issued_call_ids
-            .entry(session_id.to_owned())
-            .or_default();
         // models sometimes omit or repeat call ids; the log needs them unique
+        let mut seen = self.store.projection().call_ids(session_id)?;
         for call in &mut calls {
             if call.id.is_empty() || seen.contains(&call.id) {
                 call.id = uuid::Uuid::new_v4().to_string();
@@ -402,6 +381,14 @@ impl<P: Provider> Engine<P> {
         (!prompt.is_empty()).then_some(prompt)
     }
 
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         Ok(self.store.projection().sessions()?)
     }
@@ -418,112 +405,6 @@ impl<P: Provider> Engine<P> {
             .into_iter()
             .map(projection::history_entry)
             .collect())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn due_for_consolidation(
-        &self,
-        idle_cutoff_micros: i64,
-    ) -> Result<Vec<projection::DueSession>, Error> {
-        Ok(self
-            .store
-            .projection()
-            .due_for_consolidation(idle_cutoff_micros)?)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn review_items(
-        &self,
-        since_micros: i64,
-    ) -> Result<Vec<projection::ReviewItem>, Error> {
-        Ok(self.store.projection().review_items(since_micros)?)
-    }
-
-    #[tracing::instrument(name = "session.review_accept", skip(self), fields(record_id))]
-    pub fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
-        self.reviewable(record_id)?;
-        self.record_memory(
-            Source::User,
-            memory_event::Event::RecordReviewed(MemoryRecordReviewed {
-                record_id: record_id.to_owned(),
-            }),
-        )?;
-        Ok(())
-    }
-
-    #[tracing::instrument(name = "session.review_delete", skip(self), fields(record_id))]
-    pub fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
-        self.reviewable(record_id)?;
-        self.record_memory(
-            Source::User,
-            memory_event::Event::RecordDeleted(MemoryRecordDeleted {
-                id: record_id.to_owned(),
-            }),
-        )?;
-        Ok(())
-    }
-
-    fn reviewable(&self, record_id: &str) -> Result<(), Error> {
-        if self.store.projection().memory_record(record_id)?.is_none() {
-            return Err(Error::UnknownRecord {
-                id: record_id.to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn snapshot_for_consolidation(
-        &self,
-        idle_cutoff_micros: i64,
-        skip: &HashSet<String>,
-    ) -> Result<Option<SessionSnapshot>, Error> {
-        let Some(first) = self
-            .store
-            .projection()
-            .due_for_consolidation(idle_cutoff_micros)?
-            .into_iter()
-            .find(|due| !skip.contains(&due.session_id))
-        else {
-            return Ok(None);
-        };
-        let rows = self.store.projection().messages(&first.session_id)?;
-        let memory_index = self.store.projection().memory_index()?;
-        Ok(Some(SessionSnapshot {
-            session_id: first.session_id,
-            rows,
-            latest_seq: first.latest_seq,
-            memory_index,
-        }))
-    }
-
-    pub(crate) fn commit_consolidation(
-        &mut self,
-        snapshot: &SessionSnapshot,
-        events: Vec<memory_event::Event>,
-        prompt_version: &str,
-    ) -> Result<bool, Error> {
-        let latest = self.store.projection().latest_seq(&snapshot.session_id)?;
-        if latest != Some(snapshot.latest_seq) {
-            tracing::info!(
-                session_id = %snapshot.session_id,
-                snapshot_seq = snapshot.latest_seq,
-                latest_seq = latest,
-                "session grew during consolidation; discarding the pass"
-            );
-            return Ok(false);
-        }
-        for event in events {
-            self.record_memory(Source::System, event)?;
-        }
-        self.record(
-            Source::System,
-            session_event::Event::SessionConsolidated(SessionConsolidated {
-                session_id: snapshot.session_id.clone(),
-                through_seq: snapshot.latest_seq,
-                prompt_version: prompt_version.to_owned(),
-            }),
-        )?;
-        Ok(true)
     }
 
     fn record(&mut self, source: Source, payload: session_event::Event) -> Result<u64, Error> {
@@ -565,7 +446,6 @@ impl<P: Provider> Engine<P> {
 
     fn open_turn(&mut self, session_id: &str) -> Result<(Vec<Message>, Option<String>), Error> {
         let rows = self.store.projection().messages(session_id)?;
-        self.seed_call_ids(session_id, &rows);
         let system = self.system_prompt(
             render_memory_index(&self.store.projection().memory_index()?).as_deref(),
         );
@@ -589,19 +469,6 @@ impl<P: Provider> Engine<P> {
             },
             seed: None,
         }
-    }
-
-    fn seed_call_ids(&mut self, session_id: &str, rows: &[MessageRow]) {
-        self.issued_call_ids
-            .entry(session_id.to_owned())
-            .or_insert_with(|| {
-                rows.iter()
-                    .filter_map(|row| match row {
-                        MessageRow::ToolCall { call_id, .. } => Some(call_id.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            });
     }
 }
 
@@ -773,16 +640,6 @@ enum Ending {
     Failed(provider::Error),
 }
 
-pub(crate) fn now_ts() -> Timestamp {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Timestamp {
-        seconds: i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
-        nanos: i32::try_from(elapsed.subsec_nanos()).unwrap_or(0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -800,7 +657,7 @@ mod tests {
     use crate::provider::{
         CompletionDelta, Error as ProviderError, Message, Stop, ToolCall, Usage,
     };
-    use crate::store::Store;
+    use crate::store::{self, Store};
     use crate::testkit::{
         Canned, ScriptedProvider, TraceCapture, appended, call, channel, counter_samples,
         done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_events,
@@ -2112,6 +1969,8 @@ mod tests {
         let mut engine = review_engine(&provider, &dir);
 
         let queued: Vec<String> = engine
+            .store()
+            .projection()
             .review_items(0)
             .expect("review_items")
             .into_iter()
@@ -2123,7 +1982,7 @@ mod tests {
             "both records await a verdict"
         );
 
-        engine.review_accept("mr-fact").expect("accept");
+        engine.store_mut().review_accept("mr-fact").expect("accept");
 
         let events = replay_events(dir.path());
         let verdict = events.last().expect("the verdict");
@@ -2144,6 +2003,8 @@ mod tests {
         }
 
         let queued: Vec<String> = engine
+            .store()
+            .projection()
             .review_items(0)
             .expect("review_items")
             .into_iter()
@@ -2158,7 +2019,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let mut engine = review_engine(&provider, &dir);
 
-        engine.review_delete("mr-pref").expect("delete");
+        engine.store_mut().review_delete("mr-pref").expect("delete");
 
         let events = replay_events(dir.path());
         let verdict = events.last().expect("the verdict");
@@ -2169,6 +2030,8 @@ mod tests {
         }
 
         let queued: Vec<String> = engine
+            .store()
+            .projection()
             .review_items(0)
             .expect("review_items")
             .into_iter()
@@ -2184,14 +2047,14 @@ mod tests {
         let mut engine = review_engine(&provider, &dir);
         let before = replay_events(dir.path()).len();
 
-        let accept = engine.review_accept("mr-ghost");
+        let accept = engine.store_mut().review_accept("mr-ghost");
         assert!(
-            matches!(accept, Err(Error::UnknownRecord { ref id }) if id == "mr-ghost"),
+            matches!(accept, Err(store::Error::UnknownRecord { ref id }) if id == "mr-ghost"),
             "got: {accept:?}"
         );
-        let delete = engine.review_delete("mr-ghost");
+        let delete = engine.store_mut().review_delete("mr-ghost");
         assert!(
-            matches!(delete, Err(Error::UnknownRecord { ref id }) if id == "mr-ghost"),
+            matches!(delete, Err(store::Error::UnknownRecord { ref id }) if id == "mr-ghost"),
             "got: {delete:?}"
         );
 

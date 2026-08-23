@@ -5,8 +5,8 @@ use arc_proto::v1::{event, session_event};
 
 use crate::log::{self, LogReader};
 use crate::projection;
-use crate::session::now_ts;
 use crate::store::Store;
+use crate::store::now_ts;
 
 pub(crate) const CLOSER_CONTENT: &str = "The daemon restarted before this call's result was recorded; the call may or may not have run.";
 

@@ -7,17 +7,11 @@ use std::future::Future;
 use arc_proto::v1::memory_event;
 use tokio::sync::Mutex;
 
-use crate::projection::{MemoryIndexEntry, MessageRow};
 use crate::provider::Provider;
-use crate::session::{self, Engine};
+use crate::session::Engine;
+use crate::store;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSnapshot {
-    pub session_id: String,
-    pub rows: Vec<MessageRow>,
-    pub latest_seq: u64,
-    pub memory_index: Vec<MemoryIndexEntry>,
-}
+pub use crate::store::SessionSnapshot;
 
 pub trait Extractor: Send + Sync {
     fn extract(
@@ -45,8 +39,8 @@ impl Extractor for NoopExtractor {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("consolidation engine: {0}")]
-    Engine(#[from] session::Error),
+    #[error("consolidation store: {0}")]
+    Store(#[from] store::Error),
 
     #[error("consolidation extractor for {session_id}: {source}")]
     Extractor {
@@ -131,10 +125,12 @@ async fn pass<P: Provider, E: Extractor>(
     prompt_version: &str,
     skip: &HashSet<String>,
 ) -> Result<Outcome, Error> {
-    let snapshot = engine
-        .lock()
-        .await
-        .snapshot_for_consolidation(idle_cutoff_micros, skip)?;
+    let snapshot = {
+        let engine = engine.lock().await;
+        engine
+            .store()
+            .snapshot_for_consolidation(idle_cutoff_micros, skip)?
+    };
     let Some(snapshot) = snapshot else {
         return Ok(Outcome::NothingDue);
     };
@@ -157,10 +153,12 @@ async fn pass<P: Provider, E: Extractor>(
         .count();
 
     // re-locked, not held: extraction can take minutes
-    let committed = engine
-        .lock()
-        .await
-        .commit_consolidation(&snapshot, events, prompt_version)?;
+    let committed = {
+        let mut engine = engine.lock().await;
+        engine
+            .store_mut()
+            .commit_consolidation(&snapshot, events, prompt_version)?
+    };
     Ok(if committed {
         Outcome::Consolidated {
             session_id: snapshot.session_id,
@@ -321,6 +319,7 @@ mod tests {
         let snapshot = engine
             .lock()
             .await
+            .store()
             .snapshot_for_consolidation(ALL_IDLE, &HashSet::new())
             .expect("snapshot")
             .expect("the session is due");
@@ -339,6 +338,7 @@ mod tests {
         let committed = engine
             .lock()
             .await
+            .store_mut()
             .commit_consolidation(&snapshot, vec![created_record("mr-x")], "")
             .expect("commit");
 
@@ -358,6 +358,7 @@ mod tests {
         let due = engine
             .lock()
             .await
+            .store()
             .due_for_consolidation(ALL_IDLE)
             .expect("due");
         assert_eq!(due.len(), 1);
@@ -544,6 +545,7 @@ mod tests {
         let due = engine
             .lock()
             .await
+            .store()
             .due_for_consolidation(ALL_IDLE)
             .expect("due");
         assert_eq!(due.len(), 2);
