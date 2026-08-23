@@ -8,7 +8,7 @@
 
 ## 1. What ARC is
 
-ARC is a personal AI assistant. An always-on Rust daemon (`arcd`) serves thin TUI, voice, and mobile clients over WebSocket. ARC has durable memory, a stable identity, pi-style branching sessions, and swappable LLM providers. In time, it will control machine and cloud tools and support a robotics workbench through MCP device servers.
+ARC is a personal AI assistant. An always-on Rust daemon (`arcd`) serves a thin TUI client over WebSocket. ARC has durable memory, a stable identity, and swappable LLM providers. Voice, mobile, and device support are later work.
 
 Conversation stays short and responsive. ARC sends longer work, such as writing a program or flashing a board, to jobs with their own models and tools. Coding is the first job type, not a special case.
 
@@ -149,16 +149,6 @@ The boundary is one line: **if the model will see it, it is durable; if only the
 
 **Secrets.** Tools must keep secrets out of results before they reach the log. The log writer cannot know which text is secret, and regex redaction is unreliable. A tool that uses credentials returns a reference, never the value. The model cannot echo a credential because credentials never enter its context. This guarantee only holds for tools that cannot read their own environment; Phase 2 has none that can.
 
-**Reserved, not built.** One number in the `SessionEvent.event` oneof, for a future reasoning event. Reasoning is streamed by decision, and reserving keeps "durable after all" an addition rather than a migration. A oneof number beats a field on `MessageAppended`, because a call-only step has no `MessageAppended` to hang reasoning on.
-
-Three field-level reserves, cheap while the messages are new:
-
-- `ToolCallIssued`, tool *source* — an MCP server id. §9's devices are MCP servers, and two servers can both offer `read`.
-- `ToolCallIssued`, the model that issued the call. §6 makes provider choice per-completion, and only `SessionCreated` records what ran.
-- `ToolResultRecorded`, structured content. `content` is a string; an image result needs its own field.
-
-Not reserved: call duration. Latency is trace material (§8), and in the log it would make every replay assert timing it cannot reproduce.
-
 **What the projection needs.** Messages stop being `(role, content)` rows:
 
 - calls and results as their own rows, keyed by `call_id`
@@ -214,38 +204,42 @@ Rules:
 - **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
 - **A job has a budget**, declared at dispatch and enforced by arcd. A loop that cannot terminate must not be able to drain a month's allowance.
 
-**A job runs in its own process**, not inside `arcd`. The daemon must not share an address space with `bash` or a runaway loop. The worker uses the same `Store` and appends the same events, but it can fail without taking down the conversation.
+**A job runs as a supervised task in `arcd`.** It uses the same `Store` and appends the same events. This keeps the conversation responsive without adding process coordination. It is not a security boundary: workspace tools still run as the user. Move jobs to a separate worker only when a real sandbox design is ready.
 
 **Dispatch is a normal tool call with a delayed result.** The model calls dispatch, ARC appends `ToolCallIssued`, the worker starts, and the turn ends. When the job finishes, its summary becomes that call's `ToolResultRecorded`. The existing unfinished-call recovery rule also covers a crash: a durable dispatch without a result is unknown, not failed.
 
-Coding is the first job kind, not a privileged one. A device job (§9) is the same shape with a different tool set.
-
-Its internal shape is fixed and lives in the worker, not in a prompt: **plan → implement → review → fix → review**, with counsel (§6.2) supplying plan and review, `hands` supplying implement and fix, and the loop bounded. Every step is an ordinary event in the child session, so the whole cycle is replayable and traceable, and the parent sees one summary at the end. A job that runs out of rounds with blocking comments left says so rather than reporting success.
+Coding is the first job kind, not a privileged one. Its loop is deliberately small: send messages, run requested tools, append results, and stop when the model stops. ARC adds strict `edit`, durable events, and a per-job budget. Planning, review, retry policy, and similar workflow choices belong in prompts or configuration until repeated use proves they need machinery.
 
 ### 4.2 Workspaces
 
-A session may be bound to a project: `sessions.project` (§5.3) plus a root directory on disk. The binding scopes the workspace tools in §4.3, and every path those tools resolve must stay inside the root.
+A session may be bound to a project: `sessions.project` plus a set of granted roots on disk. The project's own root is granted read-write. Anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. The binding scopes the workspace tools, and every path those tools resolve must sit under one of the grants.
+
+Grants list what is reachable. They are never a list of what is forbidden. A deny list fails open the first time an entry is forgotten; a grant list fails closed, so arcd's own state directory is unreachable because nobody granted it rather than because it was banned. This is the same argument as the model allow-list.
+
+Grants are session-scoped and durable. Replay has to be able to say what a tool call was allowed to see.
 
 Unbound sessions are ordinary conversation and get no workspace tools. That is also the token argument — schemas for tools a session cannot use are not loaded into it.
 
-### 4.3 Tools, sources, and approval
+### 4.3 Tools, sources, and containment
 
-One registry, many sources. A tool reaches the model identically whichever source it came from:
+One registry has two sources in Phase 3. A tool reaches the model identically whichever source it came from:
 
 - **builtin** — memory and archive (§5.5)
 - **workspace** — `read`, `write`, `edit`, `glob`, `grep`, `bash`; only in a bound session (§4.2)
-- **expert** — `consult_expert` (§6)
-- **mcp** — device servers (§9), later
 
-Sources exist so that Phase 5 devices are a config entry rather than a subsystem. §3.1 already reserves the tool-source field on `ToolCallIssued` for exactly this case: two sources may both offer `read`.
+Expert and MCP tools are deferred. Add a source only when that tool type is ready to ship; a future source is not a current registry requirement.
 
-**Sources are session-scoped.** A session declares which it gets. Seven always-loaded schemas already cost real context; loading every source into every session does not survive Phase 5.
+**Sources are session-scoped.** A session declares which it gets. Available tool schemas cost real context, so a session never receives tools it cannot use.
 
-**Approval has one shape.** Running `rm -rf` and rotating a servo are the same event: a proposed call, a gate, a durable decision, and an allow-list that is a projection rather than a hand-edited file. Verdicts carry `Event.source = USER`, like §5.4's review verdicts and for the same reason — this is ground truth the log must be able to answer.
+**Nothing prompts for permission.** What a project allows is configuration, read once when the session is created. A call outside it is refused and comes back as an ordinary `ToolOutcome::ERROR` with the reason, so the loop adapts instead of stalling. There is no runtime verdict and therefore nothing to record: a per-call prompt trains the user to say yes, and it would block the jobs that most need to run — the twenty-minute ones, started while the user is elsewhere.
 
-Three verdicts: once, for this session, always for this project. A denial carries a reason, returned to the model as an ordinary `ToolOutcome::ERROR` result (§3.1) so the loop adapts instead of stalling.
+Containment does the work instead: granted roots, a scrubbed environment, and a tool set the session declares rather than discovers.
 
-**Confinement.** Every path resolves to canonical form and is rejected if it escapes the workspace root — `..`, symlinks, and absolute paths are the obvious cases. The check lives in the tool, not the caller.
+**That containment is incomplete and it should be said plainly.** Every check here lives in a tool, not in the kernel. arcd runs as the user, and `bash` has nothing between it and the filesystem. The honest fix is a sandboxed worker, not a dialog. Until then the protection is the tool set, the granted roots, and the fact that this is a personal machine.
+
+**Prefer a CLI tool in the workspace over a new builtin.** Every builtin is paid for in context by every session that declares its source. A program in the project with a README is discovered through `bash`, costs nothing until used, and ships as a file rather than a release. Add a builtin only when the model needs it before it can run anything at all.
+
+**Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants — `..`, symlinks, and absolute paths outside them are the obvious cases. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in the tool, not the caller, which means `glob` and `grep` walk granted roots and nothing else: a walk that skips the check returns file contents through its matches.
 
 **Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
 
@@ -345,7 +339,7 @@ Memory access is tools, not silent RAG injection. The model calls:
 
 One pattern throughout: search cheap, read targeted. Lookups appear in traces and debug like any other tool call. Nothing enters context automatically except the identity file and the record index.
 
-These five are the **builtin** source in §4.3's registry. Workspace, expert, and device tools reach the model through the same registry and the same events.
+These five are the **builtin** source in §4.3's registry. Workspace tools use the same registry and events. Future expert and device tools must do the same when they are introduced.
 
 ## 6. Providers
 
@@ -360,44 +354,25 @@ trait Provider {
 
 ### 6.1 Roles
 
-**A role is a name in config that resolves to a provider and a model.** Four in v1:
+**A role is a name in config that resolves to a provider and a model.** Three are needed in Phase 3:
 
 | Role | Job | Why it is its own role |
 | --- | --- | --- |
 | **face** | The conversation. Talk, recall, dispatch jobs (§4.1). Loads the identity file and the record index; §5.1 defines its register. | Small token volume, high sensitivity to voice and judgment, latency-critical once §7's voice client lands. Needs vision. |
 | **hands** | Job execution. The overwhelming majority of tokens ARC will ever spend. | High volume, mechanical. Cost per *completed task* is the only figure that matters. |
-| **counsel** | Bounded advice — plans, unsticking. Never writes. | Rare, expensive, worth a frontier model precisely because it is rare. |
-| **local** | Consolidation, extraction, classification, and the offline fallback for face. | High volume, low stakes, latency-insensitive, free. |
+| **local** | Consolidation, extraction, and classification. | High volume, low stakes, latency-insensitive, free. |
 
 This is how §12's routing question gets answered without a runtime difficulty classifier: the mapping is static config, and the role label rides every `CompletionRequest` onto its span (§8), so traces attribute spend by role from the first day.
 
-**A role resolves to an ordered ladder, not a single model.** The first rung is what the role uses when nothing is wrong; each lower rung is what it degrades to under a named condition — an allowance crossing a threshold, an allowance exhausted, the network gone. `face` degrades to `local`. `counsel` degrades from Opus to Sonnet under budget pressure and no further, because advice from a weak model is worse than no advice.
+**A role resolves to one configured model in Phase 3.** A provider failure is reported to the client. Add an explicit fallback policy only when real outages or spend data show that it is needed.
 
-Three properties make this safe rather than a silent quality drop:
-
-- **The ladder is the allow-list.** A role can only ever run a model named on one of its rungs, so a provider adding a model — or changing which one an alias points at — cannot route work somewhere unvetted. It fails closed.
-- **Degrading is visible.** The client says which rung is live and why. A user who cannot tell that answers got cheaper cannot judge them.
-- **Rungs recover.** A threshold-triggered degrade lifts when the window resets. Degraded is a state, not a latch.
-
-**Local is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. It is also the bottom rung of `face`'s ladder, which is what lets ARC keep talking with the network down.
+**Local is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted.
 
 **A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork.
 
-### 6.2 counsel is a tool, not a provider
+### 6.2 Expert consultation is deferred
 
-`consult_expert` spawns a foreign agent — a CLI subprocess with **read-only** access to the workspace — asks one bounded question, and returns text. It is not a `Provider`, has no `CompletionDelta` stream, and never touches the calling session's prefix.
-
-That last property is the point. Escalating costs one subprocess and one tool-result event; it does not invalidate the face's or the job's cache. And because the expert reads the repository itself rather than being handed a summary, its answer is better than a completion built from a lossy brief.
-
-**Two modes, one mechanism.** `plan` is asked before work starts and returns an approach. `review` is asked after a change and returns comments. Both read the repository themselves, both are read-only, and both are the same subprocess with a different prompt.
-
-**counsel is called from inside a job, not only from the face.** The coding job's loop is plan, implement, review, fix, review — all of it inside the child session (§4.1). The conversation sees one dispatch and one summary. Putting the review cycle in the face instead would pay for the whole transcript twice and would put "is this comment worth another round" on the model least suited to judging it.
-
-Three invariants:
-
-- **counsel never writes.** Read-only tools, always. An expert that edits is a second coding agent with a second cost profile, and the whole point of the split is that the expensive model does not do the work that is expensive by volume.
-- **The expert is a command, not a code path.** An argv template, a working directory, and a timeout in config. Swapping one CLI for another is an edit, not a release.
-- **Review loops are bounded and terminate honestly.** "Loop until no comments" does not terminate on its own — a reviewer asked for comments will find some, and the last few rounds trade real money for taste. So: a configured maximum number of rounds, and only comments the reviewer marks *blocking* trigger another implement round. Non-blocking comments ride along in the handback for a human to judge. If the bound is reached with blocking comments outstanding, the job reports done-with-unresolved and names them. It never reports success it did not reach.
+`consult_expert` is a useful future tool, but it does not belong in the initial job path. Add it when the basic hands job repeatedly needs a separate planning or review model. It must then be a read-only command-backed tool, not a provider or a hard-coded job workflow.
 
 ### 6.3 Transport and credentials
 
@@ -405,7 +380,7 @@ The local provider is a llama.cpp `llama-server` sidecar supervised by `arcd`, s
 
 It is also why the same code reaches most hosted options: an OpenAI-compatible endpoint is a base URL, a key, and a model id.
 
-Hosted providers use plain HTTP and SSE (`reqwest` + rustls), never vendor SDKs. Authentication is replaceable; for now it uses API keys only. The Google OAuth path was removed after hidden rate limits made it unreliable and its terms became questionable. Keys live in `data/secrets/` (0700 and excluded from backups). Phase 3 uses that storage for face, hands, and counsel.
+Hosted providers use plain HTTP and SSE (`reqwest` + rustls), never vendor SDKs. Authentication is replaceable; for now it uses API keys only. The Google OAuth path was removed after hidden rate limits made it unreliable and its terms became questionable. Keys live in `data/secrets/` (0700 and excluded from backups). Phase 3 uses that storage for face and hands.
 
 Tool-calling and system-prompt differences are normalized in `arc-core`, never leaked to clients. The log records which model actually ran.
 
@@ -417,21 +392,15 @@ Tool-calling and system-prompt differences are normalized in `arc-core`, never l
 
 Protobuf over WebSocket (`wire.proto`), served by `arcd` on localhost. Remote access is Tailscale reaching the same socket. ARC does not implement its own tunnel, TLS termination, or auth beyond a local token in v1.
 
-The protocol is client-agnostic: subscribe to a session, send a message, fork, receive streamed deltas and tool-call events, query the tree. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state.
-
-Three capabilities the protocol needs beyond that, all forced by §4.1 and §6:
-
-- **Images in messages.** The face has vision. A turn may carry a camera frame or a screenshot, and `ToolResultRecorded` may need to return one — §3.1 already reserves structured tool-result content for this.
-- **A modality hint on subscribe.** Without it a voice turn gets the answer the TUI would get: four hundred words of markdown, read aloud. The client declares its modality and the face adapts length. Same identity, shorter sentences.
-- **Server-initiated output.** A job runs for twenty minutes while the user is elsewhere; "this needs approval" and "this is done" have to reach them. Clients subscribe for unsolicited output rather than only answering when addressed. This is also the path ARC speaks first on at all — a contradiction noticed during consolidation, a sidecar down for two days — so it is built general and voice is one subscriber.
+The protocol serves the TUI in Phase 3: send a message, receive streamed deltas and tool-call events, and query sessions and history. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state. Job status can be queried or refreshed by the TUI. Images, modality hints, unsolicited notifications, and additional transports arrive with the clients that require them.
 
 Clients:
 
-- `arc` (TUI): first client, exercises everything — tree navigation, streaming, tool visibility, job status, approval prompts. Should use UDS when local, WebSocket when not.
+- `arc` (TUI): first client, exercises everything — tree navigation, streaming, tool visibility, job status. Should use UDS when local, WebSocket when not.
 - `arc-voice`: a thin pipeline — wake word, local ASR, text over this socket, reply text, local TTS. No model logic. Stages sit behind traits like providers do: openWakeWord or Porcupine for the wake word, whisper.cpp for ASR with Silero VAD in front for endpointing, Kokoro for TTS streamed sentence-by-sentence so the first sentence speaks while the model writes the third. Cloud stage backends can slot in later without touching the architecture.
 - Mobile: same protocol over Tailscale. Last, after the protocol has been stable under two other clients.
 
-**Speech-to-speech APIs are rejected.** They would own the conversation loop, and under §4.3 the face is not a chat model — it holds the memory tools, `consult_expert`, job dispatch, and the approval gate. Handing the loop to a vendor means replumbing all of it through their tool protocol, and the log stops being where the conversation happens. That breaks invariants 1 and 2, not merely §7's client-agnosticism. Text on the wire is the only shape that keeps the log authoritative, and it keeps voice provider-independent besides.
+**Speech-to-speech APIs are rejected.** They would own the conversation loop, while the face holds memory tools and job dispatch. Handing the loop to a vendor means replumbing those tools through its protocol, and the log stops being where the conversation happens. That breaks invariants 1 and 2, not merely §7's client-agnosticism. Text on the wire is the only shape that keeps the log authoritative and voice provider-independent.
 
 **Voice degrades rather than failing.** With a hosted face, a dropped network breaks talking, not just coding. Falling back to the local role (§6.1) is a Phase 4 exit requirement, with the degraded state visible or audible.
 
@@ -439,11 +408,7 @@ ARC's speaking voice is designed separately from its writing voice (§5.1) and i
 
 ## 8. Observability: Perfetto
 
-ARC emits Perfetto protobuf traces of its own operation: a track per session and branch, spans for LLM calls (with token counts as counters), tool calls, memory reads and writes, consolidation passes, and log replays. Traces land in `data/traces/` and open directly in the Perfetto UI.
-
-This is not decoration. It is the debugging surface for the two genuinely hard subsystems — consolidation quality and retrieval behaviour — and it makes latency and token spend measurable from day one. Implementation: a `tracing` subscriber in `arc-core` that renders `TracePacket` protos.
-
-Every LLM span carries its **role** (§6.1), and every job span carries its job id and budget consumption. Cost is metered by role and by completed task, not by request, because that is the figure §6's model choices are actually made against.
+ARC records `tracing` spans for LLM calls, tool calls, memory operations, and jobs. Existing Perfetto output remains the debugging surface, but Phase 3 adds only the fields needed to diagnose live work: role, job id, latency, and token use. Cost attribution and richer trace structure wait for a decision based on real traces.
 
 ## 9. Robotics (future)
 
@@ -452,16 +417,16 @@ Devices integrate as MCP servers, never as bespoke daemon code: an ESP32 pan-til
 1. The model plans and issues high-level actions only. Firmware enforces joint limits, speeds, and e-stop. The LLM never commands motors directly.
 2. Device MCP servers are separate processes with their own lifecycle. `arcd` treats them like any other tool source.
 
-Both constraints sit on top of machinery Phase 3 already builds. A device is an `mcp` source in §4.3's registry, and a movement request goes through the same approval gate as `bash` — one shape, one event, one allow-list. §3.1's orphan contract already covers the hard case: a durable call with no durable result means the outcome is *unknown*, never failed, because an actuator that moved cannot be un-moved by a retry.
+Both constraints fit the registry shape, but Phase 5 adds the MCP source when the first device exists. Its confirmation flow is designed there against a real actuator, not inherited from Phase 3: a servo that moved cannot be un-moved, which is a different problem from a shell command. §3.1's orphan contract already covers the hard case: a durable call with no durable result means the outcome is *unknown*, never failed, because an actuator that moved cannot be un-moved by a retry.
 
 No robotics code lands before Phase 5.
 
 ## 10. Security, backup, and running
 
 - **Always-on** means a systemd user unit (`arcd/arcd.service`): starts with the machine, restarts on failure, logs to the journal. `SIGTERM` is a clean stop, and the sidecar dies with it either way because systemd kills the whole control group. Nothing is left holding the GPU.
-- Runtime state lives under `data/`: log, index, identity, traces.
-- Backup is rustic, encrypted at the repository level, covering `data/log/` and `data/identity.md`. `data/index.db` and `data/traces/` are excluded — both are rebuildable.
-- Credentials live in the OS keychain or an encrypted secrets file under `data/secrets/` (0700 and excluded from backups). They never enter the log or backups. Phase 3 uses credentials for face, hands, and counsel.
+- Runtime state lives under one data directory: log, index, identity, traces, secrets. `data/` in a checkout, `~/.local/state/arc/` once installed, with config at `~/.config/arc/arc.toml`. Installed layout matters beyond tidiness: a data directory inside a checkout sits within a root the workspace tools can be granted.
+- Backup is rustic, encrypted at the repository level, covering `log/` and `identity.md` in the data directory. `index.db` and `traces/` are excluded — both are rebuildable.
+- Credentials live in the OS keychain or an encrypted secrets file under `secrets/` in the data directory (0700 and excluded from backups). They never enter the log or backups. Phase 3 uses credentials for face and hands.
 - **Workspace tools run with a scrubbed environment** (§4.3). `bash` is the first thing ARC runs that could read its own process environment, and the answer is that there is nothing there to read — no keys, no tokens. arcd holds credentials; the tools it spawns do not inherit them.
 - The WebSocket binds localhost only. Remote access is Tailscale's problem, by design.
 
@@ -475,13 +440,13 @@ Each phase ends in something used daily. No phase starts until the previous one 
 
 **Phase 2 — Memory.** *Done 2026-08-22.* `MemoryEvent`, distilled records and the always-loaded index, the five memory and archive tools, FTS5 over messages, explicit `memory_write` plus end-of-session consolidation, `arcd memory-replay` with a versioned prompt, the weekly TUI review, Perfetto spans on every memory operation. Exit criterion: "what do you know about X" and "what did we say about X" both work on real history.
 
-**Phase 3 — Development.** ARC becomes the way its own code gets written, and runs in production. The four roles of §6 with real credentials, the job abstraction (§4.1), workspaces (§4.2), the tool registry with workspace tools and the approval model (§4.3), the three protocol capabilities of §7, notification, and `arcd rebuild` proven against the real log. Installed as a systemd user unit with a data directory that survives a rebuild. Exit criterion: a week of real development done through ARC rather than through another harness, and a full rebuild matching live state.
+**Phase 3 — Development.** ARC becomes the way its own code gets written, and runs in production. Configured face, hands, and local roles; jobs (§4.1); workspaces (§4.2); builtin and workspace tools with containment (§4.3); and `arcd rebuild` proven against the real log. Installed as a systemd user unit with a data directory that survives a rebuild. Exit criterion: a week of real development done through ARC rather than through another harness, and a full rebuild matching live state.
 
 **Phase 3.5 — Tree.** Session forking with §4's branch semantics, rewind, and tree navigation in the TUI. Split out of Phase 3 and kept immediately after it because rewind is a development feature: recovering from a bad edit path without re-prompting from scratch is what makes a cheap `hands` model affordable. Exit criterion: branching gets used naturally.
 
 **Phase 4 — Voice + remote.** `arc-voice` per §7 — wake word, local ASR, text on the wire, local TTS — the daemon reached from a phone over Tailscale (the mobile client can start as the TUI over SSH), and rustic backup automated. Exit criteria: a restore drill rather than a backup existing, and voice degrading to the local role when the network is gone.
 
-**Phase 5 — Devices.** The first device MCP server (ESP32 pan-tilt) as a source in §4.3's registry, device-tool safety conventions on the approval model already built, then the arm. A wake-word room satellite, if one appears, is a §7 *client* and not a device — same board, different integration path, and conflating them would put a special case in the device layer. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
+**Phase 5 — Devices.** The first device MCP server (ESP32 pan-tilt) as a source in §4.3's registry, device-tool safety conventions designed against the first real actuator, then the arm. A wake-word room satellite, if one appears, is a §7 *client* and not a device — same board, different integration path, and conflating them would put a special case in the device layer. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
 
 ## 12. Open questions
 

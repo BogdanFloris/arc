@@ -8,7 +8,7 @@ Write and speak in plain English. Say only what the reader needs. Lead with the 
 
 ## Current phase
 
-Phase 3 is development. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. ARC becomes the harness used to write its own code. This includes provider roles, child-session jobs, workspaces, the tool registry and approval model, and an installed service. Do not build later-phase features. If work points toward forking, rewind, voice, or devices, add only the interface needed now.
+Phase 3 is development. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. ARC becomes the harness used to write its own code. This includes provider roles, child-session jobs, workspaces, the tool registry and its containment rules, and an installed service. Do not build later-phase features. If work points toward forking, rewind, voice, or devices, add only the interface needed now.
 
 ## Workspace
 
@@ -34,7 +34,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 5. **Secrets never touch the log**, backups, traces, or test fixtures.
 6. **Memory is tools, not injection.** Nothing enters model context automatically except the identity file and the distilled-record index.
 7. **Identity file is human-owned.** Code may propose edits in session output; it never writes `data/identity.md`.
-8. **Tools stay inside the workspace and require approval.** Workspace tools resolve paths to their canonical form and reject anything outside the session's project root. They run with a scrubbed environment: arcd keeps credentials and child tools never inherit them. Approval verdicts are durable events with `source = USER`; the allow-list is a projection, never a hand-edited file. `consult_expert` is always read-only.
+8. **Tools are contained, not gated.** Workspace tools resolve paths to their canonical form and accept them only under one of the session's granted roots; `write` and `edit` also refuse a read-only grant. Grants list what is reachable, never what is forbidden. Tools run with a scrubbed environment: arcd keeps credentials and child tools never inherit them. `consult_expert` is always read-only. Nothing prompts the user mid-turn — what a project allows is configuration, and a call outside it returns an error the model can act on.
 9. **Sessions are pinned to one provider.** Role is chosen at session or job creation and does not change for its lifetime. A mid-session model swap discards the prompt cache, which is ~96% of the workload.
 
 ## Conventions
@@ -50,7 +50,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 
   One line above the code, under ten words, plain English. Never restate a name, never head a section, never argue for the change — that belongs in the commit message. Tests, `thiserror` messages, and generated code document themselves.
 - Tests live with the code; projection logic must have replay tests (log in → state out, deterministic).
-- Runtime state under `data/` (gitignored). Never write outside it at runtime.
+- Runtime state under the configured data directory — `data/` in a checkout, `~/.local/state/arc/` once installed. Never write outside it at runtime.
 
 ## Commit style
 

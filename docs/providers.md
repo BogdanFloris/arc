@@ -37,8 +37,8 @@ These roles are stable. The next section records the current model for each one.
 | Role | Filled by | Access | Est. monthly |
 | --- | --- | --- | --- |
 | **face** | Gemini 3.7 Flash | Direct API key | ~$10 |
-| **hands** | DeepSeek V4 Pro, via OpenCode Go | Go subscription | $10 (plan) |
-| ↳ escalation | GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
+| **hands** | DeepSeek V4 Flash, via OpenCode Go | Go subscription | $10 (plan) |
+| ↳ escalation | DeepSeek V4 Pro first; GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
 | **counsel** | Opus via `claude -p`, read-only tools, for both `plan` and `review`. Degrades to Sonnet only under budget pressure | Claude Pro | $20 |
 | **local** | Qwen3-8B Q4_K_M on the RTX 5070 | llama.cpp sidecar | $0 |
 | **reserve** | Prepaid Zen credit for Go spillover | — | ~$10 |
@@ -54,17 +54,20 @@ Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not 
 
 Keep thinking off or minimal on face. It adds latency to conversational turns, which is why the local configuration has `no_think`.
 
-### Why hands uses DeepSeek V4 Pro
+### Why hands uses DeepSeek
 
 Go meters dollars, so the cost leader completes the most work. The expected workload is roughly 19M output tokens a month:
 
 | Candidate | Character | Est. monthly against the workload |
 | --- | --- | --- |
-| **DeepSeek V4 Pro** | Cost leader by a wide margin. 80.6% SWE-bench Verified. MIT. | **~$17–25** — fits inside the cap with room |
+| **DeepSeek V4 Flash** | The cheaper of the two DeepSeek tiers and the current default. Its rates are not priced here yet. | **under Pro** — rewrite this row from traces |
+| DeepSeek V4 Pro | Cost leader among the frontier-class models by a wide margin. 80.6% SWE-bench Verified. MIT. First escalation. | ~$17–25 — fits inside the cap with room |
 | GLM-5.3 | Trained for long-horizon agentic tool use. 1M context. ~92 tok/s. | ~$35–45 — fits, tighter |
 | Kimi K3 | Highest intelligence index on the plan. Also a documented heavy token consumer, and 38 tok/s. | ~$70+ — exceeds the monthly cap |
 
-Kimi K3 is the strongest model in the lineup but cannot be the default: it costs more per token and uses more tokens per task. Reserve it for work that has failed on a cheaper model. Use GLM-5.3 for multi-file jobs where its long-horizon tuning justifies the price.
+Start on Flash and escalate to Pro when a job fails on it. Kimi K3 is the strongest model in the lineup but cannot be the default: it costs more per token and uses more tokens per task. Reserve it for work that has failed on a cheaper model. Use GLM-5.3 for multi-file jobs where its long-horizon tuning justifies the price.
+
+The latest DeepSeek versions on Go are hosted in China and need an explicit opt-in in the workspace settings, done 2026-08-23. Acceptable for hands while the retention terms hold; it is the zero-retention agreement below that governs, not the hosting region.
 
 These are published-rate estimates, not measured spend. Phase 3 adds a role label to every trace span. Rewrite this table from traces after a month of data.
 
@@ -108,7 +111,7 @@ These decisions use one month of real Claude Code usage: **about 4.4M input toke
 
 Priced at Opus 5 list rates ($5/$25 per MTok, cache reads at roughly a tenth of input) that workload is about **$800/month**, against $100 paid. The subsidy on the old plan was closer to 8× than the 4× previously assumed — which is why no combination of routing reproduces it at $30, and why the plan is instead to move the bulk of those tokens onto a model that costs an order of magnitude less per token.
 
-The bet is that **most of those 19M output tokens are mechanical**: edits, tool calls, and rereads. A cheaper model can handle them if the harness is strict. The budget works for DeepSeek V4 Pro but not Kimi K3. The key controls are exact edits with a staleness check, a shell tool that runs the test suite, and rewind for bad paths.
+The bet is that **most of those 19M output tokens are mechanical**: edits, tool calls, and rereads. A cheaper model can handle them if the harness is strict. The budget works for either DeepSeek tier but not Kimi K3. The key controls are exact edits with a staleness check, a shell tool that runs the test suite, and rewind for bad paths.
 
 Face is inexpensive. At about 700k monthly output tokens, it costs $3–5 on Flash, $4–6 on Haiku 4.5, and $13–17 on Sonnet 5. Voice may increase turns two- to threefold because speaking is easier than typing. That alone supports using Flash.
 
