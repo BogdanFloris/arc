@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_proto::v1::{MemoryRecordCreated, MemoryRecordSuperseded, Role, memory_event};
+use arc_proto::v1::{MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, memory_event};
 use futures::StreamExt as _;
 use serde::Deserialize;
 
@@ -157,6 +157,7 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
     ) -> Result<Vec<memory_event::Event>, ExtractError> {
         let request = CompletionRequest {
             model: self.model.clone(),
+            role: SessionRole::Archivist,
             system: Some(self.prompt.clone()),
             messages: vec![Message::Text {
                 role: Role::User,

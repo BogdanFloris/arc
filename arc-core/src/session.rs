@@ -24,6 +24,7 @@ pub struct Engine<P> {
     store: Store,
     provider: Arc<P>,
     model: String,
+    role: SessionRole,
     system: Option<String>,
     registry: Registry,
     no_think: bool,
@@ -78,6 +79,7 @@ impl<P: Provider> Engine<P> {
         store: Store,
         provider: Arc<P>,
         model: &str,
+        role: SessionRole,
         system: Option<String>,
         registry: Registry,
         no_think: bool,
@@ -86,6 +88,7 @@ impl<P: Provider> Engine<P> {
             store,
             provider,
             model: model.to_owned(),
+            role,
             system,
             registry,
             no_think,
@@ -98,6 +101,7 @@ impl<P: Provider> Engine<P> {
         skip_all,
         fields(
             model = %self.model,
+            role = provider::role_label(self.role),
             session_id = tracing::field::Empty,
             new_session = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -136,7 +140,7 @@ impl<P: Provider> Engine<P> {
                     title: String::new(),
                     provider: self.provider.name().to_owned(),
                     model: self.model.clone(),
-                    role: SessionRole::Unspecified as i32,
+                    role: self.role as i32,
                     project: String::new(),
                     budget: None,
                 }),
@@ -464,6 +468,7 @@ impl<P: Provider> Engine<P> {
     ) -> CompletionRequest {
         CompletionRequest {
             model: self.model.clone(),
+            role: self.role,
             system,
             messages,
             tools: if last_step {
@@ -650,8 +655,8 @@ mod tests {
 
     use arc_proto::v1::{
         HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
-        MemoryRecordCreated, MemoryRecordSuperseded, Role, Source, ToolOutcome, history_entry,
-        memory_event, memory_record, session_event,
+        MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome,
+        history_entry, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -749,6 +754,7 @@ mod tests {
         assert_eq!(created.session_id, reply.session_id);
         assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
+        assert_eq!(created.role, SessionRole::Concierge as i32);
 
         let user = appended(&events[1]);
         assert_eq!(
@@ -1548,6 +1554,7 @@ mod tests {
             Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
+            SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
             true,
@@ -1560,6 +1567,43 @@ mod tests {
             provider.requests()[0].system.as_deref(),
             Some("be terse\n/no_think")
         );
+    }
+
+    #[tokio::test]
+    async fn the_role_lands_on_the_session_and_on_every_request() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let dir = TempDir::new().expect("temp dir");
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let mut engine = Engine::new(
+            Store::new(log, projection),
+            Arc::clone(&provider),
+            "test-model",
+            SessionRole::Executor,
+            None,
+            Registry::new(512),
+            false,
+        );
+
+        let (tx, _rx) = channel();
+        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some(&reply.session_id), "again", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated first, got {:?}", events[0]);
+        };
+        assert_eq!(created.role, SessionRole::Executor as i32);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.role, SessionRole::Executor);
+        }
     }
 
     fn seeded_records() -> Vec<memory_event::Event> {
@@ -1665,6 +1709,7 @@ mod tests {
             Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
+            SessionRole::Concierge,
             None,
             Registry::new(512),
             false,
@@ -1945,6 +1990,7 @@ mod tests {
             Store::new(log, projection),
             Arc::clone(&provider),
             "test-model",
+            SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
             true,

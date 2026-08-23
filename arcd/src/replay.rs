@@ -1,15 +1,14 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use arc_core::consolidation::extract::KNOWN_VERSIONS;
 use arc_core::consolidation::replay::{self, ReplayDiff, ReplayRecord, ReplayReport};
-use arc_core::provider::openai::OpenAiCompat;
 use tracing::info;
 
-use crate::config::{Config, ProviderChoice};
+use crate::config::Config;
 use crate::dirs::DataDirs;
 use crate::llama::Sidecar;
+use crate::roles::Roles;
 
 pub async fn run(
     config: Config,
@@ -22,25 +21,30 @@ pub async fn run(
     if let Some(against) = against {
         versions.push(resolve(against)?);
     }
-    let model = config.model();
     let timeout = Duration::from_secs(config.consolidation.timeout_seconds);
 
-    // irrefutable today; a second provider must break this line
-    let ProviderChoice::Local = config.provider;
+    // replaying extraction is archivist work, so it runs on the archivist's model
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
-    let sidecar = if probe(&endpoint).await {
-        info!(%endpoint, "using the already-running llama endpoint");
-        None
-    } else {
-        Some(Sidecar::start(&config.llama, &model).await?)
+    let roles = Roles::resolve(&config, &endpoint)?;
+    let archivist = roles.archivist();
+    let sidecar = match archivist.provider.is_local() {
+        true if probe(&endpoint).await => {
+            info!(%endpoint, "using the already-running llama endpoint");
+            None
+        }
+        true => Some(Sidecar::start(&config.llama, &archivist.model).await?),
+        false => None,
     };
-    let provider = Arc::new(OpenAiCompat::new(
-        sidecar
-            .as_ref()
-            .map_or(endpoint.as_str(), Sidecar::endpoint),
-    ));
 
-    let outcome = replay::run(&provider, &model, timeout, dirs.log(), &versions, sessions).await;
+    let outcome = replay::run(
+        &archivist.provider,
+        &archivist.model,
+        timeout,
+        dirs.log(),
+        &versions,
+        sessions,
+    )
+    .await;
     if let Some(sidecar) = sidecar {
         sidecar.stop().await;
     }

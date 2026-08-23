@@ -15,6 +15,7 @@ mod dirs;
 mod identity;
 mod llama;
 mod replay;
+mod roles;
 mod server;
 mod telemetry;
 

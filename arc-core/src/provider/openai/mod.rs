@@ -48,7 +48,12 @@ impl Provider for OpenAiCompat {
         level = "info",
         name = "openai.complete",
         skip_all,
-        fields(provider = NAME, model = %request.model, messages = request.messages.len())
+        fields(
+            provider = NAME,
+            model = %request.model,
+            role = crate::provider::role_label(request.role),
+            messages = request.messages.len(),
+        )
     )]
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
         let payload = Payload::new(&request)?;
@@ -273,10 +278,12 @@ mod tests {
 
     use super::*;
     use crate::provider::{CompletionDelta, Stop, ToolCall, Usage};
+    use arc_proto::v1::SessionRole;
 
     fn request(system: Option<&str>, turns: &[(Role, &str)]) -> CompletionRequest {
         CompletionRequest {
             model: "qwen3-8b".to_owned(),
+            role: SessionRole::Archivist,
             system: system.map(str::to_owned),
             messages: turns
                 .iter()

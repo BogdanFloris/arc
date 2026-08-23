@@ -5,14 +5,15 @@ use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection, Reader};
-use arc_core::provider::Provider;
-use arc_core::provider::openai::OpenAiCompat;
+use arc_core::provider::any::AnyProvider;
+use arc_core::provider::{Provider, role_label};
 use arc_core::session::Engine;
 use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
+use arc_proto::v1::SessionRole;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -23,41 +24,44 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, ConsolidationConfig, ProviderChoice};
+use crate::config::{Config, ConsolidationConfig};
 use crate::dirs::DataDirs;
 use crate::identity;
 use crate::llama::Sidecar;
+use crate::roles::Roles;
 use crate::server;
 
 pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
-    match config.provider {
-        ProviderChoice::Local => {
-            let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
-            let provider = OpenAiCompat::new(sidecar.endpoint());
-            let served = match Daemon::start(config, dirs, provider) {
-                Ok(daemon) => daemon.serve().await,
-                Err(error) => Err(error),
-            };
+    let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
+    let roles = match Roles::resolve(&config, sidecar.endpoint()) {
+        Ok(roles) => roles,
+        Err(error) => {
             sidecar.stop().await;
-            served
+            return Err(error);
         }
-    }
+    };
+    let served = match Daemon::start(config, dirs, roles) {
+        Ok(daemon) => daemon.serve().await,
+        Err(error) => Err(error),
+    };
+    sidecar.stop().await;
+    served
 }
 
-pub struct Daemon<P: Provider> {
+pub struct Daemon {
     config: Config,
     dirs: DataDirs,
 
-    engine: Arc<Mutex<Engine<P>>>,
+    engine: Arc<Mutex<Engine<AnyProvider>>>,
 
     reads: Arc<Reader>,
 
-    provider: Arc<P>,
+    roles: Roles,
 }
 
-impl<P: Provider + 'static> Daemon<P> {
+impl Daemon {
     #[tracing::instrument(name = "daemon.start", skip_all, fields(data_dir = %dirs.root().display()))]
-    pub fn start(config: Config, dirs: DataDirs, provider: P) -> Result<Self> {
+    pub fn start(config: Config, dirs: DataDirs, roles: Roles) -> Result<Self> {
         dirs.create()
             .with_context(|| format!("preparing {}", dirs.root().display()))?;
 
@@ -118,11 +122,12 @@ impl<P: Provider + 'static> Daemon<P> {
                 .with_context(|| format!("opening {} for reads", dirs.index().display()))?,
         );
 
-        let provider = Arc::new(provider);
+        let concierge = roles.concierge();
         let engine = Engine::new(
             store,
-            Arc::clone(&provider),
-            &config.model(),
+            Arc::clone(&concierge.provider),
+            &concierge.model,
+            SessionRole::Concierge,
             identity,
             registry,
             config.no_think,
@@ -133,7 +138,7 @@ impl<P: Provider + 'static> Daemon<P> {
             dirs,
             engine: Arc::new(Mutex::new(engine)),
             reads,
-            provider,
+            roles,
         })
     }
 
@@ -143,20 +148,32 @@ impl<P: Provider + 'static> Daemon<P> {
             .with_context(|| format!("binding {}", self.config.bind))?;
         let bound = listener.local_addr().unwrap_or(self.config.bind);
 
+        for (role, resolved) in [
+            (SessionRole::Concierge, self.roles.concierge()),
+            (SessionRole::Executor, self.roles.executor()),
+            (SessionRole::Archivist, self.roles.archivist()),
+        ] {
+            info!(
+                role = role_label(role),
+                provider = resolved.provider.name(),
+                model = resolved.model,
+                endpoint = resolved.provider.endpoint(),
+                "role resolved"
+            );
+        }
         info!(
-            model = self.config.model(),
-            provider = ?self.config.provider,
             bind = %bound,
             data_dir = %self.dirs.root().display(),
             version = env!("CARGO_PKG_VERSION"),
             "arcd ready"
         );
 
+        let archivist = self.roles.archivist();
         let consolidation = consolidation_task(
             self.config.consolidation,
-            &self.config.model(),
+            &archivist.model,
             Arc::clone(&self.engine),
-            Arc::clone(&self.provider),
+            Arc::clone(&archivist.provider),
         );
 
         server::serve(listener, self.engine, self.reads, shutdown()).await;
@@ -314,26 +331,15 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use arc_core::provider::{CompletionRequest, CompletionStream, Error as ProviderError};
     use arc_proto::v1::{Event, SessionCreated, SessionEvent, event, session_event};
     use tempfile::TempDir;
 
     use super::*;
     use crate::dirs::DataDirs;
 
-    struct NeverCalled;
-
-    impl Provider for NeverCalled {
-        fn name(&self) -> &'static str {
-            "never"
-        }
-
-        async fn complete(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionStream, ProviderError> {
-            panic!("startup must not call the provider")
-        }
+    // port 1 refuses every connection: startup must not reach a provider
+    fn unreachable_roles() -> Roles {
+        Roles::resolve(&Config::default(), "http://127.0.0.1:1").expect("no roles configured")
     }
 
     #[tokio::test]
@@ -371,8 +377,8 @@ mod tests {
         .expect("age the version");
         drop(conn);
 
-        let daemon =
-            Daemon::start(Config::default(), dirs, NeverCalled).expect("start over a stale index");
+        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles())
+            .expect("start over a stale index");
 
         let sessions = daemon.engine.lock().await.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
@@ -383,14 +389,14 @@ mod tests {
     async fn the_consolidation_tick_only_runs_when_enabled() {
         let temp = TempDir::new().expect("temp dir");
         let dirs = DataDirs::new(&temp.path().join("data"));
-        let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
+        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles()).expect("start");
 
         assert!(
             consolidation_task(
                 Config::default().consolidation,
                 "test-model",
                 Arc::clone(&daemon.engine),
-                Arc::clone(&daemon.provider),
+                Arc::clone(&daemon.roles.archivist().provider),
             )
             .is_none(),
             "disabled by default: no task, so a tick can do nothing"
@@ -405,7 +411,7 @@ mod tests {
             enabled,
             "test-model",
             Arc::clone(&daemon.engine),
-            Arc::clone(&daemon.provider),
+            Arc::clone(&daemon.roles.archivist().provider),
         )
         .expect("enabled spawns the tick");
         task.abort();
@@ -472,7 +478,7 @@ mod tests {
         seed_idle_session(&mut log, "s-a", 1_000_000);
         seed_idle_session(&mut log, "s-b", 2_000_000);
         drop(log);
-        let daemon = Daemon::start(Config::default(), dirs, NeverCalled).expect("start");
+        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles()).expect("start");
 
         let extractor = AlwaysFailing(std::sync::Mutex::new(Vec::new()));
         let mut strikes = Strikes::default();

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use arc_proto::v1::{Role, memory_event, session_event};
+use arc_proto::v1::{Role, SessionRole, memory_event, session_event};
 use futures::stream;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -89,6 +89,7 @@ pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<Scripte
         Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
+        SessionRole::Concierge,
         Some("be terse".to_owned()),
         Registry::new(512),
         false,
@@ -106,6 +107,7 @@ pub fn engine_with_tools(
         Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
+        SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
         false,
@@ -124,6 +126,7 @@ pub fn engine_with_tools_at(
         Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
+        SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
         false,
@@ -142,6 +145,7 @@ pub fn reopened_engine(
         Store::new(log, projection),
         Arc::clone(provider),
         "test-model",
+        SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
         false,

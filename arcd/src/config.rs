@@ -26,8 +26,6 @@ const DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS: u64 = 300;
 pub struct Config {
     pub data_dir: PathBuf,
 
-    pub provider: ProviderChoice,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -72,7 +70,7 @@ pub struct RoleConfig {
     pub endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleProvider {
     Local,
@@ -179,12 +177,6 @@ impl Default for ConsolidationConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderChoice {
-    Local,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LlamaConfig {
@@ -204,7 +196,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
-            provider: ProviderChoice::Local,
             model: None,
             bind: DEFAULT_BIND.parse().expect("default bind address is valid"),
             llama: LlamaConfig::default(),
@@ -260,20 +251,16 @@ impl Config {
         if let Some(model) = &self.model {
             return model.clone();
         }
-        match self.provider {
-            ProviderChoice::Local => self.llama.model_file.file_stem().map_or_else(
-                || "local".to_owned(),
-                |stem| stem.to_string_lossy().into_owned(),
-            ),
-        }
+        self.llama.model_file.file_stem().map_or_else(
+            || "local".to_owned(),
+            |stem| stem.to_string_lossy().into_owned(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Config, ProjectConfig, ProviderChoice, RoleConfig, RoleProvider, RolesConfig, ToolSource,
-    };
+    use super::{Config, ProjectConfig, RoleConfig, RoleProvider, RolesConfig, ToolSource};
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -283,7 +270,6 @@ mod tests {
         let config: Config = toml::from_str("").expect("empty config parses");
         assert_eq!(config, Config::default());
         assert_eq!(config.data_dir, PathBuf::from("data"));
-        assert_eq!(config.provider, ProviderChoice::Local);
         assert_eq!(config.model, None);
         assert_eq!(config.bind, "127.0.0.1:8787".parse::<SocketAddr>().unwrap());
         assert_eq!(config.llama.server, PathBuf::from("llama-server"));
@@ -313,7 +299,6 @@ mod tests {
     fn every_field_round_trips() {
         let config = Config {
             data_dir: PathBuf::from("/srv/arc"),
-            provider: ProviderChoice::Local,
             model: Some("qwen".to_owned()),
             bind: "127.0.0.1:9000".parse().expect("valid address"),
             llama: super::LlamaConfig {
@@ -522,10 +507,10 @@ sources   = ["builtin", "workspace"]
     }
 
     #[test]
-    fn an_unknown_provider_is_rejected() {
-        let err = toml::from_str::<Config>("provider = \"openai\"\n")
-            .expect_err("an unknown provider must not load");
-        assert!(err.to_string().contains("openai"), "{err}");
+    fn a_top_level_provider_key_is_rejected_now_that_roles_choose_one() {
+        let err = toml::from_str::<Config>("provider = \"local\"\n")
+            .expect_err("the daemon-wide provider key is gone");
+        assert!(err.to_string().contains("provider"), "{err}");
     }
 
     #[test]

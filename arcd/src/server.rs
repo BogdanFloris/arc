@@ -457,8 +457,8 @@ mod tests {
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
         ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
-        MemoryReviewDelete, MemoryReviewList, Role, Source, ToolOutcome, event, memory_event,
-        memory_record,
+        MemoryReviewDelete, MemoryReviewList, Role, SessionRole, Source, ToolOutcome, event,
+        memory_event, memory_record,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -593,6 +593,7 @@ mod tests {
                 Store::new(log, projection),
                 Arc::clone(&provider),
                 "test-model",
+                SessionRole::Concierge,
                 Some("be terse".to_owned()),
                 registry,
                 false,

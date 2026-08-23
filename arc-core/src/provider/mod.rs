@@ -1,3 +1,4 @@
+pub mod any;
 pub mod openai;
 pub mod sse;
 pub(crate) mod stream;
@@ -5,7 +6,7 @@ pub(crate) mod stream;
 use std::future::Future;
 use std::pin::Pin;
 
-use arc_proto::v1::Role;
+use arc_proto::v1::{Role, SessionRole};
 use futures::Stream;
 
 const MAX_BODY_SNIPPET: usize = 512;
@@ -14,6 +15,8 @@ const MAX_BODY_SNIPPET: usize = 512;
 pub struct CompletionRequest {
     pub model: String,
 
+    pub role: SessionRole,
+
     pub system: Option<String>,
 
     pub messages: Vec<Message>,
@@ -21,6 +24,15 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
 
     pub seed: Option<u64>,
+}
+
+pub fn role_label(role: SessionRole) -> &'static str {
+    match role {
+        SessionRole::Unspecified => "unspecified",
+        SessionRole::Concierge => "concierge",
+        SessionRole::Executor => "executor",
+        SessionRole::Archivist => "archivist",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,7 +151,7 @@ mod tests {
 
     use super::{
         CompletionDelta, CompletionRequest, CompletionStream, Error, MAX_BODY_SNIPPET, Message,
-        Provider, Role, Stop, ToolCall, Usage,
+        Provider, Role, SessionRole, Stop, ToolCall, Usage,
     };
 
     struct MockProvider {
@@ -187,6 +199,7 @@ mod tests {
     fn request() -> CompletionRequest {
         CompletionRequest {
             model: "test-model".to_owned(),
+            role: SessionRole::Concierge,
             system: Some("be terse".to_owned()),
             messages: vec![Message::Text {
                 role: Role::User,
