@@ -1198,6 +1198,7 @@ mod tests {
                     index,
                     name: "lookup".to_string(),
                     arguments_json: arguments.to_string(),
+                    provider_roundtrip: Vec::new(),
                 })),
             })),
         }

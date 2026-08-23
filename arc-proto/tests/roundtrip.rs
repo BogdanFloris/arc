@@ -77,6 +77,7 @@ fn tool_call_issued_event() -> Event {
                 index: 1,
                 name: "memory_search".to_string(),
                 arguments_json: r#"{"query":"hello"}"#.to_string(),
+                provider_roundtrip: vec![0xde, 0xad, 0x00, 0xbe, 0xef],
             })),
         })),
     }

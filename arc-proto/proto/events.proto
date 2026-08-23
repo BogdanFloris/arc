@@ -57,6 +57,7 @@ message ToolCallIssued {
   string name = 5;
   string arguments_json = 6;
   reserved 7, 8;
+  bytes provider_roundtrip = 9;
 }
 
 enum ToolOutcome {

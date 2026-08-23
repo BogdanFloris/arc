@@ -308,6 +308,7 @@ impl<P: Provider> Engine<P> {
                     index: call.index,
                     name: call.name.clone(),
                     arguments_json: call.arguments.clone(),
+                    provider_roundtrip: Vec::new(),
                 }),
             )?;
             let _ = events
@@ -699,6 +700,7 @@ mod tests {
             index,
             name: "lookup".to_owned(),
             arguments_json: "{}".to_owned(),
+            provider_roundtrip: Vec::new(),
         })
     }
 
