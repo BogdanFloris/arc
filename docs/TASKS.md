@@ -22,6 +22,17 @@ Tasks are dependency-ordered; tasks at the same number may run in parallel. The 
 - **Nothing prompts for permission.** What a project allows is configuration; a call outside it returns an error the model acts on. A per-call prompt would block the twenty-minute jobs it exists to guard. Phase 5 designs an actuator's confirmation against a real actuator instead of inheriting this.
 - **This phase tests whether** a cheap model can handle most of about 19M monthly output tokens when the harness is strict. If it fails, investigate the harness first: strict `edit`, a working test loop, and rewind.
 
+## Decisions, 2026-08-23
+
+Taken after a read of pi, opencode, Claude Code, codex, and mini-swe-agent. Across those five the only universal core is a mutation tool plus a shell; everything above it is output shaping.
+
+- **Four workspace tools: `read`, `write`, `edit`, `bash`.** `glob` and `grep` are cut. They are one search program with different arguments, that program is already on the machine, and DESIGN.md's rule already prefers the program that exists over a new builtin. Search moves to `bash`.
+- **`edit` is string-replace, not a patch format.** Codex is the only harness on patch and it is OpenAI-only. No spike; follow the field.
+- **Web is a builtin source, not a CLI.** It is the one capability a session needs before it can run anything, which is the exception the CLI rule already names. It keeps the shell out of the concierge, which is the session most exposed to untrusted text, and it keeps the search credential inside arcd.
+- **Dispatch names a configured project.** A model selects from projects a human wrote; it never composes roots and modes. A voice session has no working directory because it is unbound and has no filesystem.
+- **An actuator gets its own dispatch.** Starting a print or activating a system generation is confirmed at a turn boundary, not by a mid-turn prompt. This is prompt and configuration, not machinery.
+- **A home-wide grant waits for the sandboxed worker.** OS-level change goes through a project over the Nix configuration instead, with `nixos-rebuild build` unprivileged inside the job and `switch` as its own dispatch.
+
 ## 1. Spikes (before schemas harden)
 
 | # | Task | Assignee | Status |
@@ -62,12 +73,13 @@ These are schemas and nothing writes a non-default value yet. 3.1 fills in the r
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 4.1 | Add a registry with builtin and workspace sources. Declarations are session-scoped. Move the five memory tools without changing them. Do not add expert or MCP source plumbing. | — | todo |
+| 4.1 | Add a registry with builtin, web, and workspace sources. Declarations are session-scoped. Move the five memory tools without changing them. Do not add expert or MCP source plumbing. | — | todo |
 | 4.2 | Session tool sources: a session gets the builtin and workspace sources its project declares, resolved once at creation and fixed for its lifetime. A call to a tool the session does not hold returns `ToolOutcome::ERROR` with the reason so the loop adapts. No runtime prompt and no durable verdict — there is no decision left to record | — | todo |
-| 4.3 | Workspace tools, read-only half: `read`, `glob`, `grep`. Confinement resolves every path to canonical form and accepts it only if it sits under one of the session's granted roots, with `..`, symlinks, and absolute paths outside them rejected — tested adversarially. A grant carries a mode; the read-only half only ever needs `read`. The check lives in `resolve()`, so `glob` and `grep` walk granted roots and nothing else — a walk that skips the check leaks file contents through match output. A rejected path returns `ToolOutcome::ERROR` with the reason so the loop adapts | — | todo |
-| 4.4 | Add workspace `write` and `edit`. Both refuse a path whose grant is read-only, so a session can read notes it cannot change. `edit` must match exactly one occurrence and reject a file changed since the last read. Test this rule thoroughly. | — | todo |
-| 4.5 | Add `bash` with a scrubbed environment. It runs as the user with nothing between it and the filesystem; the grants are a tool-level check, not containment. A sandbox is later work. | — | todo |
-| 4.6 | **Token budget re-measure** (carried, re-scoped). The Phase 2 note assumed a 16k local concierge; with a hosted one the ceiling changes and the question becomes which sources load into which session. Measure before 5.2 wires anything else always-on | — | todo |
+| 4.3 | Workspace `read`, and the confinement it rests on. `resolve()` canonicalises every path and accepts it only under one of the session's granted roots, with `..`, symlinks, and absolute paths outside them rejected — tested adversarially. A grant carries a mode; `read` only ever needs the read one. The check lives in `resolve()` so every path-taking tool shares one gate. `read` caps and paginates, since it is what keeps a large file from spending the executor's context in one call. A rejected path returns `ToolOutcome::ERROR` with the reason so the loop adapts | — | todo |
+| 4.4 | Add workspace `write` and `edit`. `edit` is string-replace. Both refuse a path whose grant is read-only, so a session can read notes it cannot change. `edit` must match exactly one occurrence and reject a file changed since the last read — that rule is why `read` stays a tool, since a file read through `cat` gives it nothing to compare against. Test this thoroughly. | — | todo |
+| 4.5 | Add `bash` with a scrubbed environment. It is now the search and listing path, which makes two things load-bearing: a deterministic output cap with a timeout, and a `PATH` in the scrubbed environment that carries the search tool, git, and the toolchain. Scrubbed is not empty — Nix and cargo also need `HOME`, `USER`, and the `XDG_*` vars, or builds fail in ways that read as bugs. `bash` runs as the user with nothing between it and the filesystem; the grants are a tool-level check, not containment. A sandbox is later work. | — | todo |
+| 4.6 | Web source: `web_search` and `web_fetch`. Read-only, no grants, available to unbound sessions. arcd caps the output of both — a fetched page is unbounded text heading into a small model — and holds the search credential, so no tool process ever sees it. `web_fetch` returns markdown. Treat everything either returns as untrusted text | — | todo |
+| 4.7 | **Token budget re-measure** (carried, re-scoped). The Phase 2 note assumed a 16k local concierge; with a hosted one the ceiling changes and the question becomes which sources load into which session. Measure before 5.2 wires anything else always-on | — | todo |
 
 The two expert invocations from spike 1.2 are retained here for the deferred expert-tool task. Both were verified read-only against a workspace on 2026-08-23. Close stdin: both CLIs block on an open one. The prompt is a positional argument. claude has no `--cd`, so set the child's working directory; codex takes `-C`. codex runs commands through `zsh -lc`, a login shell that sources the user's profile, so set `shell_environment_policy.inherit` explicitly for invariant 8.
 
@@ -85,6 +97,10 @@ codex exec "<prompt>" -s read-only --json --ephemeral
 
 `--strict-mcp-config --setting-sources ""` is load-bearing. Without them the child inherits the user's MCP servers — a plain `claude -p` came back holding Gmail, Calendar, and Drive tools, none of which are read-only or inside the workspace. codex cannot be closed the same way: `--ignore-user-config` leaves `web__run` and its bundled app tools in place, so its read-only covers the filesystem and not the tool surface. Prefer claude when a diff may contain secrets. `--bare` would cut claude's prompt prefix but reads auth only from `ANTHROPIC_API_KEY`, so it cannot run on the subscription.
 
+On 4.5: `rg` is on erebor but not in `flake.nix`'s devshell. Routing search through `bash` makes that a dependency rather than a convenience, so it goes in the devshell in the same change as the `PATH` the tool hands its children.
+
+On changing the machine: a project over `~/dotfiles` plus one sudoers entry for `nixos-rebuild switch` reaches the whole system without a home-wide grant, and every change is a reviewable diff with a generation to roll back to. Two rules make it hold. The rule that grants the power cannot live where the power reaches, so the sudoers entry and arcd's own unit and `arc.toml` stay outside any granted root — otherwise one rebuild widens the grant to `ALL`. And `switch` is a separate dispatch, because a mid-uptime switch leaves the running kernel on the old generation and the mismatch surfaces at the next reboot. `build` and `--dry-activate` need no privilege at all, so the job iterates freely and only activation needs a yes.
+
 On 4.3 and 5.1: the workspace is a set of granted roots, not one root. Settled in DESIGN.md under workspaces and confinement, and in invariant 8, so the tasks below implement a decision rather than making one.
 
 The reason to grant rather than deny is the same as principle 6 in `providers.md`. A deny list fails open the first time an entry is forgotten. A grant list fails closed: `~/.local/state/arc/` is unreachable because nobody granted it, not because it was banned. Do not redact tool results either — redaction is unbounded pattern-matching and it lies to the model about what it read. DESIGN.md already settles the adjacent case for `bash` by scrubbing the environment, which is the same argument: protection comes from what the tool can reach, not from a regex afterwards.
@@ -96,7 +112,7 @@ The residual risk is worth stating rather than designing around. arcd runs as th
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 5.1 | Workspace binding: `sessions.project` plus a set of granted roots on disk, and the rule that unbound sessions get no workspace tools. The project root is granted read-write; anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. Grants are a list of what is reachable, never a list of what is forbidden, so a path nobody granted is unreachable by construction rather than by remembering to ban it. Grants are session-scoped and belong in the log, since replay has to rebuild what a tool call was allowed to see | — | todo |
-| 5.2 | Add the dispatch tool. It creates a child session with its own role, tool sources, and budget, then returns the summary later. It uses the existing tool-call recovery model. Every field is required with an explicit escape value in its enum — 1.3 measured optional fields being silently dropped, which was most of the local model's errors. The concierge prompt must say that recall is answered directly and that `archivist` is for extraction. | — | todo |
+| 5.2 | Add the dispatch tool. It creates a child session with its own role, tool sources, and budget, then returns the summary later. The project is named from the configured set, never composed by the model; with none named it lands in a standing scratch project and the handback says where it went. It uses the existing tool-call recovery model. Every field is required with an explicit escape value in its enum — 1.3 measured optional fields being silently dropped, which was most of the local model's errors. The concierge prompt must say that recall is answered directly and that `archivist` is for extraction. | — | todo |
 | 5.3 | Supervised job task: owns the generic loop, talks to the same `Store`, and leaves the daemon responsive. It is not a sandbox and does not add process supervision or restart semantics. | — | todo |
 | 5.4 | Steering: messages to a running child, queued and processed in order | — | todo |
 | 5.5 | Budget enforcement per job, in tokens and wall-clock, recorded at dispatch and checked by the task | — | todo |
@@ -131,9 +147,9 @@ Verify these live, not only in the test suite:
 
 ## Not in this phase
 
-- **A sandboxed worker.** The honest replacement for the approval gate we removed, and the change that would make `bash` genuinely contained. Phase 3.1, once jobs are real enough to say what the sandbox has to allow.
+- **A sandboxed worker.** The honest replacement for the approval gate we removed, and the change that would make `bash` genuinely contained. Phase 3.1, once jobs are real enough to say what the sandbox has to allow. A grant over the whole home directory waits for it: arcd's own keys live under `~/.local/state/arc/`, so a wide grant puts them back inside a project root, and an exclusion list cannot help when the shell never consulted one.
 - **Provider fallback ladders.** Add them only after real outage or spend data justifies their state and recovery rules.
-- **Expert consultation and MCP sources.** The spike and source interface guide later work; neither is in the initial job path.
+- **Expert consultation and MCP sources.** The spike and source interface guide later work; neither is in the initial job path. Web is not on this list any more: it is a source in 4.6.
 - **Built-in to-dos.** A file in the workspace is the whole feature. Do not add a tool for it.
 
 - **Forking, rewind, tree navigation:** Phase 3.5. Wanting them now makes them next, not part of this phase.

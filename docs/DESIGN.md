@@ -208,6 +208,8 @@ Rules:
 
 **Dispatch is a normal tool call with a delayed result.** The model calls dispatch, ARC appends `ToolCallIssued`, the worker starts, and the turn ends. When the job finishes, its summary becomes that call's `ToolResultRecorded`. The existing unfinished-call recovery rule also covers a crash: a durable dispatch without a result is unknown, not failed.
 
+**Handback is also where a physical action gets its yes.** A job that ends by reporting what it would do returns into the conversation as an ordinary result, and the action itself is a second dispatch the user asks for. Starting a print, or activating a system generation, is confirmed at a turn boundary the user is present for. Nothing prompts mid-turn and no new mechanism appears. Which calls deserve the split is prompt and configuration, like planning and review.
+
 Coding is the first job kind, not a privileged one. Its loop is deliberately small: send messages, run requested tools, append results, and stop when the model stops. ARC adds strict `edit`, durable events, and a per-job budget. Planning, review, retry policy, and similar workflow choices belong in prompts or configuration until repeated use proves they need machinery.
 
 ### 4.2 Workspaces
@@ -218,14 +220,17 @@ Grants list what is reachable. They are never a list of what is forbidden. A den
 
 Grants are session-scoped and durable. Replay has to be able to say what a tool call was allowed to see.
 
-Unbound sessions are ordinary conversation and get no workspace tools. That is also the token argument — schemas for tools a session cannot use are not loaded into it.
+**Projects are configuration and only a human writes them.** A session or a job names one; it never composes roots and modes of its own. A grant list fails closed because a person authored it, not because of its shape. A model that can write its own grants asks for whatever the task needs and gets it, which is a deny list with extra steps.
+
+Unbound sessions are ordinary conversation and get no workspace tools. That is also the token argument — schemas for tools a session cannot use are not loaded into it. A voice session starts as one: it has no working directory because it has no filesystem to be wrong about. The directory question appears at dispatch, where the model names a configured project or asks which one.
 
 ### 4.3 Tools, sources, and containment
 
-One registry has two sources in Phase 3. A tool reaches the model identically whichever source it came from:
+One registry has three sources in Phase 3. A tool reaches the model identically whichever source it came from:
 
 - **builtin** — memory and archive (§5.5)
-- **workspace** — `read`, `write`, `edit`, `glob`, `grep`, `bash`; only in a bound session (§4.2)
+- **web** — `web_search` and `web_fetch`; read-only, no grants, output capped by arcd
+- **workspace** — `read`, `write`, `edit`, `bash`; only in a bound session (§4.2)
 
 Expert and MCP tools are deferred. Add a source only when that tool type is ready to ship; a future source is not a current registry requirement.
 
@@ -237,9 +242,15 @@ Containment does the work instead: granted roots, a scrubbed environment, and a 
 
 **That containment is incomplete and it should be said plainly.** Every check here lives in a tool, not in the kernel. arcd runs as the user, and `bash` has nothing between it and the filesystem. The honest fix is a sandboxed worker, not a dialog. Until then the protection is the tool set, the granted roots, and the fact that this is a personal machine.
 
+Grants are therefore advisory in any session that holds `bash`. They stop the model wandering out of its project, which is the common failure, and they record what a session was scoped to. They do not stop a determined one. A grant over the whole home directory waits for the sandbox for the same reason: arcd's own keys live under it, so a wide grant puts them back inside a project root, and no exclusion list helps when the shell never consulted one. Changing the machine itself does not need that grant — a project over the Nix configuration plus one privileged activation command reaches the whole system, and every change is a reviewable diff with a generation to roll back to.
+
 **Prefer a CLI tool in the workspace over a new builtin.** Every builtin is paid for in context by every session that declares its source. A program in the project with a README is discovered through `bash`, costs nothing until used, and ships as a file rather than a release. Add a builtin only when the model needs it before it can run anything at all.
 
-**Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants — `..`, symlinks, and absolute paths outside them are the obvious cases. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in the tool, not the caller, which means `glob` and `grep` walk granted roots and nothing else: a walk that skips the check returns file contents through its matches.
+That rule sets the workspace list. `glob` and `grep` are one search program with different arguments, and that program is already on the machine, so they are not builtins: two schemas in every bound session buying what a shell call already does. `read` stays, because the staleness rule below needs an anchor and because it can cap and paginate where `cat` cannot. Routing search through `bash` makes two incidental things load-bearing — the shell tool caps its own output, and the scrubbed environment still carries a `PATH` with the search tool on it. Scrubbed is not empty.
+
+The web source is that rule's exception rather than a break from it. A session with no shell cannot run a program, and the concierge is exactly that session: unbound, no filesystem, and the one place a spoken question becomes a web lookup. Giving it a shell to reach a CLI would put the widest exposure to untrusted text in front of the tool with the least between it and the machine. As builtins, `web_search` and `web_fetch` also keep the search credential inside arcd where no tool process sees it, which is the same argument as scrubbing the environment for `bash`.
+
+**Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants — `..`, symlinks, and absolute paths outside them are the obvious cases. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in `resolve()`, not the caller, so every tool that touches a path goes through the same gate.
 
 **Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
 
@@ -339,7 +350,7 @@ Memory access is tools, not silent RAG injection. The model calls:
 
 One pattern throughout: search cheap, read targeted. Lookups appear in traces and debug like any other tool call. Nothing enters context automatically except the identity file and the record index.
 
-These five are the **builtin** source in §4.3's registry. Workspace tools use the same registry and events. Future expert and device tools must do the same when they are introduced.
+These five are the **builtin** source in §4.3's registry. Web and workspace tools use the same registry and events. Future expert and device tools must do the same when they are introduced.
 
 ## 6. Providers
 
@@ -440,7 +451,7 @@ Each phase ends in something used daily. No phase starts until the previous one 
 
 **Phase 2 — Memory.** *Done 2026-08-22.* `MemoryEvent`, distilled records and the always-loaded index, the five memory and archive tools, FTS5 over messages, explicit `memory_write` plus end-of-session consolidation, `arcd memory-replay` with a versioned prompt, the weekly TUI review, Perfetto spans on every memory operation. Exit criterion: "what do you know about X" and "what did we say about X" both work on real history.
 
-**Phase 3 — Development.** ARC becomes the way its own code gets written, and runs in production. Configured concierge, executor, and archivist roles; jobs (§4.1); workspaces (§4.2); builtin and workspace tools with containment (§4.3); and `arcd rebuild` proven against the real log. Installed as a systemd user unit with a data directory that survives a rebuild. Exit criterion: a week of real development done through ARC rather than through another harness, and a full rebuild matching live state.
+**Phase 3 — Development.** ARC becomes the way its own code gets written, and runs in production. Configured concierge, executor, and archivist roles; jobs (§4.1); workspaces (§4.2); builtin, web, and workspace tools with containment (§4.3); and `arcd rebuild` proven against the real log. Installed as a systemd user unit with a data directory that survives a rebuild. Exit criterion: a week of real development done through ARC rather than through another harness, and a full rebuild matching live state.
 
 **Phase 3.5 — Tree.** Session forking with §4's branch semantics, rewind, and tree navigation in the TUI. Split out of Phase 3 and kept immediately after it because rewind is a development feature: recovering from a bad edit path without re-prompting from scratch is what makes a cheap `executor` model affordable. Exit criterion: branching gets used naturally.
 
