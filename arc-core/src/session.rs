@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_proto::v1::{
-    MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, Source, ToolCallIssued,
-    ToolOutcome, ToolResultRecorded,
+    MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, SessionRole, Source,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded,
 };
 use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
@@ -136,6 +136,9 @@ impl<P: Provider> Engine<P> {
                     title: String::new(),
                     provider: self.provider.name().to_owned(),
                     model: self.model.clone(),
+                    role: SessionRole::Unspecified as i32,
+                    project: String::new(),
+                    budget: None,
                 }),
             )?;
         }
@@ -672,6 +675,9 @@ mod tests {
             title: String::new(),
             provider: "scripted".to_owned(),
             model: "test-model".to_owned(),
+            role: arc_proto::v1::SessionRole::Unspecified as i32,
+            project: String::new(),
+            budget: None,
         })
     }
 
@@ -977,6 +983,9 @@ mod tests {
                     title: String::new(),
                     provider: "scripted".to_owned(),
                     model: "test-model".to_owned(),
+                    role: arc_proto::v1::SessionRole::Unspecified as i32,
+                    project: String::new(),
+                    budget: None,
                 }),
             )
             .expect("record");

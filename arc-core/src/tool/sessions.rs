@@ -192,7 +192,8 @@ fn read_failed(error: &Error) -> ToolReply {
 #[cfg(test)]
 mod tests {
     use arc_proto::v1::{
-        MessageAppended, Role, SessionCreated, ToolOutcome, ToolResultRecorded, session_event,
+        MessageAppended, Role, SessionCreated, SessionRole, ToolOutcome, ToolResultRecorded,
+        session_event,
     };
     use tempfile::TempDir;
 
@@ -209,6 +210,9 @@ mod tests {
             title: title.to_owned(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),
+            role: SessionRole::Unspecified as i32,
+            project: String::new(),
+            budget: None,
         })
     }
 

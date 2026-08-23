@@ -353,6 +353,9 @@ mod tests {
                     title: String::new(),
                     provider: "never".to_owned(),
                     model: "test-model".to_owned(),
+                    role: arc_proto::v1::SessionRole::Unspecified as i32,
+                    project: String::new(),
+                    budget: None,
                 })),
             })),
         })
@@ -434,6 +437,9 @@ mod tests {
                 title: String::new(),
                 provider: "never".to_owned(),
                 model: "test-model".to_owned(),
+                role: arc_proto::v1::SessionRole::Unspecified as i32,
+                project: String::new(),
+                budget: None,
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),

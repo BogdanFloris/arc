@@ -18,12 +18,27 @@ enum Role {
   ROLE_ASSISTANT = 3;
 }
 
+enum SessionRole {
+  SESSION_ROLE_UNSPECIFIED = 0;
+  SESSION_ROLE_CONCIERGE = 1;
+  SESSION_ROLE_EXECUTOR = 2;
+  SESSION_ROLE_ARCHIVIST = 3;
+}
+
+message Budget {
+  uint64 total_tokens = 1;
+  uint32 wall_clock_seconds = 2;
+}
+
 message SessionCreated {
   string session_id = 1;
   string title = 2;
   string provider = 3;
   string model = 4;
   reserved 5, 6;
+  SessionRole role = 7;
+  string project = 8;
+  Budget budget = 9;
 }
 
 message MessageAppended {

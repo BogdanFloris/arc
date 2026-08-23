@@ -1124,8 +1124,9 @@ mod tests {
     use arc_proto::v1::{
         Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, SessionConsolidated, SessionCreated, SessionEvent, Source, ToolCallIssued,
-        ToolOutcome, ToolResultRecorded, event, memory_event, memory_record, session_event,
+        Role, SessionConsolidated, SessionCreated, SessionEvent, SessionRole, Source,
+        ToolCallIssued, ToolOutcome, ToolResultRecorded, event, memory_event, memory_record,
+        session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
@@ -1159,6 +1160,9 @@ mod tests {
                     title: "first light".to_string(),
                     provider: "gemini".to_string(),
                     model: "gemini-3-pro".to_string(),
+                    role: SessionRole::Unspecified as i32,
+                    project: String::new(),
+                    budget: None,
                 })),
             })),
         }
@@ -1576,6 +1580,9 @@ mod tests {
                     title: title.to_string(),
                     provider: "gemini".to_string(),
                     model: "gemini-3-pro".to_string(),
+                    role: SessionRole::Unspecified as i32,
+                    project: String::new(),
+                    budget: None,
                 })),
             })),
         }

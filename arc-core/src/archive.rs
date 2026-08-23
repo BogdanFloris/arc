@@ -614,8 +614,8 @@ mod tests {
 
     use arc_proto::v1::{
         MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Provenance,
-        ProvenanceEntry, Role, SessionCreated, ToolOutcome, ToolResultRecorded, memory_event,
-        memory_record, session_event,
+        ProvenanceEntry, Role, SessionCreated, SessionRole, ToolOutcome, ToolResultRecorded,
+        memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -630,6 +630,9 @@ mod tests {
             title: title.to_owned(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),
+            role: SessionRole::Unspecified as i32,
+            project: String::new(),
+            budget: None,
         })
     }
 

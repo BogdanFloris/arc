@@ -1,11 +1,11 @@
 use arc_proto::v1::{
-    ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
+    Budget, ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
     HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
     MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MemoryReviewAccept,
     MemoryReviewDelete, MemoryReviewItem, MemoryReviewItems, MemoryReviewList, MessageAccepted,
     MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame,
     SessionConsolidated, SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList,
-    Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
+    SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
     ToolResultRecorded, client_frame, event, history_entry, memory_event, memory_record,
     server_frame, session_event,
 };
@@ -36,6 +36,12 @@ fn session_created_event() -> Event {
                 title: "first light".to_string(),
                 provider: "gemini".to_string(),
                 model: "gemini-2.5-pro".to_string(),
+                role: SessionRole::Executor as i32,
+                project: "arc".to_string(),
+                budget: Some(Budget {
+                    total_tokens: 250_000,
+                    wall_clock_seconds: 1_200,
+                }),
             })),
         })),
     }
@@ -373,4 +379,22 @@ fn empty_bytes_decode_to_defaults() {
     assert!(decoded.ts.is_none());
     assert_eq!(decoded.source, Source::Unspecified as i32);
     assert!(decoded.payload.is_none());
+}
+
+#[test]
+fn a_session_created_from_before_role_project_and_budget_still_decodes() {
+    let before = [
+        0x0a, 0x04, 0x73, 0x2d, 0x30, 0x31, 0x12, 0x0b, 0x66, 0x69, 0x72, 0x73, 0x74, 0x20, 0x6c,
+        0x69, 0x67, 0x68, 0x74, 0x1a, 0x06, 0x67, 0x65, 0x6d, 0x69, 0x6e, 0x69, 0x22, 0x0e, 0x67,
+        0x65, 0x6d, 0x69, 0x6e, 0x69, 0x2d, 0x32, 0x2e, 0x35, 0x2d, 0x70, 0x72, 0x6f,
+    ];
+
+    let decoded = SessionCreated::decode(&before[..])
+        .expect("decode bytes written before the fields existed");
+
+    assert_eq!(decoded.session_id, "s-01");
+    assert_eq!(decoded.model, "gemini-2.5-pro");
+    assert_eq!(decoded.role, SessionRole::Unspecified as i32);
+    assert!(decoded.project.is_empty());
+    assert!(decoded.budget.is_none());
 }

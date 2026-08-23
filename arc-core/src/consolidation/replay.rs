@@ -276,7 +276,7 @@ mod tests {
 
     use arc_proto::v1::{
         MemoryEvent, MemoryRecord, MemoryRecordCreated, MessageAppended, Role, SessionCreated,
-        SessionEvent, event, memory_event, memory_record, session_event,
+        SessionEvent, SessionRole, event, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -301,6 +301,9 @@ mod tests {
                 title: String::new(),
                 provider: "scripted".to_owned(),
                 model: "test-model".to_owned(),
+                role: SessionRole::Unspecified as i32,
+                project: String::new(),
+                budget: None,
             })),
         })
     }
