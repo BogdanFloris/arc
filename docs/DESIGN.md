@@ -8,9 +8,9 @@
 
 ## 1. What ARC is
 
-ARC is a personal AI assistant: an always-on Rust daemon (`arcd`) with thin clients (TUI, voice, mobile) on a WebSocket. It has durable memory, a stable identity, pi-style branching sessions, and swappable LLM providers. Long term it is the control plane for the machine, cloud tools, and a robotics workbench, where devices appear as MCP servers.
+ARC is a personal AI assistant. An always-on Rust daemon (`arcd`) serves thin TUI, voice, and mobile clients over WebSocket. ARC has durable memory, a stable identity, pi-style branching sessions, and swappable LLM providers. In time, it will control machine and cloud tools and support a robotics workbench through MCP device servers.
 
-The conversation is small and always available; the work is not. ARC dispatches long-running work — writing a program, flashing a board — to jobs that run against different models with different tool sets, and stays responsive while they do (§4.1). Coding is the first job kind and not a privileged one.
+Conversation stays short and responsive. ARC sends longer work, such as writing a program or flashing a board, to jobs with their own models and tools. Coding is the first job type, not a special case.
 
 Priorities, in order:
 
@@ -19,13 +19,13 @@ Priorities, in order:
 3. **Speed.** No GC, small idle footprint, protobuf on disk and on the wire.
 4. **Independence.** Providers, auth, and models sit behind one interface. Local models are a planned path, not an afterthought.
 
-Not in v1: multi-user, cloud hosting, plugin sandboxing, robotics code. The architecture leaves room; the code does not attempt them.
+v1 excludes multi-user use, cloud hosting, plugin sandboxing, and robotics code. The architecture leaves room for them; the code does not.
 
 ## 2. Repository layout
 
-Five crates:
+The workspace has five crates:
 
-- `arc-proto` — every protobuf schema (`events.proto`, `memory.proto`, `wire.proto`, package `arc.v1`) and its prost types. The single schema authority: log and wire share the generated types, and no other crate defines a serialized format. One schema is not ours: `perfetto.proto` is a trimmed copy of Perfetto's, in package `perfetto.protos`. Its field numbers are upstream's and must match exactly, so §3's additive rules do not govern it. Nothing in it is ever written to the log.
+- `arc-proto` — every protobuf schema (`events.proto`, `memory.proto`, `wire.proto`, package `arc.v1`) and its prost types. It is the only place ARC defines serialized formats; log and wire use the same generated types. `perfetto.proto` is different: it is a trimmed copy of Perfetto's upstream schema in package `perfetto.protos`. Its upstream field numbers must remain unchanged, and it is never written to the log.
 - `arc-core` — all logic: log, projections, provider abstraction, memory tools, tracing. Testable without a running daemon.
 - `arcd` — the daemon. Owns the log, runs projections, serves the WebSocket, holds credentials, runs consolidation.
 - `arc` — the TUI client.
@@ -35,13 +35,13 @@ A future `arc-mobile` speaks the same protocol and depends only on `arc-proto`.
 
 ## 3. The event log
 
-The log is the single source of truth for everything durable except the identity file. It is an append-only run of length-prefixed protobuf records under `data/log/`. Each record carries a CRC32 of its payload: the length prefix catches truncation, the CRC catches corruption. Files are split by size so backups stay cheap.
+The log is the source of truth for all durable state except the identity file. It is an append-only sequence of length-prefixed protobuf records in `data/log/`. Each payload has a CRC32: the prefix detects truncation and the CRC detects corruption. Size-based segments keep backups cheap.
 
-Segment mechanics, load-bearing for durability:
+These segment rules preserve durability:
 
 - **Naming.** A segment is named for the seq of its first event, padded to 20 digits (`00000000000000004711.log`). Name order is log order, and any seq is locatable without opening a file. If a segment dies on its first record, its replacement takes a `_1`, `_2`, … suffix. Ordering still holds. This is deliberate.
 - **Sealing.** A segment is sealed when a later one exists. Creating the successor is the seal; there are no marker files.
-- **Recovery seals, never truncates.** A torn tail — an append the machine died inside — stays on disk untouched, and the next segment starts at the recovered seq. Replay tolerates torn bytes and proves integrity by seq instead: seqs are gapless across every boundary, and a full replay must start at seq 0. So neither a tear nor a lost segment can hide missing records.
+- **Recovery seals; it never truncates.** A torn tail remains untouched and the next segment starts at the recovered sequence number. Replay tolerates torn bytes and verifies gapless sequence numbers across every boundary, beginning at 0. Neither a torn tail nor a missing segment can hide records.
 - **Record cap.** One encoded event is at most 16 MiB. This is a product constraint, not framing trivia: no memory record or tool result may exceed it, and it lets the reader reject an absurd length prefix before allocating for it.
 
 ```proto
@@ -57,23 +57,23 @@ message Event {
 }
 ```
 
-Three rules make the model work:
+Three rules define the model:
 
 1. **Only an append changes durable state.** Model writes, user hand-edits, and migrations all append. None edits prior bytes.
 2. **Everything else is a projection.** The SQLite index, current memory state, and session trees are deterministic replays. Delete any of them and rebuild.
 3. **Schema changes are additive.** Fields are never renumbered or repurposed; old events must always decode. Forward compatibility has one boundary: a new *kind* inside an existing payload arm is skipped safely on replay, but a new top-level `Event.payload` arm decodes as empty on an older binary and reads as corruption. So replaying a log needs a binary at least as new as its newest payload arm. That is fine while writer and reader ship together; revisit if they stop.
 
-**Durability.** v1 fsyncs every append; batching needs trace data to justify it. Expect the question in Phase 2/3, when tool loops turn one user turn into many events. The shape to evaluate: a fixed coalescing window (~200 ms) draining to one fsync per batch, with an explicit flush before a turn is called complete. Any batching keeps the writer's contract — seq stamped internally, a written-but-unfsynced record still consumes its seq, a failed writer is rebuilt and never retried.
+**Durability.** v1 fsyncs every append. Add batching only when traces justify it. Tool loops may make this worthwhile in Phases 2–3. The candidate design is a fixed coalescing window of about 200 ms, one fsync per batch, and an explicit flush before completing a turn. Batching must retain the writer contract: sequence numbers are assigned internally; a written but unsynced record keeps its number; and a failed writer is rebuilt, never retried.
 
-**Consequences.** Backup is "copy the segments." Moving machines is "copy log + identity file, replay." There is no live-database backup problem, because SQLite is disposable.
+**Consequences.** Backup copies the segments. Moving machines copies the log and identity file, then replays. SQLite needs no live-database backup because it is disposable.
 
 ### 3.1 Tool-call events
 
 Tool use appends two kinds inside `SessionEvent`: `ToolCallIssued` and `ToolResultRecorded`.
 
-Not fields on `MessageAppended`: its `content` is the prose the user saw and what §5.3 indexes, and a sometimes-empty `content` beside a calls field would force every reader to learn a new shape. Not a new top-level payload arm either, because rule 3 makes that a replay hazard while a new kind inside an existing arm is skip-safe.
+Do not add them to `MessageAppended`. Its `content` is the text the user saw and the archive indexes. An optional calls field would give every reader another message form to handle. Do not add a top-level payload arm either: an older binary can skip a new kind in an existing arm, but it treats a new top-level arm as corruption.
 
-**One turn.** Reasoning, two parallel calls, their results, final text:
+One turn with reasoning, two parallel calls, their results, and final text:
 
 ```
 user asks                    MessageAppended{USER, content, turn_id=T}
@@ -92,11 +92,11 @@ step 1 final text            MessageAppended{ASSISTANT, content, partial=false, 
 - Results append in completion order, because the log records what happened when. The provider transcript sorts them by the index of the call each one closes.
 - `Event.source` is `MODEL` on a call and `SYSTEM` on a result: the model asked, arcd ran it.
 
-**Turns are an id, not events.** No `TurnStarted`/`TurnEnded`. A `turn_id` is minted when a user message opens a turn and carried by every event in it. That groups just as well, without two extra fsyncs and without a second source of truth that can disagree with the messages. Phase 1 events decode with `turn_id` empty, which reads as "one message, one turn" — exactly true of a log with no tools.
+**Turns use an id, not events.** There are no `TurnStarted` or `TurnEnded` events. A user message creates a `turn_id`, which every event in the turn carries. This gives the same grouping without two extra fsyncs or another source of truth. Phase 1 events decode with an empty `turn_id`, meaning one message per turn, which is true for a log without tools.
 
 Within a turn, grouping is by seq: an assistant text message plus the calls after it, with no result between, is one step. That works only because events are filtered by `turn_id` first. The raw log interleaves sessions and payload arms, so adjacency in it means nothing.
 
-**Per-call identity.** A call is named by `call_id`, the provider's own id recorded verbatim, and ordered by `index`, dense from 0, restarting each step. Parallel calls are real, and a parser keyed on anything but `index` silently merges them.
+**Per-call identity.** A call uses the provider's `call_id`, recorded verbatim, and a dense `index` that starts at 0 for each step. Parallel calls are valid. A parser keyed on anything other than `index` can silently merge them.
 
 `call_id` is the unique key within a session. arcd mints one if the provider sends none, and mints a replacement if an incoming id collides with any call the session already logged, open or closed — the projection's join and the rebuilt transcript both see the whole session, where a repeated string is an ambiguity the open-call set never catches. Either way the log records the id actually used and replay reads it rather than regenerating it, so the provider never sees a mismatch.
 
@@ -129,25 +129,25 @@ enum ToolOutcome {        // UNSPECIFIED stays 0 and is never written
 }
 ```
 
-**Write order and resume.** `ToolCallIssued` is appended and fsynced before its tool runs, and a step's whole batch is durable before any of them runs. That is what makes the log's silence meaningful: nothing ran that is not on disk.
+**Write order and resume.** ARC appends and fsyncs `ToolCallIssued` before running its tool. It makes a step's full batch durable before running any call. The log can therefore prove that no unrecorded call ran.
 
-It also creates the one case that matters: a durable call with no durable result. A replayer concludes exactly one thing — **the outcome is unknown.** Not failed. The tool may never have started, may have run and had its effect before dying, or may have had its result torn off by the crash. The bytes cannot tell these apart, and a tool that moved an actuator (§9) moved it either way. So the call is never silently re-dispatched and never silently dropped. Detection is cheap: replay carries a set of open `call_id`s and removes each on its result. What remains is orphaned.
+This creates one important case: a durable call with no durable result. Replay can conclude only that **the outcome is unknown**, not that it failed. The tool may not have started, may have completed before the process died, or may have lost its result in the crash. The log cannot distinguish these cases. ARC therefore never silently retries or drops the call. Replay tracks open `call_id`s and removes them when it sees a result; calls left over are orphaned.
 
 Only arcd may act on an orphan, at startup, before it dispatches anything for that session. An in-flight call in a live daemon looks identical on disk to an abandoned one, so "orphaned" is a property of the log *plus* nobody running. That is why the repair is an appended event rather than something each reader invents: `arcd rebuild`, `memory-replay`, and the projection all read an orphan as unknown and append nothing.
 
-At startup arcd appends, per orphan, a `ToolResultRecorded{outcome: UNKNOWN}` with `Event.source = SYSTEM`, whose content is a fixed sentence: the daemon restarted before the result was recorded, and the call may or may not have run. The call is now closed durably, the next replay is clean, and every `tool_call_id` in the rebuilt transcript has an answer. The closer lands at the log tail, maybe hours later — the second reason correlation is by `call_id` and not adjacency.
+At startup, arcd appends one `ToolResultRecorded{outcome: UNKNOWN}` for each orphan, with `Event.source = SYSTEM`. Its fixed message says that the daemon restarted before recording the result and that the call may have run. This closes the call durably, keeps future replays clean, and gives every `tool_call_id` in a rebuilt transcript a result. The result may appear hours after the call, so correlation uses `call_id`, not neighbouring log entries.
 
 arcd does not re-drive the model. A restarted daemon resuming a turn the user walked away from is a surprise, and the cost of not doing it is that the user types "continue." The turn resumes on the next user message, which follows a tool result perfectly well.
 
-**Tool errors are results.** A tool that fails — bad arguments, missing file, timeout, no such tool, denied — produces `ToolResultRecorded{outcome: ERROR}` with the text the model should see, and the loop continues. §4's "errors go to clients, never archived" covers ARC failing at its own job: provider unreachable, malformed frame, log write failed.
+**Tool errors are results.** Bad arguments, missing files, timeouts, unknown tools, and denials produce `ToolResultRecorded{outcome: ERROR}` containing the text shown to the model. The loop continues. ARC's own failures—an unavailable provider, malformed frame, or failed log write—go only to the client.
 
 The boundary is one line: **if the model will see it, it is durable; if only the user sees it, it is a wire `Error`.** A tool error changes the conversation and the model must reason about it. A provider outage changes nothing and the fix is to ask again. If the log append itself fails, nothing durable happened, the turn is abandoned, and the client gets an `Error`. Readers treat an unrecognized `ToolOutcome` as UNKNOWN, never ERROR — unknown carries the safe behaviour.
 
 **`partial` does not extend to calls.** It stays on `MessageAppended` and stays about text. A call is appended only once its arguments are complete, so a half-streamed call is never appended and there is nothing to mark. A result arrives whole. What marks a turn cut mid-loop is the orphaned call. Two mechanisms for two different failures: cut text loses only what the user did not see, while a cut loop may have left an effect in the world.
 
-**Size.** The 16 MiB cap is the backstop, not the policy. The tool registry truncates before the event is built, to a configurable `max_tool_result_bytes` — 32 KiB to start, because the real constraint is an 8k-context model, not the disk. Truncation sets `truncated` and leaves a marker in the content. It is lossy on purpose: nothing else stores the full result, which is the rule `partial` already encodes — the log keeps what was seen. The registry enforces it because it knows the tool and can cut meaningfully; a log-layer refusal would leave the loop holding a result it cannot record. An event still over 16 MiB is a registry bug, and the log's refusal catches it.
+**Size.** The 16 MiB cap is a backstop, not the policy. Before building an event, the tool registry truncates results to configurable `max_tool_result_bytes`, initially 32 KiB. An 8k-token context is the real limit. Truncation sets `truncated` and adds a content marker. This loss is intentional: the log stores what the model saw, not a hidden full result. The registry enforces the limit because it knows how to truncate each tool's result. An event above 16 MiB is a registry bug that the log catches.
 
-**Secrets.** Invariant 5 holds at the tool boundary: a result entering the log contains no secret, and **the tool owns that.** Not the log writer, which cannot tell. Not a regex scrubber, which is a false promise. A tool that touches credentials returns a reference, never a value. Arguments are covered from the other side — the model can only echo what it was given, and credentials never enter model context (§10). Airtight only for tools that cannot read their own environment; Phase 2 has none.
+**Secrets.** Tools must keep secrets out of results before they reach the log. The log writer cannot know which text is secret, and regex redaction is unreliable. A tool that uses credentials returns a reference, never the value. The model cannot echo a credential because credentials never enter its context. This guarantee only holds for tools that cannot read their own environment; Phase 2 has none that can.
 
 **Reserved, not built.** One number in the `SessionEvent.event` oneof, for a future reasoning event. Reasoning is streamed by decision, and reserving keeps "durable after all" an addition rather than a migration. A oneof number beats a field on `MessageAppended`, because a call-only step has no `MessageAppended` to hang reasoning on.
 
@@ -200,9 +200,9 @@ A reply cut mid-stream is appended with `partial = true` — the log records wha
 
 ### 4.1 Jobs
 
-**A job is a child session.** Not a queue and not a new abstraction: the conversation forks, the child gets a different provider role (§6), a different tool set, and its own budget, and the parent holds a pointer to it.
+**A job is a child session.** It is not a queue or a separate abstraction. The child has its own provider role, tools, and budget; the parent stores its identifier.
 
-Everything else follows from the tree. A job is searchable, replayable, forkable, and rewindable like any other session, and its transcript lands in the archive (§5.3) with no second storage path.
+This gives a job the same archive, replay, fork, and rewind behaviour as any other session. It needs no separate transcript store.
 
 The reason to separate them at all is size. A conversational turn is small; writing a driver is twenty minutes and a hundred thousand tokens. Run that in the conversation and the context the user talks to drowns in tool output.
 
@@ -214,9 +214,9 @@ Rules:
 - **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
 - **A job has a budget**, declared at dispatch and enforced by arcd. A loop that cannot terminate must not be able to drain a month's allowance.
 
-**A job runs in its own process**, not inside `arcd`. `bash` in the daemon's address space is a blast radius the always-on process should not carry, and a runaway loop should not be able to take the conversation down with it. The worker talks to the same `Store` (§3.2) and appends the same events; what it does not share is a fate.
+**A job runs in its own process**, not inside `arcd`. The daemon must not share an address space with `bash` or a runaway loop. The worker uses the same `Store` and appends the same events, but it can fail without taking down the conversation.
 
-**Dispatch is an ordinary tool call with a late result.** The model calls the dispatch tool, `ToolCallIssued` is appended, the worker starts, and the turn ends. Minutes later the job's summary lands as that call's `ToolResultRecorded`, which opens the next turn. Nothing new is needed for the asynchrony — §3.1's contract already covers it, including the crash case: a durable dispatch with no durable result is an orphan, and its outcome is *unknown*, never failed.
+**Dispatch is a normal tool call with a delayed result.** The model calls dispatch, ARC appends `ToolCallIssued`, the worker starts, and the turn ends. When the job finishes, its summary becomes that call's `ToolResultRecorded`. The existing unfinished-call recovery rule also covers a crash: a durable dispatch without a result is unknown, not failed.
 
 Coding is the first job kind, not a privileged one. A device job (§9) is the same shape with a different tool set.
 
@@ -249,7 +249,7 @@ Three verdicts: once, for this session, always for this project. A denial carrie
 
 **Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
 
-**The shell tool answers §3.1's open redaction question.** `bash` is the first tool that can read its own environment, which §3.1 banked for whoever hit it first. The answer: arcd runs workspace tools with a scrubbed environment — no keys, no tokens. A result cannot contain a credential the process never had. Invariant 5 stays a property of what the tool can see, not of a regex applied afterwards.
+**The shell tool settles the open redaction question.** `bash` is the first tool that can read its own environment. arcd runs workspace tools with a scrubbed environment: no keys and no tokens. A result cannot contain credentials the process never received. Secret protection depends on what the tool can access, not on a regex applied afterwards.
 
 ## 5. Memory
 
@@ -292,7 +292,7 @@ message MemoryRecord {
 
 Current state is a projection of `MemoryEvent`s. Context always carries an index of ACTIVE records — `namespace + kind + title + summary` only — so the model knows what exists without loading bodies. Superseding rather than deleting keeps history ("you used to live at X") and keeps replay honest. A user-requested purge is a `DELETED` event, and the projection then drops the record entirely.
 
-Provenance is load-bearing: every fact can answer "where did you learn that" by pointing into the archive.
+Provenance is required: every fact must answer “where did you learn that?” by pointing into the archive.
 
 ### 5.3 Archive tier
 
@@ -405,13 +405,13 @@ The local provider is a llama.cpp `llama-server` sidecar supervised by `arcd`, s
 
 It is also why the same code reaches most hosted options: an OpenAI-compatible endpoint is a base URL, a key, and a model id.
 
-Hosted providers are plain HTTP + SSE (`reqwest` + rustls), never vendor SDKs. Auth is a swappable layer; API keys only. The original Google OAuth path was removed outright — provider, flow, `arcd login`, token file — after hidden rate limits made it unreliable and its ToS gray area stopped being worth carrying. Keys live in `data/secrets/` (0700, excluded from backups), which stops being an empty seam in Phase 3.
+Hosted providers use plain HTTP and SSE (`reqwest` + rustls), never vendor SDKs. Authentication is replaceable; for now it uses API keys only. The Google OAuth path was removed after hidden rate limits made it unreliable and its terms became questionable. Keys live in `data/secrets/` (0700 and excluded from backups). Phase 3 uses that storage for face, hands, and counsel.
 
 Tool-calling and system-prompt differences are normalized in `arc-core`, never leaked to clients. The log records which model actually ran.
 
 ### 6.4 The concrete stack is dated
 
-Which model fills each role today, what it costs, what it is metered on, and what would change the answer all live in `docs/providers.md`. That file is expected to churn as plans and prices move. This section defines the seam and should not.
+`docs/providers.md` records each current model, its cost, its limits, and the conditions for changing it. Update that file as plans and prices change. Keep this section stable because it defines the architecture.
 
 ## 7. Wire protocol and clients
 
@@ -461,7 +461,7 @@ No robotics code lands before Phase 5.
 - **Always-on** means a systemd user unit (`arcd/arcd.service`): starts with the machine, restarts on failure, logs to the journal. `SIGTERM` is a clean stop, and the sidecar dies with it either way because systemd kills the whole control group. Nothing is left holding the GPU.
 - Runtime state lives under `data/`: log, index, identity, traces.
 - Backup is rustic, encrypted at the repository level, covering `data/log/` and `data/identity.md`. `data/index.db` and `data/traces/` are excluded — both are rebuildable.
-- Credentials live in the OS keychain or an encrypted secrets file under `data/secrets/` (0700, excluded from backups). Never in the log, never in backups. Phase 3 is where this stops being an empty seam: face, hands, and counsel all need keys.
+- Credentials live in the OS keychain or an encrypted secrets file under `data/secrets/` (0700 and excluded from backups). They never enter the log or backups. Phase 3 uses credentials for face, hands, and counsel.
 - **Workspace tools run with a scrubbed environment** (§4.3). `bash` is the first thing ARC runs that could read its own process environment, and the answer is that there is nothing there to read — no keys, no tokens. arcd holds credentials; the tools it spawns do not inherit them.
 - The WebSocket binds localhost only. Remote access is Tailscale's problem, by design.
 
@@ -488,7 +488,7 @@ Each phase ends in something used daily. No phase starts until the previous one 
 Deferred on purpose. Decide when the phase forces it.
 
 - **Consolidation triggering:** idle timeout vs explicit session close vs continuous. The v1 placeholder is a configurable idle timeout, so the pass has something to hang on. Traces judge it. (Phase 2.)
-- ~~**Model routing.**~~ **Decided in §6.1**, using the usage data Phase 2 generated: static roles in config, no runtime difficulty classifier, the role label on every span. hermes-agent's per-task label at one chokepoint is the shape that survived. What stays open is narrower — whether roles need per-task sub-labels (consolidation and titling are both `local` today but may want different timeouts and concurrency), and whether the **face** is reliable enough at dispatch to keep that decision on a cheap model, or whether dispatch alone should escalate. Both are answerable from traces once Phase 3 runs.
+- ~~**Model routing.**~~ **Decided.** Configuration assigns static roles; there is no runtime difficulty classifier, and every trace span records its role. Two questions remain: whether roles need task-specific labels (for example, consolidation and titling may need different timeouts and concurrency), and whether face can dispatch reliably enough or needs a stronger model just for dispatch. Phase 3 traces should answer both.
 - **Compaction and the log.** A long job (§4.1) will exceed any context window, and summarising its own history is a durable decision that changes what the model sees. Replay must reproduce it, so it cannot be an in-memory convenience. Likely a new kind inside `SessionEvent`, recording what was compacted and the prompt version that did it — the same shape as `SessionConsolidated` in §5.4. Decide when the first job hits the limit, not before. (Phase 3.)
 - **Voice stage placement.** With the face hosted, the GPU is free during a voice turn — the sidecar is asleep and consolidation only runs on idle sessions. The Phase 4 plan's "whisper on CPU so the GPU stays free" constraint may no longer apply, which would allow a larger ASR model or GPU-side TTS for faster first audio. Measure in Phase 4 rather than inheriting the assumption. (Phase 4.)
 - **Identity edits in the log.** Revisit if hand-editing becomes a bottleneck.

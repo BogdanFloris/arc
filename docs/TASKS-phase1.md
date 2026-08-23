@@ -1,10 +1,10 @@
 # TASKS — Phase 1 walking skeleton
 
-**Phase 1 closed 2026-08-13.** All 26 tasks built and reviewed; the exit criterion was called met on real use — simple questions go to ARC daily instead of to a chat app. Not a full replacement (no tools, and an 8B local model does no coding), and neither gap belonged to this phase. This file is the frozen record; the live list is `TASKS.md` (Phase 2).
+**Phase 1 closed 2026-08-13.** All 26 tasks were built and reviewed. ARC handled simple daily questions instead of a chat app, meeting the exit criterion. It was not a full replacement: it had no tools and the 8B local model could not code. Neither belonged in this phase. This is a historical record; `TASKS.md` is the live list.
 
-Working agreement: Bogdan assigns each task (`bogdan` or `claude`). The implementer's work is reviewed by the other. Statuses: `todo` → `in progress` → `in review` → `done`.
+Bogdan assigned each task (`bogdan` or `claude`), and the other person reviewed it. Statuses were `todo` → `in progress` → `in review` → `done`.
 
-Tasks are ordered by dependency; anything at the same number can go in parallel.
+Tasks are ordered by dependency. Tasks with the same number could run in parallel.
 
 Loose ends (fold into the next touch of the relevant file, no own task): `log::Error::Io`'s field doc says "segment" but the variant also carries directory paths (from `sync_parent_dir`, `discover_segments`).
 
@@ -135,6 +135,6 @@ Cost of leaving it on, measured 2026-08-13 (100k synthetic turns, release build)
 
 Found while shutting the daemon down for that test, fixed in the same batch: arcd only handled Ctrl-C, so a `SIGTERM` — what any service manager sends — killed it before the shutdown path ran and orphaned llama-server holding 5.7 GiB of VRAM. It now stops on both.
 
-Next session picks up here (banked 2026-08-13, second batch): all 26 Phase 1 tasks are built and reviewed. Nothing is in flight. What is left is not code — it is daily use answering the exit criterion ("ARC replaces a chat app"), which is also what Phase 2's memory design is supposed to be built from. When it holds up, mark Phase 1 done in DESIGN.md §11 and open Phase 2. The unit is installed but not enabled (`systemctl --user enable --now arcd`), and the release binary it points at is built.
+Next session, 2026-08-13: all 26 Phase 1 tasks were built and reviewed. Nothing remained in flight. The remaining work was daily use to test whether ARC could replace a chat app, which would inform Phase 2's memory design. The service unit was installed but not enabled (`systemctl --user enable --now arcd`), and its release binary was built.
 
 Open on purpose, none of them Phase 1's problem: the wire friction banked above for Phase 3; no `partial` column in the projection, so a reopened session cannot show a cut reply (`HistoryMessage` field 3 is reserved); no sidecar restart policy; no retention on `data/traces/`; `log::Error::Io`'s field doc. Machine notes that bit us live in the host dotfiles, not here: GNOME idle-suspend disabled for SSH work, `llama-cpp` built with Vulkan.

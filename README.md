@@ -1,18 +1,18 @@
 # ARC (Autonomous Robotic Core)
 
-A personal AI assistant built as an always-on Rust daemon (`arcd`) with thin clients — a TUI today, voice later — talking to it over a local socket. Durable event-sourced memory, a stable identity, branching sessions, and swappable providers, starting with a local llama.cpp model.
+A personal AI assistant built around an always-on Rust daemon (`arcd`). Thin clients connect over a local socket: a TUI today and voice later. ARC has durable event-sourced memory, a stable identity, branching sessions, and swappable providers. It starts with a local llama.cpp model.
 
 ![The arc TUI](docs/arc-tui.png)
 
-It is one person's daily driver, built in the open. No stability promises, no releases, no multi-user story. [docs/DESIGN.md](docs/DESIGN.md) is the architectural authority and the honest account of what exists; [docs/TASKS.md](docs/TASKS.md) is what's being built now.
+This is one person's daily driver, built in the open. There are no releases, stability promises, or multi-user plan. [docs/DESIGN.md](docs/DESIGN.md) is the architectural authority. [docs/TASKS.md](docs/TASKS.md) is the current work list.
 
-Four priorities, in order: **durability** (one append-only log, everything else rebuildable), **observability** (every LLM call, tool call, and memory write shows up in a Perfetto trace), **speed** (no GC, protobuf on disk and on the wire), **independence** (plain HTTP + SSE behind one provider trait, never vendor SDKs).
+Priorities, in order: **durability** (one append-only log; everything else rebuildable), **observability** (Perfetto traces cover every LLM call, tool call, and memory write), **speed** (no GC; protobuf on disk and on the wire), and **independence** (one provider trait over plain HTTP and SSE; no vendor SDKs).
 
-**Status:** Phase 1 (walking skeleton) and Phase 2 (memory + tool calling) are done and in daily use. Phase 3 — ARC as the harness its own code is written in — is in progress. Phases are in [DESIGN.md §11](docs/DESIGN.md).
+**Status:** Phases 1 (walking skeleton) and 2 (memory and tool calling) are complete and used daily. Phase 3 makes ARC the harness used to write its own code. [DESIGN.md](docs/DESIGN.md) describes every phase.
 
 ## Running it
 
-Needs a Rust toolchain, `protoc`, and llama.cpp's `llama-server` on your `PATH`. The Nix flake (`nix develop`) provides everything but the sidecar.
+Install a Rust toolchain, `protoc`, and llama.cpp's `llama-server` on your `PATH`. The Nix flake (`nix develop`) provides everything except the sidecar.
 
 ```sh
 just model          # download the default GGUF (Qwen3-8B Q4_K_M, ~5GB) to data/models/
@@ -21,7 +21,7 @@ cargo run -p arcd   # daemon: owns the log, supervises the sidecar, binds 127.0.
 cargo run -p arc    # TUI, in another terminal
 ```
 
-Config is `data/arc.toml`, every field optional — see the module docs in `arcd/src/config.rs`. Runtime state lives under `data/`: the log, the SQLite projection, `identity.md`, traces. `just install-service` sets up a systemd user unit.
+Configuration is in `data/arc.toml`; every field is optional. See `arcd/src/config.rs` for field documentation. Runtime state lives under `data/`: the log, SQLite projection, `identity.md`, and traces. `just install-service` installs a systemd user unit.
 
 ## Layout
 
@@ -37,9 +37,9 @@ Config is `data/arc.toml`, every field optional — see the module docs in `arcd
 
 ## Traces
 
-Every `arcd` run writes one Perfetto trace to `data/traces/arc-<unix-seconds>.pftrace`, and says so in its first log line. Open it by dragging the file into <https://ui.perfetto.dev> — nothing is uploaded, the UI parses it in the browser. What you get: a row per session, the span tree of each turn under it (`session.send_message` → `openai.complete`), and counter tracks graphing tokens in and out.
+Each `arcd` run writes a Perfetto trace to `data/traces/arc-<unix-seconds>.pftrace` and reports its path in the first log line. Drag it into <https://ui.perfetto.dev>. The browser parses the file locally; nothing is uploaded. The trace shows one row per session, each turn's span tree (`session.send_message` → `openai.complete`), and input/output token counters.
 
-To ask questions instead of looking, `trace_processor_shell` is in the dev shell:
+The development shell also provides `trace_processor_shell`:
 
 ```sh
 nix develop --command trace_processor_shell data/traces/arc-*.pftrace
@@ -47,7 +47,7 @@ nix develop --command trace_processor_shell data/traces/arc-*.pftrace
 > select name, value from stats where severity = 'error' and value > 0;   -- should be empty
 ```
 
-The file is flushed packet by packet, so a trace can be opened while the daemon it belongs to is still running. `RUST_LOG` filters the trace and the stderr log together. Traces are disposable and excluded from backups; delete them whenever.
+Packets are flushed as they are written, so you can open a trace while its daemon is still running. `RUST_LOG` filters both the trace and stderr log. Traces are disposable and excluded from backups.
 
 ## License
 

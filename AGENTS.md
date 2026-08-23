@@ -1,14 +1,14 @@
 # AGENTS.md — ARC (Autonomous Robotic Core)
 
-Personal AI assistant harness: always-on Rust daemon, thin clients, event-sourced memory, multi-provider LLM support. **`docs/DESIGN.md` is the architectural authority.** If a task conflicts with it, stop and flag the conflict — amend DESIGN.md first, then implement. Do not silently diverge.
+ARC is a personal AI assistant harness: an always-on Rust daemon, thin clients, event-sourced memory, and multiple LLM providers. **`docs/DESIGN.md` is the architectural authority.** If work conflicts with it, stop and raise the conflict. Update the design first; do not silently diverge.
 
 ## You
 
-Write and talk in plain English, only as much information as the point needs. Lead with the claim, then the evidence. Short sentences over hedged compound ones; no filler ("importantly", "notably", "it is worth noting"); no restating context the reader already has; one statement of each correction, not a narrated history. Reference standard: the plain-language principles of ISO 24495-1 (readers find what they need, understand it on first read, can use it)
+Write and speak in plain English. Say only what the reader needs. Lead with the claim, then the evidence. Use short sentences. Do not add filler, repeat known context, or narrate a correction's history. State each correction once. Follow ISO 24495-1: readers should find, understand, and use the information on first reading.
 
 ## Current phase
 
-Phase 3 — development (see `docs/DESIGN.md` §11 for the phase contract, `docs/TASKS.md` for the live task list). ARC becomes the way its own code gets written: the four provider roles of §6, jobs as child sessions (§4.1), workspaces (§4.2), the tool registry and approval model (§4.3), and running as an installed unit. Do not implement features from later phases, even if convenient. When a task tempts you toward Phase 3.5+ scope — forking, rewind, voice, devices — build the seam, not the feature.
+Phase 3 is development. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. ARC becomes the harness used to write its own code. This includes provider roles, child-session jobs, workspaces, the tool registry and approval model, and an installed service. Do not build later-phase features. If work points toward forking, rewind, voice, or devices, add only the interface needed now.
 
 ## Workspace
 
@@ -34,7 +34,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 5. **Secrets never touch the log**, backups, traces, or test fixtures.
 6. **Memory is tools, not injection.** Nothing enters model context automatically except the identity file and the distilled-record index.
 7. **Identity file is human-owned.** Code may propose edits in session output; it never writes `data/identity.md`.
-8. **Tools are confined and gated.** Workspace tools resolve every path to canonical form and refuse anything outside the session's project root, and run with a scrubbed environment — arcd holds credentials, spawned tools never inherit them. Approval verdicts are durable events with `source = USER`; the allow-list is a projection, never a hand-edited file. `consult_expert` is read-only, always.
+8. **Tools stay inside the workspace and require approval.** Workspace tools resolve paths to their canonical form and reject anything outside the session's project root. They run with a scrubbed environment: arcd keeps credentials and child tools never inherit them. Approval verdicts are durable events with `source = USER`; the allow-list is a projection, never a hand-edited file. `consult_expert` is always read-only.
 9. **Sessions are pinned to one provider.** Role is chosen at session or job creation and does not change for its lifetime. A mid-session model swap discards the prompt cache, which is ~96% of the workload.
 
 ## Conventions
@@ -43,7 +43,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 - Errors: `thiserror` for library errors in arc-core, `anyhow` at binary edges.
 - Async: tokio throughout; no other runtimes.
 - Instrumentation: every LLM call, tool call, memory operation, and consolidation pass gets `tracing` spans (these become Perfetto traces). If you add a subsystem, instrument it in the same change, not later.
-- Comments are rare and load-bearing. Default to none; the code says what it does. Write one only when the code cannot:
+- Comments are rare. Default to none; the code should explain itself. Add one only when code cannot explain:
   - an external rule you can't see from here (an SSE framing quirk, what SQLite's `content=` tables do, fsync ordering);
   - a constant whose consequence lives in another file (bumping this rebuilds the index; 20 digits is what makes names sort);
   - a line that looks wrong and isn't (dropping this sender *is* the kill signal; this empty loop reaps tasks).
@@ -58,4 +58,4 @@ Small, single-purpose commits: `<crate>: <imperative summary>` (e.g. `arc-core: 
 
 ## When unsure
 
-Prefer: smaller diff, seam over feature, DESIGN.md over cleverness, asking over assuming. Open questions in `docs/DESIGN.md` §12 are deliberately unresolved — do not resolve them in code.
+Prefer a smaller diff, a narrow interface over a premature feature, `DESIGN.md` over cleverness, and asking over assuming. The open questions in `docs/DESIGN.md` are deliberate. Do not settle them in code.
