@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DATA_DIR: &str = "data";
@@ -39,6 +40,123 @@ pub struct Config {
     pub no_think: bool,
 
     pub consolidation: ConsolidationConfig,
+
+    pub roles: RolesConfig,
+
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, ProjectConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RolesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concierge: Option<RoleConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor: Option<RoleConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archivist: Option<RoleConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleConfig {
+    pub provider: RoleProvider,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleProvider {
+    Local,
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
+    Gemini,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    pub root: PathBuf,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only: Vec<PathBuf>,
+
+    pub sources: Vec<ToolSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    Builtin,
+    Workspace,
+}
+
+impl RolesConfig {
+    fn configured(&self) -> impl Iterator<Item = (&'static str, &RoleConfig)> {
+        [
+            ("concierge", self.concierge.as_ref()),
+            ("executor", self.executor.as_ref()),
+            ("archivist", self.archivist.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, role)| role.map(|role| (name, role)))
+    }
+}
+
+impl RoleConfig {
+    fn validate(&self, name: &str) -> Result<()> {
+        match self.provider {
+            RoleProvider::Local => ensure!(
+                self.endpoint.is_none(),
+                "role `{name}` runs on the sidecar, which owns its own endpoint"
+            ),
+            RoleProvider::OpenAiCompat => ensure!(
+                self.endpoint.is_some(),
+                "role `{name}` needs an endpoint: openai_compat has no default"
+            ),
+            RoleProvider::Gemini => {}
+        }
+        if !matches!(self.provider, RoleProvider::Local) {
+            ensure!(
+                self.model.as_ref().is_some_and(|model| !model.is_empty()),
+                "role `{name}` needs a model: only the sidecar can name its own"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl ProjectConfig {
+    fn validate(&self, name: &str) -> Result<()> {
+        ensure!(
+            self.root.is_absolute(),
+            "project `{name}`: root {} must be an absolute path, and `~` is not expanded",
+            self.root.display()
+        );
+        for grant in &self.read_only {
+            ensure!(
+                grant.is_absolute(),
+                "project `{name}`: read-only grant {} must be an absolute path, and `~` is not expanded",
+                grant.display()
+            );
+            if grant.starts_with(&self.root) || self.root.starts_with(grant) {
+                bail!(
+                    "project `{name}`: read-only grant {} overlaps the read-write root {}; grants are separate roots, not holes",
+                    grant.display(),
+                    self.root.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -93,6 +211,8 @@ impl Default for Config {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             no_think: true,
             consolidation: ConsolidationConfig::default(),
+            roles: RolesConfig::default(),
+            projects: BTreeMap::new(),
         }
     }
 }
@@ -118,7 +238,22 @@ impl Config {
                 return Err(err).with_context(|| format!("reading config {}", path.display()));
             }
         };
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("in config {}", path.display()))?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, role) in self.roles.configured() {
+            role.validate(name)?;
+        }
+        for (name, project) in &self.projects {
+            project.validate(name)?;
+        }
+        Ok(())
     }
 
     pub fn model(&self) -> String {
@@ -136,7 +271,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ProviderChoice};
+    use super::{
+        Config, ProjectConfig, ProviderChoice, RoleConfig, RoleProvider, RolesConfig, ToolSource,
+    };
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -192,9 +330,174 @@ mod tests {
                 idle_seconds: 600,
                 timeout_seconds: 120,
             },
+            roles: RolesConfig {
+                concierge: Some(RoleConfig {
+                    provider: RoleProvider::Gemini,
+                    model: Some("gemini-3.7-flash".to_owned()),
+                    endpoint: None,
+                }),
+                executor: Some(RoleConfig {
+                    provider: RoleProvider::OpenAiCompat,
+                    model: Some("deepseek-v4-pro".to_owned()),
+                    endpoint: Some("http://127.0.0.1:4096/v1".to_owned()),
+                }),
+                archivist: Some(RoleConfig {
+                    provider: RoleProvider::Local,
+                    model: None,
+                    endpoint: None,
+                }),
+            },
+            projects: BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectConfig {
+                    root: PathBuf::from("/home/bogdan/arc"),
+                    read_only: vec![PathBuf::from("/home/bogdan/notes")],
+                    sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                },
+            )]),
         };
         let text = toml::to_string(&config).expect("serializes");
         assert_eq!(toml::from_str::<Config>(&text).expect("parses"), config);
+    }
+
+    fn parse(text: &str) -> Config {
+        let config: Config = toml::from_str(text).expect("parses");
+        config.validate().expect("validates");
+        config
+    }
+
+    fn rejected(text: &str) -> String {
+        let config: Config = toml::from_str(text).expect("parses");
+        config
+            .validate()
+            .expect_err("must not validate")
+            .to_string()
+    }
+
+    #[test]
+    fn an_empty_file_configures_no_roles_and_no_projects() {
+        let config = parse("");
+        assert_eq!(config.roles, RolesConfig::default());
+        assert!(config.projects.is_empty());
+    }
+
+    #[test]
+    fn each_role_resolves_to_a_provider_and_a_model() {
+        let config = parse(
+            r#"
+[roles.concierge]
+provider = "gemini"
+model    = "gemini-3.7-flash"
+
+[roles.executor]
+provider = "openai_compat"
+model    = "deepseek-v4-pro"
+endpoint = "http://127.0.0.1:4096/v1"
+
+[roles.archivist]
+provider = "local"
+"#,
+        );
+
+        let concierge = config.roles.concierge.expect("concierge is configured");
+        assert_eq!(concierge.provider, RoleProvider::Gemini);
+        assert_eq!(concierge.model.as_deref(), Some("gemini-3.7-flash"));
+        let executor = config.roles.executor.expect("executor is configured");
+        assert_eq!(
+            executor.endpoint.as_deref(),
+            Some("http://127.0.0.1:4096/v1")
+        );
+        let archivist = config.roles.archivist.expect("archivist is configured");
+        assert_eq!(archivist.provider, RoleProvider::Local);
+        assert_eq!(archivist.model, None, "the sidecar names its own model");
+    }
+
+    #[test]
+    fn a_role_that_is_not_a_role_is_rejected() {
+        let err = toml::from_str::<Config>("[roles.hands]\nprovider = \"local\"\n")
+            .expect_err("an unknown role must not load");
+        assert!(err.to_string().contains("hands"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_role_provider_is_rejected() {
+        let err = toml::from_str::<Config>("[roles.executor]\nprovider = \"anthropic\"\n")
+            .expect_err("an unconfigurable provider must not load");
+        assert!(err.to_string().contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn a_hosted_role_without_a_model_is_rejected() {
+        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\n");
+        assert!(err.contains("concierge") && err.contains("model"), "{err}");
+    }
+
+    #[test]
+    fn an_openai_compat_role_without_an_endpoint_is_rejected() {
+        let err = rejected("[roles.executor]\nprovider = \"openai_compat\"\nmodel = \"glm-5.3\"\n");
+        assert!(
+            err.contains("executor") && err.contains("endpoint"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_local_role_with_an_endpoint_is_rejected() {
+        let err = rejected(
+            "[roles.archivist]\nprovider = \"local\"\nendpoint = \"http://127.0.0.1:8080/v1\"\n",
+        );
+        assert!(
+            err.contains("archivist") && err.contains("sidecar"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_project_resolves_to_a_root_grants_and_sources() {
+        let config = parse(
+            r#"
+[projects.arc]
+root      = "/home/bogdan/arc"
+read_only = ["/home/bogdan/notes"]
+sources   = ["builtin", "workspace"]
+"#,
+        );
+
+        let project = &config.projects["arc"];
+        assert_eq!(project.root, PathBuf::from("/home/bogdan/arc"));
+        assert_eq!(project.read_only, [PathBuf::from("/home/bogdan/notes")]);
+        assert_eq!(
+            project.sources,
+            [ToolSource::Builtin, ToolSource::Workspace]
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_source_is_rejected() {
+        let err = toml::from_str::<Config>(
+            "[projects.arc]\nroot = \"/home/bogdan/arc\"\nsources = [\"mcp\"]\n",
+        )
+        .expect_err("a source that does not exist must not load");
+        assert!(err.to_string().contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn a_project_path_that_is_not_absolute_is_rejected() {
+        let err = rejected("[projects.arc]\nroot = \"~/arc\"\nsources = []\n");
+        assert!(err.contains("absolute"), "{err}");
+
+        let err = rejected(
+            "[projects.arc]\nroot = \"/home/bogdan/arc\"\nread_only = [\"notes\"]\nsources = []\n",
+        );
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn a_read_only_grant_inside_the_read_write_root_is_rejected() {
+        let err = rejected(
+            "[projects.arc]\nroot = \"/home/bogdan/arc\"\nread_only = [\"/home/bogdan/arc/data\"]\nsources = []\n",
+        );
+        assert!(err.contains("overlaps"), "{err}");
     }
 
     #[test]
