@@ -35,7 +35,7 @@ message SessionCreated {
   string title = 2;
   string provider = 3;
   string model = 4;
-  reserved 5, 6;
+  reserved 5, 6;  // forking's parent_session and fork_point
   SessionRole role = 7;
   string project = 8;
   Budget budget = 9;
@@ -56,7 +56,7 @@ message ToolCallIssued {
   uint32 index = 4;
   string name = 5;
   string arguments_json = 6;
-  reserved 7, 8;
+  reserved 7, 8;  // tool source and issuing model
   bytes provider_roundtrip = 9;
 }
 
@@ -74,7 +74,7 @@ message ToolResultRecorded {
   ToolOutcome outcome = 4;
   string content = 5;
   bool truncated = 6;
-  reserved 7;
+  reserved 7;  // structured, non-text result content
 }
 
 message SessionConsolidated {
@@ -91,7 +91,7 @@ message SessionEvent {
     ToolResultRecorded tool_result_recorded = 4;
     SessionConsolidated session_consolidated = 6;
   }
-  reserved 5;
+  reserved 5;  // a reasoning event; streamed-only by decision
 }
 
 message ProvenanceEntry {
@@ -169,5 +169,5 @@ message Event {
     SessionEvent session = 10;
     MemoryEvent memory = 11;
   }
-  reserved 12;
+  reserved 12;  // IdentityEvent, if identity ever stops being a file
 }

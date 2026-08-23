@@ -39,11 +39,13 @@ Tasks are dependency-ordered; tasks at the same number may run in parallel. The 
 
 Each schema change is its own commit, separate from code that uses it (invariant 3: additive only).
 
+These are schemas and nothing writes a non-default value yet. 3.1 fills in the role, 5.1 the project, 5.2 the budget, and 3.3 the round-trip blob; the projection's `sessions.project` column stays NULL until then. The top-level `provider` and `model` keys are still the live path, and 3.1 replaces them with role resolution.
+
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 2.1 | Record a session's role, project, and budget at creation so replay shows what a job ran with. Use the reserved model field on `ToolCallIssued`; do not add another copy. | — | todo |
-| 2.2 | `arc.toml`: `[roles.*]` and `[projects.*]`. A role resolves to one provider and model. A project resolves to its read-write root, any read-only grants, and its declared builtin/workspace sources. Do not add expert configuration, fallback policy, or workflow configuration. | — | todo |
-| 2.3 | Add a generic opaque per-call provider blob to `ToolCallIssued`. Gemini rejects a tool result whose call did not carry back its `thought_signature`, about 620 bytes, and the transcript is rebuilt from the log, so it cannot be provider-local state. Name it for what it is — provider round-trip data — not for Gemini. Must land before 3.3 | — | todo |
+| 2.1 | Record a session's role, project, and budget at creation so replay shows what a job ran with. Use the reserved model field on `ToolCallIssued`; do not add another copy. **`SessionCreated` fields 7, 8, 9: `SessionRole`, `project`, and an optional `Budget` of total tokens and wall-clock seconds. Absent budget means no budget.** | claude | done |
+| 2.2 | `arc.toml`: `[roles.*]` and `[projects.*]`. A role resolves to one provider and model. A project resolves to its read-write root, any read-only grants, and its declared builtin/workspace sources. Do not add expert configuration, fallback policy, or workflow configuration. **The three role keys are fixed, so a typo is a load error rather than a silent extra role. Grants must be absolute — `~` is not expanded — and a read-only grant may not sit inside the read-write root, because a grant is a separate root and not a hole.** | claude | done |
+| 2.3 | Add a generic opaque per-call provider blob to `ToolCallIssued`. Gemini rejects a tool result whose call did not carry back its `thought_signature`, about 620 bytes, and the transcript is rebuilt from the log, so it cannot be provider-local state. Name it for what it is — provider round-trip data — not for Gemini. Must land before 3.3 **Landed as `bytes provider_roundtrip = 9`.** | claude | done |
 
 ## 3. Roles and providers (`arc-core`)
 
