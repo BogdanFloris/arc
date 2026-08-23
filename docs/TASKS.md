@@ -12,8 +12,8 @@ Tasks are dependency-ordered; tasks at the same number may run in parallel. The 
 
 ## Decisions made before planning, 2026-08-22
 
-- **Three configured roles:** face, hands, and local. There is no runtime difficulty classifier. `providers.md` records the current models.
-- **The concrete stack to build against:** face = Gemini 3.7 Flash on a direct key; hands = DeepSeek V4 Pro via OpenCode Go's OpenAI-compatible endpoint; local = the existing Qwen3-8B sidecar. Budget target under $50/month against $100 today.
+- **Three configured roles:** concierge, executor, and archivist. Each is named for the work it does, not for where its model runs. There is no runtime difficulty classifier. `providers.md` records the current models.
+- **The concrete stack to build against:** concierge = Gemini 3.7 Flash on a direct key; executor = DeepSeek V4 Pro via OpenCode Go's OpenAI-compatible endpoint; archivist = the existing Qwen3-8B sidecar. Budget target under $50/month against $100 today.
 - **Roles use one model each.** Provider failure reaches the client. Fallback ladders need real outage or spend evidence before they become stateful policy.
 - **Dispatch is a tool call with a delayed result.** `ToolCallIssued` starts the job. `ToolResultRecorded` carries the final summary. The existing unfinished-call recovery rule handles crashes.
 - **Jobs run as supervised daemon tasks.** This keeps the conversation responsive; it is not containment. Process separation waits for a sandbox design.
@@ -32,7 +32,7 @@ Tasks are dependency-ordered; tasks at the same number may run in parallel. The 
 
 1.3 came back reliable, so dispatch stays on Flash. The findings that bind later tasks are folded into the rows below. Two remain unfiled:
 
-- **Gemini caching is unverified.** No probe carried a prefix worth caching, so no cached tokens appeared in `usage`. Re-check with a real face prompt before trusting the 90% discount in `providers.md`. Explicit caching needs `extra_body.cached_content`, which the new `Provider` should carry from the start.
+- **Gemini caching is unverified.** No probe carried a prefix worth caching, so no cached tokens appeared in `usage`. Re-check with a real concierge prompt before trusting the 90% discount in `providers.md`. Explicit caching needs `extra_body.cached_content`, which the new `Provider` should carry from the start.
 - **Gemini bills thinking it never streams.** There is no `reasoning_content`; one reply reported 70 completion tokens against 406 total. `Usage` under-reports output by about five times until the new `Provider` reads the right field.
 
 ## 2. Schemas (`arc-proto`)
@@ -51,10 +51,10 @@ Each schema change is its own commit, separate from code that uses it (invariant
 |---|------|----------|--------|
 | 3.1 | Resolve each configured role to a provider and model. Add the role label to every `CompletionRequest` and trace span. This is the single place where Phase 3 work is measured. | — | todo |
 | 3.2 | Session pinning: role chosen at session or job creation, immutable for its lifetime | — | todo |
-| 3.3 | Keyed providers: keys from `data/secrets/` (0700). `OpenAiCompat` sends no `Authorization` header at all today. Go needs nothing else — `glm-5.3` decoded every parser case unchanged, model ids are bare (`deepseek-v4-flash`, not `opencode-go/…`), and `/v1/models` exists so 3.4 can validate the allow-list at startup. Gemini gets its own `Provider`: it omits `index` on tool-call deltas, never sends `reasoning_content`, and needs 2.6's blob echoed back or the next turn is a 400 | — | todo |
-| 3.4 | Prefix stability for the face: identity file and record index render first and byte-identically, everything volatile after. A regression test asserts two consecutive turns produce an identical prefix. | — | todo |
-| 3.5 | **Sidecar restart policy** (carried from Phase 1). It supports the local role's consolidation work. | — | todo |
-| 3.6 | **Write `data/identity.md` for the face** — ARC's register per §5.1's four rules, plus the stable facts the always-loaded prompt should carry. Not code, and by invariant 7 not something an agent may write; this one is Bogdan's. Until it exists the face runs on whatever voice the model defaults to | bogdan | todo |
+| 3.3 | Keyed providers: keys from `data/secrets/` (0700). `OpenAiCompat` sends no `Authorization` header at all today. Go needs nothing else — `glm-5.3` decoded every parser case unchanged, model ids are bare (`deepseek-v4-flash`, not `opencode-go/…`), and `/v1/models` exists so 3.4 can validate the allow-list at startup. Gemini gets its own `Provider`: it omits `index` on tool-call deltas, never sends `reasoning_content`, and needs 2.3's blob echoed back or the next turn is a 400 | — | todo |
+| 3.4 | Prefix stability for the concierge: identity file and record index render first and byte-identically, everything volatile after. A regression test asserts two consecutive turns produce an identical prefix. | — | todo |
+| 3.5 | **Sidecar restart policy** (carried from Phase 1). It supports the archivist's consolidation work. | — | todo |
+| 3.6 | **Write `data/identity.md` for the concierge** — ARC's register per §5.1's four rules, plus the stable facts the always-loaded prompt should carry. Not code, and by invariant 7 not something an agent may write; this one is Bogdan's. Until it exists the concierge runs on whatever voice the model defaults to | bogdan | todo |
 
 ## 4. Tool registry (`arc-core`)
 
@@ -65,7 +65,7 @@ Each schema change is its own commit, separate from code that uses it (invariant
 | 4.3 | Workspace tools, read-only half: `read`, `glob`, `grep`. Confinement resolves every path to canonical form and accepts it only if it sits under one of the session's granted roots, with `..`, symlinks, and absolute paths outside them rejected — tested adversarially. A grant carries a mode; the read-only half only ever needs `read`. The check lives in `resolve()`, so `glob` and `grep` walk granted roots and nothing else — a walk that skips the check leaks file contents through match output. A rejected path returns `ToolOutcome::ERROR` with the reason so the loop adapts | — | todo |
 | 4.4 | Add workspace `write` and `edit`. Both refuse a path whose grant is read-only, so a session can read notes it cannot change. `edit` must match exactly one occurrence and reject a file changed since the last read. Test this rule thoroughly. | — | todo |
 | 4.5 | Add `bash` with a scrubbed environment. It runs as the user with nothing between it and the filesystem; the grants are a tool-level check, not containment. A sandbox is later work. | — | todo |
-| 4.6 | **Token budget re-measure** (carried, re-scoped). The Phase 2 note assumed a 16k local face; with a hosted face the ceiling changes and the question becomes which sources load into which session. Measure before 5.2 wires anything else always-on | — | todo |
+| 4.6 | **Token budget re-measure** (carried, re-scoped). The Phase 2 note assumed a 16k local concierge; with a hosted one the ceiling changes and the question becomes which sources load into which session. Measure before 5.2 wires anything else always-on | — | todo |
 
 The two expert invocations from spike 1.2 are retained here for the deferred expert-tool task. Both were verified read-only against a workspace on 2026-08-23. Close stdin: both CLIs block on an open one. The prompt is a positional argument. claude has no `--cd`, so set the child's working directory; codex takes `-C`. codex runs commands through `zsh -lc`, a login shell that sources the user's profile, so set `shell_environment_policy.inherit` explicitly for invariant 8.
 
@@ -94,7 +94,7 @@ The residual risk is worth stating rather than designing around. arcd runs as th
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 5.1 | Workspace binding: `sessions.project` plus a set of granted roots on disk, and the rule that unbound sessions get no workspace tools. The project root is granted read-write; anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. Grants are a list of what is reachable, never a list of what is forbidden, so a path nobody granted is unreachable by construction rather than by remembering to ban it. Grants are session-scoped and belong in the log, since replay has to rebuild what a tool call was allowed to see | — | todo |
-| 5.2 | Add the dispatch tool. It creates a child session with its own role, tool sources, and budget, then returns the summary later. It uses the existing tool-call recovery model. Every field is required with an explicit escape value in its enum — 1.3 measured optional fields being silently dropped, which was most of the local model's errors. The face prompt must say that recall is answered directly and that `local` is for extraction. | — | todo |
+| 5.2 | Add the dispatch tool. It creates a child session with its own role, tool sources, and budget, then returns the summary later. It uses the existing tool-call recovery model. Every field is required with an explicit escape value in its enum — 1.3 measured optional fields being silently dropped, which was most of the local model's errors. The concierge prompt must say that recall is answered directly and that `archivist` is for extraction. | — | todo |
 | 5.3 | Supervised job task: owns the generic loop, talks to the same `Store`, and leaves the daemon responsive. It is not a sandbox and does not add process supervision or restart semantics. | — | todo |
 | 5.4 | Steering: messages to a running child, queued and processed in order | — | todo |
 | 5.5 | Budget enforcement per job, in tokens and wall-clock, recorded at dispatch and checked by the task | — | todo |
@@ -105,7 +105,7 @@ The residual risk is worth stating rather than designing around. arcd runs as th
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 6.1 | TUI: refreshable job list showing live jobs, status, and budget consumed. The conversation stays usable while one runs. | — | todo |
-| 6.2 | **Session titling pass** (carried). Now cheap: titles are `local`-role work and the job list needs something better than a session id to display. | — | todo |
+| 6.2 | **Session titling pass** (carried). Now cheap: titles are `archivist` work and the job list needs something better than a session id to display. | — | todo |
 
 ## 7. Production
 
