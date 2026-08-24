@@ -397,6 +397,8 @@ impl<P: Provider> Engine<P> {
         }
     }
 
+    // stable first, volatile after: everything here is prefix the provider caches,
+    // so anything that changes per turn has to go in the messages instead
     fn system_prompt(&self, memory_index: Option<&str>) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &self.system {
@@ -1803,6 +1805,62 @@ mod tests {
          - global/preference: Terse replies — prefers short answers (id: mr-pref)\n\
          - global/fact: Gruvbox — the palette everywhere (id: mr-fact)"
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn two_turns_send_a_byte_identical_prefix() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, seeded_records());
+        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found", true)]));
+
+        let (tx, _rx) = channel();
+        let reply = engine.send_message(None, "first", tx).await.expect("send");
+        let (tx2, _rx2) = channel();
+        engine
+            .send_message(Some(&reply.session_id), "second", tx2)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].system, requests[1].system,
+            "the identity and record index are the cached prefix; they must not move"
+        );
+        assert_eq!(
+            requests[0].tools, requests[1].tools,
+            "tool schemas sit in the prefix too, so their order is part of it"
+        );
+        assert!(
+            requests[1].messages.len() > requests[0].messages.len(),
+            "only the transcript grew"
+        );
+
+        let system = requests[0].system.as_deref().expect("a system prompt");
+        assert!(
+            system.starts_with("be terse"),
+            "the identity file renders first: {system}"
+        );
+        assert!(
+            system.ends_with("(id: mr-fact)"),
+            "the record index renders last, so nothing volatile precedes it: {system}"
+        );
+
+        // the index is rebuilt by replay, so a restart is where an ordering bug shows
+        let restarted = ScriptedProvider::scripted(vec![done_reply("third")]);
+        let mut engine = reopened_engine(&restarted, &dir, tools(&[("lookup", "found", true)]));
+        let (tx3, _rx3) = channel();
+        engine
+            .send_message(Some(&reply.session_id), "third", tx3)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            restarted.requests()[0].system,
+            requests[0].system,
+            "a restart replays the log and must land on the same prefix"
+        );
     }
 
     #[tokio::test]

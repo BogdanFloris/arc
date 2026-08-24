@@ -33,42 +33,18 @@ impl Sidecar {
             );
         }
 
-        let device = match &config.device {
-            Some(wanted) => Some(resolve_device(config, wanted).await?),
-            None => None,
-        };
-
         let endpoint = format!("http://127.0.0.1:{}", config.port);
-        let mut command = Command::new(&config.server);
-        command
-            .arg("--model")
-            .arg(&config.model_file)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(config.port.to_string())
-            .arg("--alias")
-            .arg(model)
-            .args(&config.args);
-        if let Some(id) = &device {
-            command.arg("--device").arg(id);
-        }
-        let mut child = command
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "spawning {} — is llama.cpp installed and on PATH?",
-                    config.server.display()
-                )
-            })?;
-
-        wait_ready(&mut child, &endpoint).await?;
+        let child = spawn_ready(config, model, &endpoint).await?;
         info!(%endpoint, model, "llama-server ready");
 
         let (kill, killed) = oneshot::channel();
-        let monitor = tokio::spawn(monitor(child, killed));
+        let monitor = tokio::spawn(monitor(
+            child,
+            killed,
+            config.clone(),
+            model.to_owned(),
+            endpoint.clone(),
+        ));
         Ok(Self {
             endpoint,
             kill: Some(kill),
@@ -125,15 +101,110 @@ fn find_device(listing: &str, wanted: &str) -> Option<(String, String)> {
     None
 }
 
-async fn monitor(mut child: Child, killed: oneshot::Receiver<()>) {
-    tokio::select! {
-        status = child.wait() => match status {
-            Ok(status) => error!(%status, "llama-server exited unexpectedly"),
-            Err(error) => error!(%error, "waiting on llama-server failed"),
-        },
-        _ = killed => {
-            if let Err(error) = child.kill().await {
-                warn!(%error, "killing llama-server failed");
+async fn spawn_ready(config: &LlamaConfig, model: &str, endpoint: &str) -> Result<Child> {
+    // re-resolved on every spawn: enumeration order is not stable across a driver reset
+    let device = match &config.device {
+        Some(wanted) => Some(resolve_device(config, wanted).await?),
+        None => None,
+    };
+
+    let mut command = Command::new(&config.server);
+    command
+        .arg("--model")
+        .arg(&config.model_file)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(config.port.to_string())
+        .arg("--alias")
+        .arg(model)
+        .args(&config.args);
+    if let Some(id) = &device {
+        command.arg("--device").arg(id);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "spawning {} — is llama.cpp installed and on PATH?",
+                config.server.display()
+            )
+        })?;
+
+    wait_ready(&mut child, endpoint).await?;
+    Ok(child)
+}
+
+const RESTART_LIMIT: u32 = 3;
+
+// a sidecar that stayed up this long counts as recovered
+const HEALTHY_FOR: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Restarts {
+    consecutive: u32,
+}
+
+impl Restarts {
+    fn next_backoff(&mut self, uptime: Duration) -> Option<Duration> {
+        if uptime >= HEALTHY_FOR {
+            self.consecutive = 0;
+        }
+        self.consecutive += 1;
+        (self.consecutive <= RESTART_LIMIT)
+            .then(|| Duration::from_secs(1 << (self.consecutive - 1)))
+    }
+}
+
+async fn monitor(
+    mut child: Child,
+    mut killed: oneshot::Receiver<()>,
+    config: LlamaConfig,
+    model: String,
+    endpoint: String,
+) {
+    let mut restarts = Restarts::default();
+    loop {
+        let started = Instant::now();
+        tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(status) => error!(%status, "llama-server exited unexpectedly"),
+                    Err(error) => {
+                        error!(%error, "waiting on llama-server failed; leaving it down");
+                        return;
+                    }
+                }
+                let Some(backoff) = restarts.next_backoff(started.elapsed()) else {
+                    error!(
+                        limit = RESTART_LIMIT,
+                        "llama-server keeps failing; leaving it down, the archivist will error"
+                    );
+                    return;
+                };
+                warn!(seconds = backoff.as_secs(), "restarting llama-server");
+                tokio::select! {
+                    () = tokio::time::sleep(backoff) => {}
+                    _ = &mut killed => return,
+                }
+                match spawn_ready(&config, &model, &endpoint).await {
+                    Ok(next) => {
+                        info!(%endpoint, "llama-server back up");
+                        child = next;
+                    }
+                    Err(error) => {
+                        error!(%error, "restarting llama-server failed; leaving it down");
+                        return;
+                    }
+                }
+            }
+            _ = &mut killed => {
+                if let Err(error) = child.kill().await {
+                    warn!(%error, "killing llama-server failed");
+                }
+                return;
             }
         }
     }
@@ -169,7 +240,43 @@ async fn wait_ready(child: &mut Child, endpoint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_device;
+    use super::{HEALTHY_FOR, RESTART_LIMIT, Restarts, find_device};
+    use std::time::Duration;
+
+    const CRASHED: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn a_crash_loop_backs_off_and_then_gives_up() {
+        let mut restarts = Restarts::default();
+
+        let waits: Vec<u64> = (0..RESTART_LIMIT)
+            .map(|_| {
+                restarts
+                    .next_backoff(CRASHED)
+                    .expect("under the limit")
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [1, 2, 4], "each failure waits twice as long");
+        assert!(
+            restarts.next_backoff(CRASHED).is_none(),
+            "past the limit the sidecar stays down instead of spinning"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_that_ran_a_while_starts_its_count_over() {
+        let mut restarts = Restarts::default();
+        for _ in 0..RESTART_LIMIT {
+            restarts.next_backoff(CRASHED).expect("under the limit");
+        }
+
+        assert_eq!(
+            restarts.next_backoff(HEALTHY_FOR).map(|w| w.as_secs()),
+            Some(1),
+            "an exit after a healthy run is a first failure, not a fourth"
+        );
+    }
 
     const LISTING: &str = "Available devices:\n  \
         Vulkan0: NVIDIA GeForce RTX 5070 (12227 MiB, 8861 MiB free)\n  \
