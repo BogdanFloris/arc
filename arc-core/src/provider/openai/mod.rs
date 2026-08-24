@@ -4,7 +4,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Serialize;
 
 use crate::provider::{
-    CompletionRequest, CompletionStream, Error, Message, Provider, ToolDefinition,
+    CompletionRequest, CompletionStream, Error, Message, Provider, ToolDefinition, failure,
     stream as delta_stream,
 };
 use arc_proto::v1::Role;
@@ -247,45 +247,6 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
         }
     };
     Ok(WireMessage::Text { role, content })
-}
-
-async fn failure(response: reqwest::Response) -> Error {
-    let status = response.status().as_u16();
-    let body = response.text().await.unwrap_or_default();
-
-    match status {
-        401 | 403 => Error::Auth(format!(
-            "the endpoint rejected the request with HTTP {status}: {}",
-            snippet(&body)
-        )),
-        429 => Error::RateLimited {
-            retry_after: None,
-            detail: snippet(&body),
-        },
-        _ => Error::http(status, &body),
-    }
-}
-
-fn snippet(body: &str) -> String {
-    #[derive(serde::Deserialize)]
-    struct ErrorBody {
-        error: ErrorDetail,
-    }
-    #[derive(serde::Deserialize)]
-    struct ErrorDetail {
-        message: String,
-    }
-
-    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body) {
-        return parsed.error.message;
-    }
-    let mut prefix = body.trim().to_owned();
-    let mut end = prefix.len().min(200);
-    while !prefix.is_char_boundary(end) {
-        end -= 1;
-    }
-    prefix.truncate(end);
-    prefix
 }
 
 #[cfg(test)]

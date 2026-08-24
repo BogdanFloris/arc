@@ -80,7 +80,7 @@ The relevant operating rules.
 **OpenCode Go — $10/month, $5 first month.**
 
 - Limits are **dollar-denominated**: $12 per 5 hours, $30 per week, and $60 per month. The monthly cap is binding; a heavy Saturday can consume half the weekly budget.
-- OpenAI-compatible endpoint at `https://opencode.ai/zen/go/v1`. Model ids are bare — spike 1.1 measured `deepseek-v4-flash`, not `opencode-go/deepseek-v4-flash`. Our existing `provider/openai` reaches it with a base URL and a key.
+- OpenAI-compatible endpoint at `https://opencode.ai/zen/go/v1`. Model ids are bare — spike 1.1 measured `deepseek-v4-flash`, not `opencode-go/deepseek-v4-flash`. Our existing `provider/openai` reaches it with a base URL and a key. In `arc.toml` the endpoint is `https://opencode.ai/zen/go`: arcd appends `/v1/chat/completions`, and config validation rejects a base that already ends in `/v1` rather than letting it 404 at the first turn.
 - **Spillover:** with "use balance" enabled, requests fall through to prepaid Zen credit instead of blocking at the cap. Auto-reload stays **off**, which makes the ceiling a hard cap by construction. Free models remain available at the cap regardless.
 - It exists because Anthropic blocked third-party tools from subscription credentials. Its key-based, any-client access is the product, not a workaround. Personal ARC meets the own-internal-use terms.
 

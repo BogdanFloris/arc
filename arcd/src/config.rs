@@ -140,6 +140,14 @@ impl RoleConfig {
                 "role `{name}` needs a model: only the sidecar can name its own"
             );
         }
+        if let Some(endpoint) = &self.endpoint {
+            let trimmed = endpoint.trim_end_matches('/');
+            ensure!(
+                !trimmed.ends_with("/v1") && !trimmed.ends_with("/v1beta/openai/v1"),
+                "role `{name}`: endpoint {endpoint} must not end in `/v1` — arcd appends the version and the path, \
+                 so a published base URL of `https://host/x/v1` is configured as `https://host/x`"
+            );
+        }
         Ok(())
     }
 }
@@ -337,7 +345,7 @@ mod tests {
                 executor: Some(RoleConfig {
                     provider: RoleProvider::OpenAiCompat,
                     model: Some("deepseek-v4-pro".to_owned()),
-                    endpoint: Some("http://127.0.0.1:4096/v1".to_owned()),
+                    endpoint: Some("http://127.0.0.1:4096".to_owned()),
                     key: Some("opencode-go".to_owned()),
                 }),
                 archivist: Some(RoleConfig {
@@ -393,7 +401,7 @@ key      = "gemini"
 [roles.executor]
 provider = "openai_compat"
 model    = "deepseek-v4-pro"
-endpoint = "http://127.0.0.1:4096/v1"
+endpoint = "http://127.0.0.1:4096"
 
 [roles.archivist]
 provider = "local"
@@ -404,10 +412,7 @@ provider = "local"
         assert_eq!(concierge.provider, RoleProvider::Gemini);
         assert_eq!(concierge.model.as_deref(), Some("gemini-3.7-flash"));
         let executor = config.roles.executor.expect("executor is configured");
-        assert_eq!(
-            executor.endpoint.as_deref(),
-            Some("http://127.0.0.1:4096/v1")
-        );
+        assert_eq!(executor.endpoint.as_deref(), Some("http://127.0.0.1:4096"));
         let archivist = config.roles.archivist.expect("archivist is configured");
         assert_eq!(archivist.provider, RoleProvider::Local);
         assert_eq!(archivist.model, None, "the sidecar names its own model");
@@ -437,6 +442,14 @@ provider = "local"
     fn a_gemini_role_without_a_key_is_rejected() {
         let err = rejected("[roles.concierge]\nprovider = \"gemini\"\nmodel = \"flash\"\n");
         assert!(err.contains("concierge") && err.contains("key"), "{err}");
+    }
+
+    #[test]
+    fn an_endpoint_that_already_carries_the_version_is_rejected() {
+        let err = rejected(
+            "[roles.executor]\nprovider = \"openai_compat\"\nmodel = \"deepseek-v4-flash\"\nendpoint = \"https://opencode.ai/zen/go/v1\"\n",
+        );
+        assert!(err.contains("executor") && err.contains("/v1"), "{err}");
     }
 
     #[test]

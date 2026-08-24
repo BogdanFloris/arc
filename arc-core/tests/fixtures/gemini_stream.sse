@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"hello there","role":"assistant"},"index":0}],"created":1787580151,"id":"006MaqqGLaenkdUP3Z-F2Ak","model":"gemini-3.7-flash","object":"chat.completion.chunk","usage":{"completion_tokens":2,"prompt_tokens":10,"total_tokens":77}}
+
+data: {"choices":[{"delta":{"extra_content":{"google":{"thought_signature":"EoADCv0CARFNMg9WBk5T5E0nheNS6QmEtsigSh38bwihIDgvW0f+FxlCZsbZoP5kJev5G2eyRADRDg8c6dLvtDzMbJOpNcMKLSx8gNzk26WsRxRzxEFu+5Hn2cifbfRGEW0BGCbzi/mPG4bbCMHumim75zp4u4u9tNV9kJkZTLBX2d3JAc3qAyn9Kx1/TttFWx890U4xyWqrvroBzCXNGH9dlYaXRtICiMQN3WiXlWKnEM93HQUzkncYi/hvPvDGEUXdSO3Vrtxc7rDb4TarWr416P6lV6aX6eu//LF1apGNACaZnJNyi7X/HO0HA2rvXbzGtccE/hyDFBHKRxKTYcSO6btxZzNA+SpImvA8wUVaF1eROzuw3zhmD0XSrb2UFHGgjZa6GXtIvZ4iUnQazTan3DWwjswEQZgldxJHIuzZImglEfeUd/4HG5rXof3/09G/B0kwx8177fmADMmuwcEUtD+f85lOed8awKMVsMu5Fq3dQSrcyk/8d+uvvZJFSVs1"}},"role":"assistant"},"finish_reason":"stop","index":0}],"created":1787580151,"id":"006MaqqGLaenkdUP3Z-F2Ak","model":"gemini-3.7-flash","object":"chat.completion.chunk","usage":{"completion_tokens":2,"prompt_tokens":10,"total_tokens":77}}
+
+data: [DONE]
+

@@ -31,14 +31,14 @@ impl FrameParser for Parser {
         let chunk: Chunk = serde_json::from_str(payload).map_err(|source| {
             Error::MalformedStream(format!(
                 "the endpoint sent a frame that is not a completion chunk: {source}: {}",
-                super::snippet(payload)
+                crate::provider::snippet(payload)
             ))
         })?;
         let (choices, usage) = match (chunk.choices, chunk.usage) {
             (None, None) => {
                 return Err(Error::MalformedStream(format!(
                     "the endpoint sent a frame that is not a completion chunk: {}",
-                    super::snippet(payload)
+                    crate::provider::snippet(payload)
                 )));
             }
             (choices, usage) => (choices.unwrap_or_default(), usage),
@@ -129,7 +129,7 @@ impl Building {
             return Err(Error::MalformedStream(format!(
                 "the endpoint's arguments for tool call `{}` at index {index} are not a JSON object: {}",
                 self.name,
-                super::snippet(&self.arguments)
+                crate::provider::snippet(&self.arguments)
             )));
         }
         Ok(ToolCall {

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use arc_core::provider::any::AnyProvider;
+use arc_core::provider::gemini;
 use arc_core::secrets::Secrets;
 
 use crate::config::{Config, RoleConfig, RoleProvider};
@@ -83,32 +84,45 @@ impl<'a> Built<'a> {
                     .endpoint
                     .clone()
                     .expect("config validation requires an endpoint for openai_compat");
+                let key = role.key.clone();
                 Ok(Resolved {
-                    provider: self.shared(
-                        RoleProvider::OpenAiCompat,
-                        endpoint,
-                        role.key.clone(),
-                    )?,
+                    provider: self.shared(name, RoleProvider::OpenAiCompat, endpoint, key)?,
                     model: role
                         .model
                         .clone()
                         .expect("config validation requires a model for openai_compat"),
                 })
             }
-            RoleProvider::Gemini => bail!(
-                "role `{name}` is configured for gemini, which has no provider yet; \
-                 it echoes a per-call thought_signature the OpenAI-compatible path cannot carry"
-            ),
+            RoleProvider::Gemini => {
+                let endpoint = role
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| gemini::DEFAULT_ENDPOINT.to_owned());
+                let key = role.key.clone();
+                Ok(Resolved {
+                    provider: self.shared(name, RoleProvider::Gemini, endpoint, key)?,
+                    model: role
+                        .model
+                        .clone()
+                        .expect("config validation requires a model for gemini"),
+                })
+            }
         }
     }
 
     fn sidecar(&mut self) -> Arc<AnyProvider> {
-        self.shared(RoleProvider::Local, self.sidecar_endpoint.to_owned(), None)
-            .expect("the sidecar takes no key, so nothing can be read")
+        self.shared(
+            "sidecar",
+            RoleProvider::Local,
+            self.sidecar_endpoint.to_owned(),
+            None,
+        )
+        .expect("the sidecar takes no key, so nothing can be read")
     }
 
     fn shared(
         &mut self,
+        name: &str,
         kind: RoleProvider,
         endpoint: String,
         key: Option<String>,
@@ -125,19 +139,19 @@ impl<'a> Built<'a> {
         let key = client
             .key
             .as_deref()
-            .map(|name| {
+            .map(|secret| {
                 self.secrets
-                    .read(name)
-                    .with_context(|| format!("the key for a {kind:?} role"))
+                    .read(secret)
+                    .with_context(|| format!("the key for the `{name}` role"))
             })
             .transpose()?;
         let provider = Arc::new(match kind {
             RoleProvider::Local => AnyProvider::local(&client.endpoint),
             RoleProvider::OpenAiCompat => AnyProvider::openai_compat(&client.endpoint, key),
-            // 3.3 adds the variant; this match makes it a compile error, not a silent fallback
-            RoleProvider::Gemini => {
-                unreachable!("a gemini role is rejected before a provider is built")
-            }
+            RoleProvider::Gemini => AnyProvider::gemini(
+                &client.endpoint,
+                key.expect("config validation requires a key for gemini"),
+            ),
         });
         self.providers.insert(client, Arc::clone(&provider));
         Ok(provider)
@@ -191,12 +205,12 @@ mod tests {
 [roles.concierge]
 provider = "openai_compat"
 model    = "deepseek-v4-flash"
-endpoint = "http://127.0.0.1:4096/v1"
+endpoint = "http://127.0.0.1:4096"
 
 [roles.executor]
 provider = "openai_compat"
 model    = "deepseek-v4-pro"
-endpoint = "http://127.0.0.1:4096/v1"
+endpoint = "http://127.0.0.1:4096"
 
 [roles.archivist]
 provider = "local"
@@ -217,12 +231,12 @@ provider = "local"
 [roles.concierge]
 provider = "openai_compat"
 model    = "deepseek-v4-flash"
-endpoint = "http://127.0.0.1:4096/v1"
+endpoint = "http://127.0.0.1:4096"
 
 [roles.executor]
 provider = "openai_compat"
 model    = "deepseek-v4-pro"
-endpoint = "http://127.0.0.1:4096/v1"
+endpoint = "http://127.0.0.1:4096"
 "#,
         );
 
@@ -317,16 +331,44 @@ key      = "opencode-go"
     }
 
     #[test]
-    fn a_gemini_role_fails_loudly_until_it_has_a_provider() {
-        let config: Config = toml::from_str(
-            "[roles.concierge]\nprovider = \"gemini\"\nmodel = \"gemini-3.7-flash\"\n",
-        )
-        .expect("parses");
-
+    fn a_gemini_role_resolves_to_its_own_provider_on_the_published_endpoint() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let err = Roles::resolve(&config, SIDECAR, &Secrets::new(dir.path()))
-            .expect_err("gemini must not silently run on the openai-compatible path")
-            .to_string();
-        assert!(err.contains("concierge") && err.contains("gemini"), "{err}");
+        let roles = with_secrets(
+            r#"
+[roles.concierge]
+provider = "gemini"
+model    = "gemini-3.7-flash"
+key      = "gemini"
+"#,
+            dir.path(),
+            &[("gemini", "sk-gemini")],
+        )
+        .expect("resolves");
+
+        let concierge = roles.concierge();
+        assert_eq!(concierge.provider.name(), "gemini");
+        assert_eq!(concierge.model, "gemini-3.7-flash");
+        assert_eq!(
+            concierge.provider.endpoint(),
+            arc_core::provider::gemini::DEFAULT_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn a_gemini_role_without_its_key_names_the_role_that_wanted_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let err = with_secrets(
+            "[roles.concierge]\nprovider = \"gemini\"\nmodel = \"flash\"\nkey = \"gemini\"\n",
+            dir.path(),
+            &[],
+        )
+        .expect_err("no key, no provider");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("concierge") && chain.contains("gemini"),
+            "{chain}"
+        );
     }
 }

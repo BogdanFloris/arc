@@ -1,3 +1,4 @@
+use crate::provider::gemini::Gemini;
 use crate::provider::openai::OpenAiCompat;
 use crate::provider::{CompletionRequest, CompletionStream, Error, Provider};
 
@@ -6,6 +7,8 @@ pub enum AnyProvider {
     Local(OpenAiCompat),
 
     OpenAiCompat(OpenAiCompat),
+
+    Gemini(Gemini),
 }
 
 impl AnyProvider {
@@ -22,9 +25,14 @@ impl AnyProvider {
         })
     }
 
+    pub fn gemini(endpoint: &str, key: String) -> Self {
+        Self::Gemini(Gemini::new(endpoint, key))
+    }
+
     pub fn endpoint(&self) -> &str {
         match self {
             Self::Local(inner) | Self::OpenAiCompat(inner) => inner.endpoint(),
+            Self::Gemini(inner) => inner.endpoint(),
         }
     }
 
@@ -38,12 +46,14 @@ impl Provider for AnyProvider {
         match self {
             Self::Local(_) => "local",
             Self::OpenAiCompat(inner) => inner.name(),
+            Self::Gemini(inner) => inner.name(),
         }
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
         match self {
             Self::Local(inner) | Self::OpenAiCompat(inner) => inner.complete(request).await,
+            Self::Gemini(inner) => inner.complete(request).await,
         }
     }
 }

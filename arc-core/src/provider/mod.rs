@@ -1,4 +1,5 @@
 pub mod any;
+pub mod gemini;
 pub mod openai;
 pub mod sse;
 pub(crate) mod stream;
@@ -146,6 +147,45 @@ impl Error {
             body: body[..end].to_owned(),
         }
     }
+}
+
+pub(crate) async fn failure(response: reqwest::Response) -> Error {
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    match status {
+        401 | 403 => Error::Auth(format!(
+            "the endpoint rejected the request with HTTP {status}: {}",
+            snippet(&body)
+        )),
+        429 => Error::RateLimited {
+            retry_after: None,
+            detail: snippet(&body),
+        },
+        _ => Error::http(status, &body),
+    }
+}
+
+pub(crate) fn snippet(body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        error: ErrorDetail,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorDetail {
+        message: String,
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body) {
+        return parsed.error.message;
+    }
+    let mut prefix = body.trim().to_owned();
+    let mut end = prefix.len().min(200);
+    while !prefix.is_char_boundary(end) {
+        end -= 1;
+    }
+    prefix.truncate(end);
+    prefix
 }
 
 #[cfg(test)]

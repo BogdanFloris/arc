@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"EtECCs4CARFNMg9/5nIW99pd/18AU9CbaplhVA6KcFBz6Nb0W8H08DkBYeT6FMB3IjxIZB8IDA5xvl/4Nz29ST9nMdJbmMO2WepFrAZ3Jt/Wj4r4a1BnFjSZ+14yUq4TXATquxgsFREttbw8q6kwrmJC7Fb8wyrvLaET1vRF0IiPo93UYG3cnTN6xpAcCQSgBxFUsCW/FLrh1ux6gTPBo/TU6YjL+u1zaFWYqy/JbnD85/GWIYi3RVuN/k1lp53050Tt3/t1rIUdBSBpOPRodh85ln9fpp60yoAkx2IcrwQ09Xrobb4s8b0iNmdvQkU++Uo4jcObtct5HJPK9XH4+GxBbpB8I8FJC6lCMr8M3/kT1D/JH4stADhqUSo7UV+tVpk3x6XBqKQGrLrVZhv5hpaVfFzLZURwL4Fu9ZGukUHe5whw3BXTUqaRtb0CcIS/6RfTuQ=="}},"function":{"arguments":"{\"timezone\":\"UTC\"}","name":"get_time"},"id":"call_4051480","type":"function"}]},"index":0}],"created":1787580174,"id":"CU-Mar_7K9SsnsEPgLLgmAM","model":"gemini-3.7-flash","object":"chat.completion.chunk","usage":{"completion_tokens":16,"prompt_tokens":51,"total_tokens":123}}
+
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}],"created":1787580174,"id":"CU-Mar_7K9SsnsEPgLLgmAM","model":"gemini-3.7-flash","object":"chat.completion.chunk","usage":{"completion_tokens":16,"prompt_tokens":51,"total_tokens":123}}
+
+data: [DONE]
+
