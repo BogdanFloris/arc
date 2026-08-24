@@ -229,7 +229,7 @@ Unbound sessions are ordinary conversation and get no workspace tools. That is a
 One registry has three sources in Phase 3. A tool reaches the model identically whichever source it came from:
 
 - **builtin** — memory and archive (§5.5)
-- **web** — `web_search` and `web_fetch`; read-only, no grants, output capped by arcd
+- **web** — read-only, no grants; provided by the model's own provider where it has one, and empty where it does not
 - **workspace** — `read`, `write`, `edit`, `bash`; only in a bound session (§4.2)
 
 Expert and MCP tools are deferred. Add a source only when that tool type is ready to ship; a future source is not a current registry requirement.
@@ -248,7 +248,11 @@ Grants are therefore advisory in any session that holds `bash`. They stop the mo
 
 That rule sets the workspace list. `glob` and `grep` are one search program with different arguments, and that program is already on the machine, so they are not builtins: two schemas in every bound session buying what a shell call already does. `read` stays, because the staleness rule below needs an anchor and because it can cap and paginate where `cat` cannot. Routing search through `bash` makes two incidental things load-bearing — the shell tool caps its own output, and the scrubbed environment still carries a `PATH` with the search tool on it. Scrubbed is not empty.
 
-The web source is that rule's exception rather than a break from it. A session with no shell cannot run a program, and the concierge is exactly that session: unbound, no filesystem, and the one place a spoken question becomes a web lookup. Giving it a shell to reach a CLI would put the widest exposure to untrusted text in front of the tool with the least between it and the machine. As builtins, `web_search` and `web_fetch` also keep the search credential inside arcd where no tool process sees it, which is the same argument as scrubbing the environment for `bash`.
+The web source is that rule's exception rather than a break from it. A session with no shell cannot run a program, and the concierge is exactly that session: unbound, no filesystem, and the one place a spoken question becomes a web lookup. Giving it a shell to reach a CLI would put the widest exposure to untrusted text in front of the tool with the least between it and the machine.
+
+**But the exception no longer needs tools of ours to satisfy it.** A provider that grounds its own answers — searching, reading, and citing server-side — meets the concierge's need without a search credential in arcd, without a cap on unbounded page text, and without two schemas in every unbound session. The web source therefore stays in the registry as a declaration and resolves to whatever the session's provider offers. Where the provider offers nothing, the source is empty, and a bound session reaches the web through `bash` like any other program. Tools of our own get written only when a role needs the web on a provider that cannot ground, and that has not happened.
+
+The cost is a pin. A concierge whose web access comes from its provider is tied to that provider for a capability, not merely for price and latency, and changing it costs a feature rather than a line of configuration. That is the trade, taken knowingly. It also imports the provider's attribution terms into the clients: a grounded answer generally carries a display obligation, which the text client can meet and an audio-only client cannot, so the voice work has to answer that before it does anything else with the web.
 
 **Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants — `..`, symlinks, and absolute paths outside them are the obvious cases. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in `resolve()`, not the caller, so every tool that touches a path goes through the same gate.
 
