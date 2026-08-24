@@ -68,6 +68,9 @@ pub struct RoleConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -112,15 +115,24 @@ impl RolesConfig {
 impl RoleConfig {
     fn validate(&self, name: &str) -> Result<()> {
         match self.provider {
-            RoleProvider::Local => ensure!(
-                self.endpoint.is_none(),
-                "role `{name}` runs on the sidecar, which owns its own endpoint"
-            ),
+            RoleProvider::Local => {
+                ensure!(
+                    self.endpoint.is_none(),
+                    "role `{name}` runs on the sidecar, which owns its own endpoint"
+                );
+                ensure!(
+                    self.key.is_none(),
+                    "role `{name}` runs on the sidecar, which takes no key"
+                );
+            }
             RoleProvider::OpenAiCompat => ensure!(
                 self.endpoint.is_some(),
                 "role `{name}` needs an endpoint: openai_compat has no default"
             ),
-            RoleProvider::Gemini => {}
+            RoleProvider::Gemini => ensure!(
+                self.key.is_some(),
+                "role `{name}` needs a key: gemini has no unauthenticated endpoint"
+            ),
         }
         if !matches!(self.provider, RoleProvider::Local) {
             ensure!(
@@ -320,16 +332,19 @@ mod tests {
                     provider: RoleProvider::Gemini,
                     model: Some("gemini-3.7-flash".to_owned()),
                     endpoint: None,
+                    key: Some("gemini".to_owned()),
                 }),
                 executor: Some(RoleConfig {
                     provider: RoleProvider::OpenAiCompat,
                     model: Some("deepseek-v4-pro".to_owned()),
                     endpoint: Some("http://127.0.0.1:4096/v1".to_owned()),
+                    key: Some("opencode-go".to_owned()),
                 }),
                 archivist: Some(RoleConfig {
                     provider: RoleProvider::Local,
                     model: None,
                     endpoint: None,
+                    key: None,
                 }),
             },
             projects: BTreeMap::from([(
@@ -373,6 +388,7 @@ mod tests {
 [roles.concierge]
 provider = "gemini"
 model    = "gemini-3.7-flash"
+key      = "gemini"
 
 [roles.executor]
 provider = "openai_compat"
@@ -413,8 +429,20 @@ provider = "local"
 
     #[test]
     fn a_hosted_role_without_a_model_is_rejected() {
-        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\n");
+        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\nkey = \"gemini\"\n");
         assert!(err.contains("concierge") && err.contains("model"), "{err}");
+    }
+
+    #[test]
+    fn a_gemini_role_without_a_key_is_rejected() {
+        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\nmodel = \"flash\"\n");
+        assert!(err.contains("concierge") && err.contains("key"), "{err}");
+    }
+
+    #[test]
+    fn a_local_role_with_a_key_is_rejected() {
+        let err = rejected("[roles.archivist]\nprovider = \"local\"\nkey = \"gemini\"\n");
+        assert!(err.contains("archivist") && err.contains("key"), "{err}");
     }
 
     #[test]

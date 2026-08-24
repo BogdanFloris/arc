@@ -15,8 +15,11 @@ impl AnyProvider {
         Self::Local(OpenAiCompat::new(endpoint))
     }
 
-    pub fn openai_compat(endpoint: &str) -> Self {
-        Self::OpenAiCompat(OpenAiCompat::new(endpoint))
+    pub fn openai_compat(endpoint: &str, key: Option<String>) -> Self {
+        Self::OpenAiCompat(match key {
+            Some(key) => OpenAiCompat::keyed(endpoint, key),
+            None => OpenAiCompat::new(endpoint),
+        })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -53,7 +56,7 @@ mod tests {
     #[test]
     fn the_sidecar_and_a_hosted_endpoint_are_named_apart_in_the_log() {
         let sidecar = AnyProvider::local("http://127.0.0.1:8080");
-        let hosted = AnyProvider::openai_compat("http://127.0.0.1:4096/v1");
+        let hosted = AnyProvider::openai_compat("http://127.0.0.1:4096/v1", None);
 
         assert_eq!(sidecar.name(), "local");
         assert_eq!(hosted.name(), "openai-compat");
@@ -63,7 +66,7 @@ mod tests {
     #[test]
     fn a_trailing_slash_does_not_change_the_endpoint() {
         assert_eq!(
-            AnyProvider::openai_compat("http://127.0.0.1:4096/v1/").endpoint(),
+            AnyProvider::openai_compat("http://127.0.0.1:4096/v1/", None).endpoint(),
             "http://127.0.0.1:4096/v1"
         );
     }

@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use arc_core::consolidation::extract::KNOWN_VERSIONS;
 use arc_core::consolidation::replay::{self, ReplayDiff, ReplayRecord, ReplayReport};
+use arc_core::secrets::Secrets;
 use tracing::info;
 
 use crate::config::Config;
@@ -25,7 +26,7 @@ pub async fn run(
 
     // replaying extraction is archivist work, so it runs on the archivist's model
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
-    let roles = Roles::resolve(&config, &endpoint)?;
+    let roles = Roles::resolve(&config, &endpoint, &Secrets::new(dirs.secrets()))?;
     let archivist = roles.archivist();
     let sidecar = match archivist.provider.is_local() {
         true if probe(&endpoint).await => {

@@ -1,6 +1,6 @@
 mod stream;
 
-use reqwest::header::ACCEPT;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Serialize;
 
 use crate::provider::{
@@ -13,19 +13,37 @@ const NAME: &str = "openai-compat";
 
 const COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
-#[derive(Debug)]
 pub struct OpenAiCompat {
     endpoint: String,
-
+    key: Option<String>,
     http: reqwest::Client,
+}
+
+// key should not reache a log
+impl std::fmt::Debug for OpenAiCompat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompat")
+            .field("endpoint", &self.endpoint)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenAiCompat {
     pub fn new(endpoint: &str) -> Self {
+        Self::build(endpoint, None)
+    }
+
+    pub fn keyed(endpoint: &str, key: String) -> Self {
+        Self::build(endpoint, Some(key))
+    }
+
+    fn build(endpoint: &str, key: Option<String>) -> Self {
         let mut endpoint = endpoint.to_owned();
         endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
             endpoint,
+            key,
             // no pooling: a stale keep-alive kills the tool loop's second call
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
@@ -58,13 +76,14 @@ impl Provider for OpenAiCompat {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
         let payload = Payload::new(&request)?;
 
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}{COMPLETIONS_PATH}", self.endpoint))
-            .header(ACCEPT, "text/event-stream")
-            .json(&payload)
-            .send()
-            .await?;
+            .header(ACCEPT, "text/event-stream");
+        if let Some(key) = &self.key {
+            request = request.header(AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = request.json(&payload).send().await?;
 
         if !response.status().is_success() {
             return Err(failure(response).await);

@@ -16,6 +16,7 @@ pub mod memory;
 pub mod orphan;
 pub mod projection;
 pub mod provider;
+pub mod secrets;
 pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "testkit"))]

@@ -57,6 +57,10 @@ impl DataDirs {
         &self.traces
     }
 
+    pub fn secrets(&self) -> &Path {
+        &self.secrets
+    }
+
     pub fn identity(&self) -> &Path {
         &self.identity
     }

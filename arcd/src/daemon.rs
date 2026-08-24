@@ -7,6 +7,7 @@ use arc_core::orphan;
 use arc_core::projection::{self, Projection, Reader};
 use arc_core::provider::any::AnyProvider;
 use arc_core::provider::{Provider, role_label};
+use arc_core::secrets::Secrets;
 use arc_core::session::Engine;
 use arc_core::store::Store;
 use arc_core::tool::Registry;
@@ -33,7 +34,8 @@ use crate::server;
 
 pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
-    let roles = match Roles::resolve(&config, sidecar.endpoint()) {
+    let secrets = Secrets::new(dirs.secrets());
+    let roles = match Roles::resolve(&config, sidecar.endpoint(), &secrets) {
         Ok(roles) => roles,
         Err(error) => {
             sidecar.stop().await;
@@ -339,7 +341,12 @@ mod tests {
 
     // port 1 refuses every connection: startup must not reach a provider
     fn unreachable_roles() -> Roles {
-        Roles::resolve(&Config::default(), "http://127.0.0.1:1").expect("no roles configured")
+        Roles::resolve(
+            &Config::default(),
+            "http://127.0.0.1:1",
+            &Secrets::new(Path::new("/nonexistent")),
+        )
+        .expect("no roles configured")
     }
 
     #[tokio::test]
