@@ -257,6 +257,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
+    use crate::provider::Thinking;
     use crate::provider::{CompletionDelta, Stop, ToolCall, Usage};
     use arc_proto::v1::SessionRole;
 
@@ -274,6 +275,7 @@ mod tests {
                 .collect(),
             tools: Vec::new(),
             seed: None,
+            thinking: Thinking::Default,
         }
     }
 

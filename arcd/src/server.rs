@@ -468,6 +468,7 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     use super::*;
+    use arc_core::provider::Thinking;
     use arc_core::testkit::{Canned, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -597,7 +598,7 @@ mod tests {
                 SessionRole::Concierge,
                 Some("be terse".to_owned()),
                 registry,
-                false,
+                Thinking::Default,
             );
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
 

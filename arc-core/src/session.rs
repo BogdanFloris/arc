@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::memory::render_memory_index;
 use crate::projection::{self, MessageRow, SessionSummary};
 use crate::provider::{
-    self, CompletionDelta, CompletionRequest, Message, Provider, Stop, ToolCall, Usage,
+    self, CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking, ToolCall, Usage,
 };
 use crate::store::{self, Store, now_ts};
 use crate::tool::{Registry, TurnContext};
@@ -27,7 +27,7 @@ pub struct Engine<P> {
     role: SessionRole,
     system: Option<String>,
     registry: Registry,
-    no_think: bool,
+    thinking: Thinking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl<P: Provider> Engine<P> {
         role: SessionRole,
         system: Option<String>,
         registry: Registry,
-        no_think: bool,
+        thinking: Thinking,
     ) -> Self {
         Self {
             store,
@@ -98,7 +98,7 @@ impl<P: Provider> Engine<P> {
             role,
             system,
             registry,
-            no_think,
+            thinking,
         }
     }
 
@@ -109,6 +109,7 @@ impl<P: Provider> Engine<P> {
         fields(
             model = %self.model,
             role = provider::role_label(self.role),
+            thinking = self.thinking.label(),
             session_id = tracing::field::Empty,
             new_session = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -404,13 +405,7 @@ impl<P: Provider> Engine<P> {
         if let Some(index) = memory_index {
             parts.push(index);
         }
-        let mut prompt = parts.join("\n\n");
-        if self.no_think {
-            if !prompt.is_empty() {
-                prompt.push('\n');
-            }
-            prompt.push_str("/no_think");
-        }
+        let prompt = parts.join("\n\n");
         (!prompt.is_empty()).then_some(prompt)
     }
 
@@ -494,6 +489,7 @@ impl<P: Provider> Engine<P> {
         CompletionRequest {
             model: self.model.clone(),
             role: self.role,
+            thinking: self.thinking,
             system,
             messages,
             tools: if last_step {
@@ -698,7 +694,7 @@ mod tests {
     use crate::log::Log;
     use crate::projection::Projection;
     use crate::provider::{
-        CompletionDelta, Error as ProviderError, Message, Stop, ToolCall, Usage,
+        CompletionDelta, Error as ProviderError, Message, Stop, Thinking, ToolCall, Usage,
     };
     use crate::store::{self, Store};
     use crate::testkit::{
@@ -1706,7 +1702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_think_rides_the_system_prompt() {
+    async fn the_role_thinking_level_rides_the_request_not_the_prompt() {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
@@ -1718,7 +1714,7 @@ mod tests {
             SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
-            true,
+            Thinking::Off,
         );
         let (tx, _rx) = channel();
 
@@ -1726,8 +1722,10 @@ mod tests {
 
         assert_eq!(
             provider.requests()[0].system.as_deref(),
-            Some("be terse\n/no_think")
+            Some("be terse"),
+            "the marker is the sidecar's dialect and belongs to its provider"
         );
+        assert_eq!(provider.requests()[0].thinking, Thinking::Off);
     }
 
     #[tokio::test]
@@ -1743,7 +1741,7 @@ mod tests {
             SessionRole::Executor,
             None,
             Registry::new(512),
-            false,
+            Thinking::Default,
         );
 
         let (tx, _rx) = channel();
@@ -1873,7 +1871,7 @@ mod tests {
             SessionRole::Concierge,
             None,
             Registry::new(512),
-            false,
+            Thinking::Default,
         );
         let (tx, _rx) = channel();
 
@@ -2140,7 +2138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_think_lands_after_the_block() {
+    async fn the_memory_block_is_the_tail_of_the_system_prompt() {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
@@ -2154,7 +2152,7 @@ mod tests {
             SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
-            true,
+            Thinking::Off,
         );
         let (tx, _rx) = channel();
 
@@ -2162,7 +2160,7 @@ mod tests {
 
         assert_eq!(
             provider.requests()[0].system,
-            Some(format!("be terse\n\n{}\n/no_think", seeded_block()))
+            Some(format!("be terse\n\n{}", seeded_block()))
         );
     }
 

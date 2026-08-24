@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::{ExtractError, Extractor, SessionSnapshot};
 use crate::memory::index_line;
 use crate::projection::MessageRow;
-use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop};
+use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking};
 use crate::tool::memory::{mint_record, parse_kind};
 
 pub const PROMPT_VERSION_V1: &str = "v1";
@@ -60,16 +60,18 @@ const TOOL_SNIPPET: usize = 200;
 pub struct ModelExtractor<P> {
     provider: Arc<P>,
     model: String,
+    thinking: Thinking,
     timeout: Duration,
     prompt: String,
     seed: Option<u64>,
 }
 
 impl<P: Provider> ModelExtractor<P> {
-    pub fn new(provider: Arc<P>, model: &str, timeout: Duration) -> Self {
+    pub fn new(provider: Arc<P>, model: &str, thinking: Thinking, timeout: Duration) -> Self {
         Self {
             provider,
             model: model.to_owned(),
+            thinking,
             timeout,
             prompt: PROMPT_V1.to_owned(),
             seed: None,
@@ -86,6 +88,7 @@ impl<P: Provider> ModelExtractor<P> {
         Self {
             provider,
             model: model.to_owned(),
+            thinking: Thinking::Off,
             timeout,
             prompt: prompt.to_owned(),
             seed: Some(seed),
@@ -158,6 +161,7 @@ impl<P: Provider> Extractor for ModelExtractor<P> {
         let request = CompletionRequest {
             model: self.model.clone(),
             role: SessionRole::Archivist,
+            thinking: self.thinking,
             system: Some(self.prompt.clone()),
             messages: vec![Message::Text {
                 role: Role::User,
@@ -376,6 +380,8 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{Role, Source, event, memory_event, memory_record, session_event};
+
+    use crate::provider::Thinking;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
@@ -438,7 +444,12 @@ mod tests {
         index: Vec<MemoryIndexEntry>,
     ) -> Result<Vec<memory_event::Event>, crate::consolidation::ExtractError> {
         let provider = ScriptedProvider::scripted(vec![script]);
-        let extractor = ModelExtractor::new(provider, "test-model", Duration::from_secs(5));
+        let extractor = ModelExtractor::new(
+            provider,
+            "test-model",
+            Thinking::Off,
+            Duration::from_secs(5),
+        );
         extractor.extract(&snapshot(index)).await
     }
 
@@ -466,6 +477,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             Arc::clone(&provider),
             "test-model",
+            Thinking::Off,
             Duration::from_secs(300),
         );
         let outcome = run_pass(
@@ -584,6 +596,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             Arc::clone(&provider),
             "test-model",
+            Thinking::Off,
             Duration::from_secs(300),
         );
         let outcome = run_pass(
@@ -723,8 +736,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_hung_model_call_times_out_as_an_extract_error() {
-        let extractor =
-            ModelExtractor::new(Arc::new(Stalled), "test-model", Duration::from_millis(10));
+        let extractor = ModelExtractor::new(
+            Arc::new(Stalled),
+            "test-model",
+            Thinking::Off,
+            Duration::from_millis(10),
+        );
         let err = extractor
             .extract(&snapshot(Vec::new()))
             .await

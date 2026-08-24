@@ -52,7 +52,11 @@ Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not 
 - **Latency.** Kimi K3, Go's most general model, runs at about 38 tokens/second and uses a thinking mode. Voice makes time to first audio the limiting constraint.
 - **Vision.** The concierge needs it for screenshots now and the pan-tilt camera later, and Google's spatial grounding is the strongest cheap option.
 
-Keep thinking off or minimal on the concierge. It adds latency to conversational turns, which is why the local configuration has `no_think`.
+Keep thinking as low as the model allows on the concierge. It adds latency, and on Gemini it is also most of the bill.
+
+Measured 2026-08-24 against 3.7 Flash. Thinking cannot be switched off: `none` still thinks and `minimal` is rejected for this model. `reasoning_effort: low` is a cap the model may use rather than a setting — six runs of one chat turn gave 24, 37, 282, 289, 303 and 320 output tokens, against 295–390 with the field unset. It is never worse than unset and sometimes collapses to almost nothing, so it is worth setting, but a single turn tells you nothing. `extra_body.google.thinking_config.thinking_level` reaches the same control and the two cannot be sent together; we send `reasoning_effort` because it is a flat field and leaves the `extra_body.google` envelope free for `cached_content`.
+
+Thinking is billed and never streamed, so `completion_tokens` under-reports output by about five times. The real figure is `total_tokens - prompt_tokens`, and every estimate in this file predates that correction.
 
 ### Why the executor uses DeepSeek
 

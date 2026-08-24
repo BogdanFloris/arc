@@ -14,7 +14,7 @@ use crate::log::{Log, LogReader, discover_segments};
 use crate::projection::Projection;
 use crate::provider::{
     CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
-    Provider, Stop, ToolCall, ToolDefinition, Usage,
+    Provider, Stop, Thinking, ToolCall, ToolDefinition, Usage,
 };
 use crate::session::{Engine, EngineEvent};
 use crate::store::Store;
@@ -92,7 +92,7 @@ pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<Scripte
         SessionRole::Concierge,
         Some("be terse".to_owned()),
         Registry::new(512),
-        false,
+        Thinking::Default,
     )
 }
 
@@ -110,7 +110,7 @@ pub fn engine_with_tools(
         SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
-        false,
+        Thinking::Default,
     )
 }
 
@@ -129,7 +129,7 @@ pub fn engine_with_tools_at(
         SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
-        false,
+        Thinking::Default,
     )
 }
 
@@ -148,7 +148,7 @@ pub fn reopened_engine(
         SessionRole::Concierge,
         Some("be terse".to_owned()),
         registry,
-        false,
+        Thinking::Default,
     )
 }
 

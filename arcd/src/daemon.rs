@@ -6,7 +6,7 @@ use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection, Reader};
 use arc_core::provider::any::AnyProvider;
-use arc_core::provider::{Provider, role_label};
+use arc_core::provider::{Provider, Thinking, role_label};
 use arc_core::secrets::Secrets;
 use arc_core::session::Engine;
 use arc_core::store::Store;
@@ -132,7 +132,7 @@ impl Daemon {
             SessionRole::Concierge,
             identity,
             registry,
-            config.no_think,
+            concierge.thinking,
         );
 
         Ok(Self {
@@ -159,6 +159,7 @@ impl Daemon {
                 role = role_label(role),
                 provider = resolved.provider.name(),
                 model = resolved.model,
+                thinking = resolved.thinking.label(),
                 endpoint = resolved.provider.endpoint(),
                 "role resolved"
             );
@@ -174,6 +175,7 @@ impl Daemon {
         let consolidation = consolidation_task(
             self.config.consolidation,
             &archivist.model,
+            archivist.thinking,
             Arc::clone(&self.engine),
             Arc::clone(&archivist.provider),
         );
@@ -194,6 +196,7 @@ const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
 fn consolidation_task<P: Provider + 'static>(
     config: ConsolidationConfig,
     model: &str,
+    thinking: Thinking,
     engine: Arc<Mutex<Engine<P>>>,
     provider: Arc<P>,
 ) -> Option<JoinHandle<()>> {
@@ -202,8 +205,12 @@ fn consolidation_task<P: Provider + 'static>(
         return None;
     }
     let idle = Duration::from_secs(config.idle_seconds);
-    let extractor =
-        ModelExtractor::new(provider, model, Duration::from_secs(config.timeout_seconds));
+    let extractor = ModelExtractor::new(
+        provider,
+        model,
+        thinking,
+        Duration::from_secs(config.timeout_seconds),
+    );
     info!(
         idle_seconds = config.idle_seconds,
         timeout_seconds = config.timeout_seconds,
@@ -402,6 +409,7 @@ mod tests {
             consolidation_task(
                 Config::default().consolidation,
                 "test-model",
+                Thinking::Off,
                 Arc::clone(&daemon.engine),
                 Arc::clone(&daemon.roles.archivist().provider),
             )
@@ -417,6 +425,7 @@ mod tests {
         let task = consolidation_task(
             enabled,
             "test-model",
+            Thinking::Off,
             Arc::clone(&daemon.engine),
             Arc::clone(&daemon.roles.archivist().provider),
         )

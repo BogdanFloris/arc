@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use arc_core::provider::Thinking;
 use arc_core::provider::any::AnyProvider;
 use arc_core::provider::gemini;
 use arc_core::secrets::Secrets;
@@ -12,6 +13,7 @@ use crate::config::{Config, RoleConfig, RoleProvider};
 pub struct Resolved {
     pub provider: Arc<AnyProvider>,
     pub model: String,
+    pub thinking: Thinking,
 }
 
 #[derive(Debug)]
@@ -72,12 +74,15 @@ impl<'a> Built<'a> {
             return Ok(Resolved {
                 provider: self.sidecar(),
                 model: config.model(),
+                thinking: Thinking::Default,
             });
         };
+        let thinking = role.thinking;
         match role.provider {
             RoleProvider::Local => Ok(Resolved {
                 provider: self.sidecar(),
                 model: role.model.clone().unwrap_or_else(|| config.model()),
+                thinking,
             }),
             RoleProvider::OpenAiCompat => {
                 let endpoint = role
@@ -91,6 +96,7 @@ impl<'a> Built<'a> {
                         .model
                         .clone()
                         .expect("config validation requires a model for openai_compat"),
+                    thinking,
                 })
             }
             RoleProvider::Gemini => {
@@ -105,6 +111,7 @@ impl<'a> Built<'a> {
                         .model
                         .clone()
                         .expect("config validation requires a model for gemini"),
+                    thinking,
                 })
             }
         }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail, ensure};
+use arc_core::provider::Thinking;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DATA_DIR: &str = "data";
@@ -26,16 +27,11 @@ const DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS: u64 = 300;
 pub struct Config {
     pub data_dir: PathBuf,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
     pub bind: SocketAddr,
 
     pub llama: LlamaConfig,
 
     pub max_tool_result_bytes: usize,
-
-    pub no_think: bool,
 
     pub consolidation: ConsolidationConfig,
 
@@ -71,6 +67,9 @@ pub struct RoleConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+
+    #[serde(default)]
+    pub thinking: Thinking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -140,6 +139,20 @@ impl RoleConfig {
                 "role `{name}` needs a model: only the sidecar can name its own"
             );
         }
+        match (self.provider, self.thinking) {
+            (_, Thinking::Default)
+            | (RoleProvider::Gemini, _)
+            | (RoleProvider::Local, Thinking::Off) => {}
+            (RoleProvider::Local, level) => bail!(
+                "role `{name}`: the sidecar reads `/no_think` out of the prompt and has no `{}` level; \
+                 use `off` or leave it unset",
+                level.label()
+            ),
+            (RoleProvider::OpenAiCompat, _) => bail!(
+                "role `{name}`: no openai_compat endpoint is known to accept `reasoning_effort`, \
+                 and an unknown field is a 400; measure one before configuring it"
+            ),
+        }
         if let Some(endpoint) = &self.endpoint {
             let trimmed = endpoint.trim_end_matches('/');
             ensure!(
@@ -204,6 +217,10 @@ pub struct LlamaConfig {
 
     pub model_file: PathBuf,
 
+    /// The alias the sidecar serves under. Defaults to the GGUF's file stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     pub port: u16,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,11 +233,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
-            model: None,
             bind: DEFAULT_BIND.parse().expect("default bind address is valid"),
             llama: LlamaConfig::default(),
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
-            no_think: true,
             consolidation: ConsolidationConfig::default(),
             roles: RolesConfig::default(),
             projects: BTreeMap::new(),
@@ -233,6 +248,7 @@ impl Default for LlamaConfig {
         Self {
             server: PathBuf::from(DEFAULT_LLAMA_SERVER),
             model_file: PathBuf::from(DEFAULT_MODEL_FILE),
+            model: None,
             port: DEFAULT_LLAMA_PORT,
             device: None,
             args: Vec::new(),
@@ -268,7 +284,7 @@ impl Config {
     }
 
     pub fn model(&self) -> String {
-        if let Some(model) = &self.model {
+        if let Some(model) = &self.llama.model {
             return model.clone();
         }
         self.llama.model_file.file_stem().map_or_else(
@@ -281,6 +297,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{Config, ProjectConfig, RoleConfig, RoleProvider, RolesConfig, ToolSource};
+    use arc_core::provider::Thinking;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -290,7 +307,6 @@ mod tests {
         let config: Config = toml::from_str("").expect("empty config parses");
         assert_eq!(config, Config::default());
         assert_eq!(config.data_dir, PathBuf::from("data"));
-        assert_eq!(config.model, None);
         assert_eq!(config.bind, "127.0.0.1:8787".parse::<SocketAddr>().unwrap());
         assert_eq!(config.llama.server, PathBuf::from("llama-server"));
         assert_eq!(config.llama.port, 8080);
@@ -309,9 +325,9 @@ mod tests {
             Config::default()
         );
 
-        std::fs::write(&path, "model = \"gemini-3.1-pro\"\n").expect("write config");
+        std::fs::write(&path, "[llama]\nmodel = \"qwen3-8b\"\n").expect("write config");
         let config = Config::load(&path).expect("present config loads");
-        assert_eq!(config.model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(config.model(), "qwen3-8b");
         assert_eq!(config.data_dir, Config::default().data_dir);
     }
 
@@ -319,17 +335,16 @@ mod tests {
     fn every_field_round_trips() {
         let config = Config {
             data_dir: PathBuf::from("/srv/arc"),
-            model: Some("qwen".to_owned()),
             bind: "127.0.0.1:9000".parse().expect("valid address"),
             llama: super::LlamaConfig {
                 server: PathBuf::from("/opt/llama/llama-server"),
                 model_file: PathBuf::from("/models/q.gguf"),
+                model: Some("qwen".to_owned()),
                 port: 9090,
                 device: Some("RTX 5070".to_owned()),
                 args: vec!["-ngl".to_owned(), "99".to_owned()],
             },
             max_tool_result_bytes: 512,
-            no_think: false,
             consolidation: super::ConsolidationConfig {
                 enabled: true,
                 idle_seconds: 600,
@@ -341,18 +356,21 @@ mod tests {
                     model: Some("gemini-3.7-flash".to_owned()),
                     endpoint: None,
                     key: Some("gemini".to_owned()),
+                    thinking: Thinking::Low,
                 }),
                 executor: Some(RoleConfig {
                     provider: RoleProvider::OpenAiCompat,
                     model: Some("deepseek-v4-pro".to_owned()),
                     endpoint: Some("http://127.0.0.1:4096".to_owned()),
                     key: Some("opencode-go".to_owned()),
+                    thinking: Thinking::Default,
                 }),
                 archivist: Some(RoleConfig {
                     provider: RoleProvider::Local,
                     model: None,
                     endpoint: None,
                     key: None,
+                    thinking: Thinking::Off,
                 }),
             },
             projects: BTreeMap::from([(

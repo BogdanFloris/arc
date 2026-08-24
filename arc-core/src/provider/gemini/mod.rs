@@ -4,8 +4,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Serialize;
 
 use crate::provider::{
-    CompletionRequest, CompletionStream, Error, Message, Provider, ToolDefinition, failure,
-    stream as delta_stream,
+    CompletionRequest, CompletionStream, Error, Message, Provider, Thinking, ToolDefinition,
+    failure, stream as delta_stream,
 };
 use arc_proto::v1::Role;
 
@@ -99,6 +99,10 @@ struct Payload<'a> {
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
+    // measured 2026-08-24: `low` is the cheapest setting, and none of them
+    // stop the thinking that `completion_tokens` leaves out
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -194,6 +198,13 @@ impl<'a> Payload<'a> {
             },
             tools: request.tools.iter().map(wire_tool).collect(),
             seed: request.seed,
+            reasoning_effort: match request.thinking {
+                Thinking::Default => None,
+                Thinking::Off => Some("none"),
+                Thinking::Low => Some("low"),
+                Thinking::Medium => Some("medium"),
+                Thinking::High => Some("high"),
+            },
         })
     }
 }
@@ -272,7 +283,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
 #[cfg(test)]
 mod tests {
     use super::{Gemini, Payload};
-    use crate::provider::{CompletionRequest, Message, Provider as _, ToolCall};
+    use crate::provider::{CompletionRequest, Message, Provider as _, Thinking, ToolCall};
     use arc_proto::v1::{Role, SessionRole};
     use serde_json::Value;
 
@@ -284,6 +295,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             seed: None,
+            thinking: Thinking::Default,
         }
     }
 

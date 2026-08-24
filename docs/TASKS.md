@@ -69,6 +69,10 @@ These are schemas and nothing writes a non-default value yet. 3.1 fills in the r
 | 3.5 | **Sidecar restart policy** (carried from Phase 1). It supports the archivist's consolidation work. | — | todo |
 | 3.6 | **Write `data/identity.md` for the concierge** — ARC's register per §5.1's four rules, plus the stable facts the always-loaded prompt should carry. Not code, and by invariant 7 not something an agent may write; this one is Bogdan's. Until it exists the concierge runs on whatever voice the model defaults to | bogdan | todo |
 
+Thinking is a per-role setting, not a global. `no_think` was a Qwen prompt hack sitting in front of every provider, and the sidecar's model alias was a top-level `model` key that meant nothing to a hosted role; both moved to where they apply, `[roles.*].thinking` and `[llama].model`. Each provider expresses the level its own way: Gemini sends `reasoning_effort`, the sidecar gets `/no_think` appended by the one code path that knows it is talking to the sidecar, and an `openai_compat` role rejects the setting at load because no endpoint there is measured to accept the field and an unknown field is a 400.
+
+Gemini 3.7 Flash cannot stop thinking, and `low` is a cap rather than a setting. Six runs of one chat turn gave 24, 37, 282, 289, 303 and 320 output tokens against 295–390 unset: never worse, occasionally much better, and far too noisy to read off a single turn. An earlier three-run pass reported a clean ladder and did not survive more samples — treat any thinking number here as a distribution, not a figure. `extra_body.google.thinking_config.thinking_level` reaches the same control and the two are mutually exclusive; `reasoning_effort` wins because it is flat and leaves the `extra_body.google` envelope free for the `cached_content` that caching still needs. Caching is still unverified: nothing has measured `cached_tokens` on a real concierge prefix.
+
 ## 4. Tool registry (`arc-core`)
 
 | # | Task | Assignee | Status |

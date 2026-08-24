@@ -18,6 +18,8 @@ pub struct CompletionRequest {
 
     pub role: SessionRole,
 
+    pub thinking: Thinking,
+
     pub system: Option<String>,
 
     pub messages: Vec<Message>,
@@ -25,6 +27,33 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
 
     pub seed: Option<u64>,
+}
+
+/// How much a role should think before answering. `Default` leaves the
+/// decision to the provider.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Thinking {
+    #[default]
+    Default,
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Thinking {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 pub fn role_label(role: SessionRole) -> &'static str {
@@ -194,7 +223,7 @@ mod tests {
 
     use super::{
         CompletionDelta, CompletionRequest, CompletionStream, Error, MAX_BODY_SNIPPET, Message,
-        Provider, Role, SessionRole, Stop, ToolCall, Usage,
+        Provider, Role, SessionRole, Stop, Thinking, ToolCall, Usage,
     };
 
     struct MockProvider {
@@ -250,6 +279,7 @@ mod tests {
             }],
             tools: Vec::new(),
             seed: None,
+            thinking: Thinking::Default,
         }
     }
 
