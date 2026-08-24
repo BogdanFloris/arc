@@ -323,7 +323,7 @@ impl<P: Provider> Engine<P> {
                     index: call.index,
                     name: call.name.clone(),
                     arguments_json: call.arguments.clone(),
-                    provider_roundtrip: Vec::new(),
+                    provider_roundtrip: call.provider_roundtrip.clone(),
                 }),
             )?;
             let _ = events
@@ -555,6 +555,7 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                     name,
                     arguments_json,
                     turn_id,
+                    provider_roundtrip,
                 }) = rows.get(i)
                 {
                     if turn_id != step_turn {
@@ -565,6 +566,7 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                         index: *call_index,
                         name: name.clone(),
                         arguments: arguments_json.clone(),
+                        provider_roundtrip: provider_roundtrip.clone(),
                     });
                     i += 1;
                 }
@@ -700,10 +702,10 @@ mod tests {
     };
     use crate::store::{self, Store};
     use crate::testkit::{
-        Canned, ScriptedProvider, TraceCapture, appended, call, channel, counter_samples,
-        done_reply, drain, engine, engine_with_tools, issued, reopened_engine, replay_events,
-        replay_log, resulted, seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools,
-        turn, usage,
+        Canned, ScriptedProvider, TraceCapture, appended, call, call_carrying, channel,
+        counter_samples, done_reply, drain, engine, engine_with_tools, engine_with_tools_at,
+        issued, reopened_engine, replay_events, replay_log, resulted, seed_log, seed_memory_log,
+        seed_memory_log_at, tool_stop, tools, turn, usage,
     };
     use crate::tool::Registry;
 
@@ -1193,6 +1195,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_round_trip_data_survives_the_log_into_the_next_request() {
+        let signature = b"opaque-thought-signature".to_vec();
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call_carrying(
+                    "srv1",
+                    0,
+                    "lookup",
+                    r#"{"q":1}"#,
+                    signature.clone(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("answer"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut engine =
+            engine_with_tools_at(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+
+        let session_id = engine
+            .send_message(None, "hi", tx)
+            .await
+            .expect("send")
+            .session_id;
+
+        let logged = replay_log(dir.path())
+            .into_iter()
+            .find_map(|event| match event {
+                session_event::Event::ToolCallIssued(call) => Some(call),
+                _ => None,
+            })
+            .expect("a tool call was issued");
+        assert_eq!(
+            logged.provider_roundtrip, signature,
+            "the log kept the bytes"
+        );
+
+        // a resumed session rebuilds its transcript from the log, so the bytes
+        // have to come back out of the projection, not out of memory
+        let resumed = ScriptedProvider::scripted(vec![done_reply("still here")]);
+        let mut engine = reopened_engine(&resumed, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(Some(&session_id), "again", tx)
+            .await
+            .expect("resume");
+
+        let calls = resumed.requests()[0]
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolCalls(calls) => Some(calls.clone()),
+                _ => None,
+            })
+            .expect("the rebuilt transcript replays the call");
+        assert_eq!(
+            calls[0].provider_roundtrip, signature,
+            "the rebuilt transcript handed the bytes back to the provider"
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_calls_are_written_ahead_and_answered_in_index_order() {
         let provider = ScriptedProvider::scripted(vec![
             vec![
@@ -1489,6 +1554,7 @@ mod tests {
                     index: 0,
                     name: "lookup".to_owned(),
                     arguments: r#"{"q":1}"#.to_owned(),
+                    provider_roundtrip: Vec::new(),
                 }]),
                 Message::ToolResult {
                     call_id: "c1".to_owned(),

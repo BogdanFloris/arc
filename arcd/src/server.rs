@@ -988,6 +988,7 @@ mod tests {
                     index: 0,
                     name: "lookup".to_owned(),
                     arguments: "{}".to_owned(),
+                    provider_roundtrip: Vec::new(),
                 })),
                 Ok(CompletionDelta::Done {
                     usage: usage(),
@@ -1067,6 +1068,7 @@ mod tests {
                     index: 0,
                     name: "lookup".to_owned(),
                     arguments: "{}".to_owned(),
+                    provider_roundtrip: Vec::new(),
                 })),
                 Ok(CompletionDelta::Done {
                     usage: usage(),

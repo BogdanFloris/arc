@@ -467,6 +467,7 @@ mod tests {
             index: 0,
             name: "get_time".to_owned(),
             arguments: "{}".to_owned(),
+            provider_roundtrip: Vec::new(),
         }]));
         req.messages.push(Message::ToolResult {
             call_id: "VB3c1GM6".to_owned(),

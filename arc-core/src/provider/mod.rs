@@ -62,6 +62,9 @@ pub struct ToolCall {
     pub name: String,
 
     pub arguments: String,
+
+    // opaque per-call bytes a provider must see again on the tool result
+    pub provider_roundtrip: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +275,7 @@ mod tests {
             index: 0,
             name: "memory_search".to_owned(),
             arguments: r#"{"query": "arc"}"#.to_owned(),
+            provider_roundtrip: Vec::new(),
         };
         let provider = MockProvider::streaming(vec![
             Ok(CompletionDelta::ToolCall(call.clone())),

@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCHEMA_VERSION: u32 = 7;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
     arguments_json TEXT,
     outcome        INTEGER,
     truncated      INTEGER,
-    ts             INTEGER
+    ts             INTEGER,
+    provider_roundtrip BLOB
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
@@ -139,6 +140,7 @@ pub enum MessageRow {
         name: String,
         arguments_json: String,
         turn_id: String,
+        provider_roundtrip: Vec<u8>,
     },
     ToolResult {
         call_id: String,
@@ -593,7 +595,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
 pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>, Error> {
     let mut stmt = conn.prepare(
         "SELECT kind, role, content, partial, turn_id,
-                call_id, call_index, name, arguments_json, outcome, truncated
+                call_id, call_index, name, arguments_json, outcome, truncated,
+                provider_roundtrip
          FROM messages WHERE session_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
@@ -610,6 +613,7 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
             name: row.get(7)?,
             arguments_json: row.get(8)?,
             turn_id: row.get(4)?,
+            provider_roundtrip: row.get::<_, Option<Vec<u8>>>(11)?.unwrap_or_default(),
         }),
         KIND_TOOL_RESULT => Ok(MessageRow::ToolResult {
             call_id: row.get(5)?,
@@ -784,8 +788,8 @@ fn insert_tool_call(
     tx.execute(
         "INSERT INTO messages
              (session_id, seq, kind, turn_id, content, call_id, call_index, name,
-              arguments_json, ts)
-         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9)",
+              arguments_json, ts, provider_roundtrip)
+         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             &call.session_id,
             seq_param(event.seq)?,
@@ -796,6 +800,7 @@ fn insert_tool_call(
             &call.name,
             &call.arguments_json,
             epoch_micros(event.ts.as_ref()),
+            &call.provider_roundtrip,
         ],
     )?;
     Ok(())
@@ -1497,6 +1502,7 @@ mod tests {
                     name: "lookup".to_string(),
                     arguments_json: r#"{"q":1}"#.to_string(),
                     turn_id: "t-01".to_string(),
+                    provider_roundtrip: Vec::new(),
                 },
                 MessageRow::ToolResult {
                     call_id: "c-a".to_string(),

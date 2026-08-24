@@ -748,6 +748,7 @@ mod tests {
                 name: "memory_search".to_owned(),
                 arguments_json: r#"{"query":"palette"}"#.to_owned(),
                 turn_id: "t".to_owned(),
+                provider_roundtrip: Vec::new(),
             },
             MessageRow::ToolResult {
                 call_id: "c1".to_owned(),

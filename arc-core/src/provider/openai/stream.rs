@@ -137,6 +137,7 @@ impl Building {
             index,
             name: self.name,
             arguments: self.arguments,
+            provider_roundtrip: Vec::new(),
         })
     }
 }
@@ -356,6 +357,7 @@ mod tests {
             index,
             name: name.to_owned(),
             arguments: arguments.to_owned(),
+            provider_roundtrip: Vec::new(),
         })
     }
 

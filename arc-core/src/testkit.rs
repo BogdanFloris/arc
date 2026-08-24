@@ -363,11 +363,22 @@ pub fn counter_samples(trace: &arc_proto::perfetto::Trace, name: &str) -> Vec<f6
 }
 
 pub fn call(id: &str, index: u32, name: &str, args: &str) -> CompletionDelta {
+    call_carrying(id, index, name, args, Vec::new())
+}
+
+pub fn call_carrying(
+    id: &str,
+    index: u32,
+    name: &str,
+    args: &str,
+    provider_roundtrip: Vec<u8>,
+) -> CompletionDelta {
     CompletionDelta::ToolCall(ToolCall {
         id: id.to_owned(),
         index,
         name: name.to_owned(),
         arguments: args.to_owned(),
+        provider_roundtrip,
     })
 }
 
@@ -478,6 +489,7 @@ mod tests {
                     name: "lookup".to_owned(),
                     arguments_json: r#"{"q":1}"#.to_owned(),
                     turn_id: turn_id.clone(),
+                    provider_roundtrip: Vec::new(),
                 },
                 MessageRow::ToolResult {
                     call_id: "c1".to_owned(),
@@ -513,6 +525,7 @@ mod tests {
                     index: 0,
                     name: "lookup".to_owned(),
                     arguments: r#"{"q":1}"#.to_owned(),
+                    provider_roundtrip: Vec::new(),
                 }]),
                 Message::ToolResult {
                     call_id: "c1".to_owned(),
