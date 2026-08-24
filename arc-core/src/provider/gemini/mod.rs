@@ -1,6 +1,8 @@
 mod stream;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION};
+use std::collections::HashMap;
+
+use reqwest::header::ACCEPT;
 use serde::Serialize;
 
 use crate::provider::{
@@ -11,13 +13,15 @@ use arc_proto::v1::Role;
 
 const NAME: &str = "gemini";
 
-pub const DEFAULT_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+pub const DEFAULT_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-const COMPLETIONS_PATH: &str = "/chat/completions";
+const KEY_HEADER: &str = "x-goog-api-key";
 
 pub struct Gemini {
     endpoint: String,
+
     key: String,
+
     http: reqwest::Client,
 }
 
@@ -71,9 +75,12 @@ impl Provider for Gemini {
 
         let response = self
             .http
-            .post(format!("{}{COMPLETIONS_PATH}", self.endpoint))
+            .post(format!(
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                self.endpoint, request.model
+            ))
             .header(ACCEPT, "text/event-stream")
-            .header(AUTHORIZATION, format!("Bearer {}", self.key))
+            .header(KEY_HEADER, &self.key)
             .json(&payload)
             .send()
             .await?;
@@ -90,197 +97,233 @@ impl Provider for Gemini {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Payload<'a> {
-    model: &'a str,
-    messages: Vec<WireMessage<'a>>,
-    stream: bool,
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<Content<'a>>,
+    contents: Vec<Content<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<WireTool<'a>>,
+    tools: Vec<Tools<'a>>,
+    #[serde(skip_serializing_if = "GenerationConfig::is_empty")]
+    generation_config: GenerationConfig,
+}
+
+#[derive(Serialize)]
+struct Content<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    seed: Option<u64>,
-    // measured 2026-08-24: `low` is the cheapest setting, and none of them
-    // stop the thinking that `completion_tokens` leaves out
+    role: Option<&'static str>,
+    parts: Vec<Part<'a>>,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Part<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum WireMessage<'a> {
-    Text {
-        role: &'static str,
-        content: &'a str,
-    },
-
-    ToolCalls {
-        role: &'static str,
-        tool_calls: Vec<WireToolCall<'a>>,
-    },
-
-    ToolResult {
-        role: &'static str,
-        tool_call_id: &'a str,
-        content: &'a str,
-    },
-}
-
-#[derive(Serialize)]
-struct WireToolCall<'a> {
-    id: &'a str,
-    #[serde(rename = "type")]
-    kind: &'static str,
-    function: WireCalledFunction<'a>,
+    text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    extra_content: Option<ExtraContent<'a>>,
+    function_call: Option<FunctionCall<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_response: Option<FunctionResponse<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<&'a str>,
 }
 
 #[derive(Serialize)]
-struct ExtraContent<'a> {
-    google: Google<'a>,
-}
-
-#[derive(Serialize)]
-struct Google<'a> {
-    thought_signature: &'a str,
-}
-
-#[derive(Serialize)]
-struct WireCalledFunction<'a> {
+struct FunctionCall<'a> {
     name: &'a str,
-    arguments: &'a str,
+    id: &'a str,
+    args: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct WireTool<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    function: WireFunction<'a>,
+struct FunctionResponse<'a> {
+    name: &'a str,
+    id: &'a str,
+    response: Output<'a>,
 }
 
 #[derive(Serialize)]
-struct WireFunction<'a> {
+struct Output<'a> {
+    output: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Tools<'a> {
+    function_declarations: Vec<Declaration<'a>>,
+}
+
+#[derive(Serialize)]
+struct Declaration<'a> {
     name: &'a str,
     description: &'a str,
     parameters: &'a serde_json::Value,
 }
 
-const FUNCTION: &str = "function";
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+}
+
+impl GenerationConfig {
+    fn is_empty(&self) -> bool {
+        self.thinking_config.is_none() && self.seed.is_none()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingConfig {
+    thinking_level: &'static str,
+}
 
 impl<'a> Payload<'a> {
     fn new(request: &'a CompletionRequest) -> Result<Self, Error> {
-        let system = request
-            .system
-            .as_deref()
-            .filter(|system| !system.trim().is_empty())
-            .map(|content| WireMessage::Text {
-                role: "system",
-                content,
-            });
-
-        let turns: Vec<WireMessage> = request
-            .messages
-            .iter()
-            .map(wire_message)
-            .collect::<Result<_, _>>()?;
+        // there is no NONE level; MINIMAL is as far down as it goes
+        let thinking_config = match request.thinking {
+            Thinking::Default => None,
+            Thinking::Minimal => Some("MINIMAL"),
+            Thinking::Low => Some("LOW"),
+            Thinking::Medium => Some("MEDIUM"),
+            Thinking::High => Some("HIGH"),
+        }
+        .map(|thinking_level| ThinkingConfig { thinking_level });
 
         Ok(Self {
-            model: &request.model,
-            messages: system.into_iter().chain(turns).collect(),
-            stream: true,
-            stream_options: StreamOptions {
-                include_usage: true,
+            system_instruction: request
+                .system
+                .as_deref()
+                .filter(|system| !system.trim().is_empty())
+                .map(|text| Content {
+                    role: None,
+                    parts: vec![Part {
+                        text: Some(text),
+                        ..Part::default()
+                    }],
+                }),
+            contents: contents(&request.messages)?,
+            tools: if request.tools.is_empty() {
+                Vec::new()
+            } else {
+                vec![Tools {
+                    function_declarations: request.tools.iter().map(declaration).collect(),
+                }]
             },
-            tools: request.tools.iter().map(wire_tool).collect(),
-            seed: request.seed,
-            reasoning_effort: match request.thinking {
-                Thinking::Default => None,
-                Thinking::Off => Some("none"),
-                // only some models have it, and it is the one level that
-                // actually stops thinking; 3.7 Flash answers 400
-                Thinking::Minimal => Some("minimal"),
-                Thinking::Low => Some("low"),
-                Thinking::Medium => Some("medium"),
-                Thinking::High => Some("high"),
+            generation_config: GenerationConfig {
+                thinking_config,
+                seed: request.seed,
             },
         })
     }
 }
 
-fn wire_tool(tool: &ToolDefinition) -> WireTool<'_> {
-    WireTool {
-        kind: FUNCTION,
-        function: WireFunction {
-            name: &tool.name,
-            description: &tool.description,
-            parameters: &tool.parameters,
-        },
+fn declaration(tool: &ToolDefinition) -> Declaration<'_> {
+    Declaration {
+        name: &tool.name,
+        description: &tool.description,
+        parameters: &tool.parameters,
     }
 }
 
-fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
-    let (role, content) = match message {
-        Message::Text { role, content } => (role, content),
-        Message::ToolCalls(calls) => {
-            let tool_calls = calls
-                .iter()
-                .map(|call| {
+fn contents(messages: &[Message]) -> Result<Vec<Content<'_>>, Error> {
+    // a functionResponse must name its function, and only the call knows it
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    let mut contents: Vec<Content> = Vec::new();
+
+    for message in messages {
+        match message {
+            Message::Text { role, content } => {
+                let role = match role {
+                    Role::User => "user",
+                    Role::Assistant => "model",
+                    Role::System => {
+                        return Err(Error::InvalidRequest(
+                            "system prompts go in CompletionRequest::system, not the history"
+                                .to_owned(),
+                        ));
+                    }
+                    Role::Unspecified => {
+                        return Err(Error::InvalidRequest(
+                            "a message in the request has an unset role".to_owned(),
+                        ));
+                    }
+                };
+                contents.push(Content {
+                    role: Some(role),
+                    parts: vec![Part {
+                        text: Some(content),
+                        ..Part::default()
+                    }],
+                });
+            }
+            Message::ToolCalls(calls) => {
+                let mut parts = Vec::with_capacity(calls.len());
+                for call in calls {
+                    names.insert(call.id.as_str(), call.name.as_str());
+                    let args = serde_json::from_str(&call.arguments).map_err(|source| {
+                        Error::InvalidRequest(format!(
+                            "the arguments for tool call `{}` are not a JSON object: {source}",
+                            call.name
+                        ))
+                    })?;
                     let signature = std::str::from_utf8(&call.provider_roundtrip).map_err(|_| {
                         Error::InvalidRequest(format!(
                             "the round-trip data for tool call `{}` is not the base64 text gemini sent",
                             call.name
                         ))
                     })?;
-                    Ok(WireToolCall {
-                        id: &call.id,
-                        kind: FUNCTION,
-                        function: WireCalledFunction {
+                    parts.push(Part {
+                        function_call: Some(FunctionCall {
                             name: &call.name,
-                            arguments: &call.arguments,
-                        },
-                        // without this the next turn is a 400, not a degraded answer
-                        extra_content: (!signature.is_empty()).then_some(ExtraContent {
-                            google: Google {
-                                thought_signature: signature,
-                            },
+                            id: &call.id,
+                            args,
                         }),
-                    })
-                })
-                .collect::<Result<_, Error>>()?;
-            return Ok(WireMessage::ToolCalls {
-                role: "assistant",
-                tool_calls,
-            });
+                        thought_signature: (!signature.is_empty()).then_some(signature),
+                        ..Part::default()
+                    });
+                }
+                contents.push(Content {
+                    role: Some("model"),
+                    parts,
+                });
+            }
+            Message::ToolResult { call_id, content } => {
+                let name = names.get(call_id.as_str()).copied().ok_or_else(|| {
+                    Error::InvalidRequest(format!(
+                        "the result for call {call_id} has no matching call in this request"
+                    ))
+                })?;
+                let part = Part {
+                    function_response: Some(FunctionResponse {
+                        name,
+                        id: call_id,
+                        response: Output { output: content },
+                    }),
+                    ..Part::default()
+                };
+                // parallel results belong in one turn, the way the calls were
+                match contents.last_mut() {
+                    Some(last) if is_responses(last) => last.parts.push(part),
+                    _ => contents.push(Content {
+                        role: Some("user"),
+                        parts: vec![part],
+                    }),
+                }
+            }
         }
-        Message::ToolResult { call_id, content } => {
-            return Ok(WireMessage::ToolResult {
-                role: "tool",
-                tool_call_id: call_id,
-                content,
-            });
-        }
-    };
+    }
+    Ok(contents)
+}
 
-    let role = match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::System => {
-            return Err(Error::InvalidRequest(
-                "system prompts go in CompletionRequest::system, not the history".to_owned(),
-            ));
-        }
-        Role::Unspecified => {
-            return Err(Error::InvalidRequest(
-                "a message in the request has an unset role".to_owned(),
-            ));
-        }
-    };
-    Ok(WireMessage::Text { role, content })
+fn is_responses(content: &Content<'_>) -> bool {
+    content
+        .parts
+        .iter()
+        .all(|part| part.function_response.is_some())
 }
 
 #[cfg(test)]
@@ -292,13 +335,13 @@ mod tests {
 
     fn request(messages: Vec<Message>) -> CompletionRequest {
         CompletionRequest {
-            model: "gemini-3.7-flash".to_owned(),
+            model: "gemini-3.6-flash".to_owned(),
             role: SessionRole::Concierge,
-            system: None,
+            thinking: Thinking::Minimal,
+            system: Some("Be terse.".to_owned()),
             messages,
             tools: Vec::new(),
             seed: None,
-            thinking: Thinking::Default,
         }
     }
 
@@ -308,7 +351,7 @@ mod tests {
 
     fn call(signature: &[u8]) -> ToolCall {
         ToolCall {
-            id: "call_4051480".to_owned(),
+            id: "call_2418851".to_owned(),
             index: 0,
             name: "get_time".to_owned(),
             arguments: r#"{"timezone":"UTC"}"#.to_owned(),
@@ -317,30 +360,111 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_carries_its_thought_signature_back() {
-        let json = body(&request(vec![Message::ToolCalls(vec![call(
-            b"EoADCv0CARFN",
-        )])]));
+    fn a_plain_turn_is_system_instruction_and_contents() {
+        let json = body(&request(vec![Message::Text {
+            role: Role::User,
+            content: "hi".to_owned(),
+        }]));
 
-        let tool_call = &json["messages"][0]["tool_calls"][0];
-        assert_eq!(
-            tool_call["extra_content"]["google"]["thought_signature"],
-            "EoADCv0CARFN"
+        assert_eq!(json["systemInstruction"]["parts"][0]["text"], "Be terse.");
+        assert!(
+            json["systemInstruction"].get("role").is_none(),
+            "the system instruction carries no role"
         );
-        assert_eq!(tool_call["id"], "call_4051480");
-        assert_eq!(tool_call["function"]["name"], "get_time");
+        assert_eq!(json["contents"][0]["role"], "user");
+        assert_eq!(json["contents"][0]["parts"][0]["text"], "hi");
+        assert_eq!(
+            json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MINIMAL"
+        );
     }
 
     #[test]
-    fn a_call_with_no_signature_sends_no_extra_content() {
-        let json = body(&request(vec![Message::ToolCalls(vec![call(b"")])]));
+    fn an_assistant_turn_is_a_model_turn() {
+        let json = body(&request(vec![Message::Text {
+            role: Role::Assistant,
+            content: "sure".to_owned(),
+        }]));
 
-        assert!(
-            json["messages"][0]["tool_calls"][0]
-                .get("extra_content")
-                .is_none(),
-            "an empty signature must not become an empty object: {json}"
+        assert_eq!(json["contents"][0]["role"], "model");
+    }
+
+    #[test]
+    fn a_call_carries_its_signature_and_object_arguments() {
+        let json = body(&request(vec![Message::ToolCalls(vec![call(b"EmYKZAER")])]));
+
+        let part = &json["contents"][0]["parts"][0];
+        assert_eq!(part["thoughtSignature"], "EmYKZAER");
+        assert_eq!(part["functionCall"]["name"], "get_time");
+        assert_eq!(part["functionCall"]["id"], "call_2418851");
+        assert_eq!(
+            part["functionCall"]["args"]["timezone"], "UTC",
+            "the log stores a string; the wire wants an object"
         );
+    }
+
+    #[test]
+    fn a_result_names_the_function_its_call_named() {
+        let json = body(&request(vec![
+            Message::ToolCalls(vec![call(b"sig")]),
+            Message::ToolResult {
+                call_id: "call_2418851".to_owned(),
+                content: "2026-08-24T14:00:00Z".to_owned(),
+            },
+        ]));
+
+        let response = &json["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(json["contents"][1]["role"], "user");
+        assert_eq!(
+            response["name"], "get_time",
+            "the API rejects an empty name"
+        );
+        assert_eq!(response["id"], "call_2418851");
+        assert_eq!(response["response"]["output"], "2026-08-24T14:00:00Z");
+    }
+
+    #[test]
+    fn parallel_results_share_one_turn() {
+        let second = ToolCall {
+            id: "call_2".to_owned(),
+            index: 1,
+            name: "lookup".to_owned(),
+            ..call(b"sig")
+        };
+        let json = body(&request(vec![
+            Message::ToolCalls(vec![call(b"sig"), second]),
+            Message::ToolResult {
+                call_id: "call_2418851".to_owned(),
+                content: "a".to_owned(),
+            },
+            Message::ToolResult {
+                call_id: "call_2".to_owned(),
+                content: "b".to_owned(),
+            },
+        ]));
+
+        assert_eq!(json["contents"].as_array().expect("contents").len(), 2);
+        assert_eq!(
+            json["contents"][1]["parts"]
+                .as_array()
+                .expect("parts")
+                .len(),
+            2,
+            "both results ride the same turn, the way the calls did"
+        );
+    }
+
+    #[test]
+    fn a_result_with_no_matching_call_is_refused_before_the_wire() {
+        let request = request(vec![Message::ToolResult {
+            call_id: "orphan".to_owned(),
+            content: "x".to_owned(),
+        }]);
+
+        let Err(err) = Payload::new(&request) else {
+            panic!("a response with no name cannot be built");
+        };
+        assert!(err.to_string().contains("orphan"), "{err}");
     }
 
     #[test]
@@ -354,17 +478,17 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_turn_serializes_as_openai_does() {
-        let json = body(&request(vec![Message::Text {
+    fn no_thinking_level_means_the_field_is_absent() {
+        let mut plain = request(vec![Message::Text {
             role: Role::User,
             content: "hi".to_owned(),
-        }]));
+        }]);
+        plain.thinking = Thinking::Default;
 
-        assert_eq!(json["model"], "gemini-3.7-flash");
-        assert_eq!(json["stream"], true);
-        assert_eq!(json["stream_options"]["include_usage"], true);
-        assert_eq!(json["messages"][0]["role"], "user");
-        assert_eq!(json["messages"][0]["content"], "hi");
+        assert!(
+            body(&plain).get("generationConfig").is_none(),
+            "an empty generationConfig should not be sent at all"
+        );
     }
 
     #[test]
@@ -378,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_does_not_change_the_endpoint() {
-        let provider = Gemini::new("https://example.test/v1beta/openai/", "k".to_owned());
-        assert_eq!(provider.endpoint(), "https://example.test/v1beta/openai");
+        let provider = Gemini::new("https://example.test/v1beta/", "k".to_owned());
+        assert_eq!(provider.endpoint(), "https://example.test/v1beta");
     }
 }

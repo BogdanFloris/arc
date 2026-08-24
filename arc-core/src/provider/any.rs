@@ -61,7 +61,7 @@ impl Provider for AnyProvider {
 
 // Qwen reads `/no_think` out of the prompt; it has no request field for this
 fn no_think(mut request: CompletionRequest) -> CompletionRequest {
-    if request.thinking != Thinking::Off {
+    if request.thinking != Thinking::Minimal {
         return request;
     }
     let mut prompt = request.system.unwrap_or_default();
@@ -102,7 +102,9 @@ mod tests {
         };
 
         assert_eq!(
-            super::no_think(request(Thinking::Off)).system.as_deref(),
+            super::no_think(request(Thinking::Minimal))
+                .system
+                .as_deref(),
             Some("be terse\n/no_think"),
             "the marker lands last, after the memory block"
         );
@@ -120,7 +122,7 @@ mod tests {
         let request = CompletionRequest {
             model: "qwen3-8b".to_owned(),
             role: SessionRole::Archivist,
-            thinking: Thinking::Off,
+            thinking: Thinking::Minimal,
             system: None,
             messages: Vec::new(),
             tools: Vec::new(),

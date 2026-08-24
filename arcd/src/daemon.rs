@@ -409,7 +409,7 @@ mod tests {
             consolidation_task(
                 Config::default().consolidation,
                 "test-model",
-                Thinking::Off,
+                Thinking::Minimal,
                 Arc::clone(&daemon.engine),
                 Arc::clone(&daemon.roles.archivist().provider),
             )
@@ -425,7 +425,7 @@ mod tests {
         let task = consolidation_task(
             enabled,
             "test-model",
-            Thinking::Off,
+            Thinking::Minimal,
             Arc::clone(&daemon.engine),
             Arc::clone(&daemon.roles.archivist().provider),
         )

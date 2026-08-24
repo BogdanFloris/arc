@@ -88,7 +88,7 @@ impl<P: Provider> ModelExtractor<P> {
         Self {
             provider,
             model: model.to_owned(),
-            thinking: Thinking::Off,
+            thinking: Thinking::Minimal,
             timeout,
             prompt: prompt.to_owned(),
             seed: Some(seed),
@@ -447,7 +447,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             provider,
             "test-model",
-            Thinking::Off,
+            Thinking::Minimal,
             Duration::from_secs(5),
         );
         extractor.extract(&snapshot(index)).await
@@ -477,7 +477,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             Arc::clone(&provider),
             "test-model",
-            Thinking::Off,
+            Thinking::Minimal,
             Duration::from_secs(300),
         );
         let outcome = run_pass(
@@ -596,7 +596,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             Arc::clone(&provider),
             "test-model",
-            Thinking::Off,
+            Thinking::Minimal,
             Duration::from_secs(300),
         );
         let outcome = run_pass(
@@ -739,7 +739,7 @@ mod tests {
         let extractor = ModelExtractor::new(
             Arc::new(Stalled),
             "test-model",
-            Thinking::Off,
+            Thinking::Minimal,
             Duration::from_millis(10),
         );
         let err = extractor

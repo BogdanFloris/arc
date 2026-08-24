@@ -142,10 +142,10 @@ impl RoleConfig {
         match (self.provider, self.thinking) {
             (_, Thinking::Default)
             | (RoleProvider::Gemini, _)
-            | (RoleProvider::Local, Thinking::Off) => {}
+            | (RoleProvider::Local, Thinking::Minimal) => {}
             (RoleProvider::Local, level) => bail!(
                 "role `{name}`: the sidecar reads `/no_think` out of the prompt and has no `{}` level; \
-                 use `off` or leave it unset",
+                 use `minimal` or leave it unset",
                 level.label()
             ),
             (RoleProvider::OpenAiCompat, _) => bail!(
@@ -370,7 +370,7 @@ mod tests {
                     model: None,
                     endpoint: None,
                     key: None,
-                    thinking: Thinking::Off,
+                    thinking: Thinking::Minimal,
                 }),
             },
             projects: BTreeMap::from([(

@@ -38,7 +38,8 @@ pub struct CompletionRequest {
 pub enum Thinking {
     #[default]
     Default,
-    Off,
+    /// As little as the provider allows. Not always none: Gemini has no level
+    /// below MINIMAL, and Qwen reads `/no_think` out of the prompt.
     Minimal,
     Low,
     Medium,
@@ -49,7 +50,6 @@ impl Thinking {
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Off => "off",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",

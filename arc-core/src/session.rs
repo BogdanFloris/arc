@@ -1716,7 +1716,7 @@ mod tests {
             SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
-            Thinking::Off,
+            Thinking::Minimal,
         );
         let (tx, _rx) = channel();
 
@@ -1727,7 +1727,7 @@ mod tests {
             Some("be terse"),
             "the marker is the sidecar's dialect and belongs to its provider"
         );
-        assert_eq!(provider.requests()[0].thinking, Thinking::Off);
+        assert_eq!(provider.requests()[0].thinking, Thinking::Minimal);
     }
 
     #[tokio::test]
@@ -2210,7 +2210,7 @@ mod tests {
             SessionRole::Concierge,
             Some("be terse".to_owned()),
             Registry::new(512),
-            Thinking::Off,
+            Thinking::Minimal,
         );
         let (tx, _rx) = channel();
 
