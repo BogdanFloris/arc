@@ -57,8 +57,8 @@ const TRANSCRIPT_BUDGET: usize = 24_000;
 
 const TOOL_SNIPPET: usize = 200;
 
-pub struct ModelExtractor<P> {
-    provider: Arc<P>,
+pub struct ModelExtractor {
+    provider: Arc<dyn Provider>,
     model: String,
     thinking: Thinking,
     timeout: Duration,
@@ -66,8 +66,13 @@ pub struct ModelExtractor<P> {
     seed: Option<u64>,
 }
 
-impl<P: Provider> ModelExtractor<P> {
-    pub fn new(provider: Arc<P>, model: &str, thinking: Thinking, timeout: Duration) -> Self {
+impl ModelExtractor {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model: &str,
+        thinking: Thinking,
+        timeout: Duration,
+    ) -> Self {
         Self {
             provider,
             model: model.to_owned(),
@@ -79,7 +84,7 @@ impl<P: Provider> ModelExtractor<P> {
     }
 
     pub(crate) fn pinned(
-        provider: Arc<P>,
+        provider: Arc<dyn Provider>,
         model: &str,
         timeout: Duration,
         prompt: &str,
@@ -106,7 +111,7 @@ pub(crate) fn session_seed(session_id: &str) -> u64 {
     hash
 }
 
-impl<P: Provider> ModelExtractor<P> {
+impl ModelExtractor {
     async fn completion_text(&self, request: CompletionRequest) -> Result<String, ExtractError> {
         let mut stream = self
             .provider
@@ -148,7 +153,7 @@ impl<P: Provider> ModelExtractor<P> {
     }
 }
 
-impl<P: Provider> Extractor for ModelExtractor<P> {
+impl Extractor for ModelExtractor {
     #[tracing::instrument(
         name = "consolidation.extract",
         skip_all,
@@ -465,17 +470,18 @@ mod tests {
             done_reply("hello again"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "remember: keep replies short", tx)
+            .send_message(&run, None, "remember: keep replies short", tx)
             .await
             .expect("send");
 
         let extractor = ModelExtractor::new(
-            Arc::clone(&provider),
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(300),
@@ -547,7 +553,7 @@ mod tests {
         engine
             .lock()
             .await
-            .send_message(Some(&reply.session_id), "hi again", tx)
+            .send_message(&run, Some(&reply.session_id), "hi again", tx)
             .await
             .expect("second send");
         let system = provider.requests()[2].system.clone().expect("system");
@@ -584,17 +590,18 @@ mod tests {
                     "body":"The user moved to Y.","links":[]}]}"#,
             ),
         ]);
-        let engine = Mutex::new(reopened_engine(&provider, &dir, Registry::new(512)));
+        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "I moved to Y", tx)
+            .send_message(&run, None, "I moved to Y", tx)
             .await
             .expect("send");
 
         let extractor = ModelExtractor::new(
-            Arc::clone(&provider),
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(300),
@@ -719,6 +726,7 @@ mod tests {
         assert!(err.0.contains("no tools offered"), "{}", err.0);
     }
 
+    #[derive(Debug)]
     struct Stalled;
 
     impl Provider for Stalled {
@@ -726,11 +734,11 @@ mod tests {
             "stalled"
         }
 
-        async fn complete(
+        fn complete(
             &self,
             _request: CompletionRequest,
-        ) -> Result<CompletionStream, ProviderError> {
-            std::future::pending().await
+        ) -> futures::future::BoxFuture<'_, Result<CompletionStream, ProviderError>> {
+            Box::pin(std::future::pending())
         }
     }
 

@@ -73,8 +73,8 @@ pub struct ChangedSummary {
 
 use super::extract::session_seed;
 
-pub async fn run<P: Provider>(
-    provider: &Arc<P>,
+pub async fn run(
+    provider: &Arc<dyn Provider>,
     model: &str,
     timeout: Duration,
     log_dir: &Path,
@@ -112,8 +112,8 @@ pub async fn run<P: Provider>(
         records = tracing::field::Empty,
     )
 )]
-async fn run_version<P: Provider>(
-    provider: &Arc<P>,
+async fn run_version(
+    provider: &Arc<dyn Provider>,
     model: &str,
     timeout: Duration,
     events: &[Event],
@@ -272,6 +272,7 @@ pub fn diff(a: &ReplayReport, b: &ReplayReport) -> ReplayDiff {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use arc_proto::v1::{
@@ -281,7 +282,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{ReplayOperation, ReplayRecord, ReplayReport, diff, run, session_seed};
-    use crate::provider::{CompletionDelta, Error as ProviderError, Message, Stop};
+    use crate::provider::{CompletionDelta, Error as ProviderError, Message, Provider, Stop};
     use crate::testkit::{ScriptedProvider, seed_log_payloads, usage};
 
     fn extraction_reply(json: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
@@ -391,7 +392,7 @@ mod tests {
             extraction_reply(WRITE_STORY_B),
         ]);
         let reports = run(
-            &provider,
+            &(Arc::clone(&provider) as Arc<dyn Provider>),
             "test-model",
             Duration::from_secs(5),
             dir.path(),
@@ -484,7 +485,7 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![extraction_reply(EMPTY)]);
 
         let reports = run(
-            &provider,
+            &(Arc::clone(&provider) as Arc<dyn Provider>),
             "test-model",
             Duration::from_secs(5),
             dir.path(),

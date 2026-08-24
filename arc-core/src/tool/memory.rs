@@ -457,12 +457,12 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let mut engine =
+        let (mut engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
 
         let reply = engine
-            .send_message(None, "remember this: terse replies", tx)
+            .send_message(&run, None, "remember this: terse replies", tx)
             .await
             .expect("send");
 
@@ -502,16 +502,16 @@ mod tests {
             done_reply("saved it"),
             done_reply("hello again"),
         ]);
-        let mut engine =
+        let (mut engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
         let reply = engine
-            .send_message(None, "remember this", tx)
+            .send_message(&run, None, "remember this", tx)
             .await
             .expect("send");
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "what do you know?", tx)
+            .send_message(&run, Some(&reply.session_id), "what do you know?", tx)
             .await
             .expect("second send");
 
@@ -539,11 +539,11 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let mut engine =
+        let (mut engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
         let reply = engine
-            .send_message(None, "remember this", tx)
+            .send_message(&run, None, "remember this", tx)
             .await
             .expect("send");
         let id = created_record(&replay_events(dir.path())[3]).id.clone();
@@ -582,15 +582,15 @@ mod tests {
             done_reply("hello again"),
         ]);
         let registry = registry(vec![Box::new(MemorySupersede::new(archive_at(&dir)))]);
-        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
         let reply = engine
-            .send_message(None, "I moved to Y", tx)
+            .send_message(&run, None, "I moved to Y", tx)
             .await
             .expect("send");
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "where do I live?", tx)
+            .send_message(&run, Some(&reply.session_id), "where do I live?", tx)
             .await
             .expect("second send");
 

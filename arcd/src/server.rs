@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_core::projection::{Reader, ReviewItem, SessionSummary};
-use arc_core::provider::Provider;
-use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
+use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, Delta, Error as WireError, MemoryReviewItem, MemoryReviewItems, MessageAccepted,
@@ -29,9 +28,10 @@ const EVENT_BUFFER: usize = 64;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-pub async fn serve<P: Provider + 'static>(
+pub async fn serve(
     listener: TcpListener,
-    engine: Arc<Mutex<Engine<P>>>,
+    engine: Arc<Mutex<Engine>>,
+    runner: Runner,
     reads: Arc<Reader>,
     shutdown: impl Future<Output = ()> + Send,
 ) {
@@ -50,6 +50,7 @@ pub async fn serve<P: Provider + 'static>(
                         stream,
                         peer,
                         Arc::clone(&engine),
+                        runner.clone(),
                         Arc::clone(&reads),
                         closing_rx.clone(),
                     ));
@@ -80,10 +81,11 @@ async fn drain(connections: &mut JoinSet<()>) {
 }
 
 #[tracing::instrument(name = "server.connection", skip_all, fields(peer = %peer))]
-async fn connection<P: Provider>(
+async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
-    engine: Arc<Mutex<Engine<P>>>,
+    engine: Arc<Mutex<Engine>>,
+    runner: Runner,
     reads: Arc<Reader>,
     mut closing: watch::Receiver<bool>,
 ) {
@@ -109,7 +111,10 @@ async fn connection<P: Provider>(
         match message {
             Some(Ok(WsMessage::Binary(bytes))) => match ClientFrame::decode(bytes) {
                 Ok(frame) => {
-                    if request(&mut ws, &engine, &reads, frame).await.is_break() {
+                    if request(&mut ws, &engine, &runner, &reads, frame)
+                        .await
+                        .is_break()
+                    {
                         break;
                     }
                 }
@@ -145,15 +150,16 @@ async fn told_to_close(closing: &mut watch::Receiver<bool>) {
     skip_all,
     fields(request_id = frame.request_id, kind = kind(&frame)),
 )]
-async fn request<P: Provider>(
+async fn request(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    engine: &Mutex<Engine>,
+    runner: &Runner,
     reads: &Reader,
     frame: ClientFrame,
 ) -> ControlFlow<()> {
     match frame.msg {
         Some(client_frame::Msg::SendMessage(send)) => {
-            send_message(ws, engine, frame.request_id, send).await
+            send_message(ws, engine, runner, frame.request_id, send).await
         }
         Some(client_frame::Msg::ListSessions(_)) => {
             list_sessions(ws, reads, frame.request_id).await
@@ -178,9 +184,10 @@ async fn request<P: Provider>(
     }
 }
 
-async fn send_message<P: Provider>(
+async fn send_message(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    engine: &Mutex<Engine>,
+    runner: &Runner,
     request_id: u64,
     send: SendMessage,
 ) -> ControlFlow<()> {
@@ -190,7 +197,7 @@ async fn send_message<P: Provider>(
     let mut engine = engine.lock().await;
     // forward has to run alongside the engine or the event channel fills
     let (result, connected) = tokio::join!(
-        engine.send_message(session_id, &send.content, events),
+        engine.send_message(runner, session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),
     );
     drop(engine);
@@ -287,9 +294,9 @@ async fn review_list(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-async fn review_accept<P: Provider>(
+async fn review_accept(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    engine: &Mutex<Engine>,
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
@@ -297,9 +304,9 @@ async fn review_accept<P: Provider>(
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
-async fn review_delete<P: Provider>(
+async fn review_delete(
     ws: &mut Socket,
-    engine: &Mutex<Engine<P>>,
+    engine: &Mutex<Engine>,
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
@@ -468,16 +475,18 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     use super::*;
-    use arc_core::provider::Thinking;
+    use arc_core::provider::{Provider, Thinking};
     use arc_core::testkit::{Canned, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
+    #[derive(Debug)]
     enum Script {
         Echo,
         Canned(VecDeque<Vec<Result<CompletionDelta, ProviderError>>>),
     }
 
+    #[derive(Debug)]
     struct MockProvider {
         script: StdMutex<Script>,
         captured: StdMutex<Vec<CompletionRequest>>,
@@ -501,36 +510,38 @@ mod tests {
             "mock"
         }
 
-        async fn complete(
+        fn complete(
             &self,
             request: CompletionRequest,
-        ) -> Result<CompletionStream, ProviderError> {
-            let items = match &mut *self.script.lock().expect("script") {
-                Script::Echo => {
-                    let last = request
-                        .messages
-                        .iter()
-                        .rev()
-                        .find_map(|m| match m {
-                            Message::Text {
-                                role: Role::User,
-                                content,
-                            } => Some(content.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    vec![
-                        Ok(CompletionDelta::Text(format!("re: {last}"))),
-                        Ok(CompletionDelta::Done {
-                            usage: usage(),
-                            stop: Stop::EndTurn,
-                        }),
-                    ]
-                }
-                Script::Canned(calls) => calls.pop_front().expect("script exhausted"),
-            };
-            self.captured.lock().expect("captured").push(request);
-            Ok(Box::pin(stream::iter(items)))
+        ) -> futures::future::BoxFuture<'_, Result<CompletionStream, ProviderError>> {
+            Box::pin(async move {
+                let items = match &mut *self.script.lock().expect("script") {
+                    Script::Echo => {
+                        let last = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|m| match m {
+                                Message::Text {
+                                    role: Role::User,
+                                    content,
+                                } => Some(content.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        vec![
+                            Ok(CompletionDelta::Text(format!("re: {last}"))),
+                            Ok(CompletionDelta::Done {
+                                usage: usage(),
+                                stop: Stop::EndTurn,
+                            }),
+                        ]
+                    }
+                    Script::Canned(calls) => calls.pop_front().expect("script exhausted"),
+                };
+                self.captured.lock().expect("captured").push(request);
+                Ok(Box::pin(stream::iter(items)) as CompletionStream)
+            })
         }
     }
 
@@ -591,15 +602,14 @@ mod tests {
             arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
                 .expect("replay");
             let provider = MockProvider::new(script);
-            let engine = Engine::new(
-                Store::new(log, projection),
-                Arc::clone(&provider),
-                "test-model",
-                SessionRole::Concierge,
-                Some("be terse".to_owned()),
-                registry,
-                Thinking::Default,
-            );
+            let engine = Engine::new(Store::new(log, projection), registry);
+            let runner = Runner {
+                role: SessionRole::Concierge,
+                provider: Arc::clone(&provider) as Arc<dyn Provider>,
+                model: "test-model".to_owned(),
+                thinking: Thinking::Default,
+                system: Some("be terse".to_owned()),
+            };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -608,6 +618,7 @@ mod tests {
             let server = tokio::spawn(serve(
                 listener,
                 Arc::new(Mutex::new(engine)),
+                runner,
                 reads,
                 async {
                     let _ = signal.await;

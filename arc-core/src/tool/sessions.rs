@@ -279,11 +279,11 @@ mod tests {
             done_reply("we said gruvbox with an orange accent"),
         ]);
         let registry = search_registry(&dir);
-        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine
-            .send_message(None, "what did we say about colors?", tx)
+            .send_message(&run, None, "what did we say about colors?", tx)
             .await
             .expect("send");
 
@@ -315,11 +315,11 @@ mod tests {
             done_reply("answered from history"),
         ]);
         let registry = search_registry(&dir);
-        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         let reply = engine
-            .send_message(None, "gruvbox gruvbox gruvbox — what did we say?", tx)
+            .send_message(&run, None, "gruvbox gruvbox gruvbox — what did we say?", tx)
             .await
             .expect("send");
 
@@ -361,11 +361,11 @@ mod tests {
             done_reply("found it in the tool output"),
         ]);
         let registry = search_registry(&dir);
-        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine
-            .send_message(None, "question", tx)
+            .send_message(&run, None, "question", tx)
             .await
             .expect("send");
 
@@ -404,11 +404,11 @@ mod tests {
             done_reply("noted"),
         ]);
         let registry = search_registry(&dir);
-        let mut engine = engine_with_tools_at(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine
-            .send_message(None, "question", tx)
+            .send_message(&run, None, "question", tx)
             .await
             .expect("send");
 

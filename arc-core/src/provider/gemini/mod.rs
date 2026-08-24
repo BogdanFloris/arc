@@ -2,6 +2,7 @@ mod stream;
 
 use std::collections::HashMap;
 
+use futures::future::BoxFuture;
 use reqwest::header::ACCEPT;
 use serde::Serialize;
 
@@ -59,6 +60,10 @@ impl Provider for Gemini {
         NAME
     }
 
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     #[tracing::instrument(
         level = "info",
         name = "gemini.complete",
@@ -70,29 +75,34 @@ impl Provider for Gemini {
             messages = request.messages.len(),
         )
     )]
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
-        let payload = Payload::new(&request)?;
+    fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<'_, Result<CompletionStream, Error>> {
+        Box::pin(async move {
+            let payload = Payload::new(&request)?;
 
-        let response = self
-            .http
-            .post(format!(
-                "{}/models/{}:streamGenerateContent?alt=sse",
-                self.endpoint, request.model
+            let response = self
+                .http
+                .post(format!(
+                    "{}/models/{}:streamGenerateContent?alt=sse",
+                    self.endpoint, request.model
+                ))
+                .header(ACCEPT, "text/event-stream")
+                .header(KEY_HEADER, &self.key)
+                .json(&payload)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(failure(response).await);
+            }
+            Ok(delta_stream::deltas(
+                response,
+                stream::Parser::default(),
+                tracing::Span::current(),
             ))
-            .header(ACCEPT, "text/event-stream")
-            .header(KEY_HEADER, &self.key)
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(failure(response).await);
-        }
-        Ok(delta_stream::deltas(
-            response,
-            stream::Parser::default(),
-            tracing::Span::current(),
-        ))
+        })
     }
 }
 

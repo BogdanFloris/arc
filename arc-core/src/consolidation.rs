@@ -7,7 +7,6 @@ use std::future::Future;
 use arc_proto::v1::memory_event;
 use tokio::sync::Mutex;
 
-use crate::provider::Provider;
 use crate::session::Engine;
 use crate::store;
 
@@ -76,8 +75,8 @@ pub enum Outcome {
         counter.records_superseded = tracing::field::Empty,
     )
 )]
-pub async fn run_pass<P: Provider, E: Extractor>(
-    engine: &Mutex<Engine<P>>,
+pub async fn run_pass<E: Extractor>(
+    engine: &Mutex<Engine>,
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
@@ -118,8 +117,8 @@ pub async fn run_pass<P: Provider, E: Extractor>(
     result
 }
 
-async fn pass<P: Provider, E: Extractor>(
-    engine: &Mutex<Engine<P>>,
+async fn pass<E: Extractor>(
+    engine: &Mutex<Engine>,
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
@@ -245,12 +244,13 @@ mod tests {
     async fn a_pass_marks_the_session_and_a_second_finds_nothing_due() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -286,12 +286,13 @@ mod tests {
     async fn a_recent_session_is_not_due() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -307,12 +308,13 @@ mod tests {
     async fn activity_during_the_pass_discards_it_whole() {
         let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -331,7 +333,7 @@ mod tests {
         engine
             .lock()
             .await
-            .send_message(Some(&reply.session_id), "more", tx)
+            .send_message(&run, Some(&reply.session_id), "more", tx)
             .await
             .expect("send");
 
@@ -369,12 +371,13 @@ mod tests {
     async fn extracted_records_land_as_system_before_the_marker() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -429,12 +432,13 @@ mod tests {
     async fn a_create_and_a_supersede_show_both_counters() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -481,12 +485,13 @@ mod tests {
     async fn a_zero_yield_pass_emits_no_counters() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -508,12 +513,13 @@ mod tests {
     async fn a_failed_extraction_appends_nothing_and_names_its_session() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
             .lock()
             .await
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
@@ -532,13 +538,14 @@ mod tests {
     async fn a_skipped_session_yields_to_the_next_due() {
         let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
         let dir = TempDir::new().expect("temp dir");
-        let engine = Mutex::new(engine(&provider, &dir));
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Mutex::new(engine);
         for text in ["hi", "yo"] {
             let (tx, _rx) = channel();
             engine
                 .lock()
                 .await
-                .send_message(None, text, tx)
+                .send_message(&run, None, text, tx)
                 .await
                 .expect("send");
         }

@@ -5,16 +5,14 @@ use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
 use arc_core::projection::{self, Projection, Reader};
-use arc_core::provider::any::AnyProvider;
-use arc_core::provider::{Provider, Thinking, role_label};
+use arc_core::provider::role_label;
 use arc_core::secrets::Secrets;
-use arc_core::session::Engine;
+use arc_core::session::{Engine, Runner};
 use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use arc_core::tool::sessions::{SessionRead, SessionsSearch};
 use arc_core::tool::time::GetTime;
-use arc_proto::v1::SessionRole;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -34,8 +32,14 @@ use crate::server;
 
 pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
+    let identity = identity::load(dirs.identity()).context("loading the identity file")?;
+    if let Some(text) = &identity {
+        info!(chars = text.len(), "identity file loaded");
+    } else {
+        info!("no identity file, running without one");
+    }
     let secrets = Secrets::new(dirs.secrets());
-    let roles = match Roles::resolve(&config, sidecar.endpoint(), &secrets) {
+    let roles = match Roles::resolve(&config, sidecar.endpoint(), &secrets, identity) {
         Ok(roles) => roles,
         Err(error) => {
             sidecar.stop().await;
@@ -54,7 +58,7 @@ pub struct Daemon {
     config: Config,
     dirs: DataDirs,
 
-    engine: Arc<Mutex<Engine<AnyProvider>>>,
+    engine: Arc<Mutex<Engine>>,
 
     reads: Arc<Reader>,
 
@@ -99,13 +103,6 @@ impl Daemon {
             );
         }
 
-        let identity = identity::load(dirs.identity()).context("loading the identity file")?;
-        if let Some(text) = &identity {
-            info!(chars = text.len(), "identity file loaded");
-        } else {
-            info!("no identity file, running without one");
-        }
-
         let mut registry = Registry::new(config.max_tool_result_bytes);
         registry.register(Box::new(GetTime));
         let archive = Arc::new(
@@ -124,16 +121,7 @@ impl Daemon {
                 .with_context(|| format!("opening {} for reads", dirs.index().display()))?,
         );
 
-        let concierge = roles.concierge();
-        let engine = Engine::new(
-            store,
-            Arc::clone(&concierge.provider),
-            &concierge.model,
-            SessionRole::Concierge,
-            identity,
-            registry,
-            concierge.thinking,
-        );
+        let engine = Engine::new(store, registry);
 
         Ok(Self {
             config,
@@ -150,17 +138,13 @@ impl Daemon {
             .with_context(|| format!("binding {}", self.config.bind))?;
         let bound = listener.local_addr().unwrap_or(self.config.bind);
 
-        for (role, resolved) in [
-            (SessionRole::Concierge, self.roles.concierge()),
-            (SessionRole::Executor, self.roles.executor()),
-            (SessionRole::Archivist, self.roles.archivist()),
-        ] {
+        for runner in self.roles.all() {
             info!(
-                role = role_label(role),
-                provider = resolved.provider.name(),
-                model = resolved.model,
-                thinking = resolved.thinking.label(),
-                endpoint = resolved.provider.endpoint(),
+                role = role_label(runner.role),
+                provider = runner.provider.name(),
+                model = runner.model,
+                thinking = runner.thinking.label(),
+                endpoint = runner.provider.endpoint(),
                 "role resolved"
             );
         }
@@ -171,16 +155,20 @@ impl Daemon {
             "arcd ready"
         );
 
-        let archivist = self.roles.archivist();
         let consolidation = consolidation_task(
             self.config.consolidation,
-            &archivist.model,
-            archivist.thinking,
+            self.roles.archivist(),
             Arc::clone(&self.engine),
-            Arc::clone(&archivist.provider),
         );
 
-        server::serve(listener, self.engine, self.reads, shutdown()).await;
+        server::serve(
+            listener,
+            self.engine,
+            self.roles.concierge().clone(),
+            self.reads,
+            shutdown(),
+        )
+        .await;
 
         if let Some(task) = consolidation {
             task.abort();
@@ -193,12 +181,10 @@ impl Daemon {
 
 const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
 
-fn consolidation_task<P: Provider + 'static>(
+fn consolidation_task(
     config: ConsolidationConfig,
-    model: &str,
-    thinking: Thinking,
-    engine: Arc<Mutex<Engine<P>>>,
-    provider: Arc<P>,
+    archivist: &Runner,
+    engine: Arc<Mutex<Engine>>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
         info!("consolidation disabled");
@@ -206,9 +192,9 @@ fn consolidation_task<P: Provider + 'static>(
     }
     let idle = Duration::from_secs(config.idle_seconds);
     let extractor = ModelExtractor::new(
-        provider,
-        model,
-        thinking,
+        Arc::clone(&archivist.provider),
+        &archivist.model,
+        archivist.thinking,
         Duration::from_secs(config.timeout_seconds),
     );
     info!(
@@ -233,8 +219,8 @@ fn consolidation_task<P: Provider + 'static>(
     }))
 }
 
-async fn tick_once<P: Provider, E: Extractor>(
-    engine: &Mutex<Engine<P>>,
+async fn tick_once<E: Extractor>(
+    engine: &Mutex<Engine>,
     extractor: &E,
     cutoff: i64,
     strikes: &mut Strikes,
@@ -352,6 +338,7 @@ mod tests {
             &Config::default(),
             "http://127.0.0.1:1",
             &Secrets::new(Path::new("/nonexistent")),
+            None,
         )
         .expect("no roles configured")
     }
@@ -408,10 +395,8 @@ mod tests {
         assert!(
             consolidation_task(
                 Config::default().consolidation,
-                "test-model",
-                Thinking::Minimal,
+                daemon.roles.archivist(),
                 Arc::clone(&daemon.engine),
-                Arc::clone(&daemon.roles.archivist().provider),
             )
             .is_none(),
             "disabled by default: no task, so a tick can do nothing"
@@ -424,10 +409,8 @@ mod tests {
         };
         let task = consolidation_task(
             enabled,
-            "test-model",
-            Thinking::Minimal,
+            daemon.roles.archivist(),
             Arc::clone(&daemon.engine),
-            Arc::clone(&daemon.roles.archivist().provider),
         )
         .expect("enabled spawns the tick");
         task.abort();

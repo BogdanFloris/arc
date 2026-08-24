@@ -2,54 +2,77 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use arc_core::provider::Thinking;
-use arc_core::provider::any::AnyProvider;
-use arc_core::provider::gemini;
+use arc_core::provider::gemini::Gemini;
+use arc_core::provider::openai::OpenAiCompat;
+use arc_core::provider::sidecar::Sidecar;
+use arc_core::provider::{Provider, Thinking, gemini, role_label};
 use arc_core::secrets::Secrets;
+use arc_core::session::Runner;
+use arc_proto::v1::SessionRole;
 
 use crate::config::{Config, RoleConfig, RoleProvider};
 
-#[derive(Clone, Debug)]
-pub struct Resolved {
-    pub provider: Arc<AnyProvider>,
-    pub model: String,
-    pub thinking: Thinking,
-}
-
 #[derive(Debug)]
 pub struct Roles {
-    concierge: Resolved,
-    executor: Resolved,
-    archivist: Resolved,
+    concierge: Runner,
+    executor: Runner,
+    archivist: Runner,
 }
 
 impl Roles {
-    pub fn resolve(config: &Config, sidecar_endpoint: &str, secrets: &Secrets) -> Result<Self> {
+    pub fn resolve(
+        config: &Config,
+        sidecar_endpoint: &str,
+        secrets: &Secrets,
+        identity: Option<String>,
+    ) -> Result<Self> {
         let mut built = Built::new(sidecar_endpoint, secrets);
         Ok(Self {
-            concierge: built.role("concierge", config.roles.concierge.as_ref(), config)?,
-            executor: built.role("executor", config.roles.executor.as_ref(), config)?,
-            archivist: built.role("archivist", config.roles.archivist.as_ref(), config)?,
+            // the identity file loads for the concierge and nowhere else
+            concierge: built.role(
+                SessionRole::Concierge,
+                config.roles.concierge.as_ref(),
+                config,
+                identity,
+            )?,
+            executor: built.role(
+                SessionRole::Executor,
+                config.roles.executor.as_ref(),
+                config,
+                None,
+            )?,
+            archivist: built.role(
+                SessionRole::Archivist,
+                config.roles.archivist.as_ref(),
+                config,
+                None,
+            )?,
         })
     }
 
-    pub fn concierge(&self) -> &Resolved {
+    pub fn concierge(&self) -> &Runner {
         &self.concierge
     }
 
-    pub fn executor(&self) -> &Resolved {
+    // the job loop in 5.2 is its first caller
+    #[allow(dead_code)]
+    pub fn executor(&self) -> &Runner {
         &self.executor
     }
 
-    pub fn archivist(&self) -> &Resolved {
+    pub fn archivist(&self) -> &Runner {
         &self.archivist
+    }
+
+    pub fn all(&self) -> [&Runner; 3] {
+        [&self.concierge, &self.executor, &self.archivist]
     }
 }
 
 struct Built<'a> {
     sidecar_endpoint: &'a str,
     secrets: &'a Secrets,
-    providers: HashMap<Client, Arc<AnyProvider>>,
+    providers: HashMap<Client, Arc<dyn Provider>>,
 }
 
 // two roles on one endpoint share a client only if they also share a key
@@ -69,55 +92,67 @@ impl<'a> Built<'a> {
         }
     }
 
-    fn role(&mut self, name: &str, role: Option<&RoleConfig>, config: &Config) -> Result<Resolved> {
-        let Some(role) = role else {
-            return Ok(Resolved {
+    fn role(
+        &mut self,
+        role: SessionRole,
+        configured: Option<&RoleConfig>,
+        config: &Config,
+        system: Option<String>,
+    ) -> Result<Runner> {
+        let name = role_label(role);
+        let Some(configured) = configured else {
+            return Ok(Runner {
+                role,
                 provider: self.sidecar(),
                 model: config.model(),
                 thinking: Thinking::Default,
+                system,
             });
         };
-        let thinking = role.thinking;
-        match role.provider {
-            RoleProvider::Local => Ok(Resolved {
-                provider: self.sidecar(),
-                model: role.model.clone().unwrap_or_else(|| config.model()),
-                thinking,
-            }),
+        let thinking = configured.thinking;
+        let key = configured.key.clone();
+        let (provider, model) = match configured.provider {
+            RoleProvider::Local => (
+                self.sidecar(),
+                configured.model.clone().unwrap_or_else(|| config.model()),
+            ),
             RoleProvider::OpenAiCompat => {
-                let endpoint = role
+                let endpoint = configured
                     .endpoint
                     .clone()
                     .expect("config validation requires an endpoint for openai_compat");
-                let key = role.key.clone();
-                Ok(Resolved {
-                    provider: self.shared(name, RoleProvider::OpenAiCompat, endpoint, key)?,
-                    model: role
+                (
+                    self.shared(name, RoleProvider::OpenAiCompat, endpoint, key)?,
+                    configured
                         .model
                         .clone()
                         .expect("config validation requires a model for openai_compat"),
-                    thinking,
-                })
+                )
             }
             RoleProvider::Gemini => {
-                let endpoint = role
+                let endpoint = configured
                     .endpoint
                     .clone()
                     .unwrap_or_else(|| gemini::DEFAULT_ENDPOINT.to_owned());
-                let key = role.key.clone();
-                Ok(Resolved {
-                    provider: self.shared(name, RoleProvider::Gemini, endpoint, key)?,
-                    model: role
+                (
+                    self.shared(name, RoleProvider::Gemini, endpoint, key)?,
+                    configured
                         .model
                         .clone()
                         .expect("config validation requires a model for gemini"),
-                    thinking,
-                })
+                )
             }
-        }
+        };
+        Ok(Runner {
+            role,
+            provider,
+            model,
+            thinking,
+            system,
+        })
     }
 
-    fn sidecar(&mut self) -> Arc<AnyProvider> {
+    fn sidecar(&mut self) -> Arc<dyn Provider> {
         self.shared(
             "sidecar",
             RoleProvider::Local,
@@ -133,7 +168,7 @@ impl<'a> Built<'a> {
         kind: RoleProvider,
         endpoint: String,
         key: Option<String>,
-    ) -> Result<Arc<AnyProvider>> {
+    ) -> Result<Arc<dyn Provider>> {
         let client = Client {
             kind,
             endpoint,
@@ -152,14 +187,17 @@ impl<'a> Built<'a> {
                     .with_context(|| format!("the key for the `{name}` role"))
             })
             .transpose()?;
-        let provider = Arc::new(match kind {
-            RoleProvider::Local => AnyProvider::local(&client.endpoint),
-            RoleProvider::OpenAiCompat => AnyProvider::openai_compat(&client.endpoint, key),
-            RoleProvider::Gemini => AnyProvider::gemini(
+        let provider: Arc<dyn Provider> = match kind {
+            RoleProvider::Local => Arc::new(Sidecar::new(&client.endpoint)),
+            RoleProvider::OpenAiCompat => Arc::new(match key {
+                Some(key) => OpenAiCompat::keyed(&client.endpoint, key),
+                None => OpenAiCompat::new(&client.endpoint),
+            }),
+            RoleProvider::Gemini => Arc::new(Gemini::new(
                 &client.endpoint,
                 key.expect("config validation requires a key for gemini"),
-            ),
-        });
+            )),
+        };
         self.providers.insert(client, Arc::clone(&provider));
         Ok(provider)
     }
@@ -169,7 +207,6 @@ impl<'a> Built<'a> {
 mod tests {
     use super::Roles;
     use crate::config::Config;
-    use arc_core::provider::Provider as _;
     use arc_core::secrets::Secrets;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -191,7 +228,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         }
         let config: Config = toml::from_str(text).expect("parses");
-        Roles::resolve(&config, SIDECAR, &Secrets::new(dir))
+        Roles::resolve(&config, SIDECAR, &Secrets::new(dir), None)
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod stream;
 
+use futures::future::BoxFuture;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Serialize;
 
@@ -62,6 +63,10 @@ impl Provider for OpenAiCompat {
         NAME
     }
 
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     #[tracing::instrument(
         level = "info",
         name = "openai.complete",
@@ -73,26 +78,31 @@ impl Provider for OpenAiCompat {
             messages = request.messages.len(),
         )
     )]
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream, Error> {
-        let payload = Payload::new(&request)?;
+    fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<'_, Result<CompletionStream, Error>> {
+        Box::pin(async move {
+            let payload = Payload::new(&request)?;
 
-        let mut request = self
-            .http
-            .post(format!("{}{COMPLETIONS_PATH}", self.endpoint))
-            .header(ACCEPT, "text/event-stream");
-        if let Some(key) = &self.key {
-            request = request.header(AUTHORIZATION, format!("Bearer {key}"));
-        }
-        let response = request.json(&payload).send().await?;
+            let mut request = self
+                .http
+                .post(format!("{}{COMPLETIONS_PATH}", self.endpoint))
+                .header(ACCEPT, "text/event-stream");
+            if let Some(key) = &self.key {
+                request = request.header(AUTHORIZATION, format!("Bearer {key}"));
+            }
+            let response = request.json(&payload).send().await?;
 
-        if !response.status().is_success() {
-            return Err(failure(response).await);
-        }
-        Ok(delta_stream::deltas(
-            response,
-            stream::Parser::default(),
-            tracing::Span::current(),
-        ))
+            if !response.status().is_success() {
+                return Err(failure(response).await);
+            }
+            Ok(delta_stream::deltas(
+                response,
+                stream::Parser::default(),
+                tracing::Span::current(),
+            ))
+        })
     }
 }
 

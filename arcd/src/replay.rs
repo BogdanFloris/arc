@@ -26,9 +26,10 @@ pub async fn run(
 
     // replaying extraction is archivist work, so it runs on the archivist's model
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
-    let roles = Roles::resolve(&config, &endpoint, &Secrets::new(dirs.secrets()))?;
+    let roles = Roles::resolve(&config, &endpoint, &Secrets::new(dirs.secrets()), None)?;
     let archivist = roles.archivist();
-    let sidecar = match archivist.provider.is_local() {
+    // asking the endpoint, not the provider: only the sidecar needs spawning
+    let sidecar = match archivist.provider.endpoint() == endpoint {
         true if probe(&endpoint).await => {
             info!(%endpoint, "using the already-running llama endpoint");
             None

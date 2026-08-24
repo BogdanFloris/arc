@@ -20,14 +20,21 @@ use crate::tool::{Registry, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
-pub struct Engine<P> {
+/// Who is running a turn. Resolved once per role and handed to the engine
+/// with each turn, so one log can serve a conversation and a job at once.
+#[derive(Clone, Debug)]
+pub struct Runner {
+    pub role: SessionRole,
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub thinking: Thinking,
+    /// The identity file. Concierge only: a job has no voice to pay for.
+    pub system: Option<String>,
+}
+
+pub struct Engine {
     store: Store,
-    provider: Arc<P>,
-    model: String,
-    role: SessionRole,
-    system: Option<String>,
     registry: Registry,
-    thinking: Thinking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,25 +88,9 @@ pub enum Error {
     EmptyReply,
 }
 
-impl<P: Provider> Engine<P> {
-    pub fn new(
-        store: Store,
-        provider: Arc<P>,
-        model: &str,
-        role: SessionRole,
-        system: Option<String>,
-        registry: Registry,
-        thinking: Thinking,
-    ) -> Self {
-        Self {
-            store,
-            provider,
-            model: model.to_owned(),
-            role,
-            system,
-            registry,
-            thinking,
-        }
+impl Engine {
+    pub fn new(store: Store, registry: Registry) -> Self {
+        Self { store, registry }
     }
 
     #[tracing::instrument(
@@ -107,9 +98,9 @@ impl<P: Provider> Engine<P> {
         name = "session.send_message",
         skip_all,
         fields(
-            model = %self.model,
-            role = provider::role_label(self.role),
-            thinking = self.thinking.label(),
+            model = %runner.model,
+            role = provider::role_label(runner.role),
+            thinking = runner.thinking.label(),
             session_id = tracing::field::Empty,
             new_session = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -124,6 +115,7 @@ impl<P: Provider> Engine<P> {
     )]
     pub async fn send_message(
         &mut self,
+        runner: &Runner,
         session_id: Option<&str>,
         content: &str,
         events: mpsc::Sender<EngineEvent>,
@@ -141,7 +133,7 @@ impl<P: Provider> Engine<P> {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         if !new_session {
-            self.enforce_pin(&session_id)?;
+            self.enforce_pin(runner, &session_id)?;
         }
 
         if new_session {
@@ -150,9 +142,9 @@ impl<P: Provider> Engine<P> {
                 session_event::Event::SessionCreated(SessionCreated {
                     session_id: session_id.clone(),
                     title: String::new(),
-                    provider: self.provider.name().to_owned(),
-                    model: self.model.clone(),
-                    role: self.role as i32,
+                    provider: runner.provider.name().to_owned(),
+                    model: runner.model.clone(),
+                    role: runner.role as i32,
                     project: String::new(),
                     budget: None,
                 }),
@@ -175,7 +167,7 @@ impl<P: Provider> Engine<P> {
             })
             .await;
 
-        let (mut transcript, system) = self.open_turn(&session_id)?;
+        let (mut transcript, system) = self.open_turn(runner, &session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
         let mut memory = MemoryCounters::default();
@@ -183,10 +175,11 @@ impl<P: Provider> Engine<P> {
         let reply = loop {
             // the last step offers no tools, so the model has to answer
             let last_step = steps >= MAX_TOOL_STEPS;
-            let request = self.completion_request(system.clone(), transcript.clone(), last_step);
+            let request =
+                self.completion_request(runner, system.clone(), transcript.clone(), last_step);
 
             let (ending, text, calls) = self
-                .run_completion(request, &events, &mut total_usage)
+                .run_completion(runner, request, &events, &mut total_usage)
                 .await?;
 
             match ending {
@@ -246,11 +239,12 @@ impl<P: Provider> Engine<P> {
 
     async fn run_completion(
         &mut self,
+        runner: &Runner,
         request: CompletionRequest,
         events: &mpsc::Sender<EngineEvent>,
         total_usage: &mut Option<Usage>,
     ) -> Result<(Ending, String, Vec<ToolCall>), Error> {
-        let mut stream = self.provider.complete(request).await?;
+        let mut stream = runner.provider.complete(request).await?;
         let mut text = String::new();
         let mut calls = Vec::new();
         let ending = loop {
@@ -383,15 +377,15 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
-    fn enforce_pin(&self, session_id: &str) -> Result<(), Error> {
+    fn enforce_pin(&self, runner: &Runner, session_id: &str) -> Result<(), Error> {
         match self.store.projection().session_role(session_id)? {
-            Some(pinned) if pinned == self.role as i32 => Ok(()),
+            Some(pinned) if pinned == runner.role as i32 => Ok(()),
             // sessions logged before roles exist stay unpinned
             Some(pinned) if pinned == SessionRole::Unspecified as i32 => Ok(()),
             Some(pinned) => Err(Error::RoleMismatch {
                 session_id: session_id.to_owned(),
                 pinned: role_name(pinned),
-                serving: provider::role_label(self.role).to_owned(),
+                serving: provider::role_label(runner.role).to_owned(),
             }),
             None => Ok(()),
         }
@@ -399,9 +393,9 @@ impl<P: Provider> Engine<P> {
 
     // stable first, volatile after: everything here is prefix the provider caches,
     // so anything that changes per turn has to go in the messages instead
-    fn system_prompt(&self, memory_index: Option<&str>) -> Option<String> {
+    fn system_prompt(runner: &Runner, memory_index: Option<&str>) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
-        if let Some(identity) = &self.system {
+        if let Some(identity) = &runner.system {
             parts.push(identity);
         }
         if let Some(index) = memory_index {
@@ -474,9 +468,14 @@ impl<P: Provider> Engine<P> {
         )
     }
 
-    fn open_turn(&mut self, session_id: &str) -> Result<(Vec<Message>, Option<String>), Error> {
+    fn open_turn(
+        &mut self,
+        runner: &Runner,
+        session_id: &str,
+    ) -> Result<(Vec<Message>, Option<String>), Error> {
         let rows = self.store.projection().messages(session_id)?;
-        let system = self.system_prompt(
+        let system = Self::system_prompt(
+            runner,
             render_memory_index(&self.store.projection().memory_index()?).as_deref(),
         );
         Ok((rebuild_transcript(&rows), system))
@@ -484,14 +483,15 @@ impl<P: Provider> Engine<P> {
 
     fn completion_request(
         &self,
+        runner: &Runner,
         system: Option<String>,
         messages: Vec<Message>,
         last_step: bool,
     ) -> CompletionRequest {
         CompletionRequest {
-            model: self.model.clone(),
-            role: self.role,
-            thinking: self.thinking,
+            model: runner.model.clone(),
+            role: runner.role,
+            thinking: runner.thinking,
             system,
             messages,
             tools: if last_step {
@@ -692,11 +692,11 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters};
+    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, Runner};
     use crate::log::Log;
     use crate::projection::Projection;
     use crate::provider::{
-        CompletionDelta, Error as ProviderError, Message, Stop, Thinking, ToolCall, Usage,
+        CompletionDelta, Error as ProviderError, Message, Provider, Stop, Thinking, ToolCall, Usage,
     };
     use crate::store::{self, Store};
     use crate::testkit::{
@@ -766,11 +766,11 @@ mod tests {
     async fn a_new_session_logs_created_user_and_assistant() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, mut rx) = channel();
 
         let reply = engine
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send_message");
 
@@ -830,16 +830,16 @@ mod tests {
         let provider =
             ScriptedProvider::scripted(vec![done_reply("first reply"), done_reply("second reply")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
 
         let (tx, _rx) = channel();
         let first = engine
-            .send_message(None, "one", tx)
+            .send_message(&run, None, "one", tx)
             .await
             .expect("first send");
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&first.session_id), "two", tx)
+            .send_message(&run, Some(&first.session_id), "two", tx)
             .await
             .expect("second send");
 
@@ -879,11 +879,11 @@ mod tests {
             ],
         );
         let provider = ScriptedProvider::scripted(vec![done_reply("never sent")]);
-        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (mut engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
 
         let err = engine
-            .send_message(Some("s-01"), "continue", tx)
+            .send_message(&run, Some("s-01"), "continue", tx)
             .await
             .expect_err("a concierge engine must refuse an executor session");
 
@@ -909,11 +909,11 @@ mod tests {
             vec![seeded_session(), seeded_message(Role::User, "earlier")],
         );
         let provider = ScriptedProvider::scripted(vec![done_reply("continued")]);
-        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (mut engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
 
         let reply = engine
-            .send_message(Some("s-01"), "again", tx)
+            .send_message(&run, Some("s-01"), "again", tx)
             .await
             .expect("a session logged before roles exist pins nothing");
 
@@ -927,17 +927,17 @@ mod tests {
     async fn sessions_lists_what_send_message_created() {
         let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         assert_eq!(engine.sessions().expect("sessions"), []);
 
         let (tx, _rx) = channel();
         let first = engine
-            .send_message(None, "a", tx)
+            .send_message(&run, None, "a", tx)
             .await
             .expect("first send");
         let (tx, _rx) = channel();
         let second = engine
-            .send_message(None, "b", tx)
+            .send_message(&run, None, "b", tx)
             .await
             .expect("second send");
 
@@ -957,10 +957,13 @@ mod tests {
             "partial tex".to_owned(),
         ))]]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert!(reply.partial);
         assert_eq!(reply.usage, None);
@@ -985,11 +988,11 @@ mod tests {
             Err(ProviderError::MalformedStream("boom".to_owned())),
         ]]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
         let err = engine
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect_err("must surface");
 
@@ -1007,11 +1010,11 @@ mod tests {
             "instant".to_owned(),
         ))]]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
         let err = engine
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect_err("must surface");
 
@@ -1028,11 +1031,11 @@ mod tests {
     async fn a_cut_before_any_text_is_an_empty_reply() {
         let provider = ScriptedProvider::scripted(vec![vec![]]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
         let err = engine
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect_err("must surface");
 
@@ -1044,11 +1047,14 @@ mod tests {
     async fn a_dropped_receiver_does_not_lose_the_append() {
         let provider = ScriptedProvider::scripted(vec![done_reply("nobody watched")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, rx) = channel();
         drop(rx);
 
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert!(!reply.partial);
         let events = replay_log(dir.path());
@@ -1059,11 +1065,11 @@ mod tests {
     async fn an_empty_message_is_refused_before_anything_is_appended() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
         let err = engine
-            .send_message(None, "  \n\t ", tx)
+            .send_message(&run, None, "  \n\t ", tx)
             .await
             .expect_err("must refuse");
 
@@ -1076,7 +1082,7 @@ mod tests {
     async fn an_unmappable_role_in_history_is_skipped() {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
 
         engine
             .record(
@@ -1107,7 +1113,7 @@ mod tests {
 
         let (tx, _rx) = channel();
         engine
-            .send_message(Some("s-old"), "hi", tx)
+            .send_message(&run, Some("s-old"), "hi", tx)
             .await
             .expect("send");
 
@@ -1123,10 +1129,14 @@ mod tests {
             done_reply("answer"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, mut rx) = channel();
 
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(
             reply.usage,
@@ -1209,12 +1219,12 @@ mod tests {
             done_reply("answer"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine =
+        let (mut engine, run) =
             engine_with_tools_at(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
 
         let session_id = engine
-            .send_message(None, "hi", tx)
+            .send_message(&run, None, "hi", tx)
             .await
             .expect("send")
             .session_id;
@@ -1234,10 +1244,11 @@ mod tests {
         // a resumed session rebuilds its transcript from the log, so the bytes
         // have to come back out of the projection, not out of memory
         let resumed = ScriptedProvider::scripted(vec![done_reply("still here")]);
-        let mut engine = reopened_engine(&resumed, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            reopened_engine(&resumed, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&session_id), "again", tx)
+            .send_message(&run, Some(&session_id), "again", tx)
             .await
             .expect("resume");
 
@@ -1267,10 +1278,13 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let registry = tools(&[("alpha", "A", true), ("beta", "B", true)]);
-        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let events = replay_log(dir.path());
         let first = issued(&events[2]);
@@ -1313,10 +1327,13 @@ mod tests {
             done_reply("ok"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (mut engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let events = replay_log(dir.path());
         let ids: Vec<&str> = events
@@ -1352,19 +1369,22 @@ mod tests {
             done_reply("first"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (mut engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
         drop(engine);
 
         let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("dup", 0, "alpha", "{}")), Ok(tool_stop())],
             done_reply("second"),
         ]);
-        let mut engine = reopened_engine(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (mut engine, run) = reopened_engine(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "again", tx)
+            .send_message(&run, Some(&reply.session_id), "again", tx)
             .await
             .expect("send after restart");
 
@@ -1397,10 +1417,10 @@ mod tests {
         );
 
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (mut engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
         engine
-            .send_message(Some("s-01"), "again", tx)
+            .send_message(&run, Some("s-01"), "again", tx)
             .await
             .expect("send");
 
@@ -1443,10 +1463,10 @@ mod tests {
         );
 
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (mut engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
         engine
-            .send_message(Some("s-01"), "again", tx)
+            .send_message(&run, Some("s-01"), "again", tx)
             .await
             .expect("send");
 
@@ -1493,7 +1513,7 @@ mod tests {
             ],
         );
         let provider = ScriptedProvider::scripted(vec![]);
-        let engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (engine, _run) = reopened_engine(&provider, &dir, Registry::new(512));
 
         assert_eq!(
             engine.transcript("s-01").expect("transcript"),
@@ -1524,19 +1544,21 @@ mod tests {
             done_reply("final text"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
         let reply = engine
-            .send_message(None, "question", tx)
+            .send_message(&run, None, "question", tx)
             .await
             .expect("send");
         drop(engine);
 
         let provider = ScriptedProvider::scripted(vec![done_reply("hello again")]);
-        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "again", tx)
+            .send_message(&run, Some(&reply.session_id), "again", tx)
             .await
             .expect("send after restart");
 
@@ -1578,10 +1600,13 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let registry = tools(&[("fails", "ERROR: nope", false)]);
-        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
         let (tx, mut rx) = channel();
 
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
         assert!(!reply.partial);
 
         let events = replay_log(dir.path());
@@ -1606,10 +1631,13 @@ mod tests {
             done_reply("final"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (mut engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let events = replay_log(dir.path());
         assert_eq!(events.len(), 6);
@@ -1634,10 +1662,13 @@ mod tests {
         script.push(done_reply("enough"));
         let provider = ScriptedProvider::scripted(script);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (mut engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
         let (tx, _rx) = channel();
 
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let requests = provider.requests();
         assert_eq!(requests.len(), MAX_TOOL_STEPS + 1);
@@ -1666,10 +1697,13 @@ mod tests {
             }),
         ]]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, mut rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let forwarded = drain(&mut rx);
         assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
@@ -1691,10 +1725,13 @@ mod tests {
             content: "0123456789abcdef",
             ok: true,
         }));
-        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         let events = replay_log(dir.path());
         let result = resulted(&events[3]);
@@ -1709,18 +1746,20 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
-        let mut engine = Engine::new(
-            Store::new(log, projection),
-            Arc::clone(&provider),
-            "test-model",
-            SessionRole::Concierge,
-            Some("be terse".to_owned()),
-            Registry::new(512),
-            Thinking::Minimal,
-        );
+        let mut engine = Engine::new(Store::new(log, projection), Registry::new(512));
+        let run = Runner {
+            role: SessionRole::Concierge,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "test-model".to_owned(),
+            thinking: Thinking::Minimal,
+            system: Some("be terse".to_owned()),
+        };
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(
             provider.requests()[0].system.as_deref(),
@@ -1736,21 +1775,23 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
-        let mut engine = Engine::new(
-            Store::new(log, projection),
-            Arc::clone(&provider),
-            "test-model",
-            SessionRole::Executor,
-            None,
-            Registry::new(512),
-            Thinking::Default,
-        );
+        let mut engine = Engine::new(Store::new(log, projection), Registry::new(512));
+        let run = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "test-model".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
 
         let (tx, _rx) = channel();
-        let reply = engine.send_message(None, "hi", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "again", tx)
+            .send_message(&run, Some(&reply.session_id), "again", tx)
             .await
             .expect("send");
 
@@ -1812,13 +1853,17 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
-        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found", true)]));
+        let (mut engine, run) =
+            reopened_engine(&provider, &dir, tools(&[("lookup", "found", true)]));
 
         let (tx, _rx) = channel();
-        let reply = engine.send_message(None, "first", tx).await.expect("send");
+        let reply = engine
+            .send_message(&run, None, "first", tx)
+            .await
+            .expect("send");
         let (tx2, _rx2) = channel();
         engine
-            .send_message(Some(&reply.session_id), "second", tx2)
+            .send_message(&run, Some(&reply.session_id), "second", tx2)
             .await
             .expect("send");
 
@@ -1849,10 +1894,11 @@ mod tests {
 
         // the index is rebuilt by replay, so a restart is where an ordering bug shows
         let restarted = ScriptedProvider::scripted(vec![done_reply("third")]);
-        let mut engine = reopened_engine(&restarted, &dir, tools(&[("lookup", "found", true)]));
+        let (mut engine, run) =
+            reopened_engine(&restarted, &dir, tools(&[("lookup", "found", true)]));
         let (tx3, _rx3) = channel();
         engine
-            .send_message(Some(&reply.session_id), "third", tx3)
+            .send_message(&run, Some(&reply.session_id), "third", tx3)
             .await
             .expect("send");
 
@@ -1868,10 +1914,13 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
-        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (mut engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(
             provider.requests()[0].system,
@@ -1887,11 +1936,12 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, seeded_records());
-        let mut engine = reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
 
         engine
-            .send_message(None, "question", tx)
+            .send_message(&run, None, "question", tx)
             .await
             .expect("send");
 
@@ -1906,10 +1956,13 @@ mod tests {
     async fn no_records_means_no_block() {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine(&provider, &dir);
+        let (mut engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(provider.requests()[0].system.as_deref(), Some("be terse"));
     }
@@ -1922,18 +1975,20 @@ mod tests {
         let log = Log::open(dir.path()).expect("open log");
         let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        let mut engine = Engine::new(
-            Store::new(log, projection),
-            Arc::clone(&provider),
-            "test-model",
-            SessionRole::Concierge,
-            None,
-            Registry::new(512),
-            Thinking::Default,
-        );
+        let mut engine = Engine::new(Store::new(log, projection), Registry::new(512));
+        let run = Runner {
+            role: SessionRole::Concierge,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "test-model".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(provider.requests()[0].system, Some(seeded_block()));
     }
@@ -2019,12 +2074,12 @@ mod tests {
             ("memory_search", SEARCH_HIT, true),
             ("memory_read", "the full body", true),
         ]);
-        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
 
         let capture = TraceCapture::start();
         let (tx, _rx) = channel();
         engine
-            .send_message(None, "what palette?", tx)
+            .send_message(&run, None, "what palette?", tx)
             .await
             .expect("send");
         let trace = capture.finish();
@@ -2048,7 +2103,7 @@ mod tests {
             done_reply("answered from the summary"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(
+        let (mut engine, run) = engine_with_tools(
             &provider,
             &dir,
             tools(&[("memory_search", SEARCH_HIT, true)]),
@@ -2056,7 +2111,10 @@ mod tests {
 
         let capture = TraceCapture::start();
         let (tx, _rx) = channel();
-        engine.send_message(None, "hm", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hm", tx)
+            .await
+            .expect("send");
         let trace = capture.finish();
 
         assert_eq!(counter_samples(&trace, "memory_searches"), [1.0]);
@@ -2086,12 +2144,12 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let mut registry = Registry::new(512);
         registry.register(Box::new(crate::tool::memory::MemoryWrite));
-        let mut engine = engine_with_tools(&provider, &dir, registry);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
 
         let capture = TraceCapture::start();
         let (tx, _rx) = channel();
         engine
-            .send_message(None, "remember this", tx)
+            .send_message(&run, None, "remember this", tx)
             .await
             .expect("send");
         let trace = capture.finish();
@@ -2159,12 +2217,12 @@ mod tests {
         seed_memory_log(&dir, seeded_records());
         let mut registry = Registry::new(512);
         registry.register(Box::new(Superseder));
-        let mut engine = reopened_engine(&provider, &dir, registry);
+        let (mut engine, run) = reopened_engine(&provider, &dir, registry);
 
         let capture = TraceCapture::start();
         let (tx, _rx) = channel();
         engine
-            .send_message(None, "that changed", tx)
+            .send_message(&run, None, "that changed", tx)
             .await
             .expect("send");
         let trace = capture.finish();
@@ -2180,11 +2238,15 @@ mod tests {
             done_reply("plain answer"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found", true)]));
+        let (mut engine, run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found", true)]));
 
         let capture = TraceCapture::start();
         let (tx, _rx) = channel();
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
         let trace = capture.finish();
 
         for name in TURN_COUNTERS {
@@ -2203,18 +2265,20 @@ mod tests {
         let log = Log::open(dir.path()).expect("open log");
         let mut projection = Projection::in_memory().expect("open projection");
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        let mut engine = Engine::new(
-            Store::new(log, projection),
-            Arc::clone(&provider),
-            "test-model",
-            SessionRole::Concierge,
-            Some("be terse".to_owned()),
-            Registry::new(512),
-            Thinking::Minimal,
-        );
+        let mut engine = Engine::new(Store::new(log, projection), Registry::new(512));
+        let run = Runner {
+            role: SessionRole::Concierge,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "test-model".to_owned(),
+            thinking: Thinking::Minimal,
+            system: Some("be terse".to_owned()),
+        };
         let (tx, _rx) = channel();
 
-        engine.send_message(None, "hi", tx).await.expect("send");
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
 
         assert_eq!(
             provider.requests()[0].system,
@@ -2222,7 +2286,7 @@ mod tests {
         );
     }
 
-    fn review_engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
+    fn review_engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> (Engine, Runner) {
         seed_memory_log_at(dir, seeded_records(), 1_700_000_000_000_000);
         reopened_engine(provider, dir, Registry::new(512))
     }
@@ -2240,7 +2304,7 @@ mod tests {
     async fn review_accept_appends_a_user_reviewed_event_and_clears_the_queue() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = review_engine(&provider, &dir);
+        let (mut engine, _run) = review_engine(&provider, &dir);
 
         let queued: Vec<String> = engine
             .store()
@@ -2291,7 +2355,7 @@ mod tests {
     async fn review_delete_appends_a_user_deleted_event_and_removes_the_record() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = review_engine(&provider, &dir);
+        let (mut engine, _run) = review_engine(&provider, &dir);
 
         engine.store_mut().review_delete("mr-pref").expect("delete");
 
@@ -2318,7 +2382,7 @@ mod tests {
     async fn a_verdict_for_an_unknown_record_is_refused_before_the_log() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = review_engine(&provider, &dir);
+        let (mut engine, _run) = review_engine(&provider, &dir);
         let before = replay_events(dir.path()).len();
 
         let accept = engine.store_mut().review_accept("mr-ghost");

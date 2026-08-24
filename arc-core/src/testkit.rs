@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use arc_proto::v1::{Role, SessionRole, memory_event, session_event};
+use futures::future::BoxFuture;
 use futures::stream;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -16,10 +17,11 @@ use crate::provider::{
     CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
     Provider, Stop, Thinking, ToolCall, ToolDefinition, Usage,
 };
-use crate::session::{Engine, EngineEvent};
+use crate::session::{Engine, EngineEvent, Runner};
 use crate::store::Store;
 use crate::tool::{Registry, Tool, ToolReply, TurnContext};
 
+#[derive(Debug)]
 pub struct ScriptedProvider {
     script: Mutex<VecDeque<Vec<Result<CompletionDelta, ProviderError>>>>,
     captured: Mutex<Vec<CompletionRequest>>,
@@ -43,10 +45,10 @@ impl Provider for ScriptedProvider {
         "scripted"
     }
 
-    async fn complete(
+    fn complete(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionStream, ProviderError> {
+    ) -> BoxFuture<'_, Result<CompletionStream, ProviderError>> {
         self.captured.lock().expect("captured").push(request);
         let items = self
             .script
@@ -54,7 +56,7 @@ impl Provider for ScriptedProvider {
             .expect("script")
             .pop_front()
             .expect("script exhausted");
-        Ok(Box::pin(stream::iter(items)))
+        Box::pin(async move { Ok(Box::pin(stream::iter(items)) as CompletionStream) })
     }
 }
 
@@ -82,35 +84,30 @@ pub fn turn(message: &Message) -> (Role, &str) {
     }
 }
 
-pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> Engine<ScriptedProvider> {
-    let log = Log::open(dir.path()).expect("open log");
-    let projection = Projection::in_memory().expect("open projection");
-    Engine::new(
-        Store::new(log, projection),
-        Arc::clone(provider),
-        "test-model",
-        SessionRole::Concierge,
-        Some("be terse".to_owned()),
-        Registry::new(512),
-        Thinking::Default,
-    )
+pub fn runner(provider: &Arc<ScriptedProvider>) -> Runner {
+    Runner {
+        role: SessionRole::Concierge,
+        provider: Arc::clone(provider) as Arc<dyn Provider>,
+        model: "test-model".to_owned(),
+        thinking: Thinking::Default,
+        system: Some("be terse".to_owned()),
+    }
+}
+
+pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> (Engine, Runner) {
+    engine_with_tools(provider, dir, Registry::new(512))
 }
 
 pub fn engine_with_tools(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
-) -> Engine<ScriptedProvider> {
+) -> (Engine, Runner) {
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::in_memory().expect("open projection");
-    Engine::new(
-        Store::new(log, projection),
-        Arc::clone(provider),
-        "test-model",
-        SessionRole::Concierge,
-        Some("be terse".to_owned()),
-        registry,
-        Thinking::Default,
+    (
+        Engine::new(Store::new(log, projection), registry),
+        runner(provider),
     )
 }
 
@@ -118,18 +115,13 @@ pub fn engine_with_tools_at(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
-) -> Engine<ScriptedProvider> {
+) -> (Engine, Runner) {
     let log = Log::open(dir.path()).expect("open log");
     let mut projection = Projection::open(&dir.path().join("index.db")).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-    Engine::new(
-        Store::new(log, projection),
-        Arc::clone(provider),
-        "test-model",
-        SessionRole::Concierge,
-        Some("be terse".to_owned()),
-        registry,
-        Thinking::Default,
+    (
+        Engine::new(Store::new(log, projection), registry),
+        runner(provider),
     )
 }
 
@@ -137,18 +129,13 @@ pub fn reopened_engine(
     provider: &Arc<ScriptedProvider>,
     dir: &TempDir,
     registry: Registry,
-) -> Engine<ScriptedProvider> {
+) -> (Engine, Runner) {
     let log = Log::open(dir.path()).expect("reopen log");
     let mut projection = Projection::in_memory().expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-    Engine::new(
-        Store::new(log, projection),
-        Arc::clone(provider),
-        "test-model",
-        SessionRole::Concierge,
-        Some("be terse".to_owned()),
-        registry,
-        Thinking::Default,
+    (
+        Engine::new(Store::new(log, projection), registry),
+        runner(provider),
     )
 }
 
@@ -411,11 +398,12 @@ mod tests {
             done_reply("second reply"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let mut engine = engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (mut engine, run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, mut rx) = channel();
 
         let reply = engine
-            .send_message(None, "question", tx)
+            .send_message(&run, None, "question", tx)
             .await
             .expect("send");
 
@@ -509,7 +497,7 @@ mod tests {
 
         let (tx, _rx) = channel();
         engine
-            .send_message(Some(&reply.session_id), "again", tx)
+            .send_message(&run, Some(&reply.session_id), "again", tx)
             .await
             .expect("second send");
         let requests = provider.requests();

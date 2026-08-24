@@ -1,14 +1,14 @@
-pub mod any;
 pub mod gemini;
 pub mod openai;
+pub mod sidecar;
 pub mod sse;
 pub(crate) mod stream;
 
-use std::future::Future;
 use std::pin::Pin;
 
 use arc_proto::v1::{Role, SessionRole};
 use futures::Stream;
+use futures::future::BoxFuture;
 
 const MAX_BODY_SNIPPET: usize = 512;
 
@@ -126,13 +126,19 @@ pub struct Usage {
 
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<CompletionDelta, Error>> + Send>>;
 
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &'static str;
+
+    /// Only for the startup log; a test double has nowhere to point.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn endpoint(&self) -> &str {
+        ""
+    }
 
     fn complete(
         &self,
         request: CompletionRequest,
-    ) -> impl Future<Output = Result<CompletionStream, Error>> + Send;
+    ) -> BoxFuture<'_, Result<CompletionStream, Error>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -223,11 +229,14 @@ pub(crate) fn snippet(body: &str) -> String {
 mod tests {
     use futures::{StreamExt, stream};
 
+    use futures::future::BoxFuture;
+
     use super::{
         CompletionDelta, CompletionRequest, CompletionStream, Error, MAX_BODY_SNIPPET, Message,
         Provider, Role, SessionRole, Stop, Thinking, ToolCall, Usage,
     };
 
+    #[derive(Debug)]
     struct MockProvider {
         items: Vec<Result<CompletionDelta, Error>>,
         setup_failure: Option<&'static str>,
@@ -254,19 +263,24 @@ mod tests {
             "mock"
         }
 
-        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionStream, Error> {
-            if let Some(reason) = self.setup_failure {
-                return Err(Error::Auth(reason.to_owned()));
-            }
-            let items: Vec<_> = self
-                .items
-                .iter()
-                .map(|item| match item {
-                    Ok(delta) => Ok(delta.clone()),
-                    Err(err) => Err(Error::MalformedStream(err.to_string())),
-                })
-                .collect();
-            Ok(Box::pin(stream::iter(items)))
+        fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> BoxFuture<'_, Result<CompletionStream, Error>> {
+            Box::pin(async move {
+                if let Some(reason) = self.setup_failure {
+                    return Err(Error::Auth(reason.to_owned()));
+                }
+                let items: Vec<_> = self
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        Ok(delta) => Ok(delta.clone()),
+                        Err(err) => Err(Error::MalformedStream(err.to_string())),
+                    })
+                    .collect();
+                Ok(Box::pin(stream::iter(items)) as CompletionStream)
+            })
         }
     }
 
