@@ -54,7 +54,11 @@ Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not 
 
 Keep thinking as low as the model allows on the concierge. It adds latency, and on Gemini it is also most of the bill.
 
-Measured 2026-08-24 against 3.7 Flash. Thinking cannot be switched off: `none` still thinks and `minimal` is rejected for this model. `reasoning_effort: low` is a cap the model may use rather than a setting — six runs of one chat turn gave 24, 37, 282, 289, 303 and 320 output tokens, against 295–390 with the field unset. It is never worse than unset and sometimes collapses to almost nothing, so it is worth setting, but a single turn tells you nothing. `extra_body.google.thinking_config.thinking_level` reaches the same control and the two cannot be sent together; we send `reasoning_effort` because it is a flat field and leaves the `extra_body.google` envelope free for `cached_content`.
+Measured 2026-08-24. **`minimal` is the only level that stops thinking, and it is a model capability, not an API one** — 3.6, 3.5 and 3-flash-preview have it; 3.7 Flash and `gemini-flash-latest` answer `Thinking level MINIMAL is not supported for this model` on the native and OpenAI-compatible paths alike. That is why the concierge runs 3.6 rather than the newer 3.7.
+
+Five runs of one chat turn, output tokens: **3.6 on `minimal` gave 28–33**, 3.7 on `low` gave 31–337, 3.6 on `low` gave 334–410. `low` is a cap the model may use rather than a level it obeys, so it is bimodal and a single turn tells you nothing; `minimal` is flat and predictable, and it takes the thinking latency out of a role that will front a voice client. `none` is not `minimal`: it still thinks.
+
+`extra_body.google.thinking_config.thinking_level` reaches the same control and the two cannot be sent together; we send `reasoning_effort` because it is a flat field and leaves the `extra_body.google` envelope free for `cached_content`.
 
 Thinking is billed and never streamed, so `completion_tokens` under-reports output by about five times. The real figure is `total_tokens - prompt_tokens`, and every estimate in this file predates that correction.
 

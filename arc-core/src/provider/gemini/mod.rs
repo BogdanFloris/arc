@@ -201,6 +201,9 @@ impl<'a> Payload<'a> {
             reasoning_effort: match request.thinking {
                 Thinking::Default => None,
                 Thinking::Off => Some("none"),
+                // only some models have it, and it is the one level that
+                // actually stops thinking; 3.7 Flash answers 400
+                Thinking::Minimal => Some("minimal"),
                 Thinking::Low => Some("low"),
                 Thinking::Medium => Some("medium"),
                 Thinking::High => Some("high"),

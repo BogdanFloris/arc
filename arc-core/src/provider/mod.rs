@@ -39,6 +39,7 @@ pub enum Thinking {
     #[default]
     Default,
     Off,
+    Minimal,
     Low,
     Medium,
     High,
@@ -49,6 +50,7 @@ impl Thinking {
         match self {
             Self::Default => "default",
             Self::Off => "off",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
