@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     project        TEXT,
     title          TEXT,
     started_at     INTEGER,
-    consolidated_through INTEGER
+    consolidated_through INTEGER,
+    role           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -394,6 +395,18 @@ impl Projection {
             .transpose()
     }
 
+    pub(crate) fn session_role(&self, session_id: &str) -> Result<Option<i32>, Error> {
+        let role = self
+            .conn
+            .query_row(
+                "SELECT role FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(role)
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         sessions(&self.conn)
     }
@@ -704,12 +717,13 @@ fn insert_session(
     created: &SessionCreated,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO sessions (id, parent_session, fork_point, project, title, started_at)
-         VALUES (?1, NULL, NULL, NULL, ?2, ?3)",
+        "INSERT INTO sessions (id, parent_session, fork_point, project, title, started_at, role)
+         VALUES (?1, NULL, NULL, NULL, ?2, ?3, ?4)",
         (
             &created.session_id,
             &created.title,
             epoch_micros(event.ts.as_ref()),
+            created.role,
         ),
     )?;
     Ok(())
@@ -1160,7 +1174,7 @@ mod tests {
                     title: "first light".to_string(),
                     provider: "gemini".to_string(),
                     model: "gemini-3-pro".to_string(),
-                    role: SessionRole::Unspecified as i32,
+                    role: SessionRole::Executor as i32,
                     project: String::new(),
                     budget: None,
                 })),
@@ -1241,6 +1255,7 @@ mod tests {
         project: Option<String>,
         title: Option<String>,
         started_at: Option<i64>,
+        role: i64,
     }
 
     fn table_names(projection: &Projection) -> Vec<String> {
@@ -1309,6 +1324,19 @@ mod tests {
     }
 
     #[test]
+    fn a_sessions_role_comes_back_and_an_unknown_session_has_none() {
+        let mut projection = Projection::in_memory().expect("open");
+        assert_eq!(projection.session_role("s-01").expect("role"), None);
+
+        projection.apply(&session_created(0)).expect("apply");
+
+        assert_eq!(
+            projection.session_role("s-01").expect("role"),
+            Some(SessionRole::Executor as i32)
+        );
+    }
+
+    #[test]
     fn projects_a_session_and_a_message() {
         let mut projection = Projection::in_memory().expect("open");
 
@@ -1320,7 +1348,7 @@ mod tests {
         let session = projection
             .conn
             .query_row(
-                "SELECT id, parent_session, fork_point, project, title, started_at
+                "SELECT id, parent_session, fork_point, project, title, started_at, role
                  FROM sessions",
                 [],
                 |row| {
@@ -1331,6 +1359,7 @@ mod tests {
                         project: row.get(3)?,
                         title: row.get(4)?,
                         started_at: row.get(5)?,
+                        role: row.get(6)?,
                     })
                 },
             )
@@ -1344,6 +1373,7 @@ mod tests {
                 project: None,
                 title: Some("first light".to_string()),
                 started_at: Some(TS_MICROS),
+                role: i64::from(SessionRole::Executor as i32),
             }
         );
 

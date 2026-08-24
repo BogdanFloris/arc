@@ -399,6 +399,7 @@ fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
+        SessionError::RoleMismatch { .. } => "role_mismatch",
         SessionError::Provider(_) => "provider",
         SessionError::Store(_) | SessionError::Projection(_) => "internal",
     }
@@ -457,8 +458,8 @@ mod tests {
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
         ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
-        MemoryReviewDelete, MemoryReviewList, Role, SessionRole, Source, ToolOutcome, event,
-        memory_event, memory_record,
+        MemoryReviewDelete, MemoryReviewList, Role, SessionCreated, SessionEvent, SessionRole,
+        Source, ToolOutcome, event, memory_event, memory_record, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -890,6 +891,50 @@ mod tests {
             sessions[0].title, "",
             "preview is not a title; titles wait for Phase 2"
         );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_pinned_to_another_role_is_a_role_mismatch_error() {
+        let pinned = Event {
+            seq: 0,
+            ts: None,
+            source: Source::User as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionCreated(SessionCreated {
+                    session_id: "s-exec".to_owned(),
+                    title: String::new(),
+                    provider: "mock".to_owned(),
+                    model: "test-model".to_owned(),
+                    role: SessionRole::Executor as i32,
+                    project: String::new(),
+                    budget: None,
+                })),
+            })),
+        };
+        let mut harness = Harness::with_seed(Script::Echo, Registry::new(512), vec![pinned]).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("s-exec", "continue")).await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "role_mismatch");
+        assert!(
+            error.msg.contains("executor"),
+            "the refusal names the pinned role: {}",
+            error.msg
+        );
+        assert!(
+            harness.provider.requests().is_empty(),
+            "a refused turn never reaches the provider"
+        );
+
+        send(&mut ws, 2, say("", "fresh")).await;
+        let (_, text, closing) = turn(&mut ws, 2).await;
+        assert_eq!(text, "re: fresh", "the connection survives a refusal");
+        assert!(!ended(closing).partial);
 
         harness.stop().await;
     }

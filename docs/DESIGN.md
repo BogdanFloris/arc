@@ -379,7 +379,7 @@ This is how §12's routing question gets answered without a runtime difficulty c
 
 **The archivist is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. The role is named for the work, not for where the model runs, so moving it to a hosted model would not rename it.
 
-**A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork.
+**A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork. The engine refuses to continue a session whose recorded role is not its own. Sessions written before roles existed carry `SESSION_ROLE_UNSPECIFIED` and stay unpinned.
 
 ### 6.2 Expert consultation is deferred
 

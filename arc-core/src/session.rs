@@ -70,6 +70,13 @@ pub enum Error {
     #[error("refusing to send an empty message")]
     EmptyMessage,
 
+    #[error("session {session_id} is pinned to the {pinned} role; this engine serves {serving}")]
+    RoleMismatch {
+        session_id: String,
+        pinned: String,
+        serving: String,
+    },
+
     #[error("the model produced no reply")]
     EmptyReply,
 }
@@ -131,6 +138,10 @@ impl<P: Provider> Engine<P> {
         span.record("session_id", session_id.as_str());
         span.record("new_session", new_session);
         let turn_id = uuid::Uuid::new_v4().to_string();
+
+        if !new_session {
+            self.enforce_pin(&session_id)?;
+        }
 
         if new_session {
             self.record(
@@ -371,6 +382,20 @@ impl<P: Provider> Engine<P> {
         Ok(())
     }
 
+    fn enforce_pin(&self, session_id: &str) -> Result<(), Error> {
+        match self.store.projection().session_role(session_id)? {
+            Some(pinned) if pinned == self.role as i32 => Ok(()),
+            // sessions logged before roles exist stay unpinned
+            Some(pinned) if pinned == SessionRole::Unspecified as i32 => Ok(()),
+            Some(pinned) => Err(Error::RoleMismatch {
+                session_id: session_id.to_owned(),
+                pinned: role_name(pinned),
+                serving: provider::role_label(self.role).to_owned(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     fn system_prompt(&self, memory_index: Option<&str>) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &self.system {
@@ -478,6 +503,13 @@ impl<P: Provider> Engine<P> {
             },
             seed: None,
         }
+    }
+}
+
+fn role_name(role: i32) -> String {
+    match SessionRole::try_from(role) {
+        Ok(role) => provider::role_label(role).to_owned(),
+        Err(_) => format!("unknown role {role}"),
     }
 }
 
@@ -826,6 +858,69 @@ mod tests {
             ],
             "history in order, current message last, nothing duplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_pinned_to_another_role_refuses_and_logs_nothing() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: "s-01".to_owned(),
+                    title: String::new(),
+                    provider: "scripted".to_owned(),
+                    model: "test-model".to_owned(),
+                    role: SessionRole::Executor as i32,
+                    project: String::new(),
+                    budget: None,
+                }),
+                seeded_message(Role::User, "earlier"),
+            ],
+        );
+        let provider = ScriptedProvider::scripted(vec![done_reply("never sent")]);
+        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+
+        let err = engine
+            .send_message(Some("s-01"), "continue", tx)
+            .await
+            .expect_err("a concierge engine must refuse an executor session");
+
+        assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("executor") && msg.contains("concierge"),
+            "the refusal names both roles: {msg}"
+        );
+        assert_eq!(
+            replay_log(dir.path()).len(),
+            2,
+            "the refusal appended nothing"
+        );
+        assert!(provider.requests().is_empty(), "the provider never ran");
+    }
+
+    #[tokio::test]
+    async fn a_session_from_before_roles_stays_continuable() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![seeded_session(), seeded_message(Role::User, "earlier")],
+        );
+        let provider = ScriptedProvider::scripted(vec![done_reply("continued")]);
+        let mut engine = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(Some("s-01"), "again", tx)
+            .await
+            .expect("a session logged before roles exist pins nothing");
+
+        assert_eq!(reply.session_id, "s-01");
+        let requests = provider.requests();
+        let turns: Vec<(Role, &str)> = requests[0].messages.iter().map(turn).collect();
+        assert_eq!(turns, [(Role::User, "earlier"), (Role::User, "again")]);
     }
 
     #[tokio::test]
