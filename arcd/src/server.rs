@@ -10,7 +10,7 @@ use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, Delta, Error as WireError, JobList, MemoryReviewItem, MemoryReviewItems,
     MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame, SessionHistory,
-    SessionInfo, SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame,
+    SessionInfo, SessionList, SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame,
     server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
@@ -285,12 +285,14 @@ async fn send_message(
         return flow(send_steered(ws, request_id, &send.session_id).await);
     }
 
+    let served_by = turn_runner(engine, supervisor, runner, &send.session_id);
+
     let (events, rx) = mpsc::channel(EVENT_BUFFER);
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
     // forward has to run alongside the engine or the event channel fills
     let (result, connected) = tokio::join!(
-        engine.send_message(runner, session_id, &send.content, events),
+        engine.send_message(served_by, session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),
     );
 
@@ -315,6 +317,29 @@ async fn send_message(
         }
     };
     flow(send_frame(ws, request_id, msg).await)
+}
+
+/// A turn on a job's own (finished) session is served by that job's role
+/// runner, not the concierge's: a real follow-up in the executor's own
+/// workspace, run outside the supervisor entirely (no budget, no steer
+/// queue, no handback). A fresh session, a concierge session, or a role the
+/// map has no runner for all fall through to the concierge runner, exactly
+/// as before — an unmapped role then surfaces as an honest `role_mismatch`.
+fn turn_runner<'a>(
+    engine: &Engine,
+    supervisor: &'a Supervisor,
+    concierge: &'a Runner,
+    session_id: &str,
+) -> &'a Runner {
+    if session_id.is_empty() {
+        return concierge;
+    }
+    match engine.session_role(session_id) {
+        Ok(Some(role @ (SessionRole::Executor | SessionRole::Archivist))) => {
+            supervisor.job_runner(role).unwrap_or(concierge)
+        }
+        _ => concierge,
+    }
 }
 
 /// A steered message never reaches the engine on this connection: its turn
@@ -1115,6 +1140,7 @@ mod tests {
         harness.stop().await;
     }
 
+    // also the "role with no runner in the map" case: job_runners is empty here
     #[tokio::test]
     async fn a_session_pinned_to_another_role_is_a_role_mismatch_error() {
         let pinned = Event {
@@ -1985,20 +2011,34 @@ mod tests {
             ],
             "the brief turn ran to completion before the steered turn started"
         );
+        assert_eq!(
+            harness.provider.requests().len(),
+            2,
+            "the steer never reached the engine: the concierge ran only its own two turns"
+        );
 
         harness.stop().await;
     }
 
     #[tokio::test]
-    async fn a_steer_to_a_finished_job_falls_through_to_the_role_mismatch_error() {
+    async fn typing_into_a_finished_executor_job_runs_a_real_turn_with_the_executor_runner() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let executor_script = Script::Canned(VecDeque::from([vec![
-            Ok(CompletionDelta::Text("on it".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]));
+        let executor_script = Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::Text("on it".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("still here".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]));
 
         let mut harness = Harness::with_executor(
             dispatching_concierge("fix the failing test"),
@@ -2016,14 +2056,33 @@ mod tests {
         harness.drain_jobs().await;
 
         send(&mut ws, 2, say(&child_id, "still there?")).await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 2);
-        let error = failed(frame.msg.expect("a message"));
-        assert_eq!(error.code, "role_mismatch");
-        assert!(
-            error.msg.contains("executor"),
-            "the refusal names the pinned role: {}",
-            error.msg
+        let (session_id, text, closing) = turn(&mut ws, 2).await;
+        assert_eq!(
+            session_id, child_id,
+            "the turn ran in the job's own session"
+        );
+        assert_eq!(text, "still here");
+        assert!(!ended(closing).partial, "a real turn, not a fault");
+
+        let child_messages: Vec<_> = harness
+            .logged_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == child_id => {
+                    Some((Role::try_from(m.role).expect("a known role"), m.content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_messages,
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "on it".to_owned()),
+                (Role::User, "still there?".to_owned()),
+                (Role::Assistant, "still here".to_owned()),
+            ],
+            "the follow-up landed in the child's own log, as a real conversation"
         );
 
         harness.stop().await;

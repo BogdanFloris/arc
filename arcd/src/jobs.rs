@@ -173,6 +173,13 @@ impl Supervisor {
         steer_live(&self.live, session_id, text)
     }
 
+    /// The runner a job of this role is dispatched with — the same map,
+    /// shared rather than rebuilt, so the server can serve a follow-up turn
+    /// on a job's own session with its own role instead of the concierge's.
+    pub fn job_runner(&self, role: SessionRole) -> Option<&Runner> {
+        self.runners.get(&role)
+    }
+
     /// Routes a `continue_job` request (DESIGN.md §6.16): queued into the
     /// job's steer channel if it's still running, or resumed as a fresh
     /// task over the same child session, its full transcript intact, if it
