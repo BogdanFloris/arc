@@ -131,10 +131,21 @@ The residual risk is worth stating rather than designing around. arcd runs as th
 
 ## 6. TUI
 
+Expanded on 2026-08-26, deliberately overriding the move-to-3.1 guidance above: the first live day showed the daemon working and the TUI hiding it. The goal of this list is a working agent, and for a daily driver the ambient layer is not polish. 6.3 → 6.4 is the sequence; 6.5–6.11 are independent and slot between larger tasks.
+
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
 | 6.1 | TUI: refreshable job list showing live jobs, status, and budget consumed. The conversation stays usable while one runs. **`:jobs` mirrors `:review` in architecture and look: one elided row per job — state, role/project, spent-vs-budget tokens, elapsed, id tail — running in plain, terminal dimmed, selection accented; `r` refetches, nothing polls. Job state is live daemon memory rebuilt empty on restart; the durable record is the child session. Terminal entries are retained to a cap of 50, oldest evicted, running jobs always listed first. The conversation staying usable while a job runs was already true from 5.3's concurrency work; this makes it visible.** | claude | done |
 | 6.2 | **Session titling pass** (carried). Now cheap: titles are `archivist` work and the job list needs something better than a session id to display. | — | todo |
+| 6.3 | Server push: a `Subscribe` request whose response stream never ends. The server pushes small notification frames — job state changed, message appended to a session — correlated to the subscription's request id, fitting the existing framing. Notifications carry facts, not payloads; the client refetches what it cares about. Supervisor and engine get a broadcast hook; connections forward. Schema is its own commit | — | todo |
+| 6.4 | The ambient layer on 6.3: a one-line status strip where the rule line lives — jobs running, spent tokens, elapsed — always current, elapsed ticking locally. A handback landing in the open conversation appears in it without a keypress. `:jobs` live-updates while open; `r` stays as a manual nudge | — | todo |
+| 6.5 | `HistoryMessage` carries the event source (additive field, own schema commit) so a handback renders as system output — dim, unmistakably not the user's words — instead of styled as something Bogdan typed | — | todo |
+| 6.6 | Tool lines say what they did: elide the call's arguments to width — `bash python main.py · ok`, `write main.py · error`. The data is already in history; watching a child session becomes watching. Also stop rendering an empty assistant bubble for a text-less tool turn | — | todo |
+| 6.7 | A per-turn cost line, dim, after each reply: tokens in and out and latency. The $50/month bet should be felt daily, not discovered in 7.3's accounting | — | todo |
+| 6.8 | Steering from the jobs popup: `Enter` on a row opens the child session, `s` opens an input line that steers it. The mechanism landed in 5.4; this is the reach | — | todo |
+| 6.9 | Picker QoL: `/` filters sessions as you type; times render relative. Compounds with 6.2's titles | — | todo |
+| 6.10 | `Ctrl-j` inserts a newline in the input, so a multi-step brief is written as one | — | todo |
+| 6.11 | `:help`: one dim popup listing the keys. The surface has grown enough that discoverability is real | — | todo |
 
 ## 7. Production
 
