@@ -181,6 +181,7 @@ pub struct App {
     strip_since: Instant,
     refetch_in_flight: bool,
     steer_stash: Option<String>,
+    previous_session: Option<String>,
     picker_filter_stash: Option<String>,
     /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
@@ -212,6 +213,7 @@ impl App {
             strip_since: Instant::now(),
             refetch_in_flight: false,
             steer_stash: None,
+            previous_session: None,
             picker_filter_stash: None,
             steer_turn_pending: false,
         }
@@ -286,6 +288,9 @@ impl App {
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
             KeyCode::Char('o') => self.toggle_thought(),
+            KeyCode::Char('t') if self.status != Status::Streaming => {
+                return self.back_session();
+            }
             KeyCode::Char('p') => self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
@@ -699,7 +704,16 @@ impl App {
         order
     }
 
+    fn back_session(&mut self) -> Option<Command> {
+        let previous = self.previous_session.take()?;
+        self.start_session(Some(previous))
+    }
+
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
+        if self.session_id != session_id {
+            // only a named session is worth bouncing back to
+            self.previous_session = self.session_id.clone();
+        }
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
         self.scroll_back = 0;
@@ -2876,5 +2890,31 @@ mod tests {
             block,
             Block::System("Job s-x finished.\nAll good.".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_t_bounces_between_the_last_two_sessions() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![]));
+        let first = app.start_session(Some("s-first".to_owned()));
+        assert!(first.is_some());
+        let second = app.start_session(Some("s-job".to_owned()));
+        assert!(second.is_some());
+        assert_eq!(app.session_id.as_deref(), Some("s-job"));
+
+        let back = app.on_key(ctrl('t'));
+        assert!(back.is_some(), "going back refetches history");
+        assert_eq!(app.session_id.as_deref(), Some("s-first"));
+
+        let forth = app.on_key(ctrl('t'));
+        assert!(forth.is_some());
+        assert_eq!(app.session_id.as_deref(), Some("s-job"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_t_with_no_history_does_nothing() {
+        let mut app = App::new();
+        assert_eq!(app.on_key(ctrl('t')), None);
+        assert_eq!(app.session_id, None);
     }
 }

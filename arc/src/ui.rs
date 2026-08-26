@@ -625,6 +625,7 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-u ctrl-d     page up / down",
             "G gg              scroll to bottom / top",
             "s ctrl-p          open the session picker",
+            "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces",
             "ctrl-c            quit",
