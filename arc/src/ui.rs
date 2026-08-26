@@ -480,17 +480,22 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
 
 fn job_label(job: &JobInfo) -> String {
     let state = job_state_word(job.state);
-    let role = arc_core::provider::role_label(
-        SessionRole::try_from(job.role).unwrap_or(SessionRole::Unspecified),
-    );
+    let subject = if job.title.is_empty() {
+        let role = arc_core::provider::role_label(
+            SessionRole::try_from(job.role).unwrap_or(SessionRole::Unspecified),
+        );
+        format!("{role}/{}", job.project)
+    } else {
+        job.title.clone()
+    };
     let budget = if job.budget_tokens == 0 {
         "-".to_owned()
     } else {
         job.budget_tokens.to_string()
     };
     format!(
-        "{state} {role}/{} {}/{budget} tok {}s",
-        job.project, job.spent_tokens, job.elapsed_seconds
+        "{state} {subject} {}/{budget} tok {}s",
+        job.spent_tokens, job.elapsed_seconds
     )
 }
 
@@ -580,5 +585,60 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
         3_600..86_400 => format!("{}h ago", seconds / 3_600),
         86_400..604_800 => format!("{}d ago", seconds / 86_400),
         _ => at.with_timezone(&chrono::Local).format("%m-%d").to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
+
+    use super::{job_label, label};
+
+    fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            started_at: None,
+            preview: preview.to_owned(),
+            last_at: None,
+        }
+    }
+
+    #[test]
+    fn a_picker_row_prefers_the_title_over_the_preview() {
+        let session = session("s-01", "Palette bikeshed", "what color for the accent?");
+        assert_eq!(label(&session, 40), "Palette bikeshed");
+    }
+
+    #[test]
+    fn a_picker_row_falls_back_to_the_preview_without_a_title() {
+        let session = session("s-01", "", "what color for the accent?");
+        assert_eq!(label(&session, 40), "what color for the accent?");
+    }
+
+    fn job(role: SessionRole, project: &str, title: &str) -> JobInfo {
+        JobInfo {
+            session_id: "s-01".to_owned(),
+            role: role as i32,
+            project: project.to_owned(),
+            state: job_info::State::Running as i32,
+            spent_tokens: 12,
+            budget_tokens: 0,
+            elapsed_seconds: 5,
+            budget_seconds: 0,
+            title: title.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_jobs_row_shows_the_role_and_project_without_a_title() {
+        let job = job(SessionRole::Executor, "arc", "");
+        assert_eq!(job_label(&job), "running executor/arc 12/- tok 5s");
+    }
+
+    #[test]
+    fn a_jobs_row_shows_the_title_in_place_of_role_and_project() {
+        let job = job(SessionRole::Executor, "arc", "Fix the failing test");
+        assert_eq!(job_label(&job), "running Fix the failing test 12/- tok 5s");
     }
 }

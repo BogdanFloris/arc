@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
     Event, MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, SessionConsolidated,
-    SessionEvent, Source, event, memory_event, session_event,
+    SessionEvent, SessionTitled, Source, event, memory_event, session_event,
 };
 use prost_types::Timestamp;
 use tracing::info;
@@ -79,6 +79,10 @@ impl Store {
         Ok(self.projection.due_for_consolidation(idle_cutoff_micros)?)
     }
 
+    pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
+        Ok(self.projection.session_title(session_id)?)
+    }
+
     pub(crate) fn snapshot_for_consolidation(
         &self,
         idle_cutoff_micros: i64,
@@ -131,6 +135,47 @@ impl Store {
                         prompt_version: prompt_version.to_owned(),
                     },
                 )),
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// Its own idle re-check, separate from `commit_consolidation`: titling
+    /// runs before extraction, in a lock scope of its own.
+    pub(crate) fn commit_title(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        title: &str,
+    ) -> Result<bool, Error> {
+        let latest = self.projection.latest_seq(&snapshot.session_id)?;
+        if latest != Some(snapshot.latest_seq) {
+            info!(
+                session_id = %snapshot.session_id,
+                snapshot_seq = snapshot.latest_seq,
+                latest_seq = latest,
+                "session grew before titling; discarding the title"
+            );
+            return Ok(false);
+        }
+        if self
+            .projection
+            .session_title(&snapshot.session_id)?
+            .is_some()
+        {
+            info!(
+                session_id = %snapshot.session_id,
+                "session was titled by another pass; discarding the title"
+            );
+            return Ok(false);
+        }
+        self.append(
+            Source::System,
+            Some(now_ts()),
+            event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionTitled(SessionTitled {
+                    session_id: snapshot.session_id.clone(),
+                    title: title.to_owned(),
+                })),
             }),
         )?;
         Ok(true)

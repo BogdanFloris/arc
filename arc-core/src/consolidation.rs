@@ -4,8 +4,9 @@ pub mod replay;
 use std::collections::HashSet;
 use std::future::Future;
 
-use arc_proto::v1::memory_event;
+use arc_proto::v1::{Role, memory_event};
 
+use crate::projection::MessageRow;
 use crate::session::Engine;
 use crate::store;
 
@@ -16,6 +17,15 @@ pub trait Extractor: Send + Sync {
         &self,
         session: &SessionSnapshot,
     ) -> impl Future<Output = Result<Vec<memory_event::Event>, ExtractError>> + Send;
+
+    /// A short title for the session, or `None` to leave it untitled this
+    /// pass. The default never calls a model — only `ModelExtractor` does.
+    fn title(
+        &self,
+        _session: &SessionSnapshot,
+    ) -> impl Future<Output = Result<Option<String>, ExtractError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +139,8 @@ async fn pass<E: Extractor>(
         return Ok(Outcome::NothingDue);
     };
 
+    title_if_due(engine, extractor, &snapshot).await?;
+
     // the store is not locked during extraction: it can take minutes
     let events = extractor
         .extract(&snapshot)
@@ -163,6 +175,54 @@ async fn pass<E: Extractor>(
             session_id: snapshot.session_id,
         }
     })
+}
+
+/// Titling piggybacks the same due-session snapshot: it runs before
+/// extraction, under its own re-checked commit, and never blocks it.
+#[tracing::instrument(name = "consolidation.title", skip_all, fields(session_id = %snapshot.session_id))]
+async fn title_if_due<E: Extractor>(
+    engine: &Engine,
+    extractor: &E,
+    snapshot: &SessionSnapshot,
+) -> Result<(), Error> {
+    if !eligible_for_title(engine, snapshot)? {
+        return Ok(());
+    }
+    let title = match extractor.title(snapshot).await {
+        Ok(title) => title,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %snapshot.session_id,
+                %error,
+                "title generation failed; leaving the session untitled this pass"
+            );
+            None
+        }
+    };
+    let Some(title) = title else {
+        return Ok(());
+    };
+    engine.with_store_mut(|store| store.commit_title(snapshot, &title))?;
+    Ok(())
+}
+
+fn eligible_for_title(engine: &Engine, snapshot: &SessionSnapshot) -> Result<bool, Error> {
+    if engine
+        .with_store(|store| store.session_title(&snapshot.session_id))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let has_user = snapshot.rows.iter().any(|row| is_role(row, Role::User));
+    let has_assistant = snapshot
+        .rows
+        .iter()
+        .any(|row| is_role(row, Role::Assistant));
+    Ok(has_user && has_assistant)
+}
+
+fn is_role(row: &MessageRow, role: Role) -> bool {
+    matches!(row, MessageRow::Message { role: r, .. } if *r == role as i32)
 }
 
 #[cfg(test)]
@@ -203,6 +263,49 @@ mod tests {
         ) -> Result<Vec<memory_event::Event>, ExtractError> {
             Err(ExtractError("boom".to_owned()))
         }
+    }
+
+    struct Titling(Option<String>);
+
+    impl Extractor for Titling {
+        async fn extract(
+            &self,
+            _session: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            Ok(Vec::new())
+        }
+
+        async fn title(&self, _session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct PanicsIfTitled;
+
+    impl Extractor for PanicsIfTitled {
+        async fn extract(
+            &self,
+            _session: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            Ok(Vec::new())
+        }
+
+        async fn title(&self, _session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            panic!("an already-titled session must not be retitled");
+        }
+    }
+
+    fn titled_events(dir: &std::path::Path) -> Vec<arc_proto::v1::SessionTitled> {
+        replay_events(dir)
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                Some(event::Payload::Session(session)) => match session.event {
+                    Some(session_event::Event::SessionTitled(titled)) => Some(titled),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     fn created_record(id: &str) -> memory_event::Event {
@@ -290,6 +393,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_untitled_session_is_titled_before_extraction() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let outcome = run_pass(
+            &engine,
+            &Titling(Some("Palette bikeshed".to_owned())),
+            ALL_IDLE,
+            "",
+            &HashSet::new(),
+        )
+        .await
+        .expect("pass");
+        assert!(
+            matches!(outcome, Outcome::Consolidated { .. }),
+            "{outcome:?}"
+        );
+
+        let titled = titled_events(dir.path());
+        assert_eq!(titled.len(), 1);
+        assert_eq!(titled[0].session_id, reply.session_id);
+        assert_eq!(titled[0].title, "Palette bikeshed");
+    }
+
+    #[tokio::test]
+    async fn an_already_titled_session_is_not_retitled() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("again")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        run_pass(
+            &engine,
+            &Titling(Some("First".to_owned())),
+            ALL_IDLE,
+            "",
+            &HashSet::new(),
+        )
+        .await
+        .expect("first pass titles it");
+
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&reply.session_id), "more", tx)
+            .await
+            .expect("send more");
+
+        run_pass(&engine, &PanicsIfTitled, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("second pass");
+
+        let titled = titled_events(dir.path());
+        assert_eq!(
+            titled.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            ["First"],
+            "one title event, never overwritten"
+        );
+    }
+
+    #[tokio::test]
     async fn activity_during_the_pass_discards_it_whole() {
         let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
         let dir = TempDir::new().expect("temp dir");
@@ -314,6 +487,11 @@ mod tests {
             .await
             .expect("send");
 
+        let titled = engine
+            .with_store_mut(|store| store.commit_title(&snapshot, "a stale title"))
+            .expect("commit_title");
+        assert!(!titled, "the stale snapshot must not title either");
+
         let committed = engine
             .with_store_mut(|store| {
                 store.commit_consolidation(&snapshot, vec![created_record("mr-x")], "")
@@ -331,6 +509,10 @@ mod tests {
                     Some(session_event::Event::SessionConsolidated(_))
                 ),
                 "a marker leaked from the discarded pass"
+            );
+            assert!(
+                !matches!(session.event, Some(session_event::Event::SessionTitled(_))),
+                "a title leaked from the discarded pass"
             );
         }
         let due = engine

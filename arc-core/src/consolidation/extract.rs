@@ -57,6 +57,14 @@ const TRANSCRIPT_BUDGET: usize = 24_000;
 
 const TOOL_SNIPPET: usize = 200;
 
+pub const TITLE_PROMPT: &str = "Write a short title for this conversation. \
+At most six words, plain words, no quotes, no trailing punctuation. \
+Reply with the title only.";
+
+const TITLE_INPUT_CAP: usize = 500;
+
+const TITLE_OUTPUT_CAP: usize = 60;
+
 pub struct ModelExtractor {
     provider: Arc<dyn Provider>,
     model: String,
@@ -193,6 +201,79 @@ impl Extractor for ModelExtractor {
             .map(|op| to_event(op, session))
             .collect()
     }
+
+    #[tracing::instrument(
+        name = "consolidation.title",
+        skip_all,
+        fields(task = "consolidation", session_id = %session.session_id)
+    )]
+    async fn title(&self, session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+        let Some(prompt) = title_prompt(session) else {
+            return Ok(None);
+        };
+        let request = CompletionRequest {
+            model: self.model.clone(),
+            role: SessionRole::Archivist,
+            thinking: self.thinking,
+            system: Some(TITLE_PROMPT.to_owned()),
+            messages: vec![Message::Text {
+                role: Role::User,
+                content: prompt,
+            }],
+            tools: Vec::new(),
+            seed: Some(
+                self.seed
+                    .unwrap_or_else(|| session_seed(&session.session_id)),
+            ),
+        };
+        let text = tokio::time::timeout(self.timeout, self.completion_text(request))
+            .await
+            .map_err(|_| {
+                ExtractError(format!(
+                    "title call timed out after {}s",
+                    self.timeout.as_secs()
+                ))
+            })??;
+        Ok(sanitize_title(&text))
+    }
+}
+
+fn title_prompt(session: &SessionSnapshot) -> Option<String> {
+    let first_user = first_message(session, Role::User)?;
+    let first_assistant = first_message(session, Role::Assistant)?;
+    Some(format!(
+        "User: {}\nAssistant: {}",
+        cap_chars(first_user, TITLE_INPUT_CAP),
+        cap_chars(first_assistant, TITLE_INPUT_CAP),
+    ))
+}
+
+fn first_message(session: &SessionSnapshot, role: Role) -> Option<&str> {
+    session.rows.iter().find_map(|row| match row {
+        MessageRow::Message {
+            role: r, content, ..
+        } if *r == role as i32 => Some(content.as_str()),
+        _ => None,
+    })
+}
+
+fn cap_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+fn sanitize_title(text: &str) -> Option<String> {
+    let flattened: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = flattened
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(cap_chars(trimmed, TITLE_OUTPUT_CAP))
 }
 
 fn render_input(session: &SessionSnapshot) -> String {
@@ -390,8 +471,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ModelExtractor, PROMPT_V1, PROMPT_VERSION_V1, TOOL_SNIPPET, TRANSCRIPT_BUDGET,
-        render_input, snippet, windowed,
+        ModelExtractor, PROMPT_V1, PROMPT_VERSION_V1, TITLE_PROMPT, TOOL_SNIPPET,
+        TRANSCRIPT_BUDGET, render_input, sanitize_title, snippet, title_prompt, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -465,6 +546,7 @@ mod tests {
     async fn a_scripted_extraction_lands_records_marker_and_next_index() {
         let provider = ScriptedProvider::scripted(vec![
             done_reply("noted"),
+            done_reply("  \"Terse replies\"\n"),
             extraction_reply(WRITE_OP),
             done_reply("hello again"),
         ]);
@@ -502,7 +584,26 @@ mod tests {
             }
         );
 
-        let request = &provider.requests()[1];
+        let title_request = &provider.requests()[1];
+        assert_eq!(title_request.system.as_deref(), Some(TITLE_PROMPT));
+        let [
+            Message::Text {
+                content: title_content,
+                ..
+            },
+        ] = title_request.messages.as_slice()
+        else {
+            panic!(
+                "expected one user message, got {:?}",
+                title_request.messages
+            );
+        };
+        assert_eq!(
+            title_content,
+            "User: remember: keep replies short\nAssistant: noted"
+        );
+
+        let request = &provider.requests()[2];
         assert_eq!(request.system.as_deref(), Some(PROMPT_V1));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content }] = request.messages.as_slice() else {
@@ -519,10 +620,22 @@ mod tests {
         );
 
         let events = replay_events(dir.path());
-        assert_eq!(events.len(), 5);
-        assert_eq!(events[3].source, Source::System as i32);
-        let Some(event::Payload::Memory(memory)) = &events[3].payload else {
-            panic!("expected the record before the marker, got {:?}", events[3]);
+        assert_eq!(events.len(), 6);
+        let Some(event::Payload::Session(title_event)) = &events[3].payload else {
+            panic!("expected the title event, got {:?}", events[3]);
+        };
+        let Some(session_event::Event::SessionTitled(titled)) = &title_event.event else {
+            panic!("expected SessionTitled, got {title_event:?}");
+        };
+        assert_eq!(titled.session_id, reply.session_id);
+        assert_eq!(
+            titled.title, "Terse replies",
+            "quotes and whitespace stripped"
+        );
+
+        assert_eq!(events[4].source, Source::System as i32);
+        let Some(event::Payload::Memory(memory)) = &events[4].payload else {
+            panic!("expected the record before the marker, got {:?}", events[4]);
         };
         let Some(memory_event::Event::RecordCreated(created)) = &memory.event else {
             panic!("expected RecordCreated, got {memory:?}");
@@ -536,8 +649,8 @@ mod tests {
         assert_eq!(provenance.entries.len(), 1);
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
         assert!(provenance.entries[0].ts.is_some());
-        let Some(event::Payload::Session(session)) = &events[4].payload else {
-            panic!("expected the marker last, got {:?}", events[4]);
+        let Some(event::Payload::Session(session)) = &events[5].payload else {
+            panic!("expected the marker last, got {:?}", events[5]);
         };
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
@@ -550,7 +663,7 @@ mod tests {
             .send_message(&run, Some(&reply.session_id), "hi again", tx)
             .await
             .expect("second send");
-        let system = provider.requests()[2].system.clone().expect("system");
+        let system = provider.requests()[3].system.clone().expect("system");
         assert!(system.contains("Terse replies"), "{system}");
         assert!(system.contains("User prefers short answers"), "{system}");
     }
@@ -578,6 +691,7 @@ mod tests {
         );
         let provider = ScriptedProvider::scripted(vec![
             done_reply("noted"),
+            done_reply("New address"),
             extraction_reply(
                 r#"{"operations":[{"op":"supersede","id":"mr-old","kind":"fact",
                     "title":"New address","summary":"lives at Y",
@@ -608,7 +722,7 @@ mod tests {
         .expect("pass");
         assert!(matches!(outcome, Outcome::Consolidated { records: 1, .. }));
 
-        let input = provider.requests()[1].messages.clone();
+        let input = provider.requests()[2].messages.clone();
         let [Message::Text { content, .. }] = input.as_slice() else {
             panic!("expected one message");
         };
@@ -631,6 +745,95 @@ mod tests {
         assert_eq!(replacement.namespace, "arc", "namespace inherited");
         let provenance = replacement.provenance.as_ref().expect("provenance");
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
+    }
+
+    #[tokio::test]
+    async fn a_garbage_title_reply_appends_nothing_and_the_pass_still_extracts() {
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("noted"),
+            done_reply("   \n"),
+            extraction_reply(WRITE_OP),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "remember: keep replies short", tx)
+            .await
+            .expect("send");
+
+        let extractor = ModelExtractor::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            "test-model",
+            Thinking::Minimal,
+            Duration::from_secs(300),
+        );
+        let outcome = run_pass(
+            &engine,
+            &extractor,
+            ALL_IDLE,
+            PROMPT_VERSION_V1,
+            &HashSet::new(),
+        )
+        .await
+        .expect("pass");
+        assert!(
+            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
+            "got: {outcome:?}"
+        );
+
+        for event in replay_events(dir.path()) {
+            if let Some(event::Payload::Session(session)) = &event.payload {
+                assert!(
+                    !matches!(session.event, Some(session_event::Event::SessionTitled(_))),
+                    "a blank reply must not title the session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_title_strips_quotes_whitespace_and_newlines() {
+        assert_eq!(
+            sanitize_title("  \"Terse replies\"\n"),
+            Some("Terse replies".to_owned())
+        );
+        assert_eq!(
+            sanitize_title("'lone quotes'"),
+            Some("lone quotes".to_owned())
+        );
+        assert_eq!(sanitize_title("   \n\t  "), None, "blank after sanitizing");
+        assert_eq!(sanitize_title(""), None);
+    }
+
+    #[test]
+    fn sanitize_title_caps_at_sixty_chars() {
+        let long = "word ".repeat(20);
+        let title = sanitize_title(&long).expect("non-empty");
+        assert_eq!(title.chars().count(), 60);
+    }
+
+    #[test]
+    fn title_prompt_caps_each_side_at_five_hundred_chars_and_needs_both_roles() {
+        let mut snapshot = snapshot(Vec::new());
+        assert_eq!(title_prompt(&snapshot), None, "no assistant message yet");
+
+        snapshot.rows.push(MessageRow::Message {
+            role: Role::Assistant as i32,
+            content: "y".repeat(600),
+            partial: false,
+            turn_id: "t-1".to_owned(),
+        });
+        let prompt = title_prompt(&snapshot).expect("both roles present");
+        assert!(prompt.starts_with("User: hi\nAssistant: "));
+        assert_eq!(
+            prompt
+                .strip_prefix("User: hi\nAssistant: ")
+                .expect("prefix")
+                .chars()
+                .count(),
+            500
+        );
     }
 
     #[tokio::test]

@@ -744,6 +744,10 @@ impl Engine {
         Ok(self.with_store(|store| store.projection().sessions())?)
     }
 
+    pub fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
+        Ok(self.with_store(|store| store.session_title(session_id))?)
+    }
+
     #[cfg(test)]
     pub(crate) fn transcript(
         &self,

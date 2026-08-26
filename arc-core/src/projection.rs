@@ -6,8 +6,8 @@ use arc_proto::v1::{
     Event, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryEvent,
     MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
     MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-    Role, SessionConsolidated, SessionCreated, SessionEvent, ToolCallIssued, ToolResultRecorded,
-    event, history_entry, memory_event, memory_record, session_event,
+    Role, SessionConsolidated, SessionCreated, SessionEvent, SessionTitled, ToolCallIssued,
+    ToolResultRecorded, event, history_entry, memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -348,8 +348,9 @@ impl Projection {
                     insert_message(&tx, event, appended)?;
                 }
                 session_event::Event::ToolCallIssued(call) => insert_tool_call(&tx, event, call)?,
-                // 6.2 applies it; decoding must not fail before then
-                session_event::Event::SessionTitled(_) => {}
+                session_event::Event::SessionTitled(titled) => {
+                    mark_titled(&tx, event, titled)?;
+                }
                 session_event::Event::ToolResultRecorded(result) => {
                     insert_tool_result(&tx, event, result)?;
                 }
@@ -429,6 +430,18 @@ impl Projection {
             )
             .optional()?;
         Ok(project.flatten())
+    }
+
+    pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
+        let title: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT title FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(title.filter(|title| !title.is_empty()))
     }
 
     pub(crate) fn session_grants(&self, session_id: &str) -> Result<Vec<(String, bool)>, Error> {
@@ -793,6 +806,21 @@ fn mark_consolidated(
             session_id = %consolidated.session_id,
             through_seq = consolidated.through_seq,
             "consolidation marker for a missing session or not past the current one; skipping"
+        );
+    }
+    Ok(())
+}
+
+fn mark_titled(tx: &Transaction<'_>, event: &Event, titled: &SessionTitled) -> Result<(), Error> {
+    let changed = tx.execute(
+        "UPDATE sessions SET title = ?2 WHERE id = ?1",
+        rusqlite::params![&titled.session_id, &titled.title],
+    )?;
+    if changed == 0 {
+        tracing::warn!(
+            seq = event.seq,
+            session_id = %titled.session_id,
+            "title event for a missing session; skipping"
         );
     }
     Ok(())
@@ -1183,9 +1211,9 @@ mod tests {
     use arc_proto::v1::{
         Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, SessionConsolidated, SessionCreated, SessionEvent, SessionRole, Source,
-        ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event, memory_event,
-        memory_record, session_event,
+        Role, SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled,
+        Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event,
+        memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
@@ -1768,6 +1796,20 @@ mod tests {
         }
     }
 
+    fn session_titled(seq: u64, id: &str, title: &str) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionTitled(SessionTitled {
+                    session_id: id.to_string(),
+                    title: title.to_string(),
+                })),
+            })),
+        }
+    }
+
     #[test]
     fn sessions_are_ordered_by_start_then_id() {
         let mut projection = Projection::in_memory().expect("open");
@@ -1875,6 +1917,76 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "");
+    }
+
+    #[test]
+    fn a_session_titled_event_sets_the_sessions_title() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(1)))
+            .expect("apply");
+        projection
+            .apply(&session_titled(1, "s-01", "Palette bikeshed"))
+            .expect("apply");
+
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].title,
+            "Palette bikeshed"
+        );
+    }
+
+    #[test]
+    fn the_latest_title_wins_on_replay() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(1)))
+            .expect("apply");
+        projection
+            .apply(&session_titled(1, "s-01", "First guess"))
+            .expect("apply");
+        projection
+            .apply(&session_titled(2, "s-01", "Better guess"))
+            .expect("apply");
+
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].title,
+            "Better guess",
+            "retitling appends another event; the latest wins"
+        );
+    }
+
+    #[test]
+    fn retitling_replays_deterministically_across_fresh_indexes() {
+        let events = [
+            session_created_as(0, "s-01", "", Some(1)),
+            session_titled(1, "s-01", "First guess"),
+            session_titled(2, "s-01", "Better guess"),
+        ];
+
+        let mut first = Projection::in_memory().expect("open");
+        let mut second = Projection::in_memory().expect("open");
+        for event in &events {
+            first.apply(event).expect("apply");
+            second.apply(event).expect("apply");
+        }
+
+        assert_eq!(
+            first.sessions().expect("sessions"),
+            second.sessions().expect("sessions")
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_title_event_keeps_its_created_title() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "original title", Some(1)))
+            .expect("apply");
+
+        assert_eq!(
+            projection.sessions().expect("sessions")[0].title,
+            "original title"
+        );
     }
 
     #[test]

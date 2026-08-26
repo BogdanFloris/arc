@@ -72,7 +72,21 @@ impl Supervisor {
     /// The daemon's live view of every job it remembers: running jobs first
     /// (newest first), then terminal ones (newest first).
     pub fn list(&self) -> Vec<JobInfo> {
-        self.statuses.list()
+        let mut jobs = self.statuses.list();
+        for job in &mut jobs {
+            job.title = self.title(&job.session_id);
+        }
+        jobs
+    }
+
+    fn title(&self, session_id: &str) -> String {
+        match self.engine.session_title(session_id) {
+            Ok(title) => title.unwrap_or_default(),
+            Err(error) => {
+                warn!(session_id, %error, "could not read the job's title; leaving it blank");
+                String::new()
+            }
+        }
     }
 
     /// Enqueues a steering message for a live job. `true` if the job was
@@ -1265,6 +1279,66 @@ mod tests {
 
         second_gate.notify_one();
         supervisor.shutdown().await;
+    }
+
+    struct FixedTitle;
+
+    impl arc_core::consolidation::Extractor for FixedTitle {
+        async fn extract(
+            &self,
+            _session: &arc_core::consolidation::SessionSnapshot,
+        ) -> Result<Vec<arc_proto::v1::memory_event::Event>, arc_core::consolidation::ExtractError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn title(
+            &self,
+            _session: &arc_core::consolidation::SessionSnapshot,
+        ) -> Result<Option<String>, arc_core::consolidation::ExtractError> {
+            Ok(Some("Fix the failing test".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_carries_the_title_once_the_projection_has_one() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(only_job(supervisor.list()).title, "", "not titled yet");
+
+        arc_core::consolidation::run_pass(
+            &engine,
+            &FixedTitle,
+            i64::MAX,
+            "",
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("pass");
+
+        assert_eq!(only_job(supervisor.list()).title, "Fix the failing test");
     }
 
     #[tokio::test]
