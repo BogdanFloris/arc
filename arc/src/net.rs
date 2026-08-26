@@ -113,6 +113,7 @@ async fn review_list(
                         namespace: record.namespace,
                         title: record.title,
                         summary: record.summary,
+                        body: record.body,
                         superseded: !item.superseded_by.is_empty(),
                     })
                 })

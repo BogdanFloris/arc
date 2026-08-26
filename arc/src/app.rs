@@ -69,6 +69,7 @@ pub struct ReviewEntry {
     pub namespace: String,
     pub title: String,
     pub summary: String,
+    pub body: String,
     pub superseded: bool,
 }
 
@@ -1609,6 +1610,7 @@ mod tests {
             namespace: "global".to_owned(),
             title: title.to_owned(),
             summary: "a summary".to_owned(),
+            body: "the full body".to_owned(),
             superseded: false,
         }
     }

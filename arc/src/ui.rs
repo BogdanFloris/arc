@@ -303,7 +303,11 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
     let rows = review.items.len().max(1);
     let width = 72.min(full.width.saturating_sub(4));
-    let height = u16::try_from(rows + 3)
+    let detail = review
+        .items
+        .get(review.selected)
+        .map_or(0, |entry| detail_height(entry, width));
+    let height = u16::try_from(rows + 3 + detail)
         .unwrap_or(u16::MAX)
         .min(full.height.saturating_sub(2));
     let area = Rect {
@@ -326,7 +330,7 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         return;
     }
 
-    let visible = (height as usize).saturating_sub(3);
+    let visible = (height as usize).saturating_sub(3 + detail);
     let start = review.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(ID_WIDTH + 5);
     let end = review.items.len().min(start + visible);
@@ -364,7 +368,44 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         }
         lines.push(Line::from(spans));
     }
+    if let Some(entry) = review.items.get(review.selected) {
+        lines.push(Line::default());
+        for line in wrapped(&entry.summary, width as usize) {
+            lines.push(Line::styled(format!("   {line}"), theme::PLAIN));
+        }
+        for line in wrapped(&entry.body, width as usize) {
+            lines.push(Line::styled(format!("   {line}"), theme::DIM));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+// the list must stay stable while the detail below grows, so wrapping
+// is measured here rather than left to the widget
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let room = width.saturating_sub(4).max(20);
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let mut line = String::new();
+        for word in raw.split_whitespace() {
+            if !line.is_empty() && line.len() + 1 + word.len() > room {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn detail_height(entry: &crate::app::ReviewEntry, width: u16) -> usize {
+    1 + wrapped(&entry.summary, width as usize).len() + wrapped(&entry.body, width as usize).len()
 }
 
 const ID_WIDTH: usize = 8;
