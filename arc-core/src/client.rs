@@ -1,7 +1,7 @@
 use arc_proto::v1::{
-    ClientFrame, FetchHistory, ListSessions, MemoryReviewAccept, MemoryReviewDelete,
-    MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    client_frame, server_frame,
+    ClientFrame, FetchHistory, JobInfo, ListJobs, ListSessions, MemoryReviewAccept,
+    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame,
+    SessionHistory, SessionInfo, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -137,6 +137,19 @@ impl Client {
         self.verdict_ack(id).await
     }
 
+    #[tracing::instrument(name = "client.jobs", skip_all)]
+    pub async fn jobs(&mut self) -> Result<Vec<JobInfo>, Error> {
+        let id = self.send(client_frame::Msg::ListJobs(ListJobs {})).await?;
+        match self.answer(id).await? {
+            server_frame::Msg::JobList(list) => Ok(list.jobs),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("JobList", &other)),
+        }
+    }
+
     async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
         match self.answer(id).await? {
             server_frame::Msg::MessageAccepted(_) => Ok(()),
@@ -260,7 +273,8 @@ impl Turn<'_> {
             }
             other @ (server_frame::Msg::SessionList(_)
             | server_frame::Msg::SessionHistory(_)
-            | server_frame::Msg::MemoryReviewItems(_)) => {
+            | server_frame::Msg::MemoryReviewItems(_)
+            | server_frame::Msg::JobList(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
         };
@@ -280,6 +294,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::ToolCallStarted(_) => "ToolCallStarted",
         server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
         server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
+        server_frame::Msg::JobList(_) => "JobList",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))
 }
@@ -450,6 +465,34 @@ mod tests {
             }
             other => panic!("expected MemoryReviewList, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn jobs_round_trips() {
+        let job = arc_proto::v1::JobInfo {
+            session_id: "s-job".to_owned(),
+            role: arc_proto::v1::SessionRole::Executor as i32,
+            project: "arc".to_owned(),
+            state: arc_proto::v1::job_info::State::Running as i32,
+            spent_tokens: 12,
+            budget_tokens: 100,
+            elapsed_seconds: 4,
+            budget_seconds: 60,
+        };
+        let list = server_frame::Msg::JobList(arc_proto::v1::JobList {
+            jobs: vec![job.clone()],
+        });
+        let (url, handle) = server(vec![vec![echo(list)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let jobs = client.jobs().await.expect("jobs");
+
+        assert_eq!(jobs, [job]);
+        let frames = received(handle).await;
+        assert!(matches!(
+            frames[0].msg,
+            Some(client_frame::Msg::ListJobs(_))
+        ));
     }
 
     #[tokio::test]

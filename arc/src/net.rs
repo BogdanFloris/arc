@@ -48,6 +48,7 @@ async fn handle(
         Command::ReviewDelete { record_id } => {
             verdict(client.review_delete(&record_id).await, events)
         }
+        Command::ListJobs => list_jobs(&mut client, events).await,
     };
     match result {
         Ok(()) => Some(client),
@@ -119,6 +120,23 @@ async fn review_list(
                 })
                 .collect();
             let _ = events.send(NetEvent::ReviewItems(entries));
+            Ok(())
+        }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn list_jobs(
+    client: &mut Client,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.jobs().await {
+        Ok(jobs) => {
+            let _ = events.send(NetEvent::JobItems(jobs));
             Ok(())
         }
         Err(Error::Server { code, msg }) => {

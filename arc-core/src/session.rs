@@ -88,6 +88,7 @@ pub struct DispatchedJob {
     /// The session that dispatched it, and where its handback lands.
     pub parent_session: String,
     pub role: SessionRole,
+    pub project: String,
     pub brief: String,
     pub budget: Option<Budget>,
 }
@@ -274,6 +275,7 @@ impl Engine {
                     session_id: child_id,
                     parent_session: parent_session.to_owned(),
                     role,
+                    project,
                     brief,
                     budget,
                 }),
@@ -3273,6 +3275,7 @@ mod tests {
                 session_id: child.session_id.clone(),
                 parent_session: reply.session_id.clone(),
                 role: SessionRole::Executor,
+                project: "arc".to_owned(),
                 brief: "fix the bug".to_owned(),
                 budget: Some(Budget {
                     total_tokens: 500,

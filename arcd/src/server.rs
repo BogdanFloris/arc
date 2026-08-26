@@ -8,9 +8,9 @@ use arc_core::projection::{Reader, ReviewItem, SessionSummary};
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, MemoryReviewItem, MemoryReviewItems, MessageAccepted,
-    ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, StreamEnd,
-    ToolCallEnded, ToolCallStarted, client_frame, server_frame,
+    ClientFrame, Delta, Error as WireError, JobList, MemoryReviewItem, MemoryReviewItems,
+    MessageAccepted, ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -182,6 +182,7 @@ async fn request(
         Some(client_frame::Msg::MemoryReviewDelete(delete)) => {
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
+        Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
@@ -306,6 +307,13 @@ async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> Cont
             error_frame("internal", &error)
         }
     };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+async fn list_jobs(ws: &mut Socket, supervisor: &Supervisor, request_id: u64) -> ControlFlow<()> {
+    let msg = server_frame::Msg::JobList(JobList {
+        jobs: supervisor.list(),
+    });
     flow(send_frame(ws, request_id, msg).await)
 }
 
@@ -457,6 +465,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::MemoryReviewList(_)) => "memory_review_list",
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
+        Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
         None => "unknown",
     }
 }
@@ -501,9 +510,9 @@ mod tests {
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
-        ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
+        ListJobs, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
         MemoryReviewDelete, MemoryReviewList, Role, SessionCreated, SessionEvent, SessionRole,
-        Source, ToolOutcome, event, memory_event, memory_record, session_event,
+        Source, ToolOutcome, event, job_info, memory_event, memory_record, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1930,6 +1939,59 @@ mod tests {
         assert_eq!(session_id, "s-unknown", "the named session is used as-is");
         assert_eq!(text, "re: hello");
         assert!(!ended(closing).partial);
+
+        harness.stop().await;
+    }
+
+    async fn jobs(ws: &mut Client, request_id: u64) -> Vec<arc_proto::v1::JobInfo> {
+        send(ws, request_id, client_frame::Msg::ListJobs(ListJobs {})).await;
+        let frame = next_frame(ws).await;
+        assert_eq!(frame.request_id, request_id);
+        match frame.msg {
+            Some(server_frame::Msg::JobList(list)) => list.jobs,
+            other => panic!("expected JobList, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_jobs_is_empty_before_a_dispatch_and_names_the_finished_job_after() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let executor_script = Script::Canned(VecDeque::from([vec![
+            Ok(CompletionDelta::Text("on it".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]));
+
+        let mut harness = Harness::with_executor(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_script,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        assert_eq!(jobs(&mut ws, 1).await, [], "nothing dispatched yet");
+
+        send(&mut ws, 2, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 2).await;
+
+        let child_id = dispatched_child_id(&harness);
+        harness.drain_jobs().await;
+
+        let listed = jobs(&mut ws, 3).await;
+        assert_eq!(listed.len(), 1);
+        let job = &listed[0];
+        assert_eq!(job.session_id, child_id);
+        assert_eq!(job.role, SessionRole::Executor as i32);
+        assert_eq!(job.project, "arc");
+        assert_eq!(job.state, job_info::State::Finished as i32);
+        assert_eq!(
+            job.spent_tokens,
+            u64::from(usage().input_tokens) + u64::from(usage().output_tokens)
+        );
 
         harness.stop().await;
     }

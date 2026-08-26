@@ -1,3 +1,4 @@
+use arc_proto::v1::{JobInfo, SessionRole, job_info};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -55,6 +56,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(review) = &app.review {
         draw_review(frame, frame.area(), review);
+    }
+    if let Some(jobs) = &app.jobs {
+        draw_jobs(frame, frame.area(), jobs);
     }
 }
 
@@ -251,7 +255,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
     } else {
-        let style = if app.picker.is_some() || app.review.is_some() {
+        let style = if app.picker.is_some() || app.review.is_some() || app.jobs.is_some() {
             theme::DIM
         } else {
             theme::PLAIN
@@ -295,7 +299,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 
-    if app.mode == Mode::Cmd || (app.picker.is_none() && app.review.is_none()) {
+    if app.mode == Mode::Cmd || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none())
+    {
         let col = u16::try_from(ahead % width).unwrap_or(u16::MAX);
         let row = u16::try_from(cursor_row - start).unwrap_or(u16::MAX);
         frame.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
@@ -420,6 +425,87 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
+    let rows = jobs.items.len().max(1);
+    let width = 72.min(full.width.saturating_sub(4));
+    let height = u16::try_from(rows + 3)
+        .unwrap_or(u16::MAX)
+        .min(full.height.saturating_sub(2));
+    let area = Rect {
+        x: (full.width - width) / 2,
+        y: (full.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![Line::styled(" jobs", theme::DIM), Line::default()];
+    if jobs.items.is_empty() {
+        let word = if jobs.loaded {
+            "no jobs this daemon"
+        } else {
+            "loading"
+        };
+        lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let visible = (height as usize).saturating_sub(3);
+    let start = jobs.selected.saturating_sub(visible.saturating_sub(1));
+    let room = (width as usize).saturating_sub(ID_WIDTH + 5);
+    let end = jobs.items.len().min(start + visible);
+    for (row, job) in jobs.items.iter().enumerate().take(end).skip(start) {
+        let selected = row == jobs.selected;
+        let running = job.state == job_info::State::Running as i32;
+        let (prefix, style) = match (selected, running) {
+            (true, _) => (" > ", theme::ACCENT),
+            (false, true) => ("   ", theme::PLAIN),
+            (false, false) => ("   ", theme::DIM),
+        };
+        let label = elide(&job_label(job), room);
+        let spans = vec![
+            Span::styled(format!("{prefix}{label:<room$}"), style),
+            Span::styled(
+                format!("  {:>ID_WIDTH$}", tail(&job.session_id, ID_WIDTH)),
+                theme::DIM,
+            ),
+        ];
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn job_label(job: &JobInfo) -> String {
+    let state = job_state_word(job.state);
+    let role = arc_core::provider::role_label(
+        SessionRole::try_from(job.role).unwrap_or(SessionRole::Unspecified),
+    );
+    let budget = if job.budget_tokens == 0 {
+        "-".to_owned()
+    } else {
+        job.budget_tokens.to_string()
+    };
+    format!(
+        "{state} {role}/{} {}/{budget} tok {}s",
+        job.project, job.spent_tokens, job.elapsed_seconds
+    )
+}
+
+fn job_state_word(state: i32) -> &'static str {
+    match job_info::State::try_from(state) {
+        Ok(job_info::State::Running) => "running",
+        Ok(job_info::State::Finished) => "done",
+        Ok(job_info::State::Failed) => "failed",
+        Ok(job_info::State::OverBudget) => "over",
+        Ok(job_info::State::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn tail(id: &str, width: usize) -> &str {
+    &id[id.len().saturating_sub(width)..]
 }
 
 // the list must stay stable while the detail below grows, so wrapping

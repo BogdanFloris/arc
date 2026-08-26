@@ -133,7 +133,7 @@ The residual risk is worth stating rather than designing around. arcd runs as th
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
-| 6.1 | TUI: refreshable job list showing live jobs, status, and budget consumed. The conversation stays usable while one runs. | — | todo |
+| 6.1 | TUI: refreshable job list showing live jobs, status, and budget consumed. The conversation stays usable while one runs. **`:jobs` mirrors `:review` in architecture and look: one elided row per job — state, role/project, spent-vs-budget tokens, elapsed, id tail — running in plain, terminal dimmed, selection accented; `r` refetches, nothing polls. Job state is live daemon memory rebuilt empty on restart; the durable record is the child session. Terminal entries are retained to a cap of 50, oldest evicted, running jobs always listed first. The conversation staying usable while a job runs was already true from 5.3's concurrency work; this makes it visible.** | claude | done |
 | 6.2 | **Session titling pass** (carried). Now cheap: titles are `archivist` work and the job list needs something better than a session id to display. | — | todo |
 
 ## 7. Production

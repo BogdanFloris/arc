@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_core::provider::{Usage, role_label};
 use arc_core::session::{DispatchedJob, Engine, Runner};
-use arc_proto::v1::{Budget, SessionRole};
+use arc_proto::v1::{Budget, JobInfo, SessionRole, job_info};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -13,6 +14,10 @@ use tracing::{debug, info, warn};
 const EVENT_BUFFER: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const NO_REPLY: &str = "(the job produced no reply)";
+
+/// Terminal job statuses retained after a job's task ends. Live daemon
+/// memory only: rebuilt empty on restart, unlike the child session itself.
+const MAX_TERMINAL_JOBS: usize = 50;
 
 type LiveMap = Mutex<HashMap<String, mpsc::UnboundedSender<String>>>;
 
@@ -26,6 +31,9 @@ pub struct Supervisor {
     /// sends under this lock; a job task removes its own entry under the
     /// same lock, so an enqueue can never land in a channel nobody will read.
     live: Arc<LiveMap>,
+    /// Outlives `live`: a finished job keeps its status entry after its
+    /// steer sender is torn down, until eviction or a daemon restart.
+    statuses: Arc<JobStatuses>,
 }
 
 impl Supervisor {
@@ -35,6 +43,7 @@ impl Supervisor {
             runners,
             handles: Mutex::new(Vec::new()),
             live: Arc::new(Mutex::new(HashMap::new())),
+            statuses: Arc::new(JobStatuses::new()),
         }
     }
 
@@ -52,10 +61,18 @@ impl Supervisor {
             .lock()
             .expect("live")
             .insert(job.session_id.clone(), steer_tx);
+        self.statuses.start(&job);
         let engine = Arc::clone(&self.engine);
         let live = Arc::clone(&self.live);
-        let handle = tokio::spawn(run_job(engine, runner, job, steer_rx, live));
+        let statuses = Arc::clone(&self.statuses);
+        let handle = tokio::spawn(run_job(engine, runner, job, steer_rx, live, statuses));
         self.handles.lock().expect("handles").push(handle);
+    }
+
+    /// The daemon's live view of every job it remembers: running jobs first
+    /// (newest first), then terminal ones (newest first).
+    pub fn list(&self) -> Vec<JobInfo> {
+        self.statuses.list()
     }
 
     /// Enqueues a steering message for a live job. `true` if the job was
@@ -89,15 +106,20 @@ async fn run_job(
     job: DispatchedJob,
     mut steer_rx: mpsc::UnboundedReceiver<String>,
     live: Arc<LiveMap>,
+    statuses: Arc<JobStatuses>,
 ) {
     let session_id = job.session_id.clone();
     let start = Instant::now();
     let mut spent_tokens: u64 = 0;
 
     match run_turn(&engine, &runner, &session_id, &job.brief).await {
-        TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
+        TurnOutcome::Success(usage) => {
+            spent_tokens += usage_tokens(usage);
+            statuses.record_tokens(&session_id, spent_tokens);
+        }
         TurnOutcome::Failure => {
             finish_now(&live, &mut steer_rx, &session_id);
+            statuses.finish(&session_id, JobState::Failed, start.elapsed());
             handback_failed(&engine, &job).await;
             return;
         }
@@ -107,6 +129,7 @@ async fn run_job(
         if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
             warn_over_budget(&session_id, &breach);
             finish_now(&live, &mut steer_rx, &session_id);
+            statuses.finish(&session_id, JobState::OverBudget, start.elapsed());
             handback_over_budget(&engine, &job, &breach).await;
             return;
         }
@@ -126,15 +149,20 @@ async fn run_job(
         };
         let Some(text) = steered else { break };
         match run_turn(&engine, &runner, &session_id, &text).await {
-            TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
+            TurnOutcome::Success(usage) => {
+                spent_tokens += usage_tokens(usage);
+                statuses.record_tokens(&session_id, spent_tokens);
+            }
             TurnOutcome::Failure => {
                 finish_now(&live, &mut steer_rx, &session_id);
+                statuses.finish(&session_id, JobState::Failed, start.elapsed());
                 handback_failed(&engine, &job).await;
                 return;
             }
         }
     }
 
+    statuses.finish(&session_id, JobState::Finished, start.elapsed());
     handback_clean(&engine, &job).await;
 }
 
@@ -290,6 +318,142 @@ fn finish_now(live: &LiveMap, steer_rx: &mut mpsc::UnboundedReceiver<String>, se
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Running,
+    Finished,
+    Failed,
+    OverBudget,
+}
+
+struct JobStatus {
+    role: SessionRole,
+    project: String,
+    state: JobState,
+    spent_tokens: u64,
+    budget: Option<Budget>,
+    started: Instant,
+    /// Frozen at the terminal transition; `None` while the job is running,
+    /// when `list` reports `started.elapsed()` instead.
+    elapsed: Option<Duration>,
+    /// Last write wins: bumped on start and again on the terminal
+    /// transition, so "newest first" within a state needs no extra clock.
+    ordinal: u64,
+}
+
+impl JobStatus {
+    fn to_job_info(&self, session_id: &str) -> JobInfo {
+        let elapsed = self.elapsed.unwrap_or_else(|| self.started.elapsed());
+        let state = match self.state {
+            JobState::Running => job_info::State::Running,
+            JobState::Finished => job_info::State::Finished,
+            JobState::Failed => job_info::State::Failed,
+            JobState::OverBudget => job_info::State::OverBudget,
+        };
+        JobInfo {
+            session_id: session_id.to_owned(),
+            role: self.role as i32,
+            project: self.project.clone(),
+            state: state as i32,
+            spent_tokens: self.spent_tokens,
+            budget_tokens: self.budget.as_ref().map_or(0, |budget| budget.total_tokens),
+            elapsed_seconds: u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX),
+            budget_seconds: self
+                .budget
+                .as_ref()
+                .map_or(0, |budget| budget.wall_clock_seconds),
+        }
+    }
+}
+
+/// Job status, kept separate from `live`: a finished job's steer channel is
+/// torn down immediately, but its status survives until eviction, so the
+/// two have different lifetimes over the same job.
+struct JobStatuses {
+    entries: Mutex<HashMap<String, JobStatus>>,
+    /// Insertion order of terminal jobs only, for the eviction cap: each
+    /// job reaches a terminal state at most once, so this never double-counts.
+    terminal_order: Mutex<VecDeque<String>>,
+    ordinal: AtomicU64,
+}
+
+impl JobStatuses {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            terminal_order: Mutex::new(VecDeque::new()),
+            ordinal: AtomicU64::new(0),
+        }
+    }
+
+    fn next_ordinal(&self) -> u64 {
+        self.ordinal.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn start(&self, job: &DispatchedJob) {
+        let entry = JobStatus {
+            role: job.role,
+            project: job.project.clone(),
+            state: JobState::Running,
+            spent_tokens: 0,
+            budget: job.budget,
+            started: Instant::now(),
+            elapsed: None,
+            ordinal: self.next_ordinal(),
+        };
+        self.entries
+            .lock()
+            .expect("statuses")
+            .insert(job.session_id.clone(), entry);
+    }
+
+    fn record_tokens(&self, session_id: &str, spent_tokens: u64) {
+        if let Some(entry) = self.entries.lock().expect("statuses").get_mut(session_id) {
+            entry.spent_tokens = spent_tokens;
+        }
+    }
+
+    fn finish(&self, session_id: &str, state: JobState, elapsed: Duration) {
+        let ordinal = self.next_ordinal();
+        let updated = {
+            let mut entries = self.entries.lock().expect("statuses");
+            entries.get_mut(session_id).is_some_and(|entry| {
+                entry.state = state;
+                entry.elapsed = Some(elapsed);
+                entry.ordinal = ordinal;
+                true
+            })
+        };
+        if !updated {
+            return;
+        }
+
+        let mut terminal_order = self.terminal_order.lock().expect("terminal_order");
+        terminal_order.push_back(session_id.to_owned());
+        if terminal_order.len() > MAX_TERMINAL_JOBS {
+            if let Some(oldest) = terminal_order.pop_front() {
+                self.entries.lock().expect("statuses").remove(&oldest);
+            }
+        }
+    }
+
+    fn list(&self) -> Vec<JobInfo> {
+        let entries = self.entries.lock().expect("statuses");
+        let mut listed: Vec<(&String, &JobStatus)> = entries.iter().collect();
+        listed.sort_by(|(_, a), (_, b)| {
+            let a_terminal = a.state != JobState::Running;
+            let b_terminal = b.state != JobState::Running;
+            a_terminal
+                .cmp(&b_terminal)
+                .then_with(|| b.ordinal.cmp(&a.ordinal))
+        });
+        listed
+            .into_iter()
+            .map(|(session_id, status)| status.to_job_info(session_id))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +492,7 @@ mod tests {
             session_id: "s-ghost".to_owned(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Concierge,
+            project: "arc".to_owned(),
             brief: "never runs".to_owned(),
             budget: None,
         });
@@ -376,6 +541,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -488,6 +654,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -547,6 +714,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 100_000,
@@ -600,6 +768,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -651,6 +820,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 5,
@@ -711,6 +881,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 100_000,
@@ -767,6 +938,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 0,
@@ -835,6 +1007,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 10,
@@ -885,6 +1058,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: parent_id.clone(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -920,6 +1094,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: parent_id.clone(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -958,6 +1133,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: parent_id.clone(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
                 total_tokens: 5,
@@ -1002,6 +1178,7 @@ mod tests {
             session_id: child_id.clone(),
             parent_session: parent_id.clone(),
             role: SessionRole::Executor,
+            project: "arc".to_owned(),
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
@@ -1011,6 +1188,238 @@ mod tests {
             child_user_messages(dir.path(), &parent_id),
             [(Role::User, format!("Job {child_id} finished.\n{NO_REPLY}"))],
             "an empty assistant reply reads the same as no reply at all"
+        );
+    }
+
+    fn only_job(listed: Vec<JobInfo>) -> JobInfo {
+        assert_eq!(listed.len(), 1, "got: {listed:?}");
+        listed.into_iter().next().expect("one job")
+    }
+
+    #[tokio::test]
+    async fn list_shows_a_running_job_with_its_live_elapsed_and_the_tokens_spent_so_far() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let second_gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
+                notify: Arc::clone(&first_gate),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Gated {
+                before: Vec::new(),
+                notify: Arc::clone(&second_gate),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "also check the linter"));
+        first_gate.notify_one();
+        // the steer is now its own gated turn: the brief turn's reply plus
+        // the steer's own user message have both landed, so its usage is
+        // counted and the job is provably still running, not yet finished
+        wait_for_message_count(dir.path(), &child_id, 3).await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(job.session_id, child_id);
+        assert_eq!(job.role, SessionRole::Executor as i32);
+        assert_eq!(job.project, "arc");
+        assert_eq!(job.state, job_info::State::Running as i32);
+        assert_eq!(
+            job.spent_tokens,
+            u64::from(usage().input_tokens) + u64::from(usage().output_tokens)
+        );
+        assert_eq!(
+            job.budget_tokens, 0,
+            "no budget means unlimited, not zero spent"
+        );
+
+        second_gate.notify_one();
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_retains_its_state_with_a_frozen_elapsed() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let just_after = only_job(supervisor.list());
+        assert_eq!(just_after.state, job_info::State::Finished as i32);
+        assert_eq!(
+            just_after.spent_tokens,
+            u64::from(usage().input_tokens) + u64::from(usage().output_tokens)
+        );
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let later = only_job(supervisor.list());
+        assert_eq!(
+            later.elapsed_seconds, just_after.elapsed_seconds,
+            "a finished job's elapsed time is frozen, not still ticking"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_reports_the_failed_state() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
+            ProviderError::InvalidRequest("boom".to_owned()),
+        )]]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(job.state, job_info::State::Failed as i32);
+        assert_eq!(job.spent_tokens, 0, "the failed turn reported no usage");
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_job_reports_the_over_budget_state() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        // usage() reports 8 tokens combined; a cap of 5 is over budget as
+        // soon as the brief turn lands
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 5,
+                wall_clock_seconds: 0,
+            }),
+        });
+        supervisor.shutdown().await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(job.state, job_info::State::OverBudget as i32);
+        assert_eq!(job.spent_tokens, 8);
+        assert_eq!(job.budget_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn eviction_keeps_at_most_the_terminal_cap_of_finished_jobs() {
+        const SPAWNED: usize = MAX_TERMINAL_JOBS + 5;
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider =
+            ScriptedProvider::scripted((0..SPAWNED).map(|_| done_reply("ok")).collect());
+
+        let engine = engine_for_project(&dir, &root);
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        for i in 0..SPAWNED {
+            let child_id = child_session(&engine, &concierge_provider);
+            supervisor.spawn(DispatchedJob {
+                session_id: child_id,
+                parent_session: "s-parent".to_owned(),
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+                brief: format!("job {i}"),
+                budget: None,
+            });
+        }
+        supervisor.shutdown().await;
+
+        let listed = supervisor.list();
+        assert_eq!(
+            listed.len(),
+            MAX_TERMINAL_JOBS,
+            "eviction caps retained terminal entries at the const, not the number spawned"
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|job| job.state == job_info::State::Finished as i32),
+            "every spawned job in this test finishes cleanly"
         );
     }
 }

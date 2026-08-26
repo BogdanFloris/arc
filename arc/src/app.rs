@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use arc_proto::v1::{HistoryEntry, HistoryMessage, Role, SessionInfo, ToolOutcome, history_entry};
+use arc_proto::v1::{
+    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, ToolOutcome, history_entry,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const PAGE: usize = 10;
@@ -27,6 +29,7 @@ pub enum Command {
     ReviewDelete {
         record_id: String,
     },
+    ListJobs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +63,7 @@ pub enum NetEvent {
         reason: String,
     },
     ReviewItems(Vec<ReviewEntry>),
+    JobItems(Vec<JobInfo>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +83,13 @@ pub struct Review {
     pub selected: usize,
     pub loaded: bool,
     pub pending_delete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jobs {
+    pub items: Vec<JobInfo>,
+    pub selected: usize,
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +142,7 @@ pub struct App {
     pub sessions: Vec<SessionInfo>,
     pub picker: Option<usize>,
     pub review: Option<Review>,
+    pub jobs: Option<Jobs>,
     pub status: Status,
     pub last_error: Option<String>,
     pub queued: VecDeque<String>,
@@ -152,6 +164,7 @@ impl App {
             sessions: Vec::new(),
             picker: None,
             review: None,
+            jobs: None,
             status: Status::Idle,
             last_error: None,
             queued: VecDeque::new(),
@@ -168,6 +181,14 @@ impl App {
                 review.selected.saturating_sub(1)
             } else {
                 (review.selected + 1).min(review.items.len().saturating_sub(1))
+            };
+            return;
+        }
+        if let Some(jobs) = self.jobs.as_mut() {
+            jobs.selected = if up {
+                jobs.selected.saturating_sub(1)
+            } else {
+                (jobs.selected + 1).min(jobs.items.len().saturating_sub(1))
             };
             return;
         }
@@ -204,6 +225,9 @@ impl App {
         }
         if self.review.is_some() {
             return self.on_review_key(key.code);
+        }
+        if self.jobs.is_some() {
+            return self.on_jobs_key(key.code);
         }
         if self.picker.is_some() {
             return self.on_picker_key(key.code);
@@ -332,6 +356,7 @@ impl App {
                 match self.cmd.as_str() {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
+                    "jobs" => return Some(self.open_jobs()),
                     _ => self.last_error = Some("E492".to_owned()),
                 }
             }
@@ -400,6 +425,28 @@ impl App {
         Some(entry.id)
     }
 
+    fn open_jobs(&mut self) -> Command {
+        self.jobs = Some(Jobs {
+            items: Vec::new(),
+            selected: 0,
+            loaded: false,
+        });
+        Command::ListJobs
+    }
+
+    fn on_jobs_key(&mut self, code: KeyCode) -> Option<Command> {
+        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let last = jobs.items.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.jobs = None,
+            KeyCode::Up | KeyCode::Char('k') => jobs.selected = jobs.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => jobs.selected = (jobs.selected + 1).min(last),
+            KeyCode::Char('r') => return Some(Command::ListJobs),
+            _ => {}
+        }
+        None
+    }
+
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
         let selected = self.picker.expect("picker is open");
         let last = self.sessions.len();
@@ -422,7 +469,7 @@ impl App {
     }
 
     fn open_picker(&mut self) {
-        if self.status != Status::Streaming && self.review.is_none() {
+        if self.status != Status::Streaming && self.review.is_none() && self.jobs.is_none() {
             self.picker = Some(0);
         }
     }
@@ -571,6 +618,14 @@ impl App {
                     review.selected = 0;
                     review.loaded = true;
                     review.pending_delete = false;
+                }
+                None
+            }
+            NetEvent::JobItems(items) => {
+                if let Some(jobs) = self.jobs.as_mut() {
+                    jobs.items = items;
+                    jobs.selected = 0;
+                    jobs.loaded = true;
                 }
                 None
             }
@@ -1774,6 +1829,130 @@ mod tests {
         );
         app.on_scroll(true, PAGE);
         assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        assert_eq!(app.scroll_back, 0, "the transcript never moved");
+    }
+
+    fn job(session_id: &str, state: arc_proto::v1::job_info::State) -> JobInfo {
+        JobInfo {
+            session_id: session_id.to_owned(),
+            role: arc_proto::v1::SessionRole::Executor as i32,
+            project: "arc".to_owned(),
+            state: state as i32,
+            spent_tokens: 12,
+            budget_tokens: 0,
+            elapsed_seconds: 5,
+            budget_seconds: 0,
+        }
+    }
+
+    fn jobsview(entries: Vec<JobInfo>) -> App {
+        let mut app = App::new();
+        normal(&mut app, ":jobs");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::JobItems(entries));
+        app
+    }
+
+    #[test]
+    fn colon_jobs_opens_the_pane_and_asks_for_the_list() {
+        let mut app = App::new();
+        normal(&mut app, ":jobs");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, Some(Command::ListJobs));
+        let jobs = app.jobs.as_ref().expect("the pane is open");
+        assert!(!jobs.loaded, "nothing has been answered yet");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.last_error, None, ":jobs is a command, not E492");
+    }
+
+    #[test]
+    fn job_items_land_in_the_open_pane_and_nowhere_after_it_closed() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-1", State::Running)]);
+        let jobs = app.jobs.as_ref().expect("open");
+        assert!(jobs.loaded);
+        assert_eq!(jobs.items, [job("s-1", State::Running)]);
+        assert_eq!(jobs.selected, 0);
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.jobs, None);
+        app.on_net(NetEvent::JobItems(vec![job("s-2", State::Finished)]));
+        assert_eq!(app.jobs, None);
+    }
+
+    #[test]
+    fn j_and_k_move_the_job_selection_within_bounds() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![
+            job("s-1", State::Running),
+            job("s-2", State::Finished),
+        ]);
+
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.jobs.as_ref().expect("open").selected,
+            1,
+            "j stops at the last row"
+        );
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+    }
+
+    #[test]
+    fn r_asks_for_the_job_list_again_without_closing_the_pane() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-1", State::Running)]);
+
+        let command = app.on_key(key(KeyCode::Char('r')));
+
+        assert_eq!(command, Some(Command::ListJobs));
+        assert!(app.jobs.is_some(), "the pane stays open while it refreshes");
+    }
+
+    #[test]
+    fn q_closes_the_jobs_pane_and_an_empty_pane_still_shows_its_line() {
+        let mut app = jobsview(Vec::new());
+        assert!(app.jobs.is_some(), "an empty pane still shows its line");
+
+        app.on_key(key(KeyCode::Char('q')));
+        assert_eq!(app.jobs, None);
+        assert!(!app.quit, "q closed the pane, not the app");
+    }
+
+    #[test]
+    fn the_picker_does_not_open_under_the_jobs_pane() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-1", State::Running)]);
+        app.on_key(ctrl('p'));
+        assert_eq!(app.picker, None);
+    }
+
+    #[test]
+    fn scrolling_moves_the_job_selection_when_the_pane_is_open() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![
+            job("s-1", State::Running),
+            job("s-2", State::Finished),
+        ]);
+
+        app.on_scroll(false, PAGE);
+        assert_eq!(
+            app.jobs.as_ref().expect("open").selected,
+            1,
+            "one row per gesture, not one page"
+        );
+        app.on_scroll(true, PAGE);
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
