@@ -15,7 +15,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+// 9: messages gained the source column
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS messages (
     outcome        INTEGER,
     truncated      INTEGER,
     ts             INTEGER,
-    provider_roundtrip BLOB
+    provider_roundtrip BLOB,
+    source         INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
@@ -141,6 +143,7 @@ pub enum MessageRow {
         content: String,
         partial: bool,
         turn_id: String,
+        source: i32,
     },
     ToolCall {
         call_id: String,
@@ -641,7 +644,7 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
     let mut stmt = conn.prepare(
         "SELECT kind, role, content, partial, turn_id,
                 call_id, call_index, name, arguments_json, outcome, truncated,
-                provider_roundtrip
+                provider_roundtrip, source
          FROM messages WHERE session_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
@@ -650,6 +653,7 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
             content: row.get(2)?,
             partial: row.get(3)?,
             turn_id: row.get(4)?,
+            source: row.get::<_, Option<i32>>(12)?.unwrap_or(0),
         }),
         KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
             call_id: row.get(5)?,
@@ -709,12 +713,13 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             role,
             content,
             partial,
+            source,
             ..
         } => history_entry::Entry::Message(HistoryMessage {
             role,
             content,
             partial,
-            source: 0,
+            source,
         }),
         MessageRow::ToolCall { call_id, name, .. } => {
             history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })
@@ -833,8 +838,8 @@ fn insert_message(
     appended: &MessageAppended,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             &appended.session_id,
             seq_param(event.seq)?,
@@ -844,6 +849,7 @@ fn insert_message(
             &appended.content,
             appended.partial,
             epoch_micros(event.ts.as_ref()),
+            event.source,
         ],
     )?;
     index_content(tx, event.seq, &appended.content)
@@ -1666,6 +1672,7 @@ mod tests {
                     content: "look this up".to_string(),
                     partial: false,
                     turn_id: "t-01".to_string(),
+                    source: Source::User as i32,
                 },
                 MessageRow::ToolCall {
                     call_id: "c-a".to_string(),
@@ -1714,6 +1721,7 @@ mod tests {
                 content: "half a th".to_string(),
                 partial: true,
                 turn_id: String::new(),
+                source: Source::User as i32,
             }
         );
         assert_eq!(
@@ -3287,5 +3295,25 @@ mod tests {
         projection.apply(&unstamped).expect("apply");
 
         assert_eq!(review_ids(&projection, i64::MIN), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_system_sourced_message_carries_its_source_into_history() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        let mut event = message_appended(1, "job s-x finished.");
+        event.source = Source::System as i32;
+        projection.apply(&event).expect("apply");
+
+        let rows = projection.messages("s-01").expect("rows");
+        let MessageRow::Message { source, .. } = &rows[0] else {
+            panic!("expected a message row, got {:?}", rows[0]);
+        };
+        assert_eq!(*source, Source::System as i32);
+        let entry = super::history_entry(rows.into_iter().next().expect("row"));
+        let Some(arc_proto::v1::history_entry::Entry::Message(message)) = entry.entry else {
+            panic!("expected a message entry");
+        };
+        assert_eq!(message.source, Source::System as i32);
     }
 }

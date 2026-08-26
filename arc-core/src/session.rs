@@ -1137,13 +1137,29 @@ mod tests {
         })
     }
 
+    fn sourced_entry(role: i32, content: &str, source: Source) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::Message(HistoryMessage {
+                role,
+                content: content.to_owned(),
+                partial: false,
+                source: source as i32,
+            })),
+        }
+    }
+
     fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
+        let source = match Role::try_from(role) {
+            Ok(Role::User) => Source::User,
+            Ok(Role::Assistant) => Source::Model,
+            _ => Source::Unspecified,
+        };
         HistoryEntry {
             entry: Some(history_entry::Entry::Message(HistoryMessage {
                 role,
                 content: content.to_owned(),
                 partial,
-                source: 0,
+                source: source as i32,
             })),
         }
     }
@@ -1987,8 +2003,8 @@ mod tests {
         assert_eq!(
             engine.transcript("s-01").expect("transcript"),
             [
-                prose_entry(Role::User as i32, "question", false),
-                prose_entry(99, "from the future", false),
+                sourced_entry(Role::User as i32, "question", Source::System),
+                sourced_entry(99, "from the future", Source::System),
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
                         call_id: "c1".to_owned(),

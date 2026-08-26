@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, ToolOutcome, history_entry, job_info,
+    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, Source, ToolOutcome, history_entry,
+    job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -99,6 +100,7 @@ pub struct Jobs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     You(String),
+    System(String),
     Arc {
         text: String,
         partial: bool,
@@ -797,6 +799,10 @@ fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
 }
 
 fn prose_block(message: HistoryMessage) -> Option<Block> {
+    // handbacks ride the user role for the model; the display tells the truth
+    if message.source == Source::System as i32 {
+        return Some(Block::System(message.content));
+    }
     match Role::try_from(message.role) {
         Ok(Role::User) => Some(Block::You(message.content)),
         Ok(Role::Assistant) => Some(Block::Arc {
@@ -2181,5 +2187,17 @@ mod tests {
         }
         app.on_key(key(KeyCode::Backspace));
         assert_eq!(app.input, "hllo", "backspace removed the two-byte é");
+    }
+
+    #[test]
+    fn a_system_sourced_message_becomes_a_system_block_not_yours() {
+        let mut message = prose(Role::User as i32, "Job s-x finished.\nAll good.", false);
+        message.source = Source::System as i32;
+
+        let block = prose_block(message).expect("block");
+        assert_eq!(
+            block,
+            Block::System("Job s-x finished.\nAll good.".to_owned())
+        );
     }
 }

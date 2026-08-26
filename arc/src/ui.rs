@@ -119,6 +119,10 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::styled("you", theme::DIM));
                 push_wrapped(&mut out, text, width, theme::PLAIN);
             }
+            Block::System(text) => {
+                out.push(Line::styled("system", theme::DIM));
+                push_wrapped(&mut out, text, width, theme::DIM);
+            }
             Block::Arc { text, partial } => {
                 out.push(Line::styled("arc", theme::ACCENT));
                 let streaming = i == last && app.status == Status::Streaming;

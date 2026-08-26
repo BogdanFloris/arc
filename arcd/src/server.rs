@@ -1330,7 +1330,10 @@ mod tests {
             role: role as i32,
             content: content.to_owned(),
             partial: false,
-            source: 0,
+            source: match role {
+                Role::Assistant => Source::Model as i32,
+                _ => Source::User as i32,
+            },
         };
         assert_eq!(
             answer.entries,

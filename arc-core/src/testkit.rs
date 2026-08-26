@@ -423,7 +423,7 @@ pub fn tool_stop() -> CompletionDelta {
 
 #[cfg(test)]
 mod tests {
-    use arc_proto::v1::{Role, ToolOutcome, session_event};
+    use arc_proto::v1::{Role, Source, ToolOutcome, session_event};
     use tempfile::TempDir;
 
     use super::{
@@ -515,6 +515,7 @@ mod tests {
                     content: "question".to_owned(),
                     partial: false,
                     turn_id: turn_id.clone(),
+                    source: Source::User as i32,
                 },
                 MessageRow::ToolCall {
                     call_id: "c1".to_owned(),
@@ -536,6 +537,7 @@ mod tests {
                     content: "final text".to_owned(),
                     partial: false,
                     turn_id,
+                    source: Source::Model as i32,
                 },
             ]
         );
