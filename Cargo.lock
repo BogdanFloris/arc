@@ -68,6 +68,7 @@ dependencies = [
  "crc32fast",
  "expect-test",
  "futures",
+ "libc",
  "prost",
  "prost-types",
  "reqwest",

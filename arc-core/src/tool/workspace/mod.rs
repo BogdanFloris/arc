@@ -1,3 +1,4 @@
+pub mod bash;
 pub mod edit;
 pub mod read;
 pub mod write;
@@ -95,6 +96,14 @@ impl Grants {
 
         Ok(canonical)
     }
+
+    /// The bash tool's working directory: the first grant it can write to.
+    pub fn read_write_root(&self) -> Option<&Path> {
+        self.roots
+            .iter()
+            .find(|(_, mode)| *mode == Mode::ReadWrite)
+            .map(|(root, _)| root.as_path())
+    }
 }
 
 pub struct Workspace {
@@ -153,12 +162,13 @@ pub(crate) fn ensure_fresh(
     }
 }
 
-/// The workspace source: read, write, edit, all gated through `Grants`.
+/// The workspace source: bash, read, write, edit, all gated through `Grants`.
 pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
     vec![
+        Box::new(bash::Bash::new(Arc::clone(&workspace))),
+        Box::new(edit::Edit::new(Arc::clone(&workspace))),
         Box::new(read::Read::new(Arc::clone(&workspace))),
-        Box::new(write::Write::new(Arc::clone(&workspace))),
-        Box::new(edit::Edit::new(workspace)),
+        Box::new(write::Write::new(workspace)),
     ]
 }
 
@@ -173,14 +183,14 @@ mod tests {
     use crate::tool::ToolSource;
 
     #[test]
-    fn the_workspace_source_is_read_write_and_edit() {
+    fn the_workspace_source_is_bash_edit_read_and_write() {
         let dir = TempDir::new().expect("tmp");
         let root = proj(&dir);
         let grants = grants(&root, Mode::ReadWrite);
         let tools = super::tools(std::sync::Arc::new(Workspace::new(grants)));
 
         let names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
-        assert_eq!(names, ["read", "write", "edit"]);
+        assert_eq!(names, ["bash", "edit", "read", "write"]);
         assert!(
             tools
                 .iter()
