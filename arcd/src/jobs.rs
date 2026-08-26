@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 const EVENT_BUFFER: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const NO_REPLY: &str = "(the job produced no reply)";
 
 type LiveMap = Mutex<HashMap<String, mpsc::UnboundedSender<String>>>;
 
@@ -97,6 +98,7 @@ async fn run_job(
         TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
         TurnOutcome::Failure => {
             finish_now(&live, &mut steer_rx, &session_id);
+            handback_failed(&engine, &job).await;
             return;
         }
     }
@@ -105,6 +107,7 @@ async fn run_job(
         if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
             warn_over_budget(&session_id, &breach);
             finish_now(&live, &mut steer_rx, &session_id);
+            handback_over_budget(&engine, &job, &breach).await;
             return;
         }
 
@@ -126,10 +129,66 @@ async fn run_job(
             TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
             TurnOutcome::Failure => {
                 finish_now(&live, &mut steer_rx, &session_id);
+                handback_failed(&engine, &job).await;
                 return;
             }
         }
     }
+
+    handback_clean(&engine, &job).await;
+}
+
+/// The job's last assistant reply, or the fixed no-reply line: shared by
+/// every handback path, since an empty or missing reply reads the same way
+/// regardless of how the job ended.
+fn job_summary(engine: &Engine, job: &DispatchedJob) -> String {
+    match engine.last_assistant_message(&job.session_id) {
+        Ok(Some(text)) => text,
+        Ok(None) => NO_REPLY.to_owned(),
+        Err(error) => {
+            warn!(
+                session_id = %job.session_id,
+                %error,
+                "could not read the job's last reply for its handback; using the no-reply line"
+            );
+            NO_REPLY.to_owned()
+        }
+    }
+}
+
+async fn record_handback(engine: &Engine, job: &DispatchedJob, reason: Option<&str>) {
+    let summary = job_summary(engine, job);
+    if let Err(error) = engine
+        .record_handback(&job.parent_session, &job.session_id, reason, &summary)
+        .await
+    {
+        warn!(
+            parent_session = %job.parent_session,
+            session_id = %job.session_id,
+            %error,
+            "failed to record the job's handback into the parent session"
+        );
+    }
+}
+
+async fn handback_clean(engine: &Engine, job: &DispatchedJob) {
+    record_handback(engine, job, None).await;
+}
+
+async fn handback_failed(engine: &Engine, job: &DispatchedJob) {
+    record_handback(engine, job, Some("the turn failed")).await;
+}
+
+async fn handback_over_budget(engine: &Engine, job: &DispatchedJob, breach: &BudgetBreach) {
+    let reason = match breach {
+        BudgetBreach::Tokens { spent, allowed } => {
+            format!("token budget exhausted ({spent}/{allowed})")
+        }
+        BudgetBreach::WallClock { elapsed, allowed } => {
+            format!("time budget exhausted ({elapsed}s/{allowed}s)")
+        }
+    };
+    record_handback(engine, job, Some(&reason)).await;
 }
 
 /// A completed turn's outcome. A failed turn ends the job, so the caller
@@ -267,6 +326,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: "s-ghost".to_owned(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Concierge,
             brief: "never runs".to_owned(),
             budget: None,
@@ -314,6 +374,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: None,
@@ -344,6 +405,14 @@ mod tests {
         engine
             .create_bound_session(&runner(concierge), "arc", SessionRole::Executor, None)
             .expect("create the child durably, as dispatch already does")
+    }
+
+    /// A stand-in for whatever session dispatched the job, so a test can
+    /// read its handback the same way `child_session` stands in for the job.
+    fn parent_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
+        engine
+            .create_bound_session(&runner(concierge), "arc", SessionRole::Concierge, None)
+            .expect("create the parent durably")
     }
 
     fn engine_for_project(dir: &TempDir, root: &std::path::Path) -> Arc<Engine> {
@@ -417,6 +486,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: None,
@@ -475,6 +545,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
@@ -527,6 +598,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: None,
@@ -577,6 +649,7 @@ mod tests {
         // soon as the brief turn lands, before any steer is even queued
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
@@ -636,6 +709,7 @@ mod tests {
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
@@ -691,6 +765,7 @@ mod tests {
         // wall-clock is enforced
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
@@ -758,6 +833,7 @@ mod tests {
         // so the check before the second steer is what stops the job
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
             budget: Some(Budget {
@@ -785,6 +861,156 @@ mod tests {
                 (Role::Assistant, "first steer done".to_owned()),
             ],
             "the first steer ran; the second never did once the combined usage crossed the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_finish_records_a_handback_with_the_childs_final_reply() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(Role::User, format!("Job {child_id} finished.\nall fixed"))],
+            "the handback names the child and carries its final reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_records_a_stopped_handback_naming_the_turn_failure() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
+            ProviderError::InvalidRequest("boom".to_owned()),
+        )]]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(
+                Role::User,
+                format!("Job {child_id} stopped: the turn failed.\n{NO_REPLY}")
+            )],
+            "the failure never produced any assistant text, so the summary falls back"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_finish_records_a_stopped_handback_naming_the_numbers() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        // usage() reports 8 tokens combined; a cap of 5 is over budget as
+        // soon as the brief turn lands
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 5,
+                wall_clock_seconds: 0,
+            }),
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(
+                Role::User,
+                "Job ".to_owned()
+                    + &child_id
+                    + " stopped: token budget exhausted (8/5).\npartial progress"
+            )],
+            "the reason names the spent and allowed token counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_finish_with_no_assistant_text_falls_back_to_the_no_reply_line() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![Ok(CompletionDelta::Done {
+            usage: usage(),
+            stop: Stop::EndTurn,
+        })]]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(Role::User, format!("Job {child_id} finished.\n{NO_REPLY}"))],
+            "an empty assistant reply reads the same as no reply at all"
         );
     }
 }

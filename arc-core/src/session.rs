@@ -85,6 +85,8 @@ pub struct Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchedJob {
     pub session_id: String,
+    /// The session that dispatched it, and where its handback lands.
+    pub parent_session: String,
     pub role: SessionRole,
     pub brief: String,
     pub budget: Option<Budget>,
@@ -253,6 +255,7 @@ impl Engine {
     fn dispatch_job(
         &self,
         runner: &Runner,
+        parent_session: &str,
         job_request: crate::tool::JobRequest,
     ) -> (ToolOutcome, String, Option<DispatchedJob>) {
         let role = job_request.role;
@@ -269,6 +272,7 @@ impl Engine {
                 ),
                 Some(DispatchedJob {
                     session_id: child_id,
+                    parent_session: parent_session.to_owned(),
                     role,
                     brief,
                     budget,
@@ -276,6 +280,65 @@ impl Engine {
             ),
             Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
         }
+    }
+
+    /// The job's summary and its session id, appended into the parent as
+    /// ordinary conversation (§4.1). `Event.source = System`; `role = User`
+    /// because `rebuild_transcript` drops a `System`-role row instead of
+    /// sending it to the model. `reason` is `None` for a clean finish.
+    /// Takes the parent's turn guard, so a handback never lands mid-turn.
+    #[tracing::instrument(
+        level = "info",
+        name = "session.record_handback",
+        skip_all,
+        fields(parent_session, child_session)
+    )]
+    pub async fn record_handback(
+        &self,
+        parent_session: &str,
+        child_session: &str,
+        reason: Option<&str>,
+        summary: &str,
+    ) -> Result<(), Error> {
+        let span = tracing::Span::current();
+        span.record("parent_session", parent_session);
+        span.record("child_session", child_session);
+
+        let guard = self.turn_guard(parent_session);
+        let _turn = guard.lock().await;
+
+        let summary = truncate_summary(summary);
+        let content = match reason {
+            None => format!("Job {child_session} finished.\n{summary}"),
+            Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}"),
+        };
+        self.record(
+            Source::System,
+            session_event::Event::MessageAppended(MessageAppended {
+                session_id: parent_session.to_owned(),
+                role: Role::User as i32,
+                content,
+                partial: false,
+                turn_id: uuid::Uuid::new_v4().to_string(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// The most recent assistant reply in a session, straight from the
+    /// projection. `None` covers both "no assistant text yet" and "the last
+    /// reply was empty" — a handback treats an empty reply the same as no
+    /// reply at all.
+    pub fn last_assistant_message(&self, session_id: &str) -> Result<Option<String>, Error> {
+        let rows = self.with_store(|store| store.projection().messages(session_id))?;
+        Ok(rows.into_iter().rev().find_map(|row| match row {
+            MessageRow::Message { role, content, .. }
+                if role == Role::Assistant as i32 && !content.is_empty() =>
+            {
+                Some(content)
+            }
+            _ => None,
+        }))
     }
 
     fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
@@ -604,7 +667,7 @@ impl Engine {
                 self.record_memory(Source::Model, memory_event)?;
             }
             let (outcome, content) = if let Some(job_request) = job_request {
-                let (outcome, content, job) = self.dispatch_job(runner, job_request);
+                let (outcome, content, job) = self.dispatch_job(runner, session_id, job_request);
                 if let Some(job) = job {
                     jobs.push(job);
                 }
@@ -761,6 +824,19 @@ impl Engine {
             seed: None,
         }
     }
+}
+
+const MAX_HANDBACK_SUMMARY_BYTES: usize = 2048;
+
+fn truncate_summary(summary: &str) -> String {
+    if summary.len() <= MAX_HANDBACK_SUMMARY_BYTES {
+        return summary.to_owned();
+    }
+    let mut cut = MAX_HANDBACK_SUMMARY_BYTES;
+    while !summary.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} [truncated]", &summary[..cut])
 }
 
 fn role_name(role: i32) -> String {
@@ -3195,6 +3271,7 @@ mod tests {
             reply.jobs,
             [DispatchedJob {
                 session_id: child.session_id.clone(),
+                parent_session: reply.session_id.clone(),
                 role: SessionRole::Executor,
                 brief: "fix the bug".to_owned(),
                 budget: Some(Budget {
@@ -3251,6 +3328,208 @@ mod tests {
             .send_message(&executor_run, Some(&child_id), "go", tx)
             .await
             .expect("an executor runner continues the dispatched child");
+    }
+
+    #[tokio::test]
+    async fn record_handback_appends_a_system_sourced_message_visible_in_the_parents_log() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        engine
+            .record_handback(&reply.session_id, "child-1", None, "all done")
+            .await
+            .expect("record_handback");
+
+        let events = replay_events(dir.path());
+        let last = events.last().expect("an event was appended");
+        assert_eq!(
+            last.source,
+            Source::System as i32,
+            "the daemon wrote the handback, not the user's turn"
+        );
+        let arc_proto::v1::event::Payload::Session(arc_proto::v1::SessionEvent {
+            event: Some(session_event::Event::MessageAppended(handback)),
+        }) = last.payload.clone().expect("payload")
+        else {
+            panic!("expected a MessageAppended, got {:?}", last.payload);
+        };
+        assert_eq!(handback.session_id, reply.session_id);
+        assert_eq!(
+            handback.role,
+            Role::User as i32,
+            "rebuild_transcript only carries User/Assistant rows to the model"
+        );
+        assert!(!handback.partial);
+        assert!(handback.content.contains("child-1"));
+        assert!(handback.content.contains("all done"));
+
+        let earlier_turn_id = match &events[1].payload {
+            Some(arc_proto::v1::event::Payload::Session(arc_proto::v1::SessionEvent {
+                event: Some(session_event::Event::MessageAppended(m)),
+            })) => m.turn_id.clone(),
+            other => panic!("expected the user's message, got {other:?}"),
+        };
+        assert!(!handback.turn_id.is_empty());
+        assert_ne!(
+            handback.turn_id, earlier_turn_id,
+            "the handback is its own turn, not part of the conversation turn"
+        );
+
+        let entries = engine.transcript(&reply.session_id).expect("transcript");
+        match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { role, content, .. })) => {
+                assert_eq!(*role, Role::User as i32);
+                assert!(content.contains("child-1"));
+            }
+            other => panic!("expected a message entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_handback_truncates_a_long_summary_on_a_char_boundary() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        // two-byte characters straddle the 2 KiB cap, exercising the
+        // char-boundary walk-back as well as the cap itself
+        let long_summary = "é".repeat(2000);
+        engine
+            .record_handback(&reply.session_id, "child-1", None, &long_summary)
+            .await
+            .expect("record_handback");
+
+        let entries = engine.transcript(&reply.session_id).expect("transcript");
+        let content = match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
+            other => panic!("expected a message entry, got {other:?}"),
+        };
+        assert!(content.ends_with(" [truncated]"), "{content}");
+        assert!(content.len() < long_summary.len());
+    }
+
+    async fn wait_for_event_count(dir: &std::path::Path, want: usize) {
+        for _ in 0..400 {
+            if replay_log(dir).len() >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {want} events in {}", dir.display());
+    }
+
+    #[tokio::test]
+    async fn record_handback_waits_for_the_parents_turn_guard() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session()]);
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&notify),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]);
+        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let engine = Arc::new(engine);
+
+        let turn_engine = Arc::clone(&engine);
+        let turn_run = run.clone();
+        let turn = tokio::spawn(async move {
+            let (tx, _rx) = channel();
+            turn_engine
+                .send_message(&turn_run, Some("s-01"), "go", tx)
+                .await
+                .expect("send")
+        });
+
+        // the user message lands before the provider stalls on the gate:
+        // waiting for it proves the turn is genuinely in flight, holding the
+        // guard, when record_handback is asked to run below
+        wait_for_event_count(dir.path(), 2).await;
+
+        let handback_engine = Arc::clone(&engine);
+        let handback = tokio::spawn(async move {
+            handback_engine
+                .record_handback("s-01", "child-1", None, "the child's report")
+                .await
+                .expect("record_handback");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            replay_log(dir.path()).len(),
+            2,
+            "the handback stays blocked while the parent's turn guard is held"
+        );
+
+        notify.notify_one();
+        turn.await.expect("turn task");
+        handback.await.expect("handback task");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 4, "the turn's events, then the handback");
+        let turn_id = appended(&events[1]).turn_id.clone();
+        assert_eq!(
+            appended(&events[2]).turn_id,
+            turn_id,
+            "the gated turn's own reply"
+        );
+        let handback_msg = appended(&events[3]);
+        assert_ne!(
+            handback_msg.turn_id, turn_id,
+            "the handback landed after the turn released the guard, in its own turn"
+        );
+        assert!(handback_msg.content.contains("child-1"));
+    }
+
+    #[tokio::test]
+    async fn last_assistant_message_returns_the_most_recent_non_empty_reply() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "one", tx)
+            .await
+            .expect("send");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&reply.session_id), "two", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            engine
+                .last_assistant_message(&reply.session_id)
+                .expect("last"),
+            Some("second".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn last_assistant_message_is_none_for_a_session_with_no_assistant_text() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _run) = engine(&provider, &dir);
+
+        assert_eq!(
+            engine.last_assistant_message("s-ghost").expect("last"),
+            None
+        );
     }
 
     #[tokio::test]

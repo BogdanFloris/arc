@@ -1549,7 +1549,7 @@ mod tests {
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "start a job")).await;
-        turn(&mut ws, 1).await;
+        let (parent_id, _text, _closing) = turn(&mut ws, 1).await;
 
         harness.drain_jobs().await;
 
@@ -1583,6 +1583,23 @@ mod tests {
         );
         assert_eq!(child_messages[1].role, Role::Assistant as i32);
         assert_eq!(child_messages[1].content, "on it");
+
+        let parent_messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == parent_id => Some(m),
+                _ => None,
+            })
+            .collect();
+        let handback = parent_messages
+            .last()
+            .expect("the handback landed in the parent's history");
+        assert_eq!(handback.role, Role::User as i32);
+        assert_eq!(
+            handback.content,
+            format!("Job {} finished.\non it", child.session_id),
+            "the handback names the child and carries its final reply"
+        );
 
         harness.stop().await;
     }
