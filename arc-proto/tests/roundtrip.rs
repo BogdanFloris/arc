@@ -311,6 +311,7 @@ fn server_frame_arms_round_trip() {
                         role: Role::User as i32,
                         content: "hello arc".to_string(),
                         partial: false,
+                        source: 0,
                     })),
                 },
                 HistoryEntry {

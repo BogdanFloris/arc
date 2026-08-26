@@ -146,6 +146,8 @@ message HistoryMessage {
   Role role = 1;
   string content = 2;
   bool partial = 3;
+  // who wrote it: a handback is SYSTEM where the user's words are USER
+  Source source = 4;
 }
 
 message HistoryToolCall {

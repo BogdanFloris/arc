@@ -714,6 +714,7 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             role,
             content,
             partial,
+            source: 0,
         }),
         MessageRow::ToolCall { call_id, name, .. } => {
             history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })

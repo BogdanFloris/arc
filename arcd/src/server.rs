@@ -1330,6 +1330,7 @@ mod tests {
             role: role as i32,
             content: content.to_owned(),
             partial: false,
+            source: 0,
         };
         assert_eq!(
             answer.entries,

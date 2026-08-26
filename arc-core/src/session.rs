@@ -1143,6 +1143,7 @@ mod tests {
                 role,
                 content: content.to_owned(),
                 partial,
+                source: 0,
             })),
         }
     }
