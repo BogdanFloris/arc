@@ -33,6 +33,9 @@ pub enum Step {
         notify: Arc<tokio::sync::Notify>,
         after: Vec<Result<CompletionDelta, ProviderError>>,
     },
+    /// Panics when the provider is asked to complete: drives the panic
+    /// watchdog test without a second task or a real crashing tool.
+    Panics,
 }
 
 #[derive(Debug)]
@@ -89,6 +92,7 @@ impl Provider for ScriptedProvider {
                         )
                         .chain(stream::iter(after)),
                 ),
+                Step::Panics => panic!("scripted provider panic"),
             };
             Ok(stream)
         })

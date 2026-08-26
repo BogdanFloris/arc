@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_core::provider::{Usage, role_label};
-use arc_core::session::{ContinuedJob, DispatchedJob, Engine, Runner};
+use arc_core::session::{ContinuedJob, DispatchedJob, Engine, EngineEvent, Runner};
 use arc_proto::v1::{Budget, JobInfo, Notification, SessionRole, job_info, notification};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -15,9 +15,18 @@ const EVENT_BUFFER: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const NO_REPLY: &str = "(the job produced no reply)";
 
+/// How long a turn may go without an engine event (a delta, reasoning, or
+/// tool activity) before it's failed outright. A streaming HTTP body that
+/// goes quiet without closing would otherwise hold the job open forever.
+const JOB_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Terminal job statuses retained after a job's task ends. Live daemon
 /// memory only: rebuilt empty on restart, unlike the child session itself.
 const MAX_TERMINAL_JOBS: usize = 50;
+
+/// How long a terminal job stays in `list()` after it finishes, so the
+/// list reads as "what's going on", not an ever-growing history.
+const TERMINAL_TTL: Duration = Duration::from_secs(600);
 
 /// Consecutive handback turns run for one parent since its last user
 /// message, before the daemon stops narrating and just leaves the handback
@@ -285,10 +294,10 @@ fn spawn_job_checked(
     }
     let info = statuses.start(&job);
     notify_job_changed(notifier, engine, info);
-    let handle = tokio::spawn(run_job(
+    let handle = spawn_watched(
+        job,
         Arc::clone(engine),
         runner,
-        job,
         steer_rx,
         Arc::clone(live),
         Arc::clone(statuses),
@@ -296,9 +305,72 @@ fn spawn_job_checked(
         runners.clone(),
         handback.cloned(),
         Arc::clone(handles),
-    ));
-    handles.lock().expect("handles").push(handle);
+    );
+    let mut handles = handles.lock().expect("handles");
+    // reap finished wrappers so a long-lived daemon's history stays bounded
+    handles.retain(|held| !held.is_finished());
+    handles.push(handle);
     true
+}
+
+/// Spawns `run_job` under a wrapper task that watches for it panicking
+/// (any bare `expect`, any bug) instead of reaching a terminal state. The
+/// wrapper, not `run_job`, is what `handles` tracks, so `shutdown` still
+/// waits out the recovery path too.
+#[allow(clippy::too_many_arguments)]
+fn spawn_watched(
+    job: DispatchedJob,
+    engine: Arc<Engine>,
+    runner: Runner,
+    steer_rx: mpsc::UnboundedReceiver<String>,
+    live: Arc<LiveMap>,
+    statuses: Arc<JobStatuses>,
+    notifier: Option<broadcast::Sender<Notification>>,
+    runners: BTreeMap<SessionRole, Runner>,
+    handback: Option<Arc<Handback>>,
+    handles: Arc<Handles>,
+) -> JoinHandle<()> {
+    let recovery_job = job.clone();
+    let start = Instant::now();
+    tokio::spawn(async move {
+        let inner = tokio::spawn(run_job(
+            Arc::clone(&engine),
+            runner,
+            job,
+            steer_rx,
+            Arc::clone(&live),
+            Arc::clone(&statuses),
+            notifier.clone(),
+            runners.clone(),
+            handback.clone(),
+            Arc::clone(&handles),
+        ));
+        if let Err(join_error) = inner.await {
+            if !join_error.is_panic() {
+                return;
+            }
+            warn!(
+                session_id = %recovery_job.session_id,
+                "job task panicked; forcing it to failed"
+            );
+            live.lock().expect("live").remove(&recovery_job.session_id);
+            if let Some(info) =
+                statuses.finish(&recovery_job.session_id, JobState::Failed, start.elapsed())
+            {
+                notify_job_changed(notifier.as_ref(), &engine, info);
+            }
+            let ctx = HandbackCtx {
+                engine: &engine,
+                runners: &runners,
+                live: &live,
+                statuses: &statuses,
+                notifier: notifier.as_ref(),
+                handles: &handles,
+                handback: handback.as_ref(),
+            };
+            handback_crashed(&ctx, &recovery_job).await;
+        }
+    })
 }
 
 fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
@@ -515,6 +587,10 @@ async fn handback_failed(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
     record_handback(ctx, job, Some("the turn failed")).await;
 }
 
+async fn handback_crashed(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+    record_handback(ctx, job, Some("the job crashed")).await;
+}
+
 async fn handback_over_budget(ctx: &HandbackCtx<'_>, job: &DispatchedJob, breach: &BudgetBreach) {
     let reason = match breach {
         BudgetBreach::Tokens { spent, allowed } => {
@@ -720,19 +796,41 @@ fn warn_over_budget(session_id: &str, breach: &BudgetBreach) {
     }
 }
 
-/// Runs one turn to completion.
+/// Runs one turn to completion, failing it if the engine goes quiet for
+/// `JOB_SILENCE_TIMEOUT` with no events. A pending tool call suspends the
+/// timeout instead of tripping it: bash alone is allowed to run silent for
+/// up to its own 600s cap, so a tool call in flight is activity, not stall.
 async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
-    let (result, ()) = tokio::join!(
-        engine.send_message(runner, Some(session_id), text, events),
-        async {
-            while let Some(event) = rx.recv().await {
+    let send = engine.send_message(runner, Some(session_id), text, events);
+    tokio::pin!(send);
+
+    let mut deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
+    let mut pending_tool_calls: u32 = 0;
+
+    let result = loop {
+        tokio::select! {
+            result = &mut send => break Some(result),
+            event = rx.recv() => {
+                // send_message drops its sender exactly as it returns, so a
+                // `None` here means `send` is already ready on the next poll
+                let Some(event) = event else { continue };
+                match &event {
+                    EngineEvent::ToolCallStarted { .. } => pending_tool_calls += 1,
+                    EngineEvent::ToolCallEnded { .. } => {
+                        pending_tool_calls = pending_tool_calls.saturating_sub(1);
+                    }
+                    _ => {}
+                }
                 debug!(session_id = %session_id, ?event, "job event");
+                deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
             }
-        },
-    );
+            () = tokio::time::sleep_until(deadline), if pending_tool_calls == 0 => break None,
+        }
+    };
+
     match result {
-        Ok(reply) => {
+        Some(Ok(reply)) => {
             info!(
                 session_id = %session_id,
                 input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
@@ -745,8 +843,19 @@ async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str
                 continues: reply.continues,
             }
         }
-        Err(error) => {
+        Some(Err(error)) => {
             warn!(session_id = %session_id, %error, "job turn failed");
+            TurnOutcome::Failure
+        }
+        // dropping `send` here abandons the turn mid-flight, the same shape
+        // as a crash: any durable but unresolved tool call is left for the
+        // orphan-repair a restart already needs, not fixed up here
+        None => {
+            warn!(
+                session_id = %session_id,
+                timeout_secs = JOB_SILENCE_TIMEOUT.as_secs(),
+                "job turn silent past the timeout; failing it"
+            );
             TurnOutcome::Failure
         }
     }
@@ -789,6 +898,9 @@ struct JobStatus {
     /// Last write wins: bumped on start and again on the terminal
     /// transition, so "newest first" within a state needs no extra clock.
     ordinal: u64,
+    /// Wall-clock instant of the terminal transition, for `TERMINAL_TTL`
+    /// aging; `None` while the job is running.
+    finished_at: Option<Instant>,
 }
 
 impl JobStatus {
@@ -851,6 +963,7 @@ impl JobStatuses {
             started: Instant::now(),
             elapsed: None,
             ordinal: self.next_ordinal(),
+            finished_at: None,
         };
         let info = entry.to_job_info(&job.session_id);
         self.entries
@@ -875,6 +988,7 @@ impl JobStatuses {
             entry.state = state;
             entry.elapsed = Some(elapsed);
             entry.ordinal = ordinal;
+            entry.finished_at = Some(Instant::now());
             entry.to_job_info(session_id)
         };
 
@@ -889,7 +1003,13 @@ impl JobStatuses {
     }
 
     fn list(&self) -> Vec<JobInfo> {
-        let entries = self.entries.lock().expect("statuses");
+        let now = Instant::now();
+        let mut entries = self.entries.lock().expect("statuses");
+        entries.retain(|_, status| {
+            status
+                .finished_at
+                .is_none_or(|finished_at| finished_at + TERMINAL_TTL > now)
+        });
         let mut listed: Vec<(&String, &JobStatus)> = entries.iter().collect();
         listed.sort_by(|(_, a), (_, b)| {
             let a_terminal = a.state != JobState::Running;
@@ -910,16 +1030,53 @@ mod tests {
     use super::*;
     use arc_core::log::Log;
     use arc_core::projection::Projection;
-    use arc_core::provider::{CompletionDelta, Error as ProviderError, Provider, Stop, Thinking};
+    use arc_core::provider::{
+        CompletionDelta, Error as ProviderError, Provider, Stop, Thinking, ToolDefinition,
+    };
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
         ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, tool_stop, usage,
     };
     use arc_core::tool::workspace::{Grant, Mode};
-    use arc_core::tool::{Registry, ToolSource};
+    use arc_core::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
     use arc_proto::v1::Role;
+    use std::future::Future;
+    use std::pin::Pin;
     use tempfile::TempDir;
+
+    /// A tool that blocks on a `Notify` before returning: drives the
+    /// pending-tool-call test, where the engine goes event-silent for the
+    /// whole dispatch on purpose.
+    struct GatedTool {
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl Tool for GatedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "slow_tool".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn source(&self) -> ToolSource {
+            ToolSource::Builtin
+        }
+
+        fn execute(
+            &self,
+            _arguments_json: String,
+            _ctx: TurnContext,
+        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+            let notify = Arc::clone(&self.notify);
+            Box::pin(async move {
+                notify.notified().await;
+                ToolReply::ok("done".to_owned())
+            })
+        }
+    }
 
     fn executor_runner(provider: &Arc<ScriptedProvider>) -> Runner {
         Runner {
@@ -1106,6 +1263,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for {want} messages in session {session_id}");
+    }
+
+    /// Polls the log for a tool call landing, so a test can advance a paused
+    /// clock only once the tool is genuinely dispatched and running.
+    async fn wait_for_tool_call_issued(dir: &std::path::Path, session_id: &str) {
+        for _ in 0..400 {
+            let issued = replay_log(dir).into_iter().any(|event| {
+                matches!(
+                    event,
+                    arc_proto::v1::session_event::Event::ToolCallIssued(call)
+                        if call.session_id == session_id
+                )
+            });
+            if issued {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for a tool call in session {session_id}");
     }
 
     #[tokio::test]
@@ -1852,6 +2028,91 @@ mod tests {
             later.elapsed_seconds, just_after.elapsed_seconds,
             "a finished job's elapsed time is frozen, not still ticking"
         );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_job_ages_out_of_the_list_once_the_terminal_ttl_passes() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(only_job(supervisor.list()).session_id, child_id);
+
+        tokio::time::advance(TERMINAL_TTL + Duration::from_secs(1)).await;
+        assert_eq!(
+            supervisor.list(),
+            Vec::new(),
+            "the terminal entry aged out once past the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_job_is_never_aged_out_of_the_list() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("still working".to_owned()))],
+            notify: Arc::clone(&gate),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        tokio::time::advance(TERMINAL_TTL + Duration::from_secs(1)).await;
+        assert_eq!(
+            only_job(supervisor.list()).state,
+            job_info::State::Running as i32,
+            "a running job stays listed no matter how long it's been running"
+        );
+
+        gate.notify_one();
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
@@ -2895,6 +3156,248 @@ mod tests {
             last_assistant(dir.path(), &parent_id),
             Some("noted".to_owned()),
             "the resumed job's own handback drove one more concierge turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_task_ends_failed_with_a_crashed_handback_and_no_daemon_panic() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Panics]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(
+            job.state,
+            job_info::State::Failed as i32,
+            "the watchdog forced the panicked task to failed"
+        );
+        assert!(
+            !supervisor.steer(&child_id, "too late"),
+            "the panicking task's live entry was removed"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(
+                Role::User,
+                format!("Job {child_id} stopped: the job crashed.\n{NO_REPLY}")
+            )],
+            "the crash reads as a normal stopped handback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_silent_past_the_timeout_fails_the_turn_and_hands_back_that_it_failed() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        // never notified: the stream never yields anything at all
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: gate,
+            after: Vec::new(),
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        tokio::time::advance(JOB_SILENCE_TIMEOUT + Duration::from_secs(1)).await;
+        supervisor.shutdown().await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(
+            job.state,
+            job_info::State::Failed as i32,
+            "a stream silent past the timeout fails the turn"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(
+                Role::User,
+                format!("Job {child_id} stopped: the turn failed.\n{NO_REPLY}")
+            )],
+            "the silence timeout hands back like any other failed turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn steady_events_past_the_timeout_duration_never_trip_the_silence_timeout() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let gate1 = Arc::new(tokio::sync::Notify::new());
+        let gate2 = Arc::new(tokio::sync::Notify::new());
+        // two silent gaps, each under JOB_SILENCE_TIMEOUT but summing well
+        // past it: only a single gap that long should ever trip the job
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Immediate(vec![
+                Ok(CompletionDelta::Text("chunk1".to_owned())),
+                Ok(call("c1", 0, "missing_tool", "{}")),
+                Ok(tool_stop()),
+            ]),
+            Step::Gated {
+                before: Vec::new(),
+                notify: Arc::clone(&gate1),
+                after: vec![
+                    Ok(CompletionDelta::Text("chunk2".to_owned())),
+                    Ok(call("c2", 0, "missing_tool", "{}")),
+                    Ok(tool_stop()),
+                ],
+            },
+            Step::Gated {
+                before: Vec::new(),
+                notify: Arc::clone(&gate2),
+                after: vec![
+                    Ok(CompletionDelta::Text("chunk3".to_owned())),
+                    Ok(CompletionDelta::Done {
+                        usage: usage(),
+                        stop: Stop::EndTurn,
+                    }),
+                ],
+            },
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        // each gap is well under JOB_SILENCE_TIMEOUT on its own; only their
+        // sum (800s) exceeds it
+        let gap = Duration::from_secs(400);
+        wait_for_message_count(dir.path(), &child_id, 2).await;
+        tokio::time::advance(gap).await;
+        gate1.notify_one();
+        wait_for_message_count(dir.path(), &child_id, 3).await;
+        tokio::time::advance(gap).await;
+        gate2.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            only_job(supervisor.list()).state,
+            job_info::State::Finished as i32,
+            "events kept resetting the deadline, so the long total turn never tripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_tool_call_suspends_the_silence_timeout_while_it_runs() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let tool_gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Immediate(vec![Ok(call("c1", 0, "slow_tool", "{}")), Ok(tool_stop())]),
+            Step::Immediate(done_reply("finished after the slow tool")),
+        ]);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(GatedTool {
+            notify: Arc::clone(&tool_gate),
+        }));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                },
+            )])),
+        );
+
+        let bootstrap_provider = ScriptedProvider::scripted(vec![]);
+        let child_id = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the child durably");
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "run the slow tool".to_owned(),
+            budget: None,
+        });
+
+        wait_for_tool_call_issued(dir.path(), &child_id).await;
+        // well past JOB_SILENCE_TIMEOUT, but the tool call is still pending
+        tokio::time::advance(JOB_SILENCE_TIMEOUT * 2).await;
+        tool_gate.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            only_job(supervisor.list()).state,
+            job_info::State::Finished as i32,
+            "a pending tool call is activity, not silence"
         );
     }
 }
