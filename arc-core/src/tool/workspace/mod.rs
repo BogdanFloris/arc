@@ -1,4 +1,6 @@
+pub mod edit;
 pub mod read;
+pub mod write;
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -109,15 +111,12 @@ impl Workspace {
     }
 
     fn record_read(&self, session_id: &str, path: &Path, bytes: &[u8]) {
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
         self.reads
             .lock()
             .expect("reads lock poisoned")
-            .insert((session_id.to_owned(), path.to_path_buf()), hasher.finish());
+            .insert((session_id.to_owned(), path.to_path_buf()), hash_of(bytes));
     }
 
-    #[cfg(test)]
     pub(crate) fn recorded_hash(&self, session_id: &str, path: &Path) -> Option<u64> {
         self.reads
             .lock()
@@ -127,9 +126,40 @@ impl Workspace {
     }
 }
 
-/// The workspace source: `read` for now; `write`/`edit` follow in a later task.
+pub(crate) fn hash_of(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A tool that modifies an existing file must be working from a fresh read.
+pub(crate) fn ensure_fresh(
+    workspace: &Workspace,
+    session_id: &str,
+    path: &Path,
+    current_bytes: &[u8],
+) -> Result<(), String> {
+    match workspace.recorded_hash(session_id, path) {
+        None => Err(format!(
+            "{} has not been read in this session. Read it before modifying it.",
+            path.display()
+        )),
+        Some(hash) if hash != hash_of(current_bytes) => Err(format!(
+            "{} has changed since it was last read in this session. Read it again before \
+             modifying it.",
+            path.display()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The workspace source: read, write, edit, all gated through `Grants`.
 pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
-    vec![Box::new(read::Read::new(workspace))]
+    vec![
+        Box::new(read::Read::new(Arc::clone(&workspace))),
+        Box::new(write::Write::new(Arc::clone(&workspace))),
+        Box::new(edit::Edit::new(workspace)),
+    ]
 }
 
 #[cfg(test)]
@@ -139,7 +169,24 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{Access, Grant, Grants, Mode};
+    use super::{Access, Grant, Grants, Mode, Workspace};
+    use crate::tool::ToolSource;
+
+    #[test]
+    fn the_workspace_source_is_read_write_and_edit() {
+        let dir = TempDir::new().expect("tmp");
+        let root = proj(&dir);
+        let grants = grants(&root, Mode::ReadWrite);
+        let tools = super::tools(std::sync::Arc::new(Workspace::new(grants)));
+
+        let names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
+        assert_eq!(names, ["read", "write", "edit"]);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.source() == ToolSource::Workspace)
+        );
+    }
 
     fn proj(dir: &TempDir) -> std::path::PathBuf {
         let root = dir.path().join("proj");
