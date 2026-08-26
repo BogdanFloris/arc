@@ -9,14 +9,15 @@ use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runne
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, Delta, Error as WireError, JobList, MemoryReviewItem, MemoryReviewItems,
-    MessageAccepted, ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame, server_frame,
+    MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame, SessionHistory,
+    SessionInfo, SessionList, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame,
+    server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
 use prost_types::Timestamp;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -36,6 +37,7 @@ pub async fn serve(
     runner: Runner,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
+    notifier: broadcast::Sender<Notification>,
     shutdown: impl Future<Output = ()> + Send,
 ) {
     let (closing, closing_rx) = watch::channel(false);
@@ -56,6 +58,7 @@ pub async fn serve(
                         runner.clone(),
                         Arc::clone(&reads),
                         Arc::clone(&supervisor),
+                        notifier.clone(),
                         closing_rx.clone(),
                     ));
                 }
@@ -84,6 +87,13 @@ async fn drain(connections: &mut JoinSet<()>) {
     }
 }
 
+/// A connection's `Subscribe`, once seen: the request id every push on this
+/// socket is tagged with, and the receiver end of the daemon's broadcast.
+struct Subscription {
+    request_id: u64,
+    rx: broadcast::Receiver<Notification>,
+}
+
 #[tracing::instrument(name = "server.connection", skip_all, fields(peer = %peer))]
 async fn connection(
     stream: TcpStream,
@@ -92,6 +102,7 @@ async fn connection(
     runner: Runner,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
+    notifier: broadcast::Sender<Notification>,
     mut closing: watch::Receiver<bool>,
 ) {
     let mut ws = match tokio_tungstenite::accept_async(stream).await {
@@ -103,42 +114,63 @@ async fn connection(
     };
     info!("client connected");
 
+    let mut subscription: Option<Subscription> = None;
+
     loop {
-        let message = tokio::select! {
+        tokio::select! {
             () = told_to_close(&mut closing) => {
                 info!("closing an idle connection");
                 let _ = ws.close(None).await;
                 break;
             }
-            message = ws.next() => message,
-        };
-
-        match message {
-            Some(Ok(WsMessage::Binary(bytes))) => match ClientFrame::decode(bytes) {
-                Ok(frame) => {
-                    if request(&mut ws, &engine, &runner, &reads, &supervisor, frame)
-                        .await
-                        .is_break()
-                    {
+            message = ws.next() => {
+                match message {
+                    Some(Ok(WsMessage::Binary(bytes))) => match ClientFrame::decode(bytes) {
+                        Ok(frame) => {
+                            if request(
+                                &mut ws,
+                                &engine,
+                                &runner,
+                                &reads,
+                                &supervisor,
+                                &notifier,
+                                &mut subscription,
+                                frame,
+                            )
+                            .await
+                            .is_break()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "undecodable client frame");
+                            refuse(&mut ws, 0).await;
+                            break;
+                        }
+                    },
+                    Some(Ok(WsMessage::Text(_))) => {
+                        warn!("text message on a binary protocol");
+                        refuse(&mut ws, 0).await;
+                        break;
+                    }
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Err(error)) => {
+                        warn!(%error, "websocket read failed");
                         break;
                     }
                 }
-                Err(error) => {
-                    warn!(%error, "undecodable client frame");
-                    refuse(&mut ws, 0).await;
+            }
+            // only ever polled between requests: `request` above runs a
+            // whole reply (however many frames it writes) to completion
+            // before this arm is reachable again, so a push can never land
+            // mid-turn on the wire
+            received = next_notification(&mut subscription) => {
+                let sub = subscription.as_ref().expect("resolves only once subscribed");
+                if !push_notification(&mut ws, sub.request_id, received).await {
                     break;
                 }
-            },
-            Some(Ok(WsMessage::Text(_))) => {
-                warn!("text message on a binary protocol");
-                refuse(&mut ws, 0).await;
-                break;
-            }
-            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
-            Some(Ok(WsMessage::Close(_))) | None => break,
-            Some(Err(error)) => {
-                warn!(%error, "websocket read failed");
-                break;
             }
         }
     }
@@ -148,6 +180,40 @@ async fn connection(
 
 async fn told_to_close(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closing| *closing).await;
+}
+
+async fn next_notification(
+    subscription: &mut Option<Subscription>,
+) -> Result<Notification, broadcast::error::RecvError> {
+    match subscription {
+        Some(sub) => sub.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn push_notification(
+    ws: &mut Socket,
+    request_id: u64,
+    received: Result<Notification, broadcast::error::RecvError>,
+) -> bool {
+    match received {
+        Ok(notification) => {
+            send_frame(
+                ws,
+                request_id,
+                server_frame::Msg::Notification(notification),
+            )
+            .await
+        }
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            warn!(
+                skipped,
+                "a subscriber lagged behind the notification broadcast"
+            );
+            true
+        }
+        Err(broadcast::error::RecvError::Closed) => true,
+    }
 }
 
 #[tracing::instrument(
@@ -161,6 +227,8 @@ async fn request(
     runner: &Runner,
     reads: &Reader,
     supervisor: &Supervisor,
+    notifier: &broadcast::Sender<Notification>,
+    subscription: &mut Option<Subscription>,
     frame: ClientFrame,
 ) -> ControlFlow<()> {
     match frame.msg {
@@ -183,9 +251,13 @@ async fn request(
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
         Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
-        // 6.3 implements the stream; refusing keeps old daemons honest with new clients
+        // no reply frame: the subscription's frames are the notifications,
+        // pushed from the connection loop's select, not from here
         Some(client_frame::Msg::Subscribe(_)) => {
-            refuse(ws, frame.request_id).await;
+            *subscription = Some(Subscription {
+                request_id: frame.request_id,
+                rx: notifier.subscribe(),
+            });
             ControlFlow::Continue(())
         }
         None => {
@@ -517,8 +589,9 @@ mod tests {
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
         ListJobs, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
-        MemoryReviewDelete, MemoryReviewList, Role, SessionCreated, SessionEvent, SessionRole,
-        Source, ToolOutcome, event, job_info, memory_event, memory_record, session_event,
+        MemoryReviewDelete, MemoryReviewList, Notification, Role, SessionCreated, SessionEvent,
+        SessionRole, Source, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
+        notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -529,7 +602,7 @@ mod tests {
     use super::*;
     use arc_core::provider::{Provider, Thinking};
     use arc_core::session::ProjectSpec;
-    use arc_core::testkit::{Canned, ScriptedProvider, Step, replay_log, usage};
+    use arc_core::testkit::{Canned, ScriptedProvider, Step, done_reply, replay_log, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -707,8 +780,11 @@ mod tests {
             arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
                 .expect("replay");
             let provider = MockProvider::new(script);
+            let (notifier, _receiver) = broadcast::channel(256);
             let engine = Arc::new(
-                Engine::new(Store::new(log, projection), registry).with_projects(projects),
+                Engine::new(Store::new(log, projection), registry)
+                    .with_projects(projects)
+                    .with_notifier(notifier.clone()),
             );
             let runner = Runner {
                 role: SessionRole::Concierge,
@@ -718,7 +794,9 @@ mod tests {
                 system: Some("be terse".to_owned()),
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
-            let supervisor = Arc::new(Supervisor::new(Arc::clone(&engine), job_runners));
+            let supervisor = Arc::new(
+                Supervisor::new(Arc::clone(&engine), job_runners).with_notifier(notifier.clone()),
+            );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
@@ -729,6 +807,7 @@ mod tests {
                 runner,
                 reads,
                 Arc::clone(&supervisor),
+                notifier,
                 async {
                     let _ = signal.await;
                 },
@@ -2000,5 +2079,290 @@ mod tests {
         );
 
         harness.stop().await;
+    }
+
+    async fn subscribe(ws: &mut Client, request_id: u64) {
+        send(ws, request_id, client_frame::Msg::Subscribe(Subscribe {})).await;
+    }
+
+    #[tokio::test]
+    async fn a_subscribed_connection_is_pushed_job_changed_and_session_appended_notifications() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let executor_script = Script::Canned(VecDeque::from([vec![
+            Ok(CompletionDelta::Text("on it".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]));
+        let mut harness = Harness::with_executor(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_script,
+            projects,
+        )
+        .await;
+
+        let mut subscriber = harness.connect().await;
+        subscribe(&mut subscriber, 9).await;
+
+        let mut ws = harness.connect().await;
+        send(&mut ws, 1, say("", "start a job")).await;
+        let accepted = next_frame(&mut ws).await;
+        let parent_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        run_turn_to_end(&mut ws, 1).await;
+
+        harness.drain_jobs().await;
+
+        let mut saw_finished_job = false;
+        let mut saw_handback_append = false;
+        for _ in 0..40 {
+            if saw_finished_job && saw_handback_append {
+                break;
+            }
+            let frame = next_frame(&mut subscriber).await;
+            assert_eq!(
+                frame.request_id, 9,
+                "pushes carry the subscribe's request id"
+            );
+            match frame.msg.expect("a message") {
+                server_frame::Msg::Notification(Notification {
+                    event: Some(notification::Event::JobChanged(job)),
+                }) => {
+                    if job.state == job_info::State::Finished as i32 {
+                        saw_finished_job = true;
+                    }
+                }
+                server_frame::Msg::Notification(Notification {
+                    event: Some(notification::Event::SessionAppended(appended)),
+                }) => {
+                    if appended.session_id == parent_id {
+                        saw_handback_append = true;
+                    }
+                }
+                other => panic!("expected a Notification, got {other:?}"),
+            }
+        }
+        assert!(
+            saw_finished_job,
+            "the finished job's state change was pushed"
+        );
+        assert!(saw_handback_append, "the handback's append was pushed");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unsubscribed_connection_gets_no_notification_frames() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let executor_script = Script::Canned(VecDeque::from([vec![
+            Ok(CompletionDelta::Text("on it".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]));
+        let mut harness = Harness::with_executor(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_script,
+            projects,
+        )
+        .await;
+
+        let mut bystander = harness.connect().await;
+
+        let mut ws = harness.connect().await;
+        send(&mut ws, 1, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 1).await;
+        harness.drain_jobs().await;
+
+        send(
+            &mut bystander,
+            2,
+            client_frame::Msg::ListSessions(ListSessions {}),
+        )
+        .await;
+        let frame = next_frame(&mut bystander).await;
+        assert_eq!(frame.request_id, 2);
+        assert!(
+            matches!(frame.msg, Some(server_frame::Msg::SessionList(_))),
+            "an unsubscribed connection's next frame is the plain reply, not a push: got {:?}",
+            frame.msg
+        );
+
+        harness.stop().await;
+    }
+
+    /// The hard interleave guarantee: a notification must never land between
+    /// two frames of the same streaming reply. A concierge turn is gated
+    /// mid-stream on this connection while a job finishes independently (its
+    /// notifications queue up unread, since this connection's task is deep
+    /// inside `request`, not back at the `select!` that reads them); only
+    /// once the turn's `StreamEnd` is written does the connection loop
+    /// return to `select!` and start draining the queued pushes.
+    #[tokio::test]
+    async fn a_notification_never_interleaves_a_streaming_turns_frames() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let log = Log::open(dir.path()).expect("open log");
+        let index = dir.path().join("index.db");
+        let mut projection = Projection::open(&index).expect("open projection");
+        arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
+            .expect("replay");
+
+        let (notifier, _receiver) = broadcast::channel(256);
+
+        let concierge_gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("part one ".to_owned()))],
+            notify: Arc::clone(&concierge_gate),
+            after: vec![
+                Ok(CompletionDelta::Text("part two".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        }]) as Arc<dyn Provider>;
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("job done")]);
+
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), Registry::new(512))
+                .with_projects(BTreeMap::from([(
+                    "arc".to_owned(),
+                    ProjectSpec {
+                        sources: Vec::new(),
+                        grants: vec![arc_core::tool::workspace::Grant::new(
+                            &root,
+                            arc_core::tool::workspace::Mode::ReadWrite,
+                        )],
+                    },
+                )]))
+                .with_notifier(notifier.clone()),
+        );
+        let concierge_runner = Runner {
+            role: SessionRole::Concierge,
+            provider: concierge_provider,
+            model: "test-model".to_owned(),
+            thinking: Thinking::Default,
+            system: Some("be terse".to_owned()),
+        };
+        let executor_runner = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
+            model: "executor-model".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
+        let supervisor = Arc::new(
+            Supervisor::new(
+                Arc::clone(&engine),
+                BTreeMap::from([(SessionRole::Executor, executor_runner)]),
+            )
+            .with_notifier(notifier.clone()),
+        );
+
+        let reads = Arc::new(Reader::open(&index).expect("open reads"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown, signal) = oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            concierge_runner,
+            reads,
+            Arc::clone(&supervisor),
+            notifier,
+            async {
+                let _ = signal.await;
+            },
+        ));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        subscribe(&mut ws, 9).await;
+
+        send(&mut ws, 2, say("", "hello")).await;
+        let accepted = next_frame(&mut ws).await;
+        assert_eq!(accepted.request_id, 2);
+        assert!(matches!(
+            accepted.msg,
+            Some(server_frame::Msg::MessageAccepted(_))
+        ));
+        let first_delta = next_frame(&mut ws).await;
+        assert_eq!(first_delta.request_id, 2);
+        match &first_delta.msg {
+            Some(server_frame::Msg::Delta(delta)) => assert_eq!(delta.text, "part one "),
+            other => panic!("expected the first delta, got {other:?}"),
+        }
+
+        // the turn is now stalled server-side; run a whole job to completion
+        // (including its handback) while it stays that way
+        supervisor.spawn(arc_core::session::DispatchedJob {
+            session_id: "s-job".to_owned(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        for _ in 0..400 {
+            let handed_back = replay_log(dir.path()).into_iter().any(|event| {
+                matches!(event, session_event::Event::MessageAppended(m) if m.session_id == "s-parent")
+            });
+            if handed_back {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // only now release the gate: the turn's remaining frames must still
+        // arrive with no notification spliced in between
+        concierge_gate.notify_one();
+
+        let second_delta = next_frame(&mut ws).await;
+        assert_eq!(second_delta.request_id, 2, "no push interleaves mid-turn");
+        match &second_delta.msg {
+            Some(server_frame::Msg::Delta(delta)) => assert_eq!(delta.text, "part two"),
+            other => panic!("expected the second delta, got {other:?}"),
+        }
+        let end = next_frame(&mut ws).await;
+        assert_eq!(end.request_id, 2, "no push interleaves mid-turn");
+        assert!(matches!(end.msg, Some(server_frame::Msg::StreamEnd(_))));
+
+        let mut saw_finished_job = false;
+        for _ in 0..40 {
+            if saw_finished_job {
+                break;
+            }
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.request_id, 9, "everything after StreamEnd is a push");
+            match frame.msg.expect("a message") {
+                server_frame::Msg::Notification(Notification {
+                    event: Some(notification::Event::JobChanged(job)),
+                }) if job.state == job_info::State::Finished as i32 => {
+                    saw_finished_job = true;
+                }
+                server_frame::Msg::Notification(_) => {}
+                other => panic!("expected a Notification, got {other:?}"),
+            }
+        }
+        assert!(
+            saw_finished_job,
+            "the deferred push arrived once the turn ended"
+        );
+
+        let _ = shutdown.send(());
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("server stops within the grace")
+            .expect("server task");
+        supervisor.shutdown().await;
     }
 }

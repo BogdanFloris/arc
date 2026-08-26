@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use arc_core::provider::{Usage, role_label};
 use arc_core::session::{DispatchedJob, Engine, Runner};
-use arc_proto::v1::{Budget, JobInfo, SessionRole, job_info};
-use tokio::sync::mpsc;
+use arc_proto::v1::{Budget, JobInfo, Notification, SessionRole, job_info, notification};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -34,6 +34,7 @@ pub struct Supervisor {
     /// Outlives `live`: a finished job keeps its status entry after its
     /// steer sender is torn down, until eviction or a daemon restart.
     statuses: Arc<JobStatuses>,
+    notifier: Option<broadcast::Sender<Notification>>,
 }
 
 impl Supervisor {
@@ -44,7 +45,16 @@ impl Supervisor {
             handles: Mutex::new(Vec::new()),
             live: Arc::new(Mutex::new(HashMap::new())),
             statuses: Arc::new(JobStatuses::new()),
+            notifier: None,
         }
+    }
+
+    /// Wires the daemon's broadcast spine: job state transitions then also
+    /// fan out as `job_changed` pushes. Absent, nothing is sent.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     pub fn spawn(&self, job: DispatchedJob) {
@@ -61,11 +71,15 @@ impl Supervisor {
             .lock()
             .expect("live")
             .insert(job.session_id.clone(), steer_tx);
-        self.statuses.start(&job);
+        let info = self.statuses.start(&job);
+        self.notify_job_changed(info);
         let engine = Arc::clone(&self.engine);
         let live = Arc::clone(&self.live);
         let statuses = Arc::clone(&self.statuses);
-        let handle = tokio::spawn(run_job(engine, runner, job, steer_rx, live, statuses));
+        let notifier = self.notifier.clone();
+        let handle = tokio::spawn(run_job(
+            engine, runner, job, steer_rx, live, statuses, notifier,
+        ));
         self.handles.lock().expect("handles").push(handle);
     }
 
@@ -80,13 +94,17 @@ impl Supervisor {
     }
 
     fn title(&self, session_id: &str) -> String {
-        match self.engine.session_title(session_id) {
-            Ok(title) => title.unwrap_or_default(),
-            Err(error) => {
-                warn!(session_id, %error, "could not read the job's title; leaving it blank");
-                String::new()
-            }
-        }
+        job_title(&self.engine, session_id)
+    }
+
+    fn notify_job_changed(&self, mut info: JobInfo) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        info.title = self.title(&info.session_id);
+        let _ = notifier.send(Notification {
+            event: Some(notification::Event::JobChanged(info)),
+        });
     }
 
     /// Enqueues a steering message for a live job. `true` if the job was
@@ -114,6 +132,7 @@ impl Supervisor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     engine: Arc<Engine>,
     runner: Runner,
@@ -121,6 +140,7 @@ async fn run_job(
     mut steer_rx: mpsc::UnboundedReceiver<String>,
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
+    notifier: Option<broadcast::Sender<Notification>>,
 ) {
     let session_id = job.session_id.clone();
     let start = Instant::now();
@@ -129,11 +149,15 @@ async fn run_job(
     match run_turn(&engine, &runner, &session_id, &job.brief).await {
         TurnOutcome::Success(usage) => {
             spent_tokens += usage_tokens(usage);
-            statuses.record_tokens(&session_id, spent_tokens);
+            if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
+                notify_job_changed(notifier.as_ref(), &engine, info);
+            }
         }
         TurnOutcome::Failure => {
             finish_now(&live, &mut steer_rx, &session_id);
-            statuses.finish(&session_id, JobState::Failed, start.elapsed());
+            if let Some(info) = statuses.finish(&session_id, JobState::Failed, start.elapsed()) {
+                notify_job_changed(notifier.as_ref(), &engine, info);
+            }
             handback_failed(&engine, &job).await;
             return;
         }
@@ -143,7 +167,10 @@ async fn run_job(
         if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
             warn_over_budget(&session_id, &breach);
             finish_now(&live, &mut steer_rx, &session_id);
-            statuses.finish(&session_id, JobState::OverBudget, start.elapsed());
+            if let Some(info) = statuses.finish(&session_id, JobState::OverBudget, start.elapsed())
+            {
+                notify_job_changed(notifier.as_ref(), &engine, info);
+            }
             handback_over_budget(&engine, &job, &breach).await;
             return;
         }
@@ -165,19 +192,50 @@ async fn run_job(
         match run_turn(&engine, &runner, &session_id, &text).await {
             TurnOutcome::Success(usage) => {
                 spent_tokens += usage_tokens(usage);
-                statuses.record_tokens(&session_id, spent_tokens);
+                if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
+                    notify_job_changed(notifier.as_ref(), &engine, info);
+                }
             }
             TurnOutcome::Failure => {
                 finish_now(&live, &mut steer_rx, &session_id);
-                statuses.finish(&session_id, JobState::Failed, start.elapsed());
+                if let Some(info) = statuses.finish(&session_id, JobState::Failed, start.elapsed())
+                {
+                    notify_job_changed(notifier.as_ref(), &engine, info);
+                }
                 handback_failed(&engine, &job).await;
                 return;
             }
         }
     }
 
-    statuses.finish(&session_id, JobState::Finished, start.elapsed());
+    if let Some(info) = statuses.finish(&session_id, JobState::Finished, start.elapsed()) {
+        notify_job_changed(notifier.as_ref(), &engine, info);
+    }
     handback_clean(&engine, &job).await;
+}
+
+fn job_title(engine: &Engine, session_id: &str) -> String {
+    match engine.session_title(session_id) {
+        Ok(title) => title.unwrap_or_default(),
+        Err(error) => {
+            warn!(session_id, %error, "could not read the job's title; leaving it blank");
+            String::new()
+        }
+    }
+}
+
+fn notify_job_changed(
+    notifier: Option<&broadcast::Sender<Notification>>,
+    engine: &Engine,
+    mut info: JobInfo,
+) {
+    let Some(notifier) = notifier else {
+        return;
+    };
+    info.title = job_title(engine, &info.session_id);
+    let _ = notifier.send(Notification {
+        event: Some(notification::Event::JobChanged(info)),
+    });
 }
 
 /// The job's last assistant reply, or the fixed no-reply line: shared by
@@ -405,7 +463,7 @@ impl JobStatuses {
         self.ordinal.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn start(&self, job: &DispatchedJob) {
+    fn start(&self, job: &DispatchedJob) -> JobInfo {
         let entry = JobStatus {
             role: job.role,
             project: job.project.clone(),
@@ -416,32 +474,31 @@ impl JobStatuses {
             elapsed: None,
             ordinal: self.next_ordinal(),
         };
+        let info = entry.to_job_info(&job.session_id);
         self.entries
             .lock()
             .expect("statuses")
             .insert(job.session_id.clone(), entry);
+        info
     }
 
-    fn record_tokens(&self, session_id: &str, spent_tokens: u64) {
-        if let Some(entry) = self.entries.lock().expect("statuses").get_mut(session_id) {
-            entry.spent_tokens = spent_tokens;
-        }
+    fn record_tokens(&self, session_id: &str, spent_tokens: u64) -> Option<JobInfo> {
+        let mut entries = self.entries.lock().expect("statuses");
+        let entry = entries.get_mut(session_id)?;
+        entry.spent_tokens = spent_tokens;
+        Some(entry.to_job_info(session_id))
     }
 
-    fn finish(&self, session_id: &str, state: JobState, elapsed: Duration) {
+    fn finish(&self, session_id: &str, state: JobState, elapsed: Duration) -> Option<JobInfo> {
         let ordinal = self.next_ordinal();
-        let updated = {
+        let info = {
             let mut entries = self.entries.lock().expect("statuses");
-            entries.get_mut(session_id).is_some_and(|entry| {
-                entry.state = state;
-                entry.elapsed = Some(elapsed);
-                entry.ordinal = ordinal;
-                true
-            })
+            let entry = entries.get_mut(session_id)?;
+            entry.state = state;
+            entry.elapsed = Some(elapsed);
+            entry.ordinal = ordinal;
+            entry.to_job_info(session_id)
         };
-        if !updated {
-            return;
-        }
 
         let mut terminal_order = self.terminal_order.lock().expect("terminal_order");
         terminal_order.push_back(session_id.to_owned());
@@ -450,6 +507,7 @@ impl JobStatuses {
                 self.entries.lock().expect("statuses").remove(&oldest);
             }
         }
+        Some(info)
     }
 
     fn list(&self) -> Vec<JobInfo> {
@@ -610,6 +668,40 @@ mod tests {
                 )]),
             ),
         )
+    }
+
+    fn engine_for_project_notified(
+        dir: &TempDir,
+        root: &std::path::Path,
+        notifier: broadcast::Sender<Notification>,
+    ) -> Arc<Engine> {
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        Arc::new(
+            Engine::new(Store::new(log, projection), Registry::new(512))
+                .with_projects(BTreeMap::from([(
+                    "arc".to_owned(),
+                    ProjectSpec {
+                        sources: Vec::new(),
+                        grants: vec![Grant::new(root, Mode::ReadWrite)],
+                    },
+                )]))
+                .with_notifier(notifier),
+        )
+    }
+
+    /// The next `job_changed` notification, skipping any `session_appended`
+    /// pushes (e.g. from `child_session`'s own durable creation) in between.
+    async fn job_changed(notifications: &mut broadcast::Receiver<Notification>) -> JobInfo {
+        loop {
+            let received = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+                .await
+                .expect("a notification within the timeout")
+                .expect("the notifier stays open");
+            if let Some(notification::Event::JobChanged(info)) = received.event {
+                return info;
+            }
+        }
     }
 
     fn child_user_messages(dir: &std::path::Path, session_id: &str) -> Vec<(Role, String)> {
@@ -1496,5 +1588,148 @@ mod tests {
                 .all(|job| job.state == job_info::State::Finished as i32),
             "every spawned job in this test finishes cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn spawning_a_job_broadcasts_a_running_job_changed_notification() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        let job = job_changed(&mut notifications).await;
+        assert_eq!(job.session_id, child_id);
+        assert_eq!(job.state, job_info::State::Running as i32);
+
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_clean_finish_broadcasts_a_finished_job_changed_notification() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let mut job = job_changed(&mut notifications).await;
+        while job.state != job_info::State::Finished as i32 {
+            job = job_changed(&mut notifications).await;
+        }
+        assert_eq!(job.session_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_broadcasts_a_failed_job_changed_notification() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
+            ProviderError::InvalidRequest("boom".to_owned()),
+        )]]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let mut job = job_changed(&mut notifications).await;
+        while job.state != job_info::State::Failed as i32 {
+            job = job_changed(&mut notifications).await;
+        }
+        assert_eq!(job.session_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_finish_broadcasts_an_over_budget_job_changed_notification() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        // usage() reports 8 tokens combined; a cap of 5 is over budget as
+        // soon as the brief turn lands
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 5,
+                wall_clock_seconds: 0,
+            }),
+        });
+        supervisor.shutdown().await;
+
+        let mut job = job_changed(&mut notifications).await;
+        while job.state != job_info::State::OverBudget as i32 {
+            job = job_changed(&mut notifications).await;
+        }
+        assert_eq!(job.session_id, child_id);
+        assert_eq!(job.spent_tokens, 8);
     }
 }

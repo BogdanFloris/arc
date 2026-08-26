@@ -1,7 +1,9 @@
+use std::collections::VecDeque;
+
 use arc_proto::v1::{
     ClientFrame, FetchHistory, JobInfo, ListJobs, ListSessions, MemoryReviewAccept,
-    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, SendMessage, ServerFrame,
-    SessionHistory, SessionInfo, client_frame, server_frame,
+    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification, SendMessage, ServerFrame,
+    SessionHistory, SessionInfo, Subscribe, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -54,6 +56,10 @@ pub enum TurnEvent {
 pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     request_id: u64,
+    /// The `Subscribe` request's id, once sent: pushes arrive tagged with it.
+    subscription: Option<u64>,
+    /// Notifications read while `answer` was waiting on a different request.
+    notifications: VecDeque<Notification>,
 }
 
 impl Client {
@@ -62,7 +68,30 @@ impl Client {
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(Error::Connect)?;
-        Ok(Self { ws, request_id: 0 })
+        Ok(Self {
+            ws,
+            request_id: 0,
+            subscription: None,
+            notifications: VecDeque::new(),
+        })
+    }
+
+    /// Opens the daemon's push stream. The reply never comes as a normal
+    /// answer: notifications tagged with this request id surface through
+    /// `poll_notification` instead.
+    #[tracing::instrument(name = "client.subscribe", skip_all)]
+    pub async fn subscribe(&mut self) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::Subscribe(Subscribe {}))
+            .await?;
+        self.subscription = Some(id);
+        Ok(())
+    }
+
+    /// The next queued push, if one arrived while `answer` was waiting on a
+    /// different request. Never blocks.
+    pub fn poll_notification(&mut self) -> Option<Notification> {
+        self.notifications.pop_front()
     }
 
     #[tracing::instrument(name = "client.list_sessions", skip_all)]
@@ -194,16 +223,26 @@ impl Client {
     }
 
     async fn answer(&mut self, id: u64) -> Result<server_frame::Msg, Error> {
-        let frame = self.next_frame().await?;
-        if frame.request_id != id {
-            return Err(Error::Protocol(format!(
-                "answer for request {} while request {id} was in flight",
-                frame.request_id
-            )));
+        loop {
+            let frame = self.next_frame().await?;
+            let pushed = Some(frame.request_id) == self.subscription
+                && matches!(frame.msg, Some(server_frame::Msg::Notification(_)));
+            if pushed {
+                if let Some(server_frame::Msg::Notification(notification)) = frame.msg {
+                    self.notifications.push_back(notification);
+                }
+                continue;
+            }
+            if frame.request_id != id {
+                return Err(Error::Protocol(format!(
+                    "answer for request {} while request {id} was in flight",
+                    frame.request_id
+                )));
+            }
+            return frame
+                .msg
+                .ok_or_else(|| Error::Protocol("a server frame with no message".to_owned()));
         }
-        frame
-            .msg
-            .ok_or_else(|| Error::Protocol("a server frame with no message".to_owned()))
     }
 
     async fn next_frame(&mut self) -> Result<ServerFrame, Error> {
@@ -306,8 +345,9 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{
-        Delta, Error as WireError, MemoryReviewItems, MessageAccepted, ReasoningDelta, SessionList,
-        StreamEnd, ToolCallEnded, ToolCallStarted, ToolOutcome,
+        Delta, Error as WireError, MemoryReviewItems, MessageAccepted, Notification,
+        ReasoningDelta, SessionAppended, SessionList, StreamEnd, ToolCallEnded, ToolCallStarted,
+        ToolOutcome, notification,
     };
     use prost_types::Timestamp;
     use tokio::net::TcpListener;
@@ -692,6 +732,36 @@ mod tests {
             Ok(Some(TurnEvent::Accepted { .. }))
         ));
         assert!(matches!(turn.next().await, Err(Error::Closed)));
+    }
+
+    #[tokio::test]
+    async fn a_notification_arriving_while_answer_awaits_a_different_reply_is_queued() {
+        let push = server_frame::Msg::Notification(Notification {
+            event: Some(notification::Event::SessionAppended(SessionAppended {
+                session_id: "s-1".to_owned(),
+            })),
+        });
+        let list = server_frame::Msg::SessionList(SessionList { sessions: vec![] });
+        let (url, _handle) = server(vec![vec![], vec![fixed(1, push), echo(list)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.subscribe().await.expect("subscribe");
+        assert_eq!(client.poll_notification(), None, "nothing queued yet");
+
+        let sessions = client.list_sessions().await.expect("list_sessions");
+
+        assert_eq!(
+            sessions,
+            [],
+            "the queued push never masqueraded as the answer"
+        );
+        match client.poll_notification() {
+            Some(Notification {
+                event: Some(notification::Event::SessionAppended(appended)),
+            }) => assert_eq!(appended.session_id, "s-1"),
+            other => panic!("expected the queued SessionAppended, got {other:?}"),
+        }
+        assert_eq!(client.poll_notification(), None, "the queue drains once");
     }
 
     #[tokio::test]

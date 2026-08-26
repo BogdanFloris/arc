@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    Budget, MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, SessionRole, Source,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
+    Budget, MemoryEvent, MessageAppended, Notification, Role, SessionAppended, SessionCreated,
+    SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    WorkspaceGrant,
 };
-use arc_proto::v1::{event, memory_event, session_event};
+use arc_proto::v1::{event, memory_event, notification, session_event};
 use futures::StreamExt as _;
 
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 use crate::memory::render_memory_index;
@@ -51,6 +53,7 @@ pub struct Engine {
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    notifier: Option<broadcast::Sender<Notification>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +139,7 @@ impl Engine {
             projects: BTreeMap::new(),
             role_identities: BTreeMap::new(),
             turns: StdMutex::new(HashMap::new()),
+            notifier: None,
         }
     }
 
@@ -185,6 +189,14 @@ impl Engine {
         role_identities: BTreeMap<SessionRole, (String, String)>,
     ) -> Self {
         self.role_identities = role_identities;
+        self
+    }
+
+    /// Wires the daemon's broadcast spine: every durable session append then
+    /// also fans out as a `SessionAppended` push. Absent, `record` is silent.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
+        self.notifier = Some(notifier);
         self
     }
 
@@ -761,10 +773,24 @@ impl Engine {
     }
 
     fn record(&self, source: Source, payload: session_event::Event) -> Result<u64, Error> {
+        let session_id = session_id_of(&payload).to_owned();
         let payload = event::Payload::Session(SessionEvent {
             event: Some(payload),
         });
-        Ok(self.with_store_mut(|store| store.append(source, Some(now_ts()), payload))?)
+        let seq = self.with_store_mut(|store| store.append(source, Some(now_ts()), payload))?;
+        self.notify_appended(session_id);
+        Ok(seq)
+    }
+
+    fn notify_appended(&self, session_id: String) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        let _ = notifier.send(Notification {
+            event: Some(notification::Event::SessionAppended(SessionAppended {
+                session_id,
+            })),
+        });
     }
 
     fn record_memory(&self, source: Source, payload: memory_event::Event) -> Result<u64, Error> {
@@ -843,6 +869,17 @@ fn truncate_summary(summary: &str) -> String {
         cut -= 1;
     }
     format!("{} [truncated]", &summary[..cut])
+}
+
+fn session_id_of(event: &session_event::Event) -> &str {
+    match event {
+        session_event::Event::SessionCreated(e) => &e.session_id,
+        session_event::Event::MessageAppended(e) => &e.session_id,
+        session_event::Event::ToolCallIssued(e) => &e.session_id,
+        session_event::Event::ToolResultRecorded(e) => &e.session_id,
+        session_event::Event::SessionConsolidated(e) => &e.session_id,
+        session_event::Event::SessionTitled(e) => &e.session_id,
+    }
 }
 
 fn role_name(role: i32) -> String {
@@ -1208,6 +1245,51 @@ mod tests {
                 EngineEvent::Delta("hello there".to_owned()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_notifier_receives_session_appended_for_every_durable_append() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
+        let engine = engine.with_notifier(notifier);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send_message");
+
+        let mut session_ids = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            match notification.event {
+                Some(arc_proto::v1::notification::Event::SessionAppended(appended)) => {
+                    session_ids.push(appended.session_id);
+                }
+                other => panic!("expected SessionAppended, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            session_ids,
+            vec![reply.session_id.clone(); 3],
+            "SessionCreated, the user message, and the assistant reply each notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_notifier_configured_a_send_still_appends_normally() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send_message");
+
+        assert_eq!(replay_log(dir.path()).len(), 3, "the append is unaffected");
     }
 
     #[tokio::test]

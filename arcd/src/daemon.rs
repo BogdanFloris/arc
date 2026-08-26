@@ -12,13 +12,14 @@ use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
-use arc_proto::v1::SessionRole;
+use arc_proto::v1::{Notification, SessionRole};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -54,6 +55,10 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     served
 }
 
+/// Capacity of the notification broadcast: generous enough that a slow
+/// subscriber only lags under sustained job/session churn, not a burst.
+const NOTIFICATION_CAPACITY: usize = 256;
+
 pub struct Daemon {
     config: Config,
     dirs: DataDirs,
@@ -63,6 +68,8 @@ pub struct Daemon {
     reads: Arc<Reader>,
 
     roles: Roles,
+
+    notifier: broadcast::Sender<Notification>,
 }
 
 impl Daemon {
@@ -136,9 +143,11 @@ impl Daemon {
                 )
             })
             .collect();
+        let (notifier, _receiver) = broadcast::channel(NOTIFICATION_CAPACITY);
         let engine = Engine::new(store, registry)
             .with_projects(projects)
-            .with_role_identities(role_identities);
+            .with_role_identities(role_identities)
+            .with_notifier(notifier.clone());
 
         Ok(Self {
             config,
@@ -146,6 +155,7 @@ impl Daemon {
             engine: Arc::new(engine),
             reads,
             roles,
+            notifier,
         })
     }
 
@@ -182,7 +192,10 @@ impl Daemon {
             (SessionRole::Executor, self.roles.executor().clone()),
             (SessionRole::Archivist, self.roles.archivist().clone()),
         ]);
-        let supervisor = Arc::new(Supervisor::new(Arc::clone(&self.engine), job_runners));
+        let supervisor = Arc::new(
+            Supervisor::new(Arc::clone(&self.engine), job_runners)
+                .with_notifier(self.notifier.clone()),
+        );
 
         server::serve(
             listener,
@@ -190,6 +203,7 @@ impl Daemon {
             self.roles.concierge().clone(),
             self.reads,
             Arc::clone(&supervisor),
+            self.notifier,
             shutdown(),
         )
         .await;
