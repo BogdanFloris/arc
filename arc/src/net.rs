@@ -1,8 +1,12 @@
 use arc_core::client::{Client, Error, TurnEvent};
+use arc_proto::v1::{Notification, notification};
 use tokio::sync::mpsc;
 
 use crate::app::{Command, NetEvent, ReviewEntry};
 
+// with no request in flight, a pushed frame just sits unread in the socket;
+// selecting over commands and the client's own frame read is what makes
+// notifications arrive without a poll timer
 pub async fn run(
     url: String,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -10,20 +14,71 @@ pub async fn run(
 ) {
     let mut client: Option<Client> = None;
 
-    while let Some(command) = commands.recv().await {
-        let connected = match client.take() {
-            Some(connected) => connected,
-            None => match Client::connect(&url).await {
-                Ok(connected) => connected,
+    loop {
+        let Some(mut connected) = client.take() else {
+            let Some(command) = commands.recv().await else {
+                return;
+            };
+            client = match connect(&url, &events).await {
+                Some(fresh) => handle(fresh, command, &events).await,
+                None => None,
+            };
+            continue;
+        };
+
+        client = tokio::select! {
+            command = commands.recv() => match command {
+                Some(command) => handle(connected, command, &events).await,
+                None => return,
+            },
+            result = connected.next_notification() => match result {
+                Ok(notification) => {
+                    dispatch(notification, &events);
+                    Some(connected)
+                }
                 Err(error) => {
                     let _ = events.send(NetEvent::Disconnected {
                         reason: error.to_string(),
                     });
-                    continue;
+                    None
                 }
             },
         };
-        client = handle(connected, command, &events).await;
+    }
+}
+
+async fn connect(url: &str, events: &mpsc::UnboundedSender<NetEvent>) -> Option<Client> {
+    let mut client = match Client::connect(url).await {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = events.send(NetEvent::Disconnected {
+                reason: error.to_string(),
+            });
+            return None;
+        }
+    };
+    match client.subscribe().await {
+        Ok(()) => Some(client),
+        Err(error) => {
+            let _ = events.send(NetEvent::Disconnected {
+                reason: error.to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>) {
+    match notification.event {
+        Some(notification::Event::SessionAppended(appended)) => {
+            let _ = events.send(NetEvent::SessionAppended {
+                session_id: appended.session_id,
+            });
+        }
+        Some(notification::Event::JobChanged(job)) => {
+            let _ = events.send(NetEvent::JobChanged(job));
+        }
+        None => {}
     }
 }
 

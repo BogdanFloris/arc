@@ -16,6 +16,7 @@ mod theme;
 mod ui;
 
 use std::io::Write as _;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -77,6 +78,10 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
     let mut cursor = Mode::Insert;
     set_cursor_style(cursor);
 
+    // a ticking clock display is a legitimate timer; it only runs while a
+    // running job is on the strip, so it never masquerades as data polling
+    let mut clock = tokio::time::interval(Duration::from_secs(1));
+
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
@@ -91,6 +96,7 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
                 Some(event) => app.on_net(event),
                 None => anyhow::bail!("the connection task died"),
             },
+            _ = clock.tick(), if app.has_running_job() => None,
         };
 
         if let Some(command) = command {

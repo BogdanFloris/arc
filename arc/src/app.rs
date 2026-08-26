@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, ToolOutcome, history_entry,
+    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, ToolOutcome, history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -64,6 +64,10 @@ pub enum NetEvent {
     },
     ReviewItems(Vec<ReviewEntry>),
     JobItems(Vec<JobInfo>),
+    SessionAppended {
+        session_id: String,
+    },
+    JobChanged(JobInfo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +153,10 @@ pub struct App {
     thinking_since: Option<Instant>,
     pub scroll_back: usize,
     pub quit: bool,
+    /// Every `job_changed` push, oldest to newest touched; the strip reads only the running ones.
+    pub ambient: Vec<JobInfo>,
+    strip_since: Instant,
+    refetch_in_flight: bool,
 }
 
 impl App {
@@ -171,6 +179,9 @@ impl App {
             thinking_since: None,
             scroll_back: 0,
             quit: false,
+            ambient: Vec::new(),
+            strip_since: Instant::now(),
+            refetch_in_flight: false,
         }
     }
 
@@ -479,6 +490,24 @@ impl App {
         row.checked_sub(1).and_then(|i| order.get(i).copied())
     }
 
+    /// The most recently touched running job, if any; the strip's subject.
+    pub fn strip_job(&self) -> Option<&JobInfo> {
+        self.ambient.iter().rev().find(|job| is_running(job))
+    }
+
+    pub fn running_job_count(&self) -> usize {
+        self.ambient.iter().filter(|job| is_running(job)).count()
+    }
+
+    pub fn has_running_job(&self) -> bool {
+        self.running_job_count() > 0
+    }
+
+    /// The job's elapsed seconds, ticked forward locally since the last push.
+    pub fn strip_elapsed_seconds(&self, job: &JobInfo) -> u64 {
+        u64::from(job.elapsed_seconds) + self.strip_since.elapsed().as_secs()
+    }
+
     pub fn by_recency(&self) -> Vec<&SessionInfo> {
         let mut order: Vec<&SessionInfo> = self.sessions.iter().collect();
         order.sort_by(|a, b| activity(b).cmp(&activity(a)).then_with(|| a.id.cmp(&b.id)));
@@ -490,6 +519,7 @@ impl App {
         self.transcript.clear();
         self.scroll_back = 0;
         self.last_error = None;
+        self.refetch_in_flight = false;
         let session_id = session_id?;
         self.transcript.push(Block::Note("loading".to_owned()));
         Some(Command::History { session_id })
@@ -533,6 +563,7 @@ impl App {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
                     self.transcript = history_blocks(entries);
                     self.scroll_back = 0;
+                    self.refetch_in_flight = false;
                 }
                 None
             }
@@ -629,6 +660,30 @@ impl App {
                 }
                 None
             }
+            NetEvent::SessionAppended { session_id } => {
+                let open = self.session_id.as_deref() == Some(session_id.as_str());
+                if open && self.status != Status::Streaming && !self.refetch_in_flight {
+                    self.refetch_in_flight = true;
+                    return Some(Command::History { session_id });
+                }
+                None
+            }
+            NetEvent::JobChanged(job) => {
+                self.ambient
+                    .retain(|existing| existing.session_id != job.session_id);
+                self.ambient.push(job.clone());
+                self.strip_since = Instant::now();
+                if let Some(jobs) = self.jobs.as_mut() {
+                    if let Some(row) = jobs
+                        .items
+                        .iter_mut()
+                        .find(|item| item.session_id == job.session_id)
+                    {
+                        *row = job;
+                    }
+                }
+                None
+            }
             NetEvent::Disconnected { reason } => {
                 self.last_error = Some("disconnected".to_owned());
                 self.transcript.push(Block::Fault {
@@ -720,6 +775,10 @@ impl App {
     fn char_before_cursor(&self) -> Option<(usize, char)> {
         self.input[..self.cursor].char_indices().next_back()
     }
+}
+
+fn is_running(job: &JobInfo) -> bool {
+    job.state == job_info::State::Running as i32
 }
 
 fn outcome_label(outcome: i32) -> &'static str {
@@ -1955,6 +2014,161 @@ mod tests {
         app.on_scroll(true, PAGE);
         assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
+    }
+
+    #[test]
+    fn job_changed_populates_the_strip_and_a_second_push_replaces_not_appends() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = App::new();
+        app.on_net(NetEvent::JobChanged(job("s-1", State::Running)));
+        assert_eq!(app.ambient.len(), 1);
+        assert_eq!(app.strip_job().map(|j| j.session_id.as_str()), Some("s-1"));
+
+        let mut updated = job("s-1", State::Running);
+        updated.spent_tokens = 99;
+        app.on_net(NetEvent::JobChanged(updated));
+
+        assert_eq!(
+            app.ambient.len(),
+            1,
+            "the second push replaces, not appends"
+        );
+        assert_eq!(app.strip_job().map(|j| j.spent_tokens), Some(99));
+    }
+
+    #[test]
+    fn the_strip_shows_the_most_recently_touched_running_job_and_ignores_terminal_ones() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = App::new();
+        app.on_net(NetEvent::JobChanged(job("s-1", State::Running)));
+        app.on_net(NetEvent::JobChanged(job("s-2", State::Finished)));
+        assert_eq!(
+            app.strip_job().map(|j| j.session_id.as_str()),
+            Some("s-1"),
+            "the finished job does not shadow the running one"
+        );
+        assert_eq!(app.running_job_count(), 1);
+
+        app.on_net(NetEvent::JobChanged(job("s-3", State::Running)));
+        assert_eq!(
+            app.strip_job().map(|j| j.session_id.as_str()),
+            Some("s-3"),
+            "the newest running job leads"
+        );
+        assert_eq!(app.running_job_count(), 2);
+    }
+
+    #[test]
+    fn no_running_jobs_means_no_strip_job() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = App::new();
+        app.on_net(NetEvent::JobChanged(job("s-1", State::Finished)));
+        assert_eq!(app.strip_job(), None);
+        assert_eq!(app.running_job_count(), 0);
+    }
+
+    #[test]
+    fn job_changed_patches_an_open_jobs_popup_row_in_place() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-1", State::Running), job("s-2", State::Running)]);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+
+        let mut updated = job("s-2", State::Finished);
+        updated.spent_tokens = 42;
+        app.on_net(NetEvent::JobChanged(updated.clone()));
+
+        let jobs = app.jobs.as_ref().expect("open");
+        assert_eq!(
+            jobs.items,
+            [job("s-1", State::Running), updated],
+            "the row patched in place"
+        );
+        assert_eq!(jobs.selected, 1, "the selection stayed put");
+    }
+
+    #[test]
+    fn job_changed_for_a_job_not_in_the_open_popup_only_updates_the_strip() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-1", State::Running)]);
+        app.on_net(NetEvent::JobChanged(job("s-2", State::Running)));
+
+        assert_eq!(
+            app.jobs.as_ref().expect("open").items,
+            [job("s-1", State::Running)],
+            "the popup only shows what it fetched"
+        );
+        assert_eq!(app.ambient.len(), 1, "the strip data saw the push");
+    }
+
+    #[test]
+    fn session_appended_for_the_open_session_refetches_once_per_burst() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+
+        let first = app.on_net(NetEvent::SessionAppended {
+            session_id: "s-1".to_owned(),
+        });
+        assert_eq!(
+            first,
+            Some(Command::History {
+                session_id: "s-1".to_owned()
+            })
+        );
+
+        let second = app.on_net(NetEvent::SessionAppended {
+            session_id: "s-1".to_owned(),
+        });
+        assert_eq!(second, None, "a refetch is already in flight");
+
+        let landed = app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![],
+        });
+        assert_eq!(landed, None);
+
+        let third = app.on_net(NetEvent::SessionAppended {
+            session_id: "s-1".to_owned(),
+        });
+        assert_eq!(
+            third,
+            Some(Command::History {
+                session_id: "s-1".to_owned()
+            }),
+            "the history landed, so the next push refetches again"
+        );
+    }
+
+    #[test]
+    fn session_appended_for_another_session_is_a_no_op() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+
+        let command = app.on_net(NetEvent::SessionAppended {
+            session_id: "s-2".to_owned(),
+        });
+        assert_eq!(command, None);
+        assert_eq!(app.transcript, [], "nothing else moved either");
+    }
+
+    #[test]
+    fn session_appended_for_the_open_session_is_ignored_while_our_turn_streams() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.status = Status::Streaming;
+
+        let command = app.on_net(NetEvent::SessionAppended {
+            session_id: "s-1".to_owned(),
+        });
+        assert_eq!(
+            command, None,
+            "a push for our own in-flight turn is redundant"
+        );
     }
 
     #[test]

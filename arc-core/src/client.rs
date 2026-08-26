@@ -94,6 +94,27 @@ impl Client {
         self.notifications.pop_front()
     }
 
+    /// Awaits the next pushed notification with no request in flight. Any
+    /// other frame arriving here is a protocol violation.
+    #[tracing::instrument(name = "client.next_notification", skip_all)]
+    pub async fn next_notification(&mut self) -> Result<Notification, Error> {
+        if let Some(notification) = self.notifications.pop_front() {
+            return Ok(notification);
+        }
+        let frame = self.next_frame().await?;
+        if Some(frame.request_id) != self.subscription {
+            return Err(Error::Protocol(format!(
+                "unsolicited frame for request {} outside any request",
+                frame.request_id
+            )));
+        }
+        match frame.msg {
+            Some(server_frame::Msg::Notification(notification)) => Ok(notification),
+            Some(other) => Err(unexpected("Notification", &other)),
+            None => Err(Error::Protocol("a server frame with no message".to_owned())),
+        }
+    }
+
     #[tracing::instrument(name = "client.list_sessions", skip_all)]
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>, Error> {
         let id = self
@@ -762,6 +783,61 @@ mod tests {
             other => panic!("expected the queued SessionAppended, got {other:?}"),
         }
         assert_eq!(client.poll_notification(), None, "the queue drains once");
+    }
+
+    #[tokio::test]
+    async fn next_notification_awaits_a_push_with_no_request_in_flight() {
+        let push = server_frame::Msg::Notification(Notification {
+            event: Some(notification::Event::SessionAppended(SessionAppended {
+                session_id: "s-1".to_owned(),
+            })),
+        });
+        let (url, _handle) = server(vec![vec![echo(push)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.subscribe().await.expect("subscribe");
+
+        match client.next_notification().await {
+            Ok(Notification {
+                event: Some(notification::Event::SessionAppended(appended)),
+            }) => assert_eq!(appended.session_id, "s-1"),
+            other => panic!("expected the pushed SessionAppended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_notification_drains_a_push_queued_during_a_prior_answer() {
+        let push = server_frame::Msg::Notification(Notification {
+            event: Some(notification::Event::SessionAppended(SessionAppended {
+                session_id: "s-1".to_owned(),
+            })),
+        });
+        let list = server_frame::Msg::SessionList(SessionList { sessions: vec![] });
+        let (url, _handle) = server(vec![vec![], vec![fixed(1, push), echo(list)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.subscribe().await.expect("subscribe");
+        client.list_sessions().await.expect("list_sessions");
+
+        match client.next_notification().await {
+            Ok(Notification {
+                event: Some(notification::Event::SessionAppended(appended)),
+            }) => assert_eq!(appended.session_id, "s-1"),
+            other => panic!("expected the queued SessionAppended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_outside_any_request_that_is_not_a_notification_is_a_protocol_error() {
+        let (url, _handle) = server(vec![vec![echo(accepted("s-1"))]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.subscribe().await.expect("subscribe");
+
+        assert!(matches!(
+            client.next_notification().await,
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[tokio::test]

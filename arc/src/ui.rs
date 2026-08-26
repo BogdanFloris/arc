@@ -202,6 +202,10 @@ fn draw_masthead(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(job) = app.strip_job() {
+        draw_strip(frame, area, app, job);
+        return;
+    }
     let mode = match app.mode {
         Mode::Insert => "-- insert ",
         Mode::Normal | Mode::Cmd => "",
@@ -234,6 +238,21 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     ];
     spans.extend(words);
     frame.render_widget(Line::from(spans), area);
+}
+
+// running jobs only: a finished job's evidence is its handback in the
+// conversation, not a line that lingers here
+fn draw_strip(frame: &mut Frame, area: Rect, app: &App, job: &JobInfo) {
+    let count = app.running_job_count();
+    let noun = if count == 1 { "job" } else { "jobs" };
+    let text = format!(
+        " {count} {noun} · {} {} · {:.1}k tok · {}s",
+        job_subject(job),
+        job_state_word(job.state),
+        job.spent_tokens as f64 / 1000.0,
+        app.strip_elapsed_seconds(job),
+    );
+    frame.render_widget(Line::styled(text, theme::DIM), area);
 }
 
 const INPUT_ROWS_CAP: u16 = 8;
@@ -478,16 +497,20 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn job_label(job: &JobInfo) -> String {
-    let state = job_state_word(job.state);
-    let subject = if job.title.is_empty() {
+fn job_subject(job: &JobInfo) -> String {
+    if job.title.is_empty() {
         let role = arc_core::provider::role_label(
             SessionRole::try_from(job.role).unwrap_or(SessionRole::Unspecified),
         );
         format!("{role}/{}", job.project)
     } else {
         job.title.clone()
-    };
+    }
+}
+
+fn job_label(job: &JobInfo) -> String {
+    let state = job_state_word(job.state);
+    let subject = job_subject(job);
     let budget = if job.budget_tokens == 0 {
         "-".to_owned()
     } else {
