@@ -274,7 +274,8 @@ impl Turn<'_> {
             other @ (server_frame::Msg::SessionList(_)
             | server_frame::Msg::SessionHistory(_)
             | server_frame::Msg::MemoryReviewItems(_)
-            | server_frame::Msg::JobList(_)) => {
+            | server_frame::Msg::JobList(_)
+            | server_frame::Msg::Notification(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
         };
@@ -295,6 +296,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
         server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
         server_frame::Msg::JobList(_) => "JobList",
+        server_frame::Msg::Notification(_) => "Notification",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))
 }

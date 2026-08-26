@@ -47,7 +47,25 @@ message ClientFrame {
     MemoryReviewAccept memory_review_accept = 15;
     MemoryReviewDelete memory_review_delete = 16;
     ListJobs list_jobs = 17;
+    Subscribe subscribe = 18;
   }
+}
+
+// The response stream to a Subscribe never ends: Notification frames carry
+// the subscription's request id for as long as the connection lives.
+message Subscribe {}
+
+message Notification {
+  oneof event {
+    // a session gained a durable event; refetch if it is on screen
+    SessionAppended session_appended = 1;
+    // a job started, progressed, or reached a terminal state
+    JobInfo job_changed = 2;
+  }
+}
+
+message SessionAppended {
+  string session_id = 1;
 }
 
 message ListJobs {}
@@ -179,5 +197,6 @@ message ServerFrame {
     ToolCallEnded tool_call_ended = 18;
     MemoryReviewItems memory_review_items = 19;
     JobList job_list = 20;
+    Notification notification = 21;
   }
 }

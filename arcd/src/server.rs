@@ -183,6 +183,11 @@ async fn request(
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
         Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
+        // 6.3 implements the stream; refusing keeps old daemons honest with new clients
+        Some(client_frame::Msg::Subscribe(_)) => {
+            refuse(ws, frame.request_id).await;
+            ControlFlow::Continue(())
+        }
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
@@ -466,6 +471,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
+        Some(client_frame::Msg::Subscribe(_)) => "subscribe",
         None => "unknown",
     }
 }
