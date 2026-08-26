@@ -13,6 +13,7 @@ mod config;
 mod daemon;
 mod dirs;
 mod identity;
+mod jobs;
 mod llama;
 mod replay;
 mod roles;

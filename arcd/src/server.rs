@@ -22,6 +22,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
+use crate::jobs::Supervisor;
+
 type Socket = WebSocketStream<TcpStream>;
 
 const EVENT_BUFFER: usize = 64;
@@ -33,6 +35,7 @@ pub async fn serve(
     engine: Arc<Engine>,
     runner: Runner,
     reads: Arc<Reader>,
+    supervisor: Arc<Supervisor>,
     shutdown: impl Future<Output = ()> + Send,
 ) {
     let (closing, closing_rx) = watch::channel(false);
@@ -52,6 +55,7 @@ pub async fn serve(
                         Arc::clone(&engine),
                         runner.clone(),
                         Arc::clone(&reads),
+                        Arc::clone(&supervisor),
                         closing_rx.clone(),
                     ));
                 }
@@ -87,6 +91,7 @@ async fn connection(
     engine: Arc<Engine>,
     runner: Runner,
     reads: Arc<Reader>,
+    supervisor: Arc<Supervisor>,
     mut closing: watch::Receiver<bool>,
 ) {
     let mut ws = match tokio_tungstenite::accept_async(stream).await {
@@ -111,7 +116,7 @@ async fn connection(
         match message {
             Some(Ok(WsMessage::Binary(bytes))) => match ClientFrame::decode(bytes) {
                 Ok(frame) => {
-                    if request(&mut ws, &engine, &runner, &reads, frame)
+                    if request(&mut ws, &engine, &runner, &reads, &supervisor, frame)
                         .await
                         .is_break()
                     {
@@ -155,11 +160,12 @@ async fn request(
     engine: &Engine,
     runner: &Runner,
     reads: &Reader,
+    supervisor: &Supervisor,
     frame: ClientFrame,
 ) -> ControlFlow<()> {
     match frame.msg {
         Some(client_frame::Msg::SendMessage(send)) => {
-            send_message(ws, engine, runner, frame.request_id, send).await
+            send_message(ws, engine, runner, supervisor, frame.request_id, send).await
         }
         Some(client_frame::Msg::ListSessions(_)) => {
             list_sessions(ws, reads, frame.request_id).await
@@ -188,6 +194,7 @@ async fn send_message(
     ws: &mut Socket,
     engine: &Engine,
     runner: &Runner,
+    supervisor: &Supervisor,
     request_id: u64,
     send: SendMessage,
 ) -> ControlFlow<()> {
@@ -205,7 +212,13 @@ async fn send_message(
     }
 
     let msg = match result {
-        Ok(reply) => stream_end(&reply),
+        Ok(reply) => {
+            let msg = stream_end(&reply);
+            for job in reply.jobs {
+                supervisor.spawn(job);
+            }
+            msg
+        }
         Err(error) => {
             warn!(%error, code = error_code(&error), "request failed");
             error_frame(error_code(&error), &error)
@@ -452,7 +465,7 @@ fn flow(connected: bool) -> ControlFlow<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex as StdMutex;
 
     use arc_core::log::Log;
@@ -477,7 +490,8 @@ mod tests {
 
     use super::*;
     use arc_core::provider::{Provider, Thinking};
-    use arc_core::testkit::{Canned, usage};
+    use arc_core::session::ProjectSpec;
+    use arc_core::testkit::{Canned, replay_log, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -549,9 +563,10 @@ mod tests {
     struct Harness {
         addr: SocketAddr,
         provider: Arc<MockProvider>,
+        supervisor: Arc<Supervisor>,
         shutdown: Option<oneshot::Sender<()>>,
         server: JoinHandle<()>,
-        _dir: TempDir,
+        dir: TempDir,
     }
 
     const SEEDED_AT_MICROS: i64 = 1_700_000_000_000_000;
@@ -588,10 +603,49 @@ mod tests {
         }
 
         async fn with_tools(script: Script, registry: Registry) -> Self {
-            Self::with_seed(script, registry, Vec::new()).await
+            Self::with_seed(
+                script,
+                registry,
+                Vec::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .await
         }
 
-        async fn with_seed(script: Script, registry: Registry, events: Vec<Event>) -> Self {
+        /// A harness whose concierge can dispatch to a scripted executor: the
+        /// default harness has no runner mapped for a job's role at all.
+        async fn with_executor(
+            script: Script,
+            registry: Registry,
+            executor: Script,
+            projects: BTreeMap<String, ProjectSpec>,
+        ) -> Self {
+            let executor_provider = MockProvider::new(executor);
+            let executor_runner = Runner {
+                role: SessionRole::Executor,
+                provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
+                model: "executor-model".to_owned(),
+                thinking: Thinking::Default,
+                system: None,
+            };
+            Self::with_seed(
+                script,
+                registry,
+                Vec::new(),
+                BTreeMap::from([(SessionRole::Executor, executor_runner)]),
+                projects,
+            )
+            .await
+        }
+
+        async fn with_seed(
+            script: Script,
+            registry: Registry,
+            events: Vec<Event>,
+            job_runners: BTreeMap<SessionRole, Runner>,
+            projects: BTreeMap<String, ProjectSpec>,
+        ) -> Self {
             let dir = TempDir::new().expect("temp dir");
             let mut log = Log::open(dir.path()).expect("open log");
             for event in events {
@@ -603,7 +657,9 @@ mod tests {
             arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
                 .expect("replay");
             let provider = MockProvider::new(script);
-            let engine = Engine::new(Store::new(log, projection), registry);
+            let engine = Arc::new(
+                Engine::new(Store::new(log, projection), registry).with_projects(projects),
+            );
             let runner = Runner {
                 role: SessionRole::Concierge,
                 provider: Arc::clone(&provider) as Arc<dyn Provider>,
@@ -612,21 +668,39 @@ mod tests {
                 system: Some("be terse".to_owned()),
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
+            let supervisor = Arc::new(Supervisor::new(Arc::clone(&engine), job_runners));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, signal) = oneshot::channel();
-            let server = tokio::spawn(serve(listener, Arc::new(engine), runner, reads, async {
-                let _ = signal.await;
-            }));
+            let server = tokio::spawn(serve(
+                listener,
+                engine,
+                runner,
+                reads,
+                Arc::clone(&supervisor),
+                async {
+                    let _ = signal.await;
+                },
+            ));
 
             Self {
                 addr,
                 provider,
+                supervisor,
                 shutdown: Some(shutdown),
                 server,
-                _dir: dir,
+                dir,
             }
+        }
+
+        /// Waits out every job the supervisor spawned so far.
+        async fn drain_jobs(&self) {
+            self.supervisor.shutdown().await;
+        }
+
+        fn logged_events(&self) -> Vec<session_event::Event> {
+            replay_log(self.dir.path())
         }
 
         async fn connect(&self) -> Client {
@@ -921,7 +995,14 @@ mod tests {
                 })),
             })),
         };
-        let mut harness = Harness::with_seed(Script::Echo, Registry::new(512), vec![pinned]).await;
+        let mut harness = Harness::with_seed(
+            Script::Echo,
+            Registry::new(512),
+            vec![pinned],
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("s-exec", "continue")).await;
@@ -1253,6 +1334,8 @@ mod tests {
             Script::Echo,
             Registry::new(512),
             vec![seeded_record("m-a", "alpha"), seeded_record("m-b", "beta")],
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .await;
         let mut ws = harness.connect().await;
@@ -1314,6 +1397,8 @@ mod tests {
             Script::Echo,
             Registry::new(512),
             vec![seeded_record("m-a", "alpha")],
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .await;
         let mut ws = harness.connect().await;
@@ -1365,5 +1450,194 @@ mod tests {
             Some(WsMessage::Close(_)) | None => {}
             other => panic!("expected the connection to close, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_job_runs_and_the_childs_log_carries_the_brief_and_the_reply() {
+        let dispatch_args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": "fix the failing test",
+            "budget_tokens": 0,
+            "budget_minutes": 0,
+        })
+        .to_string();
+        let concierge_script = Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::ToolCall(ToolCall {
+                    id: "d1".to_owned(),
+                    index: 0,
+                    name: "dispatch".to_owned(),
+                    arguments: dispatch_args,
+                    provider_roundtrip: Vec::new(),
+                })),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("dispatched".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]));
+        let executor_script = Script::Canned(VecDeque::from([vec![
+            Ok(CompletionDelta::Text("on it".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]));
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec!["arc".to_owned()],
+            None,
+        )));
+        let project_dir = TempDir::new().expect("project dir");
+        let projects = BTreeMap::from([(
+            "arc".to_owned(),
+            ProjectSpec {
+                sources: Vec::new(),
+                grants: vec![arc_core::tool::workspace::Grant::new(
+                    project_dir.path(),
+                    arc_core::tool::workspace::Mode::ReadWrite,
+                )],
+            },
+        )]);
+
+        let mut harness =
+            Harness::with_executor(concierge_script, registry, executor_script, projects).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        turn(&mut ws, 1).await;
+
+        harness.drain_jobs().await;
+
+        let events = harness.logged_events();
+        let child = events
+            .iter()
+            .find_map(|event| match event {
+                session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Executor as i32 =>
+                {
+                    Some(created)
+                }
+                _ => None,
+            })
+            .expect("the child session was created durably");
+
+        let child_messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == child.session_id => {
+                    Some(m)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(child_messages.len(), 2, "the job's user turn and its reply");
+        assert_eq!(child_messages[0].role, Role::User as i32);
+        assert_eq!(
+            child_messages[0].content, "fix the failing test",
+            "the brief became the child's first message"
+        );
+        assert_eq!(child_messages[1].role, Role::Assistant as i32);
+        assert_eq!(child_messages[1].content, "on it");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_job_naming_a_role_with_no_runner_logs_and_skips_without_a_panic() {
+        let dispatch_args = serde_json::json!({
+            "role": "archivist",
+            "project": "arc",
+            "brief": "file this away",
+            "budget_tokens": 0,
+            "budget_minutes": 0,
+        })
+        .to_string();
+        let concierge_script = Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::ToolCall(ToolCall {
+                    id: "d1".to_owned(),
+                    index: 0,
+                    name: "dispatch".to_owned(),
+                    arguments: dispatch_args,
+                    provider_roundtrip: Vec::new(),
+                })),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("dispatched".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]));
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec!["arc".to_owned()],
+            None,
+        )));
+        let project_dir = TempDir::new().expect("project dir");
+        let projects = BTreeMap::from([(
+            "arc".to_owned(),
+            ProjectSpec {
+                sources: Vec::new(),
+                grants: vec![arc_core::tool::workspace::Grant::new(
+                    project_dir.path(),
+                    arc_core::tool::workspace::Mode::ReadWrite,
+                )],
+            },
+        )]);
+
+        // no runner maps to archivist here: the supervisor has nothing to run the job with
+        let mut harness = Harness::with_seed(
+            concierge_script,
+            registry,
+            Vec::new(),
+            BTreeMap::new(),
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        turn(&mut ws, 1).await;
+
+        harness.drain_jobs().await;
+
+        let events = harness.logged_events();
+        let child = events
+            .iter()
+            .find_map(|event| match event {
+                session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Archivist as i32 =>
+                {
+                    Some(created)
+                }
+                _ => None,
+            })
+            .expect("the child session was still created durably by dispatch");
+        let child_messages = events.iter().any(|event| {
+            matches!(event, session_event::Event::MessageAppended(m) if m.session_id == child.session_id)
+        });
+        assert!(
+            !child_messages,
+            "no runner for the role means the job never ran, so no turn was appended"
+        );
+
+        harness.stop().await;
     }
 }

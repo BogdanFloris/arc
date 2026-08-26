@@ -54,8 +54,6 @@ impl Roles {
         &self.concierge
     }
 
-    // the supervised job task in 5.3 is its first caller
-    #[allow(dead_code)]
     pub fn executor(&self) -> &Runner {
         &self.executor
     }

@@ -47,6 +47,7 @@ pub struct Engine {
     store: StdMutex<Store>,
     registry: Registry,
     projects: BTreeMap<String, ProjectSpec>,
+    role_identities: BTreeMap<SessionRole, (String, String)>,
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -76,6 +77,16 @@ pub struct Reply {
     pub seq: u64,
     pub usage: Option<Usage>,
     pub partial: bool,
+    pub jobs: Vec<DispatchedJob>,
+}
+
+/// A child session `dispatch` created durably during this turn. The engine
+/// does not start it; the caller hands it to a supervisor that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchedJob {
+    pub session_id: String,
+    pub role: SessionRole,
+    pub brief: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +130,7 @@ impl Engine {
             store: StdMutex::new(store),
             registry,
             projects: BTreeMap::new(),
+            role_identities: BTreeMap::new(),
             turns: StdMutex::new(HashMap::new()),
         }
     }
@@ -160,6 +172,18 @@ impl Engine {
         self
     }
 
+    /// The provider and model each role records for sessions it creates.
+    /// Written once at startup from the resolved roles; a role absent from
+    /// this map falls back to the creating runner's own identity.
+    #[must_use]
+    pub fn with_role_identities(
+        mut self,
+        role_identities: BTreeMap<SessionRole, (String, String)>,
+    ) -> Self {
+        self.role_identities = role_identities;
+        self
+    }
+
     /// A new session bound to a project: grants are canonicalized now and
     /// recorded in the log, so the session keeps them even if config changes.
     /// `runner` supplies the recorded provider and model; `role` and `budget`
@@ -193,14 +217,19 @@ impl Engine {
 
         let session_id = uuid::Uuid::new_v4().to_string();
         tracing::Span::current().record("session_id", session_id.as_str());
+        let (provider, model) = self
+            .role_identities
+            .get(&role)
+            .cloned()
+            .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
         // a job session exists because a model asked for it
         self.record(
             Source::Model,
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.clone(),
                 title: String::new(),
-                provider: runner.provider.name().to_owned(),
-                model: runner.model.clone(),
+                provider,
+                model,
                 role: role as i32,
                 project: project.to_owned(),
                 budget,
@@ -224,9 +253,10 @@ impl Engine {
         &self,
         runner: &Runner,
         job_request: crate::tool::JobRequest,
-    ) -> (ToolOutcome, String) {
+    ) -> (ToolOutcome, String, Option<DispatchedJob>) {
         let role = job_request.role;
         let project = job_request.project;
+        let brief = job_request.brief;
         match self.create_bound_session(runner, &project, role, job_request.budget) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
@@ -235,8 +265,13 @@ impl Engine {
                      started; job execution arrives with the supervised task.",
                     provider::role_label(role)
                 ),
+                Some(DispatchedJob {
+                    session_id: child_id,
+                    role,
+                    brief,
+                }),
             ),
-            Err(error) => (ToolOutcome::Error, format!("ERROR: {error}")),
+            Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
         }
     }
 
@@ -369,6 +404,7 @@ impl Engine {
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
         let mut memory = MemoryCounters::default();
+        let mut jobs: Vec<DispatchedJob> = Vec::new();
 
         let reply = loop {
             // the last step offers no tools, so the model has to answer
@@ -399,6 +435,7 @@ impl Engine {
                         grants.as_ref(),
                         &mut transcript,
                         &mut memory,
+                        &mut jobs,
                         &events,
                     )
                     .await?;
@@ -412,6 +449,7 @@ impl Engine {
                         seq,
                         usage: total_usage,
                         partial: false,
+                        jobs,
                     });
                 }
                 Ending::Cut if text.is_empty() => {
@@ -427,6 +465,7 @@ impl Engine {
                         seq,
                         usage: None,
                         partial: true,
+                        jobs,
                     });
                 }
                 Ending::Failed(error) => {
@@ -488,6 +527,7 @@ impl Engine {
         grants: Option<&Arc<Grants>>,
         transcript: &mut Vec<Message>,
         memory: &mut MemoryCounters,
+        jobs: &mut Vec<DispatchedJob>,
         events: &mpsc::Sender<EngineEvent>,
     ) -> Result<(), Error> {
         if !text.is_empty() {
@@ -561,7 +601,11 @@ impl Engine {
                 self.record_memory(Source::Model, memory_event)?;
             }
             let (outcome, content) = if let Some(job_request) = job_request {
-                self.dispatch_job(runner, job_request)
+                let (outcome, content, job) = self.dispatch_job(runner, job_request);
+                if let Some(job) = job {
+                    jobs.push(job);
+                }
+                (outcome, content)
             } else {
                 memory.observe_call(&call.name, &call.arguments, &content);
                 (
@@ -905,7 +949,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, ProjectSpec, Runner};
+    use super::{
+        DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, ProjectSpec,
+        Runner,
+    };
     use crate::log::Log;
     use crate::projection::Projection;
     use crate::provider::{
@@ -2856,6 +2903,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_bound_session_with_role_identities_set_records_the_childs_own_provider_and_model()
+     {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin, ToolSource::Workspace],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_identities(BTreeMap::from([(
+                SessionRole::Executor,
+                ("opencode".to_owned(), "deepseek-v4-pro".to_owned()),
+            )]));
+
+        let session_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("create a bound session");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated first, got {:?}", events[0]);
+        };
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(
+            created.provider, "opencode",
+            "the child role's own identity, not the dispatching runner's"
+        );
+        assert_eq!(created.model, "deepseek-v4-pro");
+    }
+
+    #[tokio::test]
     async fn create_bound_session_names_an_unknown_project() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
@@ -3093,7 +3176,7 @@ mod tests {
         ));
         let (tx, _rx) = channel();
 
-        engine
+        let reply = engine
             .send_message(&run, None, "start a job", tx)
             .await
             .expect("send");
@@ -3105,6 +3188,14 @@ mod tests {
         };
         assert_eq!(child.project, "arc");
         assert_eq!(child.role, SessionRole::Executor as i32);
+        assert_eq!(
+            reply.jobs,
+            [DispatchedJob {
+                session_id: child.session_id.clone(),
+                role: SessionRole::Executor,
+                brief: "fix the bug".to_owned(),
+            }]
+        );
         assert_eq!(
             child.budget,
             Some(Budget {
@@ -3204,7 +3295,7 @@ mod tests {
         let (engine, run) = engine_with_tools(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
-        engine
+        let reply = engine
             .send_message(&run, None, "start a job", tx)
             .await
             .expect("a bad dispatch fails the call, not the turn");
@@ -3214,6 +3305,7 @@ mod tests {
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("ghost"), "{}", result.content);
+        assert!(reply.jobs.is_empty(), "a failed dispatch spawns no job");
         let assistant = appended(&events[4]);
         assert_eq!(assistant.content, "done");
     }

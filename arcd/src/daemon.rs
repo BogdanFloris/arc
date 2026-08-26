@@ -12,7 +12,8 @@ use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
-use std::collections::{HashMap, HashSet};
+use arc_proto::v1::SessionRole;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::config::{Config, ConsolidationConfig};
 use crate::dirs::DataDirs;
 use crate::identity;
+use crate::jobs::Supervisor;
 use crate::llama::Sidecar;
 use crate::roles::Roles;
 use crate::server;
@@ -124,7 +126,19 @@ impl Daemon {
             .iter()
             .map(|(name, project)| (name.clone(), project_spec(project)))
             .collect();
-        let engine = Engine::new(store, registry).with_projects(projects);
+        let role_identities = roles
+            .all()
+            .into_iter()
+            .map(|runner| {
+                (
+                    runner.role,
+                    (runner.provider.name().to_owned(), runner.model.clone()),
+                )
+            })
+            .collect();
+        let engine = Engine::new(store, registry)
+            .with_projects(projects)
+            .with_role_identities(role_identities);
 
         Ok(Self {
             config,
@@ -164,11 +178,18 @@ impl Daemon {
             Arc::clone(&self.engine),
         );
 
+        let job_runners = BTreeMap::from([
+            (SessionRole::Executor, self.roles.executor().clone()),
+            (SessionRole::Archivist, self.roles.archivist().clone()),
+        ]);
+        let supervisor = Arc::new(Supervisor::new(Arc::clone(&self.engine), job_runners));
+
         server::serve(
             listener,
             self.engine,
             self.roles.concierge().clone(),
             self.reads,
+            Arc::clone(&supervisor),
             shutdown(),
         )
         .await;
@@ -176,6 +197,7 @@ impl Daemon {
         if let Some(task) = consolidation {
             task.abort();
         }
+        supervisor.shutdown().await;
 
         info!("stopped");
         Ok(())
