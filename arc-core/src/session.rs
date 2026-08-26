@@ -1067,7 +1067,7 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        Budget, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
+        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
         MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome,
         history_entry, memory_event, memory_record, session_event,
     };
@@ -3319,19 +3319,11 @@ mod tests {
         assert!(result.content.contains("granted"), "{}", result.content);
     }
 
-    fn dispatch_args(
-        role: &str,
-        project: &str,
-        brief: &str,
-        budget_tokens: u64,
-        budget_minutes: u32,
-    ) -> String {
+    fn dispatch_args(role: &str, project: &str, brief: &str) -> String {
         serde_json::json!({
             "role": role,
             "project": project,
             "brief": brief,
-            "budget_tokens": budget_tokens,
-            "budget_minutes": budget_minutes,
         })
         .to_string()
     }
@@ -3348,7 +3340,7 @@ mod tests {
                     "c1",
                     0,
                     "dispatch",
-                    &dispatch_args("executor", "arc", "fix the bug", 500, 10),
+                    &dispatch_args("executor", "arc", "fix the bug"),
                 )),
                 Ok(tool_stop()),
             ],
@@ -3384,20 +3376,11 @@ mod tests {
                 role: SessionRole::Executor,
                 project: "arc".to_owned(),
                 brief: "fix the bug".to_owned(),
-                budget: Some(Budget {
-                    total_tokens: 500,
-                    wall_clock_seconds: 600,
-                }),
+                budget: None,
             }],
-            "the budget on the job request lands on the dispatched job, matching the child's own recorded budget"
+            "budgets are suspended; the dispatched job carries none"
         );
-        assert_eq!(
-            child.budget,
-            Some(Budget {
-                total_tokens: 500,
-                wall_clock_seconds: 600,
-            })
-        );
+        assert_eq!(child.budget, None);
         assert_eq!(
             child.grants,
             [arc_proto::v1::WorkspaceGrant {

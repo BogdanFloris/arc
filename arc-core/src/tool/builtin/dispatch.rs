@@ -48,8 +48,6 @@ struct DispatchArgs {
     role: String,
     project: String,
     brief: String,
-    budget_tokens: u64,
-    budget_minutes: u32,
 }
 
 impl Tool for Dispatch {
@@ -85,19 +83,8 @@ impl Tool for Dispatch {
                             from. It must be self-contained — the child sees nothing of \
                             this conversation."
                     },
-                    "budget_tokens": {
-                        "type": "integer",
-                        "description": "Token budget for the job. 0 means no token budget. \
-                            A coding task typically needs 100000-500000; anything under \
-                            50000 will stop a job mid-work."
-                    },
-                    "budget_minutes": {
-                        "type": "integer",
-                        "description": "Wall-clock budget for the job, in minutes. 0 means \
-                            no time limit."
-                    }
                 },
-                "required": ["role", "project", "brief", "budget_tokens", "budget_minutes"]
+                "required": ["role", "project", "brief"]
             }),
         }
     }
@@ -117,7 +104,7 @@ impl Tool for Dispatch {
                 Err(error) => {
                     return ToolReply::error(format!(
                         "ERROR: bad dispatch arguments ({error}). Pass role, project, \
-                         brief, budget_tokens, and budget_minutes."
+                         and brief."
                     ));
                 }
             };
@@ -141,10 +128,8 @@ impl Tool for Dispatch {
                         .to_owned(),
                 );
             }
-            let budget = (args.budget_tokens != 0 || args.budget_minutes != 0).then_some(Budget {
-                total_tokens: args.budget_tokens,
-                wall_clock_seconds: args.budget_minutes.saturating_mul(60),
-            });
+            // budgets are suspended while daily use calibrates; 5.5 stays dormant
+            let budget: Option<Budget> = None;
             ToolReply {
                 content: format!("Dispatching {} into {project}.", role_label(role)),
                 ok: true,
@@ -164,7 +149,7 @@ impl Tool for Dispatch {
 mod tests {
     use super::Dispatch;
     use crate::tool::{Tool, TurnContext};
-    use arc_proto::v1::{Budget, SessionRole};
+    use arc_proto::v1::SessionRole;
 
     fn dispatch(projects: &[&str], scratch: Option<&str>) -> Dispatch {
         Dispatch::new(
@@ -173,19 +158,11 @@ mod tests {
         )
     }
 
-    fn args(
-        role: &str,
-        project: &str,
-        brief: &str,
-        budget_tokens: u64,
-        budget_minutes: u32,
-    ) -> String {
+    fn args(role: &str, project: &str, brief: &str) -> String {
         serde_json::json!({
             "role": role,
             "project": project,
             "brief": brief,
-            "budget_tokens": budget_tokens,
-            "budget_minutes": budget_minutes,
         })
         .to_string()
     }
@@ -196,7 +173,7 @@ mod tests {
 
         let reply = tool
             .execute(
-                args("executor", "arc", "fix the bug", 1000, 5),
+                args("executor", "arc", "fix the bug"),
                 TurnContext::default(),
             )
             .await;
@@ -206,13 +183,7 @@ mod tests {
         assert_eq!(job.role, SessionRole::Executor);
         assert_eq!(job.project, "arc");
         assert_eq!(job.brief, "fix the bug");
-        assert_eq!(
-            job.budget,
-            Some(Budget {
-                total_tokens: 1000,
-                wall_clock_seconds: 300,
-            })
-        );
+        assert_eq!(job.budget, None);
     }
 
     #[tokio::test]
@@ -221,7 +192,7 @@ mod tests {
 
         let reply = tool
             .execute(
-                args("archivist", "none", "tidy up notes", 0, 0),
+                args("archivist", "none", "tidy up notes"),
                 TurnContext::default(),
             )
             .await;
@@ -236,7 +207,7 @@ mod tests {
 
         let reply = tool
             .execute(
-                args("executor", "none", "do something", 0, 0),
+                args("executor", "none", "do something"),
                 TurnContext::default(),
             )
             .await;
@@ -256,7 +227,7 @@ mod tests {
         let tool = dispatch(&["arc"], None);
 
         let reply = tool
-            .execute(args("executor", "arc", "   ", 0, 0), TurnContext::default())
+            .execute(args("executor", "arc", "   "), TurnContext::default())
             .await;
 
         assert!(!reply.ok);
@@ -270,7 +241,7 @@ mod tests {
 
         let reply = tool
             .execute(
-                args("executor", "arc", "fix the bug", 0, 0),
+                args("executor", "arc", "fix the bug"),
                 TurnContext::default(),
             )
             .await;
@@ -284,10 +255,7 @@ mod tests {
         let tool = dispatch(&["arc"], None);
 
         let reply = tool
-            .execute(
-                args("wizard", "arc", "fix the bug", 0, 0),
-                TurnContext::default(),
-            )
+            .execute(args("wizard", "arc", "fix the bug"), TurnContext::default())
             .await;
 
         assert!(!reply.ok);
@@ -301,7 +269,7 @@ mod tests {
 
         let reply = tool
             .execute(
-                args("executor", "ghost", "fix the bug", 0, 0),
+                args("executor", "ghost", "fix the bug"),
                 TurnContext::default(),
             )
             .await;
@@ -324,16 +292,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("string"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            required,
-            [
-                "role",
-                "project",
-                "brief",
-                "budget_tokens",
-                "budget_minutes"
-            ]
-        );
+        assert_eq!(required, ["role", "project", "brief"]);
 
         let role_enum = definition.parameters["properties"]["role"]["enum"]
             .as_array()
