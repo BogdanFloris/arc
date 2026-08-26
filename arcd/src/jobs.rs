@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_core::provider::{Usage, role_label};
-use arc_core::session::{DispatchedJob, Engine, Runner};
+use arc_core::session::{ContinuedJob, DispatchedJob, Engine, Runner};
 use arc_proto::v1::{Budget, JobInfo, Notification, SessionRole, job_info, notification};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -161,9 +161,24 @@ impl Supervisor {
     /// live and the message was enqueued; `false` otherwise, meaning the
     /// caller should fall through to a normal turn.
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
-        let live = self.live.lock().expect("live");
-        live.get(session_id)
-            .is_some_and(|sender| sender.send(text.to_owned()).is_ok())
+        steer_live(&self.live, session_id, text)
+    }
+
+    /// Routes a `continue_job` request (DESIGN.md §6.16): queued into the
+    /// job's steer channel if it's still running, or resumed as a fresh
+    /// task over the same child session, its full transcript intact, if it
+    /// already finished.
+    pub fn continue_job(&self, cont: ContinuedJob) {
+        let ctx = HandbackCtx {
+            engine: &self.engine,
+            runners: &self.runners,
+            live: &self.live,
+            statuses: &self.statuses,
+            notifier: self.notifier.as_ref(),
+            handles: &self.handles,
+            handback: self.handback.as_ref(),
+        };
+        route_continue(&ctx, cont);
     }
 
     /// Gives outstanding jobs a grace period to finish, then abandons them.
@@ -207,6 +222,14 @@ fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
     }
 }
 
+/// Routes every `continue_job` a turn produced, alongside whatever it
+/// dispatched.
+fn route_continues(ctx: &HandbackCtx<'_>, continues: Vec<ContinuedJob>) {
+    for cont in continues {
+        route_continue(ctx, cont);
+    }
+}
+
 fn spawn_job(
     job: DispatchedJob,
     engine: &Arc<Engine>,
@@ -217,18 +240,49 @@ fn spawn_job(
     handback: Option<&Arc<Handback>>,
     handles: &Arc<Handles>,
 ) {
+    spawn_job_checked(
+        job, engine, runners, live, statuses, notifier, handback, handles, false,
+    );
+}
+
+/// Spawns a job's task and registers its handle. `guard_absent` gates the
+/// `live` insert on `session_id` not already being there: a fresh dispatch
+/// never needs this (the `session_id` is brand new), but a `continue_job`
+/// resume does — two resumes racing on the same finished job must not both
+/// spawn a task and clobber each other's steer channel. Returns whether it
+/// actually spawned.
+#[allow(clippy::too_many_arguments)]
+fn spawn_job_checked(
+    job: DispatchedJob,
+    engine: &Arc<Engine>,
+    runners: &BTreeMap<SessionRole, Runner>,
+    live: &Arc<LiveMap>,
+    statuses: &Arc<JobStatuses>,
+    notifier: Option<&broadcast::Sender<Notification>>,
+    handback: Option<&Arc<Handback>>,
+    handles: &Arc<Handles>,
+    guard_absent: bool,
+) -> bool {
     let Some(runner) = runners.get(&job.role).cloned() else {
         warn!(
             session_id = %job.session_id,
             role = role_label(job.role),
             "dispatched job names a role with no runner; skipping"
         );
-        return;
+        return false;
     };
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-    live.lock()
-        .expect("live")
-        .insert(job.session_id.clone(), steer_tx);
+    {
+        let mut live_guard = live.lock().expect("live");
+        if guard_absent && live_guard.contains_key(&job.session_id) {
+            warn!(
+                session_id = %job.session_id,
+                "continue_job raced with another resume of the same job; skipping"
+            );
+            return false;
+        }
+        live_guard.insert(job.session_id.clone(), steer_tx);
+    }
     let info = statuses.start(&job);
     notify_job_changed(notifier, engine, info);
     let handle = tokio::spawn(run_job(
@@ -244,6 +298,46 @@ fn spawn_job(
         Arc::clone(handles),
     ));
     handles.lock().expect("handles").push(handle);
+    true
+}
+
+fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
+    let live = live.lock().expect("live");
+    live.get(session_id)
+        .is_some_and(|sender| sender.send(text.to_owned()).is_ok())
+}
+
+/// Routes one `ContinuedJob`: a steer if the job is still live, or a resume
+/// — a fresh task over the same child session, its `message` as the next
+/// turn — if it already finished. Shared by every turn driver that can
+/// produce one: a user turn, a handback turn, and a job's own turn.
+fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
+    if steer_live(ctx.live, &cont.session_id, &cont.message) {
+        info!(session_id = %cont.session_id, "continue_job queued into the live job");
+        return;
+    }
+    let session_id = cont.session_id.clone();
+    let resumed = spawn_job_checked(
+        DispatchedJob {
+            session_id: cont.session_id,
+            parent_session: cont.parent_session,
+            role: cont.role,
+            project: cont.project,
+            brief: cont.message,
+            budget: None,
+        },
+        ctx.engine,
+        ctx.runners,
+        ctx.live,
+        ctx.statuses,
+        ctx.notifier,
+        ctx.handback,
+        ctx.handles,
+        true,
+    );
+    if resumed {
+        info!(session_id, "continue_job resumed a finished job");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,12 +367,17 @@ async fn run_job(
     };
 
     match run_turn(&engine, &runner, &session_id, &job.brief).await {
-        TurnOutcome::Success { usage, jobs } => {
+        TurnOutcome::Success {
+            usage,
+            jobs,
+            continues,
+        } => {
             spent_tokens += usage_tokens(usage);
             if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
                 notify_job_changed(notifier.as_ref(), &engine, info);
             }
             spawn_dispatched(&ctx, jobs);
+            route_continues(&ctx, continues);
         }
         TurnOutcome::Failure => {
             finish_now(&live, &mut steer_rx, &session_id);
@@ -317,12 +416,17 @@ async fn run_job(
         };
         let Some(text) = steered else { break };
         match run_turn(&engine, &runner, &session_id, &text).await {
-            TurnOutcome::Success { usage, jobs } => {
+            TurnOutcome::Success {
+                usage,
+                jobs,
+                continues,
+            } => {
                 spent_tokens += usage_tokens(usage);
                 if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
                     notify_job_changed(notifier.as_ref(), &engine, info);
                 }
                 spawn_dispatched(&ctx, jobs);
+                route_continues(&ctx, continues);
             }
             TurnOutcome::Failure => {
                 finish_now(&live, &mut steer_rx, &session_id);
@@ -551,6 +655,7 @@ async fn run_one_handback_turn(
                     ctx.handles,
                 );
             }
+            route_continues(ctx, reply.continues);
         }
         Err(error) => warn!(parent_session, %error, "handback turn failed"),
     }
@@ -563,6 +668,7 @@ enum TurnOutcome {
     Success {
         usage: Option<Usage>,
         jobs: Vec<DispatchedJob>,
+        continues: Vec<ContinuedJob>,
     },
     Failure,
 }
@@ -636,6 +742,7 @@ async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str
             TurnOutcome::Success {
                 usage: reply.usage,
                 jobs: reply.jobs,
+                continues: reply.continues,
             }
         }
         Err(error) => {
@@ -2504,6 +2611,290 @@ mod tests {
             ran,
             ["grandchild work", "grandchild done"],
             "the grandchild actually ran, not just existed"
+        );
+    }
+
+    fn continue_job_args(session_id: &str, message: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "message": message,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn continue_job_on_a_live_job_queues_into_its_steer_channel_instead_of_resuming() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("continued reply")),
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        supervisor.continue_job(ContinuedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            message: "also check the linter".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+        });
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "working".to_owned()),
+                (Role::User, "also check the linter".to_owned()),
+                (Role::Assistant, "continued reply".to_owned()),
+            ],
+            "the live job's steer channel got it, not a resumed task"
+        );
+
+        let created = replay_log(dir.path())
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    arc_proto::v1::session_event::Event::SessionCreated(created)
+                        if created.role == SessionRole::Executor as i32
+                )
+            })
+            .count();
+        assert_eq!(created, 1, "no second session was created for a live job");
+    }
+
+    #[tokio::test]
+    async fn continue_job_on_a_finished_job_resumes_it_and_the_handback_lands_in_the_parent() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider =
+            ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("linted too")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert!(
+            !supervisor.steer(&child_id, "not live anymore"),
+            "the job already finished; nothing is left to steer"
+        );
+
+        supervisor.continue_job(ContinuedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            message: "also check the linter".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "on it".to_owned()),
+                (Role::User, "also check the linter".to_owned()),
+                (Role::Assistant, "linted too".to_owned()),
+            ],
+            "the resume ran as a fresh task over the same session, transcript intact"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [
+                (Role::User, format!("Job {child_id} finished.\non it")),
+                (Role::User, format!("Job {child_id} finished.\nlinted too")),
+            ],
+            "both the original finish and the resume's finish handed back to the same parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_job_checked_with_guard_absent_skips_a_session_already_live() {
+        let dir = TempDir::new().expect("temp dir");
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
+        let provider = ScriptedProvider::scripted(vec![]);
+        let runners = BTreeMap::from([(SessionRole::Executor, executor_runner(&provider))]);
+        let live: Arc<LiveMap> = Arc::new(Mutex::new(HashMap::new()));
+        let statuses = Arc::new(JobStatuses::new());
+        let handles: Arc<Handles> = Arc::new(Mutex::new(Vec::new()));
+
+        // stands in for a first resume already holding this session's slot
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        live.lock()
+            .expect("live")
+            .insert("s-child".to_owned(), steer_tx);
+
+        let spawned = spawn_job_checked(
+            DispatchedJob {
+                session_id: "s-child".to_owned(),
+                parent_session: "s-parent".to_owned(),
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+                brief: "second resume".to_owned(),
+                budget: None,
+            },
+            &engine,
+            &runners,
+            &live,
+            &statuses,
+            None,
+            None,
+            &handles,
+            true,
+        );
+
+        assert!(
+            !spawned,
+            "a racing resume must not clobber the first one's steer channel"
+        );
+        assert_eq!(
+            live.lock().expect("live").len(),
+            1,
+            "still exactly the first resume's entry"
+        );
+        assert!(
+            handles.lock().expect("handles").is_empty(),
+            "no task was spawned for the loser of the race"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handback_turn_that_calls_continue_job_resumes_the_finished_job() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::continue_job::ContinueJob));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                },
+            )])),
+        );
+
+        // a throwaway provider: session creation never drives it
+        let bootstrap_provider = ScriptedProvider::scripted(vec![]);
+        let parent_id = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Concierge,
+                None,
+            )
+            .expect("create the parent durably");
+        let first_child = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the first child durably");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c2",
+                    0,
+                    "continue_job",
+                    &continue_job_args(&first_child, "second link"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("chained"),
+            // the resumed job's own finish drives a second, independent
+            // handback turn on the same parent
+            done_reply("noted"),
+        ]);
+        let executor_provider = ScriptedProvider::scripted(vec![
+            done_reply("first job done"),
+            done_reply("second job done"),
+        ]);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: first_child.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &first_child),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "first job done".to_owned()),
+                (Role::User, "second link".to_owned()),
+                (Role::Assistant, "second job done".to_owned()),
+            ],
+            "the handback turn's continue_job resumed the finished job in place"
+        );
+        assert_eq!(
+            last_assistant(dir.path(), &parent_id),
+            Some("noted".to_owned()),
+            "the resumed job's own handback drove one more concierge turn"
         );
     }
 }

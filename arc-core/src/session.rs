@@ -20,7 +20,7 @@ use crate::provider::{
 };
 use crate::store::{self, Store, now_ts};
 use crate::tool::workspace::{Grant, Grants, Mode};
-use crate::tool::{DispatchOutcome, Registry, ToolSource, TurnContext};
+use crate::tool::{ContinueRequest, DispatchOutcome, Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
@@ -82,6 +82,7 @@ pub struct Reply {
     pub usage: Option<Usage>,
     pub partial: bool,
     pub jobs: Vec<DispatchedJob>,
+    pub continues: Vec<ContinuedJob>,
 }
 
 /// A child session `dispatch` created durably during this turn. The engine
@@ -95,6 +96,20 @@ pub struct DispatchedJob {
     pub project: String,
     pub brief: String,
     pub budget: Option<Budget>,
+}
+
+/// A validated `continue_job` request the engine handed off. The engine only
+/// confirms the target is a job; whether it's still live is the
+/// supervisor's to know, so this carries what a resume would need too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuedJob {
+    pub session_id: String,
+    /// The session whose turn called `continue_job` — where a resumed job's
+    /// handback lands, same as a fresh dispatch's parent.
+    pub parent_session: String,
+    pub message: String,
+    pub role: SessionRole,
+    pub project: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,6 +310,60 @@ impl Engine {
             ),
             Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
         }
+    }
+
+    /// Acts on a `continue_job` tool call: confirms `session_id` names a
+    /// recorded job (Executor or Archivist) and hands back what the
+    /// caller's tool result should say. Whether that job is still live is
+    /// the supervisor's knowledge, not the engine's — this only validates
+    /// identity.
+    fn continue_job(
+        &self,
+        parent_session: &str,
+        request: ContinueRequest,
+    ) -> (ToolOutcome, String, Option<ContinuedJob>) {
+        let raw_role =
+            match self.with_store(|store| store.projection().session_role(&request.session_id)) {
+                Ok(role) => role,
+                Err(error) => return (ToolOutcome::Error, format!("ERROR: {error}"), None),
+            };
+        let Some(raw_role) = raw_role else {
+            return (
+                ToolOutcome::Error,
+                format!("ERROR: unknown session {}.", request.session_id),
+                None,
+            );
+        };
+        let Some(role @ (SessionRole::Executor | SessionRole::Archivist)) =
+            SessionRole::try_from(raw_role).ok()
+        else {
+            return (
+                ToolOutcome::Error,
+                format!(
+                    "ERROR: session {} is a {} session, not a job. continue_job only resumes \
+                     a dispatched job.",
+                    request.session_id,
+                    role_name(raw_role)
+                ),
+                None,
+            );
+        };
+        let project = self
+            .with_store(|store| store.projection().session_project(&request.session_id))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        (
+            ToolOutcome::Ok,
+            format!("Continuing job {}.", request.session_id),
+            Some(ContinuedJob {
+                session_id: request.session_id,
+                parent_session: parent_session.to_owned(),
+                message: request.message,
+                role,
+                project,
+            }),
+        )
     }
 
     /// The job's summary and its session id, appended into the parent as
@@ -572,6 +641,7 @@ impl Engine {
         let mut steps = 0;
         let mut memory = MemoryCounters::default();
         let mut jobs: Vec<DispatchedJob> = Vec::new();
+        let mut continues: Vec<ContinuedJob> = Vec::new();
 
         let reply = loop {
             // the last step offers no tools, so the model has to answer
@@ -603,6 +673,7 @@ impl Engine {
                         &mut transcript,
                         &mut memory,
                         &mut jobs,
+                        &mut continues,
                         events,
                     )
                     .await?;
@@ -617,6 +688,7 @@ impl Engine {
                         usage: total_usage,
                         partial: false,
                         jobs,
+                        continues,
                     });
                 }
                 Ending::Cut if text.is_empty() => {
@@ -633,6 +705,7 @@ impl Engine {
                         usage: None,
                         partial: true,
                         jobs,
+                        continues,
                     });
                 }
                 Ending::Failed(error) => {
@@ -695,6 +768,7 @@ impl Engine {
         transcript: &mut Vec<Message>,
         memory: &mut MemoryCounters,
         jobs: &mut Vec<DispatchedJob>,
+        continues: &mut Vec<ContinuedJob>,
         events: &mpsc::Sender<EngineEvent>,
     ) -> Result<(), Error> {
         if !text.is_empty() {
@@ -760,6 +834,7 @@ impl Engine {
                 truncated,
                 memory_events,
                 job_request,
+                continue_request,
             } = self
                 .registry
                 .dispatch(&call.name, call.arguments.clone(), ctx, sources)
@@ -772,6 +847,12 @@ impl Engine {
                 let (outcome, content, job) = self.dispatch_job(runner, session_id, job_request);
                 if let Some(job) = job {
                     jobs.push(job);
+                }
+                (outcome, content)
+            } else if let Some(continue_request) = continue_request {
+                let (outcome, content, cont) = self.continue_job(session_id, continue_request);
+                if let Some(cont) = cont {
+                    continues.push(cont);
                 }
                 (outcome, content)
             } else {
@@ -1160,8 +1241,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, ProjectSpec,
-        Runner,
+        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters,
+        ProjectSpec, Runner,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -2780,6 +2861,7 @@ mod tests {
                             },
                         )],
                         job_request: None,
+                        continue_request: None,
                     }
                 })
             }
@@ -3509,6 +3591,162 @@ mod tests {
             .expect("an executor runner continues the dispatched child");
     }
 
+    fn continue_job_args(session_id: &str, message: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "message": message,
+        })
+        .to_string()
+    }
+
+    fn tool_result(events: &[session_event::Event]) -> &arc_proto::v1::ToolResultRecorded {
+        events
+            .iter()
+            .find_map(|event| match event {
+                session_event::Event::ToolResultRecorded(result) => Some(result),
+                _ => None,
+            })
+            .expect("a recorded tool result")
+    }
+
+    #[tokio::test]
+    async fn continue_job_on_an_existing_executor_child_lands_in_reply_continues() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::builtin::continue_job::ContinueJob));
+        // a throwaway provider: create_bound_session never drives it
+        let (engine, bootstrap_run) =
+            engine_with_tools(&ScriptedProvider::scripted(vec![]), &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let child_id = engine
+            .create_bound_session(&bootstrap_run, "arc", SessionRole::Executor, None)
+            .expect("create the child durably");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "continue_job",
+                    &continue_job_args(&child_id, "also check the linter"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("continuing"),
+        ]);
+        let run = runner(&provider);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "continue the job", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            reply.continues,
+            [ContinuedJob {
+                session_id: child_id.clone(),
+                parent_session: reply.session_id.clone(),
+                message: "also check the linter".to_owned(),
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+            }]
+        );
+
+        let events = replay_log(dir.path());
+        let result = tool_result(&events);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert!(result.content.contains("Continuing"), "{}", result.content);
+        assert!(result.content.contains(&child_id), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn continue_job_on_an_unknown_session_is_an_actionable_error_and_the_turn_completes() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "continue_job",
+                    &continue_job_args("s-ghost", "keep going"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("noted"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::builtin::continue_job::ContinueJob));
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "continue it", tx)
+            .await
+            .expect("a bad continue_job fails the call, not the turn");
+
+        assert!(reply.continues.is_empty());
+        let events = replay_log(dir.path());
+        let result = tool_result(&events);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("s-ghost"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn continue_job_on_a_non_job_session_is_an_actionable_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::builtin::continue_job::ContinueJob));
+        // a throwaway provider: create_bound_session never drives it
+        let (engine, bootstrap_run) =
+            engine_with_tools(&ScriptedProvider::scripted(vec![]), &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let other_concierge = engine
+            .create_bound_session(&bootstrap_run, "arc", SessionRole::Concierge, None)
+            .expect("create a non-job session durably");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "continue_job",
+                    &continue_job_args(&other_concierge, "keep going"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("noted"),
+        ]);
+        let run = runner(&provider);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "continue it", tx)
+            .await
+            .expect("a bad continue_job fails the call, not the turn");
+
+        assert!(reply.continues.is_empty());
+        let events = replay_log(dir.path());
+        let result = tool_result(&events);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("concierge"), "{}", result.content);
+        assert!(result.content.contains("not a job"), "{}", result.content);
+    }
+
     #[tokio::test]
     async fn record_handback_appends_a_system_sourced_message_visible_in_the_parents_log() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
@@ -3948,6 +4186,7 @@ mod tests {
                             brief: "do it".to_owned(),
                             budget: None,
                         }),
+                        continue_request: None,
                     }
                 })
             }

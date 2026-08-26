@@ -29,11 +29,21 @@ pub struct JobRequest {
     pub budget: Option<Budget>,
 }
 
+/// A validated request to continue an existing job. Mirrors `JobRequest`:
+/// the tool checks only shape, the engine resolves whether `session_id` is
+/// actually a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinueRequest {
+    pub session_id: String,
+    pub message: String,
+}
+
 pub struct ToolReply {
     pub content: String,
     pub ok: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
+    pub continue_request: Option<ContinueRequest>,
 }
 
 impl ToolReply {
@@ -43,6 +53,7 @@ impl ToolReply {
             ok: true,
             memory_events: Vec::new(),
             job_request: None,
+            continue_request: None,
         }
     }
 
@@ -52,6 +63,7 @@ impl ToolReply {
             ok: false,
             memory_events: Vec::new(),
             job_request: None,
+            continue_request: None,
         }
     }
 }
@@ -62,6 +74,7 @@ pub(crate) struct DispatchOutcome {
     pub truncated: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
+    pub continue_request: Option<ContinueRequest>,
 }
 
 /// Where a tool comes from. A session declares the sources it gets, so a tool
@@ -144,6 +157,7 @@ impl Registry {
                 truncated: false,
                 memory_events: Vec::new(),
                 job_request: None,
+                continue_request: None,
             };
         };
         if !sources.contains(&tool.source()) {
@@ -154,6 +168,7 @@ impl Registry {
                 truncated: false,
                 memory_events: Vec::new(),
                 job_request: None,
+                continue_request: None,
             };
         }
         let reply = tool.execute(arguments_json, ctx).await;
@@ -165,6 +180,7 @@ impl Registry {
             truncated,
             memory_events: reply.memory_events,
             job_request: reply.job_request,
+            continue_request: reply.continue_request,
         }
     }
 

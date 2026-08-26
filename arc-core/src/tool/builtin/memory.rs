@@ -252,6 +252,7 @@ impl Tool for MemoryWrite {
                     record: Some(record),
                 })],
                 job_request: None,
+                continue_request: None,
             }
         })
     }
@@ -321,6 +322,7 @@ impl Tool for MemorySupersede {
                     },
                 )],
                 job_request: None,
+                continue_request: None,
             }
         })
     }

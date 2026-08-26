@@ -140,6 +140,7 @@ impl Tool for Dispatch {
                     brief: args.brief,
                     budget,
                 }),
+                continue_request: None,
             }
         })
     }

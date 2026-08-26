@@ -304,6 +304,9 @@ async fn send_message(
             for job in reply.jobs {
                 supervisor.spawn(job);
             }
+            for cont in reply.continues {
+                supervisor.continue_job(cont);
+            }
             msg
         }
         Err(error) => {
