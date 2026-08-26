@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_proto::v1::{
-    MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, SessionRole, Source,
+    Budget, MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, SessionRole, Source,
     ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
 };
 use arc_proto::v1::{event, memory_event, session_event};
@@ -18,7 +18,7 @@ use crate::provider::{
 };
 use crate::store::{self, Store, now_ts};
 use crate::tool::workspace::{Grant, Grants, Mode};
-use crate::tool::{Registry, ToolSource, TurnContext};
+use crate::tool::{DispatchOutcome, Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
@@ -127,6 +127,10 @@ impl Engine {
 
     /// A new session bound to a project: grants are canonicalized now and
     /// recorded in the log, so the session keeps them even if config changes.
+    /// `runner` supplies the recorded provider and model; `role` and `budget`
+    /// are what the new session is pinned to, which is `runner.role` for a
+    /// session the runner starts for itself but differs for a dispatched
+    /// job, where the runner is the dispatching parent, not the child.
     #[tracing::instrument(
         level = "info",
         name = "session.create_bound_session",
@@ -137,6 +141,8 @@ impl Engine {
         &mut self,
         runner: &Runner,
         project: &str,
+        role: SessionRole,
+        budget: Option<Budget>,
     ) -> Result<String, Error> {
         let spec = self
             .projects
@@ -152,16 +158,17 @@ impl Engine {
 
         let session_id = uuid::Uuid::new_v4().to_string();
         tracing::Span::current().record("session_id", session_id.as_str());
+        // a job session exists because a model asked for it
         self.record(
-            Source::User,
+            Source::Model,
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.clone(),
                 title: String::new(),
                 provider: runner.provider.name().to_owned(),
                 model: runner.model.clone(),
-                role: runner.role as i32,
+                role: role as i32,
                 project: project.to_owned(),
-                budget: None,
+                budget,
                 grants: grants
                     .canonical_roots()
                     .iter()
@@ -173,6 +180,29 @@ impl Engine {
             }),
         )?;
         Ok(session_id)
+    }
+
+    /// Acts on a `dispatch` tool call: creates the child session durably and
+    /// returns what the parent's tool result should say. The child does not
+    /// start running here — that arrives with the supervised job task.
+    fn dispatch_job(
+        &mut self,
+        runner: &Runner,
+        job_request: crate::tool::JobRequest,
+    ) -> (ToolOutcome, String) {
+        let role = job_request.role;
+        let project = job_request.project;
+        match self.create_bound_session(runner, &project, role, job_request.budget) {
+            Ok(child_id) => (
+                ToolOutcome::Ok,
+                format!(
+                    "Dispatched {} into {project} as session {child_id}. The job has not \
+                     started; job execution arrives with the supervised task.",
+                    provider::role_label(role)
+                ),
+            ),
+            Err(error) => (ToolOutcome::Error, format!("ERROR: {error}")),
+        }
     }
 
     fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
@@ -321,6 +351,7 @@ impl Engine {
                     steps += 1;
                     span.record("tool_steps", steps);
                     self.tool_step(
+                        runner,
                         &session_id,
                         &turn_id,
                         text,
@@ -409,6 +440,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn tool_step(
         &mut self,
+        runner: &Runner,
         session_id: &str,
         turn_id: &str,
         text: String,
@@ -475,20 +507,33 @@ impl Engine {
                 turn_id: turn_id.to_owned(),
                 grants: grants.cloned(),
             };
-            let dispatched = self
+            let DispatchOutcome {
+                content,
+                ok,
+                truncated,
+                memory_events,
+                job_request,
+            } = self
                 .registry
                 .dispatch(&call.name, call.arguments.clone(), ctx, sources)
                 .await;
-            let outcome = if dispatched.ok {
-                ToolOutcome::Ok
-            } else {
-                ToolOutcome::Error
-            };
-            memory.observe_call(&call.name, &call.arguments, &dispatched.content);
-            for memory_event in dispatched.memory_events {
+            for memory_event in memory_events {
                 memory.observe_event(&memory_event);
                 self.record_memory(Source::Model, memory_event)?;
             }
+            let (outcome, content) = if let Some(job_request) = job_request {
+                self.dispatch_job(runner, job_request)
+            } else {
+                memory.observe_call(&call.name, &call.arguments, &content);
+                (
+                    if ok {
+                        ToolOutcome::Ok
+                    } else {
+                        ToolOutcome::Error
+                    },
+                    content,
+                )
+            };
             self.record(
                 Source::System,
                 session_event::Event::ToolResultRecorded(ToolResultRecorded {
@@ -496,8 +541,8 @@ impl Engine {
                     turn_id: turn_id.to_owned(),
                     call_id: call.id.clone(),
                     outcome: outcome as i32,
-                    content: dispatched.content.clone(),
-                    truncated: dispatched.truncated,
+                    content: content.clone(),
+                    truncated,
                 }),
             )?;
             let _ = events
@@ -506,7 +551,7 @@ impl Engine {
                     outcome,
                 })
                 .await;
-            results.push((call.id.clone(), dispatched.content));
+            results.push((call.id.clone(), content));
         }
 
         transcript.push(Message::ToolCalls(calls));
@@ -827,7 +872,7 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
+        Budget, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
         MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome,
         history_entry, memory_event, memory_record, session_event,
     };
@@ -846,8 +891,9 @@ mod tests {
         issued, reopened_engine, replay_events, replay_log, resulted, runner, seed_log,
         seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
     };
+    use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
-    use crate::tool::{Registry, ToolSource};
+    use crate::tool::{JobRequest, Registry, Tool, ToolReply, ToolSource, TurnContext};
 
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
@@ -2388,6 +2434,7 @@ mod tests {
                                 }),
                             },
                         )],
+                        job_request: None,
                     }
                 })
             }
@@ -2756,7 +2803,7 @@ mod tests {
         ));
 
         let session_id = engine
-            .create_bound_session(&run, "arc")
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
             .expect("create a bound session");
 
         let events = replay_log(dir.path());
@@ -2798,7 +2845,7 @@ mod tests {
         let (mut engine, run) = engine(&provider, &dir);
 
         let err = engine
-            .create_bound_session(&run, "ghost")
+            .create_bound_session(&run, "ghost", SessionRole::Concierge, None)
             .expect_err("an unconfigured project must be refused");
 
         assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
@@ -2819,7 +2866,7 @@ mod tests {
         ));
 
         let err = engine
-            .create_bound_session(&run, "arc")
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
             .expect_err("a missing root must fail at creation");
 
         assert!(matches!(err, Error::Grants { ref project, .. } if project == "arc"));
@@ -2865,7 +2912,7 @@ mod tests {
         ));
 
         let session_id = engine
-            .create_bound_session(&run, "arc")
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
             .expect("create a bound session");
         let (tx, _rx) = channel();
         engine
@@ -2902,7 +2949,7 @@ mod tests {
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
         let session_id = creating_engine
-            .create_bound_session(&run, "arc")
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
             .expect("create a bound session");
         drop(creating_engine);
 
@@ -2982,5 +3029,175 @@ mod tests {
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("granted"), "{}", result.content);
+    }
+
+    fn dispatch_args(
+        role: &str,
+        project: &str,
+        brief: &str,
+        budget_tokens: u64,
+        budget_minutes: u32,
+    ) -> String {
+        serde_json::json!({
+            "role": role,
+            "project": project,
+            "brief": brief,
+            "budget_tokens": budget_tokens,
+            "budget_minutes": budget_minutes,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_call_creates_the_child_durably_and_the_parent_result_names_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "fix the bug", 500, 10),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(vec!["arc".to_owned()], None)));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let mut engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 6);
+        let session_event::Event::SessionCreated(child) = &events[3] else {
+            panic!("expected the child SessionCreated, got {:?}", events[3]);
+        };
+        assert_eq!(child.project, "arc");
+        assert_eq!(child.role, SessionRole::Executor as i32);
+        assert_eq!(
+            child.budget,
+            Some(Budget {
+                total_tokens: 500,
+                wall_clock_seconds: 600,
+            })
+        );
+        assert_eq!(
+            child.grants,
+            [arc_proto::v1::WorkspaceGrant {
+                root: root
+                    .canonicalize()
+                    .expect("canon")
+                    .to_string_lossy()
+                    .into_owned(),
+                read_write: true,
+            }]
+        );
+        let child_id = child.session_id.clone();
+
+        let result = resulted(&events[4]);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert!(result.content.contains(&child_id), "{}", result.content);
+        assert!(result.content.contains("executor"), "{}", result.content);
+        assert!(result.content.contains("arc"), "{}", result.content);
+
+        // the role-mismatch pin keys on the recorded role, not the runner
+        // that created the session, so an executor runner can continue it
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+        let executor_run = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
+            model: "exec-model".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
+        let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
+        let mut child_engine = child_engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+        child_engine
+            .send_message(&executor_run, Some(&child_id), "go", tx)
+            .await
+            .expect("an executor runner continues the dispatched child");
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_to_an_unknown_project_forged_past_the_enum_is_an_actionable_error_and_the_turn_completes()
+     {
+        struct Forged;
+
+        impl Tool for Forged {
+            fn definition(&self) -> crate::provider::ToolDefinition {
+                crate::provider::ToolDefinition {
+                    name: "forged_dispatch".to_owned(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn source(&self) -> ToolSource {
+                ToolSource::Builtin
+            }
+
+            fn execute(
+                &self,
+                _arguments_json: String,
+                _ctx: TurnContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolReply> + Send + '_>>
+            {
+                Box::pin(async move {
+                    ToolReply {
+                        content: "dispatching".to_owned(),
+                        ok: true,
+                        memory_events: Vec::new(),
+                        job_request: Some(JobRequest {
+                            role: SessionRole::Executor,
+                            project: "ghost".to_owned(),
+                            brief: "do it".to_owned(),
+                            budget: None,
+                        }),
+                    }
+                })
+            }
+        }
+
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "forged_dispatch", "{}")), Ok(tool_stop())],
+            done_reply("done"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Forged));
+        let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("a bad dispatch fails the call, not the turn");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 5, "no child session was created");
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("ghost"), "{}", result.content);
+        let assistant = appended(&events[4]);
+        assert_eq!(assistant.content, "done");
     }
 }

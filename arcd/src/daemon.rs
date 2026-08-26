@@ -106,8 +106,9 @@ impl Daemon {
             Archive::open(dirs.index())
                 .with_context(|| format!("opening {} read-only", dirs.index().display()))?,
         );
+        let (project_names, scratch) = dispatch_projects(&config);
         let mut registry = Registry::new(config.max_tool_result_bytes);
-        for tool in builtin::tools(archive) {
+        for tool in builtin::tools(archive, project_names, scratch) {
             registry.register(tool);
         }
         for tool in workspace::tools(Arc::new(Workspace::new())) {
@@ -280,6 +281,17 @@ fn idle_cutoff_micros(idle: Duration) -> Option<i64> {
     Some(now.saturating_sub(idle))
 }
 
+/// What `dispatch` may bind a job to: every configured project, plus the
+/// scratch project if a project is literally named `scratch`.
+fn dispatch_projects(config: &Config) -> (Vec<String>, Option<String>) {
+    let names = config.projects.keys().cloned().collect();
+    let scratch = config
+        .projects
+        .contains_key("scratch")
+        .then(|| "scratch".to_owned());
+    (names, scratch)
+}
+
 fn project_spec(project: &crate::config::ProjectConfig) -> ProjectSpec {
     let sources = project
         .sources
@@ -345,12 +357,49 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use arc_proto::v1::{Event, SessionCreated, SessionEvent, event, session_event};
+    use arc_proto::v1::{Event, SessionCreated, SessionEvent, SessionRole, event, session_event};
     use tempfile::TempDir;
 
     use super::*;
     use crate::config::{ProjectConfig, ToolSource};
     use crate::dirs::DataDirs;
+
+    fn project_config(root: &str) -> ProjectConfig {
+        ProjectConfig {
+            root: std::path::PathBuf::from(root),
+            read_only: Vec::new(),
+            sources: vec![ToolSource::Builtin],
+        }
+    }
+
+    #[test]
+    fn dispatch_projects_lists_every_project_and_finds_the_scratch_one() {
+        let mut config = Config::default();
+        config
+            .projects
+            .insert("arc".to_owned(), project_config("/tmp/arc"));
+        config
+            .projects
+            .insert("scratch".to_owned(), project_config("/tmp/scratch"));
+
+        let (names, scratch) = dispatch_projects(&config);
+
+        assert_eq!(names, ["arc", "scratch"]);
+        assert_eq!(scratch, Some("scratch".to_owned()));
+    }
+
+    #[test]
+    fn dispatch_projects_without_a_scratch_project_names_none() {
+        let mut config = Config::default();
+        config
+            .projects
+            .insert("arc".to_owned(), project_config("/tmp/arc"));
+
+        let (names, scratch) = dispatch_projects(&config);
+
+        assert_eq!(names, ["arc"]);
+        assert_eq!(scratch, None);
+    }
 
     // port 1 refuses every connection: startup must not reach a provider
     fn unreachable_roles() -> Roles {
@@ -557,7 +606,12 @@ mod tests {
             .engine
             .lock()
             .await
-            .create_bound_session(daemon.roles.concierge(), "arc")
+            .create_bound_session(
+                daemon.roles.concierge(),
+                "arc",
+                SessionRole::Concierge,
+                None,
+            )
             .expect("create a bound session");
 
         let log = Log::open(&log_dir).expect("reopen log");

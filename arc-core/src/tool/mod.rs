@@ -6,6 +6,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arc_proto::v1::{Budget, SessionRole};
+
 use crate::provider::ToolDefinition;
 use crate::tool::workspace::Grants;
 
@@ -16,10 +18,22 @@ pub struct TurnContext {
     pub grants: Option<Arc<Grants>>,
 }
 
+/// A validated request to start a job. The tool that builds one never starts
+/// the session itself — it hands the request to the engine, which is the
+/// only thing that can hold `&mut Engine`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobRequest {
+    pub role: SessionRole,
+    pub project: String,
+    pub brief: String,
+    pub budget: Option<Budget>,
+}
+
 pub struct ToolReply {
     pub content: String,
     pub ok: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
+    pub job_request: Option<JobRequest>,
 }
 
 impl ToolReply {
@@ -28,6 +42,7 @@ impl ToolReply {
             content,
             ok: true,
             memory_events: Vec::new(),
+            job_request: None,
         }
     }
 
@@ -36,6 +51,7 @@ impl ToolReply {
             content,
             ok: false,
             memory_events: Vec::new(),
+            job_request: None,
         }
     }
 }
@@ -45,6 +61,7 @@ pub(crate) struct DispatchOutcome {
     pub ok: bool,
     pub truncated: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
+    pub job_request: Option<JobRequest>,
 }
 
 /// Where a tool comes from. A session declares the sources it gets, so a tool
@@ -126,6 +143,7 @@ impl Registry {
                 ok: false,
                 truncated: false,
                 memory_events: Vec::new(),
+                job_request: None,
             };
         };
         if !sources.contains(&tool.source()) {
@@ -135,6 +153,7 @@ impl Registry {
                 ok: false,
                 truncated: false,
                 memory_events: Vec::new(),
+                job_request: None,
             };
         }
         let reply = tool.execute(arguments_json, ctx).await;
@@ -145,6 +164,7 @@ impl Registry {
             ok: reply.ok,
             truncated,
             memory_events: reply.memory_events,
+            job_request: reply.job_request,
         }
     }
 

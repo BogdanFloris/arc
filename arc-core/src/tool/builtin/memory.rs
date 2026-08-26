@@ -251,6 +251,7 @@ impl Tool for MemoryWrite {
                 memory_events: vec![memory_event::Event::RecordCreated(MemoryRecordCreated {
                     record: Some(record),
                 })],
+                job_request: None,
             }
         })
     }
@@ -319,11 +320,14 @@ impl Tool for MemorySupersede {
                         record: Some(record),
                     },
                 )],
+                job_request: None,
             }
         })
     }
 }
 
+// an early-return-on-error reads best here; ToolReply is not on a hot path
+#[allow(clippy::result_large_err)]
 fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, ToolReply> {
     let Some(kind) = parse_kind(&args.kind) else {
         return Err(ToolReply::error(format!(
