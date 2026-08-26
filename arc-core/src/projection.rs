@@ -348,6 +348,8 @@ impl Projection {
                     insert_message(&tx, event, appended)?;
                 }
                 session_event::Event::ToolCallIssued(call) => insert_tool_call(&tx, event, call)?,
+                // 6.2 applies it; decoding must not fail before then
+                session_event::Event::SessionTitled(_) => {}
                 session_event::Event::ToolResultRecorded(result) => {
                     insert_tool_result(&tx, event, result)?;
                 }
@@ -725,6 +727,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::ToolCallIssued(_) => "tool_call_issued",
             session_event::Event::ToolResultRecorded(_) => "tool_result_recorded",
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
+            session_event::Event::SessionTitled(_) => "session_titled",
         },
         event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
             memory_event::Event::RecordCreated(_) => "memory_record_created",

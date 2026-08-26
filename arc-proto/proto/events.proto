@@ -99,8 +99,15 @@ message SessionEvent {
     ToolCallIssued tool_call_issued = 3;
     ToolResultRecorded tool_result_recorded = 4;
     SessionConsolidated session_consolidated = 6;
+    SessionTitled session_titled = 7;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
+}
+
+// The latest title wins on replay; retitling is appending another one.
+message SessionTitled {
+  string session_id = 1;
+  string title = 2;
 }
 
 message ProvenanceEntry {

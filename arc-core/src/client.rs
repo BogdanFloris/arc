@@ -478,6 +478,7 @@ mod tests {
             budget_tokens: 100,
             elapsed_seconds: 4,
             budget_seconds: 60,
+            title: String::new(),
         };
         let list = server_frame::Msg::JobList(arc_proto::v1::JobList {
             jobs: vec![job.clone()],

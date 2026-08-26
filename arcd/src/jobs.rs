@@ -362,6 +362,7 @@ impl JobStatus {
                 .budget
                 .as_ref()
                 .map_or(0, |budget| budget.wall_clock_seconds),
+            title: String::new(),
         }
     }
 }

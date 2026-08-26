@@ -1842,6 +1842,7 @@ mod tests {
             budget_tokens: 0,
             elapsed_seconds: 5,
             budget_seconds: 0,
+            title: String::new(),
         }
     }
 

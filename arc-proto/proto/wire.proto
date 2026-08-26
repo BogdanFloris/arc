@@ -72,6 +72,7 @@ message JobInfo {
   uint64 budget_tokens = 6;
   uint32 elapsed_seconds = 7;
   uint32 budget_seconds = 8;
+  string title = 9;
 }
 
 message JobList {
