@@ -30,6 +30,14 @@ message Budget {
   uint32 wall_clock_seconds = 2;
 }
 
+// What a session's workspace tools may reach, resolved from config when the
+// session is created. Recorded here because replay has to rebuild what a tool
+// call was allowed to see; config can change, the log cannot.
+message WorkspaceGrant {
+  string root = 1;
+  bool read_write = 2;
+}
+
 message SessionCreated {
   string session_id = 1;
   string title = 2;
@@ -39,6 +47,7 @@ message SessionCreated {
   SessionRole role = 7;
   string project = 8;
   Budget budget = 9;
+  repeated WorkspaceGrant grants = 10;
 }
 
 message MessageAppended {

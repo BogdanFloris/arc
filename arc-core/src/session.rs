@@ -181,6 +181,7 @@ impl Engine {
                     role: runner.role as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 }),
             )?;
         }
@@ -759,6 +760,7 @@ mod tests {
             role: arc_proto::v1::SessionRole::Unspecified as i32,
             project: String::new(),
             budget: None,
+            grants: Vec::new(),
         })
     }
 
@@ -814,6 +816,7 @@ mod tests {
             role: SessionRole::Unspecified as i32,
             project: project.to_owned(),
             budget: None,
+            grants: Vec::new(),
         })
     }
 
@@ -953,6 +956,7 @@ mod tests {
                     role: SessionRole::Executor as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -1174,6 +1178,7 @@ mod tests {
                     role: arc_proto::v1::SessionRole::Unspecified as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 }),
             )
             .expect("record");

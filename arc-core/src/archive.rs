@@ -633,6 +633,7 @@ mod tests {
             role: SessionRole::Unspecified as i32,
             project: String::new(),
             budget: None,
+            grants: Vec::new(),
         })
     }
 

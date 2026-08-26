@@ -1195,6 +1195,7 @@ mod tests {
                     role: SessionRole::Executor as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 })),
             })),
         }
@@ -1670,6 +1671,7 @@ mod tests {
                     role: SessionRole::Unspecified as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 })),
             })),
         }

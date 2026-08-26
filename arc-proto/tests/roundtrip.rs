@@ -6,8 +6,8 @@ use arc_proto::v1::{
     MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame,
     SessionConsolidated, SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList,
     SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
-    ToolResultRecorded, client_frame, event, history_entry, memory_event, memory_record,
-    server_frame, session_event,
+    ToolResultRecorded, WorkspaceGrant, client_frame, event, history_entry, memory_event,
+    memory_record, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -42,6 +42,16 @@ fn session_created_event() -> Event {
                     total_tokens: 250_000,
                     wall_clock_seconds: 1_200,
                 }),
+                grants: vec![
+                    WorkspaceGrant {
+                        root: "/home/bogdan/arc".to_string(),
+                        read_write: true,
+                    },
+                    WorkspaceGrant {
+                        root: "/home/bogdan/notes".to_string(),
+                        read_write: false,
+                    },
+                ],
             })),
         })),
     }

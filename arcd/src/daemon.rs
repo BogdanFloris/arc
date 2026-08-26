@@ -369,6 +369,7 @@ mod tests {
                     role: arc_proto::v1::SessionRole::Unspecified as i32,
                     project: String::new(),
                     budget: None,
+                    grants: Vec::new(),
                 })),
             })),
         })
@@ -451,6 +452,7 @@ mod tests {
                 role: arc_proto::v1::SessionRole::Unspecified as i32,
                 project: String::new(),
                 budget: None,
+                grants: Vec::new(),
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),
