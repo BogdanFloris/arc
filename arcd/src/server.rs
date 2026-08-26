@@ -198,6 +198,10 @@ async fn send_message(
     request_id: u64,
     send: SendMessage,
 ) -> ControlFlow<()> {
+    if !send.session_id.is_empty() && supervisor.steer(&send.session_id, &send.content) {
+        return flow(send_steered(ws, request_id, &send.session_id).await);
+    }
+
     let (events, rx) = mpsc::channel(EVENT_BUFFER);
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
@@ -225,6 +229,25 @@ async fn send_message(
         }
     };
     flow(send_frame(ws, request_id, msg).await)
+}
+
+/// A steered message never reaches the engine on this connection: its turn
+/// runs inside the job task, and its output lands in the child's log, not
+/// this stream. The client just gets an accepted, empty-usage stream end.
+async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> bool {
+    let accepted = server_frame::Msg::MessageAccepted(MessageAccepted {
+        session_id: session_id.to_owned(),
+    });
+    if !send_frame(ws, request_id, accepted).await {
+        return false;
+    }
+    let end = server_frame::Msg::StreamEnd(StreamEnd {
+        session_id: session_id.to_owned(),
+        input_tokens: 0,
+        output_tokens: 0,
+        partial: false,
+    });
+    send_frame(ws, request_id, end).await
 }
 
 async fn forward(
@@ -491,7 +514,7 @@ mod tests {
     use super::*;
     use arc_core::provider::{Provider, Thinking};
     use arc_core::session::ProjectSpec;
-    use arc_core::testkit::{Canned, replay_log, usage};
+    use arc_core::testkit::{Canned, ScriptedProvider, Step, replay_log, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -621,10 +644,22 @@ mod tests {
             executor: Script,
             projects: BTreeMap<String, ProjectSpec>,
         ) -> Self {
-            let executor_provider = MockProvider::new(executor);
+            let executor_provider = MockProvider::new(executor) as Arc<dyn Provider>;
+            Self::with_executor_provider(script, registry, executor_provider, projects).await
+        }
+
+        /// Like `with_executor`, but takes the executor's provider directly:
+        /// lets a test use `arc_core::testkit::ScriptedProvider` for a gated
+        /// step, which `Script`/`MockProvider` here has no equivalent of.
+        async fn with_executor_provider(
+            script: Script,
+            registry: Registry,
+            executor_provider: Arc<dyn Provider>,
+            projects: BTreeMap<String, ProjectSpec>,
+        ) -> Self {
             let executor_runner = Runner {
                 role: SessionRole::Executor,
-                provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
+                provider: executor_provider,
                 model: "executor-model".to_owned(),
                 thinking: Thinking::Default,
                 system: None,
@@ -1637,6 +1672,247 @@ mod tests {
             !child_messages,
             "no runner for the role means the job never ran, so no turn was appended"
         );
+
+        harness.stop().await;
+    }
+
+    fn dispatch_call(brief: &str) -> ToolCall {
+        let args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": brief,
+            "budget_tokens": 0,
+            "budget_minutes": 0,
+        })
+        .to_string();
+        ToolCall {
+            id: "d1".to_owned(),
+            index: 0,
+            name: "dispatch".to_owned(),
+            arguments: args,
+            provider_roundtrip: Vec::new(),
+        }
+    }
+
+    fn dispatching_concierge(brief: &str) -> Script {
+        Script::Canned(VecDeque::from([
+            vec![
+                Ok(CompletionDelta::ToolCall(dispatch_call(brief))),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("dispatched".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]))
+    }
+
+    /// Drains a turn to its `StreamEnd`, discarding everything else: the
+    /// dispatching concierge's turn also emits tool-call frames, which
+    /// `turn` (built for plain prose turns) would mistake for the close.
+    async fn run_turn_to_end(ws: &mut Client, request_id: u64) {
+        loop {
+            let frame = next_frame(ws).await;
+            assert_eq!(frame.request_id, request_id, "request_id is echoed");
+            if matches!(frame.msg, Some(server_frame::Msg::StreamEnd(_))) {
+                return;
+            }
+        }
+    }
+
+    fn dispatch_registry_and_projects() -> (Registry, TempDir, BTreeMap<String, ProjectSpec>) {
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec!["arc".to_owned()],
+            None,
+        )));
+        let project_dir = TempDir::new().expect("project dir");
+        let projects = BTreeMap::from([(
+            "arc".to_owned(),
+            ProjectSpec {
+                sources: Vec::new(),
+                grants: vec![arc_core::tool::workspace::Grant::new(
+                    project_dir.path(),
+                    arc_core::tool::workspace::Mode::ReadWrite,
+                )],
+            },
+        )]);
+        (registry, project_dir, projects)
+    }
+
+    fn dispatched_child_id(harness: &Harness) -> String {
+        harness
+            .logged_events()
+            .into_iter()
+            .find_map(|event| match event {
+                session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Executor as i32 =>
+                {
+                    Some(created.session_id)
+                }
+                _ => None,
+            })
+            .expect("the child session was created durably by dispatch")
+    }
+
+    async fn wait_for_child_message_count(harness: &Harness, child_id: &str, want: usize) {
+        for _ in 0..400 {
+            let count = harness
+                .logged_events()
+                .into_iter()
+                .filter(
+                    |event| matches!(event, session_event::Event::MessageAppended(m) if m.session_id == child_id),
+                )
+                .count();
+            if count >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {want} messages in session {child_id}");
+    }
+
+    #[tokio::test]
+    async fn a_steer_to_a_live_job_is_accepted_and_processed_after_the_initial_turn() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(vec![
+                Ok(CompletionDelta::Text("steer reply".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ]),
+        ]) as Arc<dyn Provider>;
+
+        let mut harness = Harness::with_executor_provider(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_provider,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 1).await;
+
+        let child_id = dispatched_child_id(&harness);
+        wait_for_child_message_count(&harness, &child_id, 1).await;
+
+        let mut steer_ws = harness.connect().await;
+        send(&mut steer_ws, 2, say(&child_id, "also check the linter")).await;
+        let accepted = next_frame(&mut steer_ws).await;
+        assert_eq!(accepted.request_id, 2);
+        match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => {
+                assert_eq!(m.session_id, child_id);
+            }
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+        let end = ended(next_frame(&mut steer_ws).await.msg.expect("a message"));
+        assert_eq!(end.session_id, child_id);
+        assert_eq!(
+            (end.input_tokens, end.output_tokens),
+            (0, 0),
+            "the steered turn's usage lands in the child's log, not this ack"
+        );
+        assert!(!end.partial);
+
+        notify.notify_one();
+        harness.drain_jobs().await;
+
+        let child_messages: Vec<_> = harness
+            .logged_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == child_id => {
+                    Some((Role::try_from(m.role).expect("a known role"), m.content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_messages,
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "working".to_owned()),
+                (Role::User, "also check the linter".to_owned()),
+                (Role::Assistant, "steer reply".to_owned()),
+            ],
+            "the brief turn ran to completion before the steered turn started"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_steer_to_a_finished_job_falls_through_to_the_role_mismatch_error() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let executor_script = Script::Canned(VecDeque::from([vec![
+            Ok(CompletionDelta::Text("on it".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]));
+
+        let mut harness = Harness::with_executor(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_script,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 1).await;
+
+        let child_id = dispatched_child_id(&harness);
+        harness.drain_jobs().await;
+
+        send(&mut ws, 2, say(&child_id, "still there?")).await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 2);
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "role_mismatch");
+        assert!(
+            error.msg.contains("executor"),
+            "the refusal names the pinned role: {}",
+            error.msg
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_steer_to_an_unknown_session_falls_through_to_the_normal_path() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("s-unknown", "hello")).await;
+        let (session_id, text, closing) = turn(&mut ws, 1).await;
+
+        assert_eq!(session_id, "s-unknown", "the named session is used as-is");
+        assert_eq!(text, "re: hello");
+        assert!(!ended(closing).partial);
 
         harness.stop().await;
     }
