@@ -87,7 +87,9 @@ impl Tool for Dispatch {
                     },
                     "budget_tokens": {
                         "type": "integer",
-                        "description": "Token budget for the job. 0 means no token budget."
+                        "description": "Token budget for the job. 0 means no token budget. \
+                            A coding task typically needs 100000-500000; anything under \
+                            50000 will stop a job mid-work."
                     },
                     "budget_minutes": {
                         "type": "integer",
