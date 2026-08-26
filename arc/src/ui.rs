@@ -29,11 +29,12 @@ const WORDMARK_ROWS: u16 = 4;
 const MASTHEAD_FLOOR: u16 = 12;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let input_height = input_height(app, frame.area());
     let [transcript, _gap, rule, input] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(GAP),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(input_height),
     ])
     .areas(frame.area());
 
@@ -231,32 +232,73 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    if app.mode == Mode::Cmd {
-        let line = Line::from(vec![
-            Span::styled(":", theme::PLAIN),
-            Span::styled(app.cmd.clone(), theme::PLAIN),
-        ]);
-        frame.render_widget(line, area);
-        let ahead = u16::try_from(app.cmd.chars().count()).unwrap_or(u16::MAX);
-        frame.set_cursor_position((area.x.saturating_add(1 + ahead), area.y));
-        return;
-    }
+const INPUT_ROWS_CAP: u16 = 8;
 
-    let style = if app.picker.is_some() || app.review.is_some() {
-        theme::DIM
+// measured before the layout: the input row has to grow with its wrapped text
+fn input_height(app: &App, frame: Rect) -> u16 {
+    let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
+    let (prefix, text) = if app.mode == Mode::Cmd {
+        (1, &app.cmd)
     } else {
-        theme::PLAIN
+        (2, &app.input)
     };
-    let line = Line::from(vec![
-        Span::styled("> ", theme::ACCENT),
-        Span::styled(app.input.clone(), style),
-    ]);
-    frame.render_widget(line, area);
+    let chars = prefix + text.chars().count();
+    let rows = u16::try_from(chars / width + 1).unwrap_or(u16::MAX);
+    rows.min(INPUT_ROWS_CAP).min(frame.height / 3).max(1)
+}
 
-    if app.picker.is_none() && app.review.is_none() {
-        let ahead = u16::try_from(app.input[..app.cursor].chars().count()).unwrap_or(u16::MAX);
-        frame.set_cursor_position((area.x.saturating_add(2 + ahead), area.y));
+fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
+    let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
+        (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
+    } else {
+        let style = if app.picker.is_some() || app.review.is_some() {
+            theme::DIM
+        } else {
+            theme::PLAIN
+        };
+        ("> ", theme::ACCENT, &app.input, style, app.cursor)
+    };
+
+    let width = (area.width.max(1)) as usize;
+    let chars: Vec<char> = prefix.chars().chain(text.chars()).collect();
+    let rows: Vec<String> = chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect();
+    let rows = if rows.is_empty() {
+        vec![String::new()]
+    } else {
+        rows
+    };
+
+    let ahead = prefix.chars().count() + text[..cursor].chars().count();
+    let cursor_row = ahead / width;
+    let visible = area.height.max(1) as usize;
+    let start = (cursor_row + 1).saturating_sub(visible);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, row)| {
+            if index == 0 {
+                let body: String = row.chars().skip(prefix.chars().count()).collect();
+                Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(body, style),
+                ])
+            } else {
+                Line::from(Span::styled(row.clone(), style))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+
+    if app.mode == Mode::Cmd || (app.picker.is_none() && app.review.is_none()) {
+        let col = u16::try_from(ahead % width).unwrap_or(u16::MAX);
+        let row = u16::try_from(cursor_row - start).unwrap_or(u16::MAX);
+        frame.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 }
 
