@@ -161,8 +161,17 @@ struct Delta {
 
     reasoning_content: Option<String>,
 
-    #[serde(default)]
+    // OpenCode Go sends an explicit `"tool_calls": null` on prose chunks
+    #[serde(default, deserialize_with = "null_as_empty")]
     tool_calls: Vec<ToolCallJson>,
+}
+
+fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<ToolCallJson>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let calls: Option<Vec<ToolCallJson>> = Deserialize::deserialize(deserializer)?;
+    Ok(calls.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -538,5 +547,22 @@ mod tests {
             panic!("expected one malformed-stream error, got {seen:?}");
         };
         assert!(message.contains("get_time"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_tool_calls_field_is_an_empty_list_not_an_error() {
+        let chunk = concat!(
+            "data: {\"id\":\"router-x\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,",
+            "\"finish_reason\":null,\"logprobs\":null,",
+            "\"delta\":{\"reasoning_content\":null,\"content\":\"hi\",\"tool_calls\":null}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let seen = ok(vec![chunk.as_bytes().to_vec()]).await;
+        assert!(
+            seen.iter()
+                .any(|delta| matches!(delta, CompletionDelta::Text(text) if text == "hi")),
+            "{seen:?}"
+        );
     }
 }

@@ -266,8 +266,8 @@ impl Engine {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
-                    "Dispatched {} into {project} as session {child_id}. The job has not \
-                     started; job execution arrives with the supervised task.",
+                    "Dispatched {} into {project} as session {child_id}. The job is \
+                     running; its summary will arrive here when it finishes.",
                     provider::role_label(role)
                 ),
                 Some(DispatchedJob {
