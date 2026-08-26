@@ -162,6 +162,12 @@ Expanded on 2026-08-26, deliberately overriding the move-to-3.1 guidance above: 
 | 7.3 | Account for token use and latency by role from existing spans. Use the measurements to replace published-rate estimates in `providers.md`. | — | todo |
 | 7.4 | Phase 1 leftovers: `log::Error::Io` field doc, a retention policy for `data/traces/`, and the `TraceCapture` test flake (a `set_default` race across parallel test threads, ~1/100). | — | todo |
 
+## State at the end of 2026-08-26
+
+Sections 4, 5, and 6 are done — one day, forty-five commits from `21249d24` to `fba55bfe`. The substrate (registry sources, confinement, workspace tools), the job loop (dispatch, supervision, steering, handback), and the closed loop (the handback turn, `continue_job`, hygiene) all landed with the reasoning folded into the rows above. Budgets are suspended for calibration (see 5.5 and DESIGN §4.1); the projection is at version 9 and rebuilds itself on first start.
+
+Next session: a deliberate test drive — Claude driving the TUI in tmux, putting the whole loop through its paces and folding every failure into this list. Known standing items for that drive: the restart-after-rebuild gotcha bit twice (a `just deploy` recipe that builds and restarts in one motion is still unwritten); 4.7's token re-measure is now urgent since handback turns changed the always-on load; and `identity.md` has no orchestrator guidance yet — briefs, verifying handbacks before believing them, reporting conclusions not transcripts — which is Bogdan's edit by invariant 7.
+
 ## Exit criteria
 
 Verify these live, not only in the test suite:
