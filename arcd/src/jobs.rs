@@ -192,6 +192,21 @@ impl Supervisor {
 /// Spawns one job's task and registers its handle, whether the job came
 /// from a client's `dispatch` or from a handback turn's own `dispatch`.
 #[allow(clippy::too_many_arguments)]
+fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
+    for job in jobs {
+        spawn_job(
+            job,
+            ctx.engine,
+            ctx.runners,
+            ctx.live,
+            ctx.statuses,
+            ctx.notifier,
+            ctx.handback,
+            ctx.handles,
+        );
+    }
+}
+
 fn spawn_job(
     job: DispatchedJob,
     engine: &Arc<Engine>,
@@ -258,11 +273,12 @@ async fn run_job(
     };
 
     match run_turn(&engine, &runner, &session_id, &job.brief).await {
-        TurnOutcome::Success(usage) => {
+        TurnOutcome::Success { usage, jobs } => {
             spent_tokens += usage_tokens(usage);
             if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
                 notify_job_changed(notifier.as_ref(), &engine, info);
             }
+            spawn_dispatched(&ctx, jobs);
         }
         TurnOutcome::Failure => {
             finish_now(&live, &mut steer_rx, &session_id);
@@ -301,11 +317,12 @@ async fn run_job(
         };
         let Some(text) = steered else { break };
         match run_turn(&engine, &runner, &session_id, &text).await {
-            TurnOutcome::Success(usage) => {
+            TurnOutcome::Success { usage, jobs } => {
                 spent_tokens += usage_tokens(usage);
                 if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
                     notify_job_changed(notifier.as_ref(), &engine, info);
                 }
+                spawn_dispatched(&ctx, jobs);
             }
             TurnOutcome::Failure => {
                 finish_now(&live, &mut steer_rx, &session_id);
@@ -543,7 +560,10 @@ async fn run_one_handback_turn(
 /// stops draining steers; a successful turn carries whatever usage the
 /// provider reported, which may itself be absent.
 enum TurnOutcome {
-    Success(Option<Usage>),
+    Success {
+        usage: Option<Usage>,
+        jobs: Vec<DispatchedJob>,
+    },
     Failure,
 }
 
@@ -613,7 +633,10 @@ async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str
                 output_tokens = reply.usage.map_or(0, |usage| usage.output_tokens),
                 "job turn completed"
             );
-            TurnOutcome::Success(reply.usage)
+            TurnOutcome::Success {
+                usage: reply.usage,
+                jobs: reply.jobs,
+            }
         }
         Err(error) => {
             warn!(session_id = %session_id, %error, "job turn failed");
@@ -2379,6 +2402,108 @@ mod tests {
             last_assistant(dir.path(), &parent_id),
             Some("chained".to_owned()),
             "the handback turn's own reply landed after it dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jobs_own_dispatch_spawns_and_runs_the_grandchild() {
+        let dispatch_args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": "grandchild work",
+        })
+        .to_string();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let executor_provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("g1", 0, "dispatch", &dispatch_args)),
+                Ok(tool_stop()),
+            ],
+            done_reply("parent job done"),
+            done_reply("grandchild done"),
+        ]);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec!["arc".to_owned()],
+            None,
+        )));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                },
+            )])),
+        );
+
+        let parent_id = engine
+            .create_bound_session(
+                &runner(&executor_provider),
+                "arc",
+                SessionRole::Concierge,
+                None,
+            )
+            .expect("create the parent durably");
+        let child = engine
+            .create_bound_session(
+                &runner(&executor_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the child durably");
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child.clone(),
+            parent_session: parent_id,
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "do the work; delegate the rest".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let events = replay_log(dir.path());
+        let grandchild = events
+            .iter()
+            .find_map(|event| match event {
+                arc_proto::v1::session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Executor as i32
+                        && created.session_id != child =>
+                {
+                    Some(created.session_id.clone())
+                }
+                _ => None,
+            })
+            .expect("the job's own dispatch created a grandchild durably");
+
+        let ran: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                arc_proto::v1::session_event::Event::MessageAppended(m)
+                    if m.session_id == grandchild =>
+                {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ran,
+            ["grandchild work", "grandchild done"],
+            "the grandchild actually ran, not just existed"
         );
     }
 }
