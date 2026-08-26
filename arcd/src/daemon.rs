@@ -194,7 +194,8 @@ impl Daemon {
         ]);
         let supervisor = Arc::new(
             Supervisor::new(Arc::clone(&self.engine), job_runners)
-                .with_notifier(self.notifier.clone()),
+                .with_notifier(self.notifier.clone())
+                .with_concierge(self.roles.concierge().clone()),
         );
 
         server::serve(

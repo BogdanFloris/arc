@@ -276,6 +276,11 @@ async fn send_message(
     request_id: u64,
     send: SendMessage,
 ) -> ControlFlow<()> {
+    // a user message ends whatever chain of handback turns was running
+    if !send.session_id.is_empty() {
+        supervisor.reset_autonomy(&send.session_id);
+    }
+
     if !send.session_id.is_empty() && supervisor.steer(&send.session_id, &send.content) {
         return flow(send_steered(ws, request_id, &send.session_id).await);
     }

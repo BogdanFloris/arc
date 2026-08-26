@@ -356,6 +356,14 @@ impl Engine {
         }))
     }
 
+    /// The role a session is pinned to, straight from the log. `None`
+    /// covers both an unknown session and one logged before roles existed;
+    /// a caller that needs to tell those apart wants `enforce_pin` instead.
+    pub fn session_role(&self, session_id: &str) -> Result<Option<SessionRole>, Error> {
+        let raw = self.with_store(|store| store.projection().session_role(session_id))?;
+        Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
+    }
+
     fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
         let project = if new_session {
             None
@@ -475,13 +483,91 @@ impl Engine {
             }),
         )?;
 
+        self.drive_turn(
+            runner,
+            &session_id,
+            &turn_id,
+            &sources,
+            grants.as_ref(),
+            &events,
+        )
+        .await
+    }
+
+    /// Runs one full model turn over `session_id`'s existing transcript,
+    /// appending no user message: the handback turn (DESIGN.md §4.1). Takes
+    /// the same turn guard as `send_message`, so a handback never lands
+    /// mid-turn and never overlaps a user turn on the same session. A
+    /// session with nothing new to react to is still just a turn — the
+    /// model sees the transcript as-is.
+    #[tracing::instrument(
+        level = "info",
+        name = "session.continue_session",
+        skip_all,
+        fields(
+            model = %runner.model,
+            role = provider::role_label(runner.role),
+            thinking = runner.thinking.label(),
+            session_id = %session_id,
+            outcome = tracing::field::Empty,
+            assistant_seq = tracing::field::Empty,
+            tool_steps = tracing::field::Empty,
+            counter.memory_searches = tracing::field::Empty,
+            counter.memory_search_hits = tracing::field::Empty,
+            counter.memory_reads_from_search = tracing::field::Empty,
+            counter.records_created = tracing::field::Empty,
+            counter.records_superseded = tracing::field::Empty,
+        )
+    )]
+    pub async fn continue_session(
+        &self,
+        runner: &Runner,
+        session_id: &str,
+        events: mpsc::Sender<EngineEvent>,
+    ) -> Result<Reply, Error> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        // held for the whole turn: serializes against a user send_message
+        // on this session through the same guard map
+        let guard = self.turn_guard(session_id);
+        let _turn = guard.lock().await;
+
+        self.enforce_pin(runner, session_id)?;
+        let sources = self.sources(session_id, false)?;
+        let grants = self.grants(session_id, false)?;
+
+        self.drive_turn(
+            runner,
+            session_id,
+            &turn_id,
+            &sources,
+            grants.as_ref(),
+            &events,
+        )
+        .await
+    }
+
+    /// The completion loop shared by `send_message` and `continue_session`:
+    /// opens the transcript, drives tool steps and dispatch, and appends the
+    /// reply. The caller has already taken the turn guard and resolved
+    /// sources/grants; this only reads and appends from `turn_id` onward.
+    async fn drive_turn(
+        &self,
+        runner: &Runner,
+        session_id: &str,
+        turn_id: &str,
+        sources: &[ToolSource],
+        grants: Option<&Arc<Grants>>,
+        events: &mpsc::Sender<EngineEvent>,
+    ) -> Result<Reply, Error> {
         let _ = events
             .send(EngineEvent::Accepted {
-                session_id: session_id.clone(),
+                session_id: session_id.to_owned(),
             })
             .await;
 
-        let (mut transcript, system) = self.open_turn(runner, &session_id)?;
+        let span = tracing::Span::current();
+        let (mut transcript, system) = self.open_turn(runner, session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
         let mut memory = MemoryCounters::default();
@@ -495,11 +581,11 @@ impl Engine {
                 system.clone(),
                 transcript.clone(),
                 last_step,
-                &sources,
+                sources,
             );
 
             let (ending, text, calls) = self
-                .run_completion(runner, request, &events, &mut total_usage)
+                .run_completion(runner, request, events, &mut total_usage)
                 .await?;
 
             match ending {
@@ -508,25 +594,25 @@ impl Engine {
                     span.record("tool_steps", steps);
                     self.tool_step(
                         runner,
-                        &session_id,
-                        &turn_id,
+                        session_id,
+                        turn_id,
                         text,
                         calls,
-                        &sources,
-                        grants.as_ref(),
+                        sources,
+                        grants,
                         &mut transcript,
                         &mut memory,
                         &mut jobs,
-                        &events,
+                        events,
                     )
                     .await?;
                 }
                 Ending::Done(_) => {
-                    let seq = self.append_reply(&session_id, &turn_id, &text, false)?;
+                    let seq = self.append_reply(session_id, turn_id, &text, false)?;
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
-                        session_id,
+                        session_id: session_id.to_owned(),
                         seq,
                         usage: total_usage,
                         partial: false,
@@ -538,11 +624,11 @@ impl Engine {
                     break Err(Error::EmptyReply);
                 }
                 Ending::Cut => {
-                    let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
+                    let seq = self.append_reply(session_id, turn_id, &text, true)?;
                     span.record("outcome", "partial");
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
-                        session_id,
+                        session_id: session_id.to_owned(),
                         seq,
                         usage: None,
                         partial: true,
@@ -551,7 +637,7 @@ impl Engine {
                 }
                 Ending::Failed(error) => {
                     if !text.is_empty() {
-                        let seq = self.append_reply(&session_id, &turn_id, &text, true)?;
+                        let seq = self.append_reply(session_id, turn_id, &text, true)?;
                         span.record("assistant_seq", seq);
                     }
                     span.record("outcome", "error");
@@ -3587,6 +3673,208 @@ mod tests {
             "the handback landed after the turn released the guard, in its own turn"
         );
         assert!(handback_msg.content.contains("child-1"));
+    }
+
+    #[tokio::test]
+    async fn continue_session_runs_a_scripted_turn_over_the_existing_transcript_without_a_user_message()
+     {
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("first"),
+            done_reply("the concierge reacts"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let (tx, mut rx) = channel();
+        let continued = engine
+            .continue_session(&run, &reply.session_id, tx)
+            .await
+            .expect("continue_session");
+
+        assert_eq!(continued.session_id, reply.session_id);
+        assert!(!continued.partial);
+
+        let events = replay_log(dir.path());
+        assert_eq!(
+            events.len(),
+            4,
+            "SessionCreated, the user message, the first reply, then only the continued reply"
+        );
+        let last = appended(&events[3]);
+        assert_eq!(last.role, Role::Assistant as i32);
+        assert_eq!(last.content, "the concierge reacts");
+
+        assert_eq!(
+            engine.transcript(&reply.session_id).expect("transcript"),
+            [
+                prose_entry(Role::User as i32, "hi", false),
+                prose_entry(Role::Assistant as i32, "first", false),
+                prose_entry(Role::Assistant as i32, "the concierge reacts", false),
+            ],
+            "no user message was appended for the handback turn"
+        );
+
+        assert_eq!(
+            drain(&mut rx),
+            [
+                EngineEvent::Accepted {
+                    session_id: reply.session_id.clone()
+                },
+                EngineEvent::Delta("the concierge reacts".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_session_over_a_transcript_with_no_messages_still_runs_a_turn() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session()]);
+        let provider =
+            ScriptedProvider::scripted(vec![done_reply("nothing to react to, but here I am")]);
+        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .continue_session(&run, "s-01", tx)
+            .await
+            .expect("continue_session");
+
+        assert!(!reply.partial);
+        let events = replay_log(dir.path());
+        assert_eq!(
+            events.len(),
+            2,
+            "SessionCreated, then only the assistant reply"
+        );
+        assert_eq!(
+            appended(&events[1]).content,
+            "nothing to react to, but here I am"
+        );
+        let requests = provider.requests();
+        assert!(
+            requests[0].messages.is_empty(),
+            "no user message and no history: the model saw an empty transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_session_on_a_session_pinned_to_another_role_refuses_and_appends_nothing() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: "s-01".to_owned(),
+                    title: String::new(),
+                    provider: "scripted".to_owned(),
+                    model: "test-model".to_owned(),
+                    role: SessionRole::Executor as i32,
+                    project: String::new(),
+                    budget: None,
+                    grants: Vec::new(),
+                }),
+                seeded_message(Role::User, "earlier"),
+            ],
+        );
+        let provider = ScriptedProvider::scripted(vec![done_reply("never sent")]);
+        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let (tx, _rx) = channel();
+
+        let err = engine
+            .continue_session(&run, "s-01", tx)
+            .await
+            .expect_err("a concierge engine must refuse an executor session");
+
+        assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
+        assert_eq!(
+            replay_log(dir.path()).len(),
+            2,
+            "the refusal appended nothing"
+        );
+        assert!(provider.requests().is_empty(), "the provider never ran");
+    }
+
+    #[tokio::test]
+    async fn continue_session_waits_for_a_pending_user_turns_guard_on_the_same_session() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session()]);
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("the concierge reacts")),
+        ]);
+        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let engine = Arc::new(engine);
+
+        let turn_engine = Arc::clone(&engine);
+        let turn_run = run.clone();
+        let turn = tokio::spawn(async move {
+            let (tx, _rx) = channel();
+            turn_engine
+                .send_message(&turn_run, Some("s-01"), "go", tx)
+                .await
+                .expect("send")
+        });
+
+        // the user message lands before the provider stalls on the gate:
+        // waiting for it proves the user turn genuinely holds the guard
+        // when continue_session is asked to run below
+        wait_for_event_count(dir.path(), 2).await;
+
+        let continue_engine = Arc::clone(&engine);
+        let continue_run = run.clone();
+        let continue_handle = tokio::spawn(async move {
+            let (tx, _rx) = channel();
+            continue_engine
+                .continue_session(&continue_run, "s-01", tx)
+                .await
+                .expect("continue_session")
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            replay_log(dir.path()).len(),
+            2,
+            "continue_session stays blocked while the user turn holds the guard"
+        );
+
+        notify.notify_one();
+        let sent = turn.await.expect("turn task");
+        let continued = continue_handle.await.expect("continue_session task");
+
+        let events = replay_log(dir.path());
+        assert_eq!(
+            events.len(),
+            4,
+            "the user turn's events, then the handback turn's reply"
+        );
+        let turn_id = appended(&events[1]).turn_id.clone();
+        assert_eq!(
+            appended(&events[2]).turn_id,
+            turn_id,
+            "the gated turn's own reply"
+        );
+        let continued_msg = appended(&events[3]);
+        assert_ne!(
+            continued_msg.turn_id, turn_id,
+            "continue_session ran in its own turn, after the guard released"
+        );
+        assert_eq!(continued_msg.content, "the concierge reacts");
+        assert_eq!(sent.session_id, "s-01");
+        assert_eq!(continued.session_id, "s-01");
     }
 
     #[tokio::test]

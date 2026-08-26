@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,14 +19,65 @@ const NO_REPLY: &str = "(the job produced no reply)";
 /// memory only: rebuilt empty on restart, unlike the child session itself.
 const MAX_TERMINAL_JOBS: usize = 50;
 
+/// Consecutive handback turns run for one parent since its last user
+/// message, before the daemon stops narrating and just leaves the handback
+/// itself in the transcript (DESIGN.md §4.1).
+const MAX_HANDBACK_TURNS: u32 = 50;
+
 type LiveMap = Mutex<HashMap<String, mpsc::UnboundedSender<String>>>;
+type Handles = Mutex<Vec<JoinHandle<()>>>;
+
+/// The handback turn's collapse and autonomy state, shared by every job's
+/// task since jobs finishing into the same parent contend on it together.
+/// Absent from a `Supervisor` that never called `with_concierge`, in which
+/// case a handback is recorded but no turn ever follows it.
+struct Handback {
+    runner: Runner,
+    /// Parents with a handback turn in flight right now: a second handback
+    /// for the same parent collapses into `dirty` instead of its own turn.
+    pending: Mutex<HashSet<String>>,
+    /// Parents that got another handback while their turn was pending: the
+    /// running turn loops once more per flag once it finishes, bounded by
+    /// `autonomy`, not by a count of its own.
+    dirty: Mutex<HashSet<String>>,
+    /// Consecutive handback turns per parent since its last user message.
+    autonomy: Mutex<HashMap<String, u32>>,
+}
+
+impl Handback {
+    fn new(runner: Runner) -> Self {
+        Self {
+            runner,
+            pending: Mutex::new(HashSet::new()),
+            dirty: Mutex::new(HashSet::new()),
+            autonomy: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn reset_autonomy(&self, session_id: &str) {
+        self.autonomy.lock().expect("autonomy").remove(session_id);
+    }
+}
+
+/// Everything a handback turn needs to run and, if it dispatches, to spawn
+/// the child itself: bundled so `run_job` can build it once and pass it to
+/// all three of its finish paths.
+struct HandbackCtx<'a> {
+    engine: &'a Arc<Engine>,
+    runners: &'a BTreeMap<SessionRole, Runner>,
+    live: &'a Arc<LiveMap>,
+    statuses: &'a Arc<JobStatuses>,
+    notifier: Option<&'a broadcast::Sender<Notification>>,
+    handles: &'a Arc<Handles>,
+    handback: Option<&'a Arc<Handback>>,
+}
 
 /// Runs the jobs `dispatch` created. One tokio task per job, driven to
 /// completion with `send_message`; nothing restarts a job that fails.
 pub struct Supervisor {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    handles: Arc<Handles>,
     /// `session_id` -> steer sender, for jobs currently running. `steer`
     /// sends under this lock; a job task removes its own entry under the
     /// same lock, so an enqueue can never land in a channel nobody will read.
@@ -35,6 +86,7 @@ pub struct Supervisor {
     /// steer sender is torn down, until eviction or a daemon restart.
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
+    handback: Option<Arc<Handback>>,
 }
 
 impl Supervisor {
@@ -42,10 +94,11 @@ impl Supervisor {
         Self {
             engine,
             runners,
-            handles: Mutex::new(Vec::new()),
+            handles: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(Mutex::new(HashMap::new())),
             statuses: Arc::new(JobStatuses::new()),
             notifier: None,
+            handback: None,
         }
     }
 
@@ -57,30 +110,37 @@ impl Supervisor {
         self
     }
 
+    /// Wires the concierge runner a handback turn drives (DESIGN.md §4.1):
+    /// once a job's summary lands in a concierge parent, the supervisor
+    /// runs one turn over it so the concierge reacts. Absent, `record_handback`
+    /// still runs but no turn follows.
+    #[must_use]
+    pub fn with_concierge(mut self, runner: Runner) -> Self {
+        self.handback = Some(Arc::new(Handback::new(runner)));
+        self
+    }
+
     pub fn spawn(&self, job: DispatchedJob) {
-        let Some(runner) = self.runners.get(&job.role).cloned() else {
-            warn!(
-                session_id = %job.session_id,
-                role = role_label(job.role),
-                "dispatched job names a role with no runner; skipping"
-            );
-            return;
-        };
-        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-        self.live
-            .lock()
-            .expect("live")
-            .insert(job.session_id.clone(), steer_tx);
-        let info = self.statuses.start(&job);
-        self.notify_job_changed(info);
-        let engine = Arc::clone(&self.engine);
-        let live = Arc::clone(&self.live);
-        let statuses = Arc::clone(&self.statuses);
-        let notifier = self.notifier.clone();
-        let handle = tokio::spawn(run_job(
-            engine, runner, job, steer_rx, live, statuses, notifier,
-        ));
-        self.handles.lock().expect("handles").push(handle);
+        spawn_job(
+            job,
+            &self.engine,
+            &self.runners,
+            &self.live,
+            &self.statuses,
+            self.notifier.as_ref(),
+            self.handback.as_ref(),
+            &self.handles,
+        );
+    }
+
+    /// Ends whatever chain of handback turns was running for `session_id`:
+    /// called from the server's send path, since a user message is what
+    /// ends autonomous narration (DESIGN.md §4.1). A no-op without a
+    /// concierge wired, or if the session has no counter yet.
+    pub fn reset_autonomy(&self, session_id: &str) {
+        if let Some(handback) = &self.handback {
+            handback.reset_autonomy(session_id);
+        }
     }
 
     /// The daemon's live view of every job it remembers: running jobs first
@@ -97,16 +157,6 @@ impl Supervisor {
         job_title(&self.engine, session_id)
     }
 
-    fn notify_job_changed(&self, mut info: JobInfo) {
-        let Some(notifier) = &self.notifier else {
-            return;
-        };
-        info.title = self.title(&info.session_id);
-        let _ = notifier.send(Notification {
-            event: Some(notification::Event::JobChanged(info)),
-        });
-    }
-
     /// Enqueues a steering message for a live job. `true` if the job was
     /// live and the message was enqueued; `false` otherwise, meaning the
     /// caller should fall through to a normal turn.
@@ -117,12 +167,19 @@ impl Supervisor {
     }
 
     /// Gives outstanding jobs a grace period to finish, then abandons them.
+    /// Loops the drain to a fixed point: a job's own turn, or a handback
+    /// turn it triggers, can spawn further jobs (chains, DESIGN.md §4.1),
+    /// so one drain pass is not enough to wait out a whole chain.
     pub async fn shutdown(&self) {
-        let handles: Vec<_> = self.handles.lock().expect("handles").drain(..).collect();
-        if handles.is_empty() {
-            return;
-        }
-        let draining = futures::future::join_all(handles);
+        let draining = async {
+            loop {
+                let handles: Vec<_> = self.handles.lock().expect("handles").drain(..).collect();
+                if handles.is_empty() {
+                    return;
+                }
+                futures::future::join_all(handles).await;
+            }
+        };
         if tokio::time::timeout(SHUTDOWN_GRACE, draining)
             .await
             .is_err()
@@ -130,6 +187,48 @@ impl Supervisor {
             warn!("shutdown grace expired; abandoning outstanding jobs");
         }
     }
+}
+
+/// Spawns one job's task and registers its handle, whether the job came
+/// from a client's `dispatch` or from a handback turn's own `dispatch`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_job(
+    job: DispatchedJob,
+    engine: &Arc<Engine>,
+    runners: &BTreeMap<SessionRole, Runner>,
+    live: &Arc<LiveMap>,
+    statuses: &Arc<JobStatuses>,
+    notifier: Option<&broadcast::Sender<Notification>>,
+    handback: Option<&Arc<Handback>>,
+    handles: &Arc<Handles>,
+) {
+    let Some(runner) = runners.get(&job.role).cloned() else {
+        warn!(
+            session_id = %job.session_id,
+            role = role_label(job.role),
+            "dispatched job names a role with no runner; skipping"
+        );
+        return;
+    };
+    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    live.lock()
+        .expect("live")
+        .insert(job.session_id.clone(), steer_tx);
+    let info = statuses.start(&job);
+    notify_job_changed(notifier, engine, info);
+    let handle = tokio::spawn(run_job(
+        Arc::clone(engine),
+        runner,
+        job,
+        steer_rx,
+        Arc::clone(live),
+        Arc::clone(statuses),
+        notifier.cloned(),
+        runners.clone(),
+        handback.cloned(),
+        Arc::clone(handles),
+    ));
+    handles.lock().expect("handles").push(handle);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,10 +240,22 @@ async fn run_job(
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
+    runners: BTreeMap<SessionRole, Runner>,
+    handback: Option<Arc<Handback>>,
+    handles: Arc<Handles>,
 ) {
     let session_id = job.session_id.clone();
     let start = Instant::now();
     let mut spent_tokens: u64 = 0;
+    let ctx = HandbackCtx {
+        engine: &engine,
+        runners: &runners,
+        live: &live,
+        statuses: &statuses,
+        notifier: notifier.as_ref(),
+        handles: &handles,
+        handback: handback.as_ref(),
+    };
 
     match run_turn(&engine, &runner, &session_id, &job.brief).await {
         TurnOutcome::Success(usage) => {
@@ -158,7 +269,7 @@ async fn run_job(
             if let Some(info) = statuses.finish(&session_id, JobState::Failed, start.elapsed()) {
                 notify_job_changed(notifier.as_ref(), &engine, info);
             }
-            handback_failed(&engine, &job).await;
+            handback_failed(&ctx, &job).await;
             return;
         }
     }
@@ -171,7 +282,7 @@ async fn run_job(
             {
                 notify_job_changed(notifier.as_ref(), &engine, info);
             }
-            handback_over_budget(&engine, &job, &breach).await;
+            handback_over_budget(&ctx, &job, &breach).await;
             return;
         }
 
@@ -202,7 +313,7 @@ async fn run_job(
                 {
                     notify_job_changed(notifier.as_ref(), &engine, info);
                 }
-                handback_failed(&engine, &job).await;
+                handback_failed(&ctx, &job).await;
                 return;
             }
         }
@@ -211,7 +322,7 @@ async fn run_job(
     if let Some(info) = statuses.finish(&session_id, JobState::Finished, start.elapsed()) {
         notify_job_changed(notifier.as_ref(), &engine, info);
     }
-    handback_clean(&engine, &job).await;
+    handback_clean(&ctx, &job).await;
 }
 
 fn job_title(engine: &Engine, session_id: &str) -> String {
@@ -256,30 +367,34 @@ fn job_summary(engine: &Engine, job: &DispatchedJob) -> String {
     }
 }
 
-async fn record_handback(engine: &Engine, job: &DispatchedJob, reason: Option<&str>) {
-    let summary = job_summary(engine, job);
-    if let Err(error) = engine
+/// Appends the job's handback and, if that succeeds, requests the turn
+/// that reads it (DESIGN.md §4.1's "the daemon drives one model turn").
+async fn record_handback(ctx: &HandbackCtx<'_>, job: &DispatchedJob, reason: Option<&str>) {
+    let summary = job_summary(ctx.engine, job);
+    match ctx
+        .engine
         .record_handback(&job.parent_session, &job.session_id, reason, &summary)
         .await
     {
-        warn!(
+        Ok(()) => maybe_run_handback_turn(ctx, &job.parent_session).await,
+        Err(error) => warn!(
             parent_session = %job.parent_session,
             session_id = %job.session_id,
             %error,
             "failed to record the job's handback into the parent session"
-        );
+        ),
     }
 }
 
-async fn handback_clean(engine: &Engine, job: &DispatchedJob) {
-    record_handback(engine, job, None).await;
+async fn handback_clean(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+    record_handback(ctx, job, None).await;
 }
 
-async fn handback_failed(engine: &Engine, job: &DispatchedJob) {
-    record_handback(engine, job, Some("the turn failed")).await;
+async fn handback_failed(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+    record_handback(ctx, job, Some("the turn failed")).await;
 }
 
-async fn handback_over_budget(engine: &Engine, job: &DispatchedJob, breach: &BudgetBreach) {
+async fn handback_over_budget(ctx: &HandbackCtx<'_>, job: &DispatchedJob, breach: &BudgetBreach) {
     let reason = match breach {
         BudgetBreach::Tokens { spent, allowed } => {
             format!("token budget exhausted ({spent}/{allowed})")
@@ -288,7 +403,140 @@ async fn handback_over_budget(engine: &Engine, job: &DispatchedJob, breach: &Bud
             format!("time budget exhausted ({elapsed}s/{allowed}s)")
         }
     };
-    record_handback(engine, job, Some(&reason)).await;
+    record_handback(ctx, job, Some(&reason)).await;
+}
+
+/// Requests a handback turn on `parent_session`, collapsing into an
+/// already-pending one instead of queuing a second (DESIGN.md §4.1). Exact
+/// shape: a `pending` set claimed before the turn runs and cleared after;
+/// a handback arriving while claimed sets `dirty` instead of running its
+/// own turn; once the running turn finishes, a set `dirty` flag reruns the
+/// turn once more (looping until nothing landed meanwhile), bounded by the
+/// autonomy cap below rather than by a catch-up count of its own.
+async fn maybe_run_handback_turn(ctx: &HandbackCtx<'_>, parent_session: &str) {
+    let Some(handback) = ctx.handback else {
+        return;
+    };
+
+    if !claim_pending(handback, parent_session) {
+        mark_dirty(handback, parent_session);
+        return;
+    }
+
+    loop {
+        run_one_handback_turn(ctx, handback, parent_session).await;
+        if !release_or_rerun(handback, parent_session) {
+            return;
+        }
+    }
+}
+
+fn claim_pending(handback: &Handback, parent_session: &str) -> bool {
+    let mut pending = handback.pending.lock().expect("pending");
+    if pending.contains(parent_session) {
+        return false;
+    }
+    pending.insert(parent_session.to_owned());
+    true
+}
+
+fn mark_dirty(handback: &Handback, parent_session: &str) {
+    handback
+        .dirty
+        .lock()
+        .expect("dirty")
+        .insert(parent_session.to_owned());
+}
+
+/// `true` if another handback collapsed into this parent while its turn
+/// ran: clears `dirty` and leaves `pending` set for one more turn. `false`
+/// releases `pending`: this parent's chain of turns is done for now.
+fn release_or_rerun(handback: &Handback, parent_session: &str) -> bool {
+    if handback.dirty.lock().expect("dirty").remove(parent_session) {
+        return true;
+    }
+    handback
+        .pending
+        .lock()
+        .expect("pending")
+        .remove(parent_session);
+    false
+}
+
+/// Runs one handback turn, if the parent is (still) a concierge session and
+/// under the autonomy cap, and spawns whatever it dispatches.
+async fn run_one_handback_turn(
+    ctx: &HandbackCtx<'_>,
+    handback: &Arc<Handback>,
+    parent_session: &str,
+) {
+    match ctx.engine.session_role(parent_session) {
+        Ok(None | Some(SessionRole::Unspecified | SessionRole::Concierge)) => {}
+        Ok(Some(other)) => {
+            warn!(
+                parent_session,
+                role = role_label(other),
+                "the handback's parent is not a concierge session; skipping the auto-turn"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(
+                parent_session,
+                %error,
+                "could not read the handback parent's role; skipping the auto-turn"
+            );
+            return;
+        }
+    }
+
+    let capped = {
+        let mut autonomy = handback.autonomy.lock().expect("autonomy");
+        let count = autonomy.entry(parent_session.to_owned()).or_insert(0);
+        if *count >= MAX_HANDBACK_TURNS {
+            true
+        } else {
+            *count += 1;
+            false
+        }
+    };
+    if capped {
+        warn!(
+            parent_session,
+            cap = MAX_HANDBACK_TURNS,
+            "consecutive handback turns hit the autonomy cap; skipping the concierge turn"
+        );
+        return;
+    }
+
+    let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
+    let (result, ()) = tokio::join!(
+        ctx.engine
+            .continue_session(&handback.runner, parent_session, events),
+        async {
+            while let Some(event) = rx.recv().await {
+                debug!(parent_session, ?event, "handback turn event");
+            }
+        },
+    );
+    match result {
+        Ok(reply) => {
+            info!(parent_session, "handback turn completed");
+            for job in reply.jobs {
+                spawn_job(
+                    job,
+                    ctx.engine,
+                    ctx.runners,
+                    ctx.live,
+                    ctx.statuses,
+                    ctx.notifier,
+                    Some(handback),
+                    ctx.handles,
+                );
+            }
+        }
+        Err(error) => warn!(parent_session, %error, "handback turn failed"),
+    }
 }
 
 /// A completed turn's outcome. A failed turn ends the job, so the caller
@@ -536,10 +784,10 @@ mod tests {
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, Step, appended, done_reply, replay_log, runner, usage,
+        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, tool_stop, usage,
     };
-    use arc_core::tool::Registry;
     use arc_core::tool::workspace::{Grant, Mode};
+    use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::Role;
     use tempfile::TempDir;
 
@@ -1731,5 +1979,406 @@ mod tests {
         }
         assert_eq!(job.session_id, child_id);
         assert_eq!(job.spent_tokens, 8);
+    }
+
+    fn last_assistant(dir: &std::path::Path, session_id: &str) -> Option<String> {
+        child_user_messages(dir, session_id)
+            .into_iter()
+            .rev()
+            .find(|(role, _)| *role == Role::Assistant)
+            .map(|(_, content)| content)
+    }
+
+    #[tokio::test]
+    async fn a_clean_finish_triggers_a_concierge_turn_that_reacts_to_the_handback() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![done_reply("the job did X")]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [
+                (Role::User, format!("Job {child_id} finished.\nall fixed")),
+                (Role::Assistant, "the job did X".to_owned()),
+            ],
+            "the handback lands, then the concierge's own turn reacts to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_jobs_handback_also_triggers_a_concierge_turn() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![done_reply("noted the failure")]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
+            ProviderError::InvalidRequest("boom".to_owned()),
+        )]]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            last_assistant(dir.path(), &parent_id),
+            Some("noted the failure".to_owned()),
+            "a failed job's handback gets a concierge turn too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handback_whose_parent_is_not_a_concierge_session_gets_no_auto_turn() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        // must never be called: the parent here stands in for a future
+        // nested job, not a concierge
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = engine
+            .create_bound_session(
+                &runner(&concierge_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the parent durably");
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id).len(),
+            1,
+            "the handback landed but no concierge turn followed"
+        );
+        assert!(
+            concierge_provider.requests().is_empty(),
+            "an executor parent never drives the concierge provider"
+        );
+    }
+
+    // record_handback's append and continue_session's turn share the
+    // parent's guard, so a second handback can only race for `pending` in
+    // the instant between them, not while a gated turn is stalled; this
+    // drives the same `claim_pending` a real second handback would call.
+    #[tokio::test]
+    async fn a_handback_arriving_while_one_is_pending_collapses_and_marks_dirty() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]); // must never be called
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("job done")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+        let handback = supervisor.handback.clone().expect("concierge wired");
+
+        assert!(
+            claim_pending(&handback, &parent_id),
+            "simulates a handback turn already running for this parent"
+        );
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id).len(),
+            1,
+            "the handback still lands durably even though its turn collapsed"
+        );
+        assert!(
+            concierge_provider.requests().is_empty(),
+            "the collapsed handback never ran its own turn"
+        );
+        assert!(
+            handback.dirty.lock().expect("dirty").contains(&parent_id),
+            "the collapse set the catch-up flag instead of running a second turn"
+        );
+        assert!(
+            release_or_rerun(&handback, &parent_id),
+            "a dirty flag means the pending turn's own task reruns once more"
+        );
+        assert!(
+            !release_or_rerun(&handback, &parent_id),
+            "nothing landed since: the second release ends the chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_autonomy_cap_skips_the_concierge_turn_and_appends_nothing_extra() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]); // must never be called
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+        supervisor
+            .handback
+            .as_ref()
+            .expect("concierge wired")
+            .autonomy
+            .lock()
+            .expect("autonomy")
+            .insert(parent_id.clone(), MAX_HANDBACK_TURNS);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id).len(),
+            1,
+            "only the handback landed; the capped concierge turn never ran"
+        );
+        assert!(
+            concierge_provider.requests().is_empty(),
+            "the capped provider was never called"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_autonomy_lets_the_next_handback_run_after_a_forced_cap() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider =
+            ScriptedProvider::scripted(vec![done_reply("the concierge reacts")]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+        supervisor
+            .handback
+            .as_ref()
+            .expect("concierge wired")
+            .autonomy
+            .lock()
+            .expect("autonomy")
+            .insert(parent_id.clone(), MAX_HANDBACK_TURNS);
+
+        supervisor.reset_autonomy(&parent_id);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            last_assistant(dir.path(), &parent_id),
+            Some("the concierge reacts".to_owned()),
+            "resetting the counter let the handback turn run again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handback_turn_that_dispatches_spawns_the_chained_child() {
+        let dispatch_args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": "second link",
+            "budget_tokens": 0,
+            "budget_minutes": 0,
+        })
+        .to_string();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("d2", 0, "dispatch", &dispatch_args)),
+                Ok(tool_stop()),
+            ],
+            done_reply("chained"),
+        ]);
+        let executor_provider = ScriptedProvider::scripted(vec![
+            done_reply("first job done"),
+            done_reply("second job done"),
+        ]);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec!["arc".to_owned()],
+            None,
+        )));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                },
+            )])),
+        );
+
+        let parent_id = engine
+            .create_bound_session(
+                &runner(&concierge_provider),
+                "arc",
+                SessionRole::Concierge,
+                None,
+            )
+            .expect("create the parent durably");
+        let first_child = engine
+            .create_bound_session(
+                &runner(&concierge_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the first child durably");
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_concierge(runner(&concierge_provider));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: first_child.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let events = replay_log(dir.path());
+        let chained_child = events
+            .iter()
+            .find_map(|event| match event {
+                arc_proto::v1::session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Executor as i32
+                        && created.session_id != first_child =>
+                {
+                    Some(created.session_id.clone())
+                }
+                _ => None,
+            })
+            .expect("the handback turn's dispatch created a second child durably");
+
+        let chained_messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                arc_proto::v1::session_event::Event::MessageAppended(m)
+                    if m.session_id == chained_child =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chained_messages.len(),
+            2,
+            "the chained job ran its own turn"
+        );
+        assert_eq!(chained_messages[0].content, "second link");
+        assert_eq!(chained_messages[1].content, "second job done");
+
+        assert_eq!(
+            last_assistant(dir.path(), &parent_id),
+            Some("chained".to_owned()),
+            "the handback turn's own reply landed after it dispatched"
+        );
     }
 }
