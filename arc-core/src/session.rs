@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_proto::v1::{
@@ -35,6 +35,7 @@ pub struct Runner {
 pub struct Engine {
     store: Store,
     registry: Registry,
+    projects: BTreeMap<String, Vec<ToolSource>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +91,39 @@ pub enum Error {
 
 impl Engine {
     pub fn new(store: Store, registry: Registry) -> Self {
-        Self { store, registry }
+        Self {
+            store,
+            registry,
+            projects: BTreeMap::new(),
+        }
+    }
+
+    /// The configured projects: name to declared sources. Written once at
+    /// startup from config; a session's project resolves through this.
+    #[must_use]
+    pub fn with_projects(mut self, projects: BTreeMap<String, Vec<ToolSource>>) -> Self {
+        self.projects = projects;
+        self
+    }
+
+    fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
+        let project = if new_session {
+            None
+        } else {
+            self.store.projection().session_project(session_id)?
+        };
+        Ok(match project {
+            None => vec![ToolSource::Builtin],
+            Some(name) => {
+                if let Some(sources) = self.projects.get(&name) {
+                    sources.clone()
+                } else {
+                    // fail closed: a project gone from config grants nothing
+                    tracing::warn!(project = %name, "session names a project that is not configured");
+                    vec![ToolSource::Builtin]
+                }
+            }
+        })
     }
 
     #[tracing::instrument(
@@ -135,6 +168,7 @@ impl Engine {
         if !new_session {
             self.enforce_pin(runner, &session_id)?;
         }
+        let sources = self.sources(&session_id, new_session)?;
 
         if new_session {
             self.record(
@@ -175,8 +209,13 @@ impl Engine {
         let reply = loop {
             // the last step offers no tools, so the model has to answer
             let last_step = steps >= MAX_TOOL_STEPS;
-            let request =
-                self.completion_request(runner, system.clone(), transcript.clone(), last_step);
+            let request = self.completion_request(
+                runner,
+                system.clone(),
+                transcript.clone(),
+                last_step,
+                &sources,
+            );
 
             let (ending, text, calls) = self
                 .run_completion(runner, request, &events, &mut total_usage)
@@ -191,6 +230,7 @@ impl Engine {
                         &turn_id,
                         text,
                         calls,
+                        &sources,
                         &mut transcript,
                         &mut memory,
                         &events,
@@ -277,6 +317,7 @@ impl Engine {
         turn_id: &str,
         text: String,
         mut calls: Vec<ToolCall>,
+        sources: &[ToolSource],
         transcript: &mut Vec<Message>,
         memory: &mut MemoryCounters,
         events: &mpsc::Sender<EngineEvent>,
@@ -338,7 +379,7 @@ impl Engine {
             };
             let dispatched = self
                 .registry
-                .dispatch(&call.name, call.arguments.clone(), ctx)
+                .dispatch(&call.name, call.arguments.clone(), ctx, sources)
                 .await;
             let outcome = if dispatched.ok {
                 ToolOutcome::Ok
@@ -487,6 +528,7 @@ impl Engine {
         system: Option<String>,
         messages: Vec<Message>,
         last_step: bool,
+        sources: &[ToolSource],
     ) -> CompletionRequest {
         CompletionRequest {
             model: runner.model.clone(),
@@ -497,8 +539,7 @@ impl Engine {
             tools: if last_step {
                 Vec::new()
             } else {
-                // Every source until a session declares its own.
-                self.registry.definitions(&ToolSource::ALL)
+                self.registry.definitions(sources)
             },
             seed: None,
         }
@@ -684,6 +725,7 @@ enum Ending {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use arc_proto::v1::{
@@ -703,10 +745,10 @@ mod tests {
     use crate::testkit::{
         Canned, ScriptedProvider, TraceCapture, appended, call, call_carrying, channel,
         counter_samples, done_reply, drain, engine, engine_with_tools, engine_with_tools_at,
-        issued, reopened_engine, replay_events, replay_log, resulted, seed_log, seed_memory_log,
-        seed_memory_log_at, tool_stop, tools, turn, usage,
+        issued, reopened_engine, replay_events, replay_log, resulted, runner, seed_log,
+        seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
     };
-    use crate::tool::Registry;
+    use crate::tool::{Registry, ToolSource};
 
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
@@ -761,6 +803,42 @@ mod tests {
                 partial,
             })),
         }
+    }
+
+    fn seeded_session_with_project(project: &str) -> session_event::Event {
+        session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+            session_id: "s-01".to_owned(),
+            title: String::new(),
+            provider: "scripted".to_owned(),
+            model: "test-model".to_owned(),
+            role: SessionRole::Unspecified as i32,
+            project: project.to_owned(),
+            budget: None,
+        })
+    }
+
+    fn reopened_engine_with_projects(
+        provider: &Arc<ScriptedProvider>,
+        dir: &TempDir,
+        registry: Registry,
+        projects: BTreeMap<String, Vec<ToolSource>>,
+    ) -> (Engine, Runner) {
+        let log = Log::open(dir.path()).expect("open log");
+        let mut projection = Projection::in_memory().expect("open projection");
+        crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
+        (
+            Engine::new(Store::new(log, projection), registry).with_projects(projects),
+            runner(provider),
+        )
+    }
+
+    fn workspace_tool(name: &'static str, content: &'static str) -> Box<dyn crate::tool::Tool> {
+        Box::new(Canned {
+            name,
+            content,
+            ok: true,
+            source: ToolSource::Workspace,
+        })
     }
 
     #[tokio::test]
@@ -1725,6 +1803,7 @@ mod tests {
             name: "big",
             content: "0123456789abcdef",
             ok: true,
+            source: ToolSource::Builtin,
         }));
         let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
         let (tx, _rx) = channel();
@@ -2406,5 +2485,132 @@ mod tests {
             before,
             "nothing was appended"
         );
+    }
+
+    #[tokio::test]
+    async fn a_project_bound_session_offers_and_can_call_its_workspace_tool() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session_with_project("arc")]);
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "ws_read", "{}")), Ok(tool_stop())],
+            done_reply("done"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(workspace_tool("ws_read", "workspace file"));
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "arc".to_owned(),
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+        );
+        let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, Some("s-01"), "read it", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        assert!(
+            requests[0].tools.iter().any(|def| def.name == "ws_read"),
+            "the project's workspace tool was offered: {:?}",
+            requests[0].tools
+        );
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(result.content, "workspace file");
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_denies_a_workspace_tool_and_the_turn_still_completes() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "ws_read", "{}")), Ok(tool_stop())],
+            done_reply("no access, sorry"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(workspace_tool("ws_read", "workspace file"));
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "arc".to_owned(),
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+        );
+        let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "read it", tx)
+            .await
+            .expect("the turn still completes after a denied tool call");
+
+        assert!(!reply.partial);
+        let requests = provider.requests();
+        assert!(
+            requests[0].tools.iter().all(|def| def.name != "ws_read"),
+            "an unbound session must not be offered a workspace tool: {:?}",
+            requests[0].tools
+        );
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(
+            result.content.contains("not available in this session"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_naming_an_unconfigured_project_fails_closed_to_builtin() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session_with_project("vanished")]);
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "ws_read", "{}")), Ok(tool_stop())],
+            done_reply("no access, sorry"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(workspace_tool("ws_read", "workspace file"));
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "arc".to_owned(),
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+        );
+        let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, Some("s-01"), "read it", tx)
+            .await
+            .expect("a project missing from config still gets builtin only");
+
+        assert!(!reply.partial);
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(
+            result.content.contains("not available in this session"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_session_records_an_empty_project() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (mut engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated first, got {:?}", events[0]);
+        };
+        assert_eq!(created.project, "");
     }
 }

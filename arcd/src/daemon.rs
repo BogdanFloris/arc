@@ -115,7 +115,19 @@ impl Daemon {
                 .with_context(|| format!("opening {} for reads", dirs.index().display()))?,
         );
 
-        let engine = Engine::new(store, registry);
+        let projects = config
+            .projects
+            .iter()
+            .map(|(name, project)| {
+                let sources = project
+                    .sources
+                    .iter()
+                    .map(|source| source.resolve())
+                    .collect();
+                (name.clone(), sources)
+            })
+            .collect();
+        let engine = Engine::new(store, registry).with_projects(projects);
 
         Ok(Self {
             config,

@@ -44,7 +44,12 @@ mod tests {
         registry.register(Box::new(GetTime));
 
         let outcome = registry
-            .dispatch("get_time", "{}".into(), crate::tool::TurnContext::default())
+            .dispatch(
+                "get_time",
+                "{}".into(),
+                crate::tool::TurnContext::default(),
+                &crate::tool::ToolSource::ALL,
+            )
             .await;
         assert!(outcome.ok);
         assert!(!outcome.truncated);

@@ -409,6 +409,18 @@ impl Projection {
         Ok(role)
     }
 
+    pub(crate) fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
+        let project: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT project FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(project.flatten())
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         sessions(&self.conn)
     }
@@ -722,9 +734,10 @@ fn insert_session(
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO sessions (id, parent_session, fork_point, project, title, started_at, role)
-         VALUES (?1, NULL, NULL, NULL, ?2, ?3, ?4)",
+         VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5)",
         (
             &created.session_id,
+            (!created.project.is_empty()).then_some(&created.project),
             &created.title,
             epoch_micros(event.ts.as_ref()),
             created.role,
@@ -1339,6 +1352,43 @@ mod tests {
             projection.session_role("s-01").expect("role"),
             Some(SessionRole::Executor as i32)
         );
+    }
+
+    fn session_created_with_project(seq: u64, project: &str) -> Event {
+        let mut event = session_created(seq);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = event.payload.as_mut()
+        {
+            created.project = project.to_owned();
+        }
+        event
+    }
+
+    #[test]
+    fn a_sessions_project_comes_back_and_an_unknown_session_has_none() {
+        let mut projection = Projection::in_memory().expect("open");
+        assert_eq!(projection.session_project("s-01").expect("project"), None);
+
+        projection
+            .apply(&session_created_with_project(0, "arc"))
+            .expect("apply");
+
+        assert_eq!(
+            projection.session_project("s-01").expect("project"),
+            Some("arc".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_project_answers_none() {
+        let mut projection = Projection::in_memory().expect("open");
+
+        projection
+            .apply(&session_created_with_project(0, ""))
+            .expect("apply");
+
+        assert_eq!(projection.session_project("s-01").expect("project"), None);
     }
 
     #[test]

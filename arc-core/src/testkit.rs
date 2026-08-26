@@ -268,6 +268,7 @@ pub struct Canned {
     pub name: &'static str,
     pub content: &'static str,
     pub ok: bool,
+    pub source: ToolSource,
 }
 
 impl Tool for Canned {
@@ -280,7 +281,7 @@ impl Tool for Canned {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Builtin
+        self.source
     }
 
     fn execute(
@@ -300,7 +301,12 @@ impl Tool for Canned {
 pub fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
     let mut registry = Registry::new(512);
     for &(name, content, ok) in entries {
-        registry.register(Box::new(Canned { name, content, ok }));
+        registry.register(Box::new(Canned {
+            name,
+            content,
+            ok,
+            source: ToolSource::Builtin,
+        }));
     }
     registry
 }

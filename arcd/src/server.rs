@@ -461,7 +461,7 @@ mod tests {
         Stop, ToolCall,
     };
     use arc_core::store::Store;
-    use arc_core::tool::Registry;
+    use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
         Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
         ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
@@ -1020,6 +1020,7 @@ mod tests {
             name: "lookup",
             content: "found it",
             ok: true,
+            source: ToolSource::Builtin,
         }));
         let mut harness = Harness::with_tools(script, registry).await;
         let mut ws = harness.connect().await;
@@ -1100,6 +1101,7 @@ mod tests {
             name: "lookup",
             content: "found it",
             ok: true,
+            source: ToolSource::Builtin,
         }));
         let mut harness = Harness::with_tools(script, registry).await;
         let mut ws = harness.connect().await;

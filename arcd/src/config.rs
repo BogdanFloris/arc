@@ -99,6 +99,15 @@ pub enum ToolSource {
     Workspace,
 }
 
+impl ToolSource {
+    pub fn resolve(self) -> arc_core::tool::ToolSource {
+        match self {
+            ToolSource::Builtin => arc_core::tool::ToolSource::Builtin,
+            ToolSource::Workspace => arc_core::tool::ToolSource::Workspace,
+        }
+    }
+}
+
 impl RolesConfig {
     fn configured(&self) -> impl Iterator<Item = (&'static str, &RoleConfig)> {
         [
