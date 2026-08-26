@@ -67,6 +67,7 @@ pub enum EngineEvent {
         call_id: String,
         index: u32,
         name: String,
+        arguments_json: String,
     },
     ToolCallEnded {
         call_id: String,
@@ -655,6 +656,7 @@ impl Engine {
                     call_id: call.id.clone(),
                     index: call.index,
                     name: call.name.clone(),
+                    arguments_json: call.arguments.clone(),
                 })
                 .await;
         }
@@ -1678,6 +1680,7 @@ mod tests {
                     call_id: "srv1".to_owned(),
                     index: 0,
                     name: "lookup".to_owned(),
+                    arguments_json: r#"{"q":1}"#.to_owned(),
                 },
                 EngineEvent::ToolCallEnded {
                     call_id: "srv1".to_owned(),

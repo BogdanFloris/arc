@@ -228,13 +228,28 @@ async fn send(
             TurnEvent::Accepted { session_id } => NetEvent::Accepted { session_id },
             TurnEvent::Delta(text) => NetEvent::Delta(text),
             TurnEvent::Reasoning(text) => NetEvent::Reasoning(text),
-            TurnEvent::ToolCallStarted { call_id, name, .. } => {
-                NetEvent::ToolStarted { call_id, name }
-            }
+            TurnEvent::ToolCallStarted {
+                call_id,
+                name,
+                arguments_json,
+                ..
+            } => NetEvent::ToolStarted {
+                call_id,
+                name,
+                arguments_json,
+            },
             TurnEvent::ToolCallEnded { call_id, outcome } => {
                 NetEvent::ToolEnded { call_id, outcome }
             }
-            TurnEvent::End { partial, .. } => NetEvent::End { partial },
+            TurnEvent::End {
+                input_tokens,
+                output_tokens,
+                partial,
+            } => NetEvent::End {
+                partial,
+                input_tokens,
+                output_tokens,
+            },
             TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
         };
         let _ = events.send(event);

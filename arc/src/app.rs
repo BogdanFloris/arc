@@ -48,6 +48,7 @@ pub enum NetEvent {
     ToolStarted {
         call_id: String,
         name: String,
+        arguments_json: String,
     },
     ToolEnded {
         call_id: String,
@@ -55,6 +56,8 @@ pub enum NetEvent {
     },
     End {
         partial: bool,
+        input_tokens: u32,
+        output_tokens: u32,
     },
     Failed {
         code: String,
@@ -97,7 +100,7 @@ pub struct Jobs {
     pub loaded: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     You(String),
     System(String),
@@ -119,7 +122,13 @@ pub enum Block {
     Tool {
         call_id: String,
         name: String,
+        args: String,
         outcome: Option<&'static str>,
+    },
+    Cost {
+        input_tokens: u32,
+        output_tokens: u32,
+        seconds: f32,
     },
 }
 
@@ -153,6 +162,7 @@ pub struct App {
     pub last_error: Option<String>,
     pub queued: VecDeque<String>,
     thinking_since: Option<Instant>,
+    turn_started: Option<Instant>,
     pub scroll_back: usize,
     pub quit: bool,
     /// Every `job_changed` push, oldest to newest touched; the strip reads only the running ones.
@@ -179,6 +189,7 @@ impl App {
             last_error: None,
             queued: VecDeque::new(),
             thinking_since: None,
+            turn_started: None,
             scroll_back: 0,
             quit: false,
             ambient: Vec::new(),
@@ -546,6 +557,7 @@ impl App {
     fn send(&mut self, content: String) -> Command {
         self.status = Status::Streaming;
         self.last_error = None;
+        self.turn_started = Some(Instant::now());
         Command::Send {
             session_id: self.session_id.clone(),
             content,
@@ -612,12 +624,17 @@ impl App {
                 }
                 None
             }
-            NetEvent::ToolStarted { call_id, name } => {
+            NetEvent::ToolStarted {
+                call_id,
+                name,
+                arguments_json,
+            } => {
                 self.finalize_thinking();
                 self.pop_empty_reply();
                 self.transcript.push(Block::Tool {
                     call_id,
                     name,
+                    args: tool_summary(&arguments_json),
                     outcome: None,
                 });
                 None
@@ -631,16 +648,31 @@ impl App {
                 }
                 None
             }
-            NetEvent::End { partial } => {
+            NetEvent::End {
+                partial,
+                input_tokens,
+                output_tokens,
+            } => {
                 self.finalize_thinking();
                 if let Some(Block::Arc { partial: p, .. }) = self.transcript.last_mut() {
                     *p = partial;
+                }
+                let elapsed = self.turn_started.take().map(|since| since.elapsed());
+                if let Some(elapsed) = elapsed {
+                    if input_tokens != 0 || output_tokens != 0 {
+                        self.transcript.push(Block::Cost {
+                            input_tokens,
+                            output_tokens,
+                            seconds: elapsed.as_secs_f32(),
+                        });
+                    }
                 }
                 self.turn_over(Status::Idle)
             }
             NetEvent::Failed { code, msg } => {
                 self.finalize_thinking();
                 self.pop_empty_reply();
+                self.turn_started = None;
                 self.last_error = Some(code.clone());
                 self.transcript.push(Block::Fault { code, msg });
                 self.turn_over(Status::Idle)
@@ -687,6 +719,7 @@ impl App {
                 None
             }
             NetEvent::Disconnected { reason } => {
+                self.turn_started = None;
                 self.last_error = Some("disconnected".to_owned());
                 self.transcript.push(Block::Fault {
                     code: "disconnected".to_owned(),
@@ -783,6 +816,28 @@ fn is_running(job: &JobInfo) -> bool {
     job.state == job_info::State::Running as i32
 }
 
+/// The first meaningful string value in the call's arguments: the bash
+/// command, the read/write/edit path, and so on for anything shaped alike.
+fn tool_summary(arguments_json: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arguments_json) else {
+        return String::new();
+    };
+    map.values()
+        .find_map(|value| match value {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+pub fn format_tokens(n: u32) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", f64::from(n) / 1000.0)
+    }
+}
+
 fn outcome_label(outcome: i32) -> &'static str {
     match ToolOutcome::try_from(outcome) {
         Ok(ToolOutcome::Ok) => "ok",
@@ -805,7 +860,7 @@ fn prose_block(message: HistoryMessage) -> Option<Block> {
     }
     match Role::try_from(message.role) {
         Ok(Role::User) => Some(Block::You(message.content)),
-        Ok(Role::Assistant) => Some(Block::Arc {
+        Ok(Role::Assistant) if !message.content.is_empty() => Some(Block::Arc {
             text: message.content,
             partial: message.partial,
         }),
@@ -823,6 +878,7 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
             Some(history_entry::Entry::ToolCall(call)) => blocks.push(Block::Tool {
                 call_id: call.call_id,
                 name: call.name,
+                args: tool_summary(&call.arguments_json),
                 outcome: None,
             }),
             Some(history_entry::Entry::ToolResult(result)) => {
@@ -885,6 +941,22 @@ mod tests {
         }
     }
 
+    fn end(partial: bool) -> NetEvent {
+        NetEvent::End {
+            partial,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    fn started(call_id: &str, name: &str) -> NetEvent {
+        NetEvent::ToolStarted {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            arguments_json: String::new(),
+        }
+    }
+
     #[test]
     fn enter_sends_and_shows_the_message() {
         let mut app = App::new();
@@ -923,7 +995,7 @@ mod tests {
         });
         app.on_net(NetEvent::Delta("hel".to_owned()));
         app.on_net(NetEvent::Delta("lo".to_owned()));
-        let next = app.on_net(NetEvent::End { partial: false });
+        let next = app.on_net(end(false));
 
         assert_eq!(
             refresh,
@@ -967,7 +1039,7 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         app.on_net(NetEvent::Delta("half a th".to_owned()));
-        app.on_net(NetEvent::End { partial: true });
+        app.on_net(end(true));
 
         assert!(matches!(
             app.transcript.last(),
@@ -1040,7 +1112,7 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         app.on_net(NetEvent::Reasoning("hmm".to_owned()));
-        app.on_net(NetEvent::End { partial: true });
+        app.on_net(end(true));
 
         assert_eq!(
             app.transcript,
@@ -1067,7 +1139,7 @@ mod tests {
         });
         app.on_net(NetEvent::Reasoning("hmm".to_owned()));
         app.on_net(NetEvent::Delta("hello".to_owned()));
-        app.on_net(NetEvent::End { partial: false });
+        app.on_net(end(false));
 
         assert_eq!(app.on_key(ctrl('o')), None, "insert mode opens it");
         assert!(matches!(
@@ -1178,7 +1250,7 @@ mod tests {
         });
         app.on_net(NetEvent::Reasoning("first".to_owned()));
         app.on_net(NetEvent::Delta("a".to_owned()));
-        app.on_net(NetEvent::End { partial: false });
+        app.on_net(end(false));
 
         typed(&mut app, "two");
         app.on_key(key(KeyCode::Enter));
@@ -1187,7 +1259,7 @@ mod tests {
         });
         app.on_net(NetEvent::Reasoning("second".to_owned()));
         app.on_net(NetEvent::Delta("b".to_owned()));
-        app.on_net(NetEvent::End { partial: false });
+        app.on_net(end(false));
 
         app.on_key(ctrl('o'));
         for at in [1, 4] {
@@ -1218,14 +1290,8 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         app.on_net(NetEvent::Reasoning("checking".to_owned()));
-        app.on_net(NetEvent::ToolStarted {
-            call_id: "a".to_owned(),
-            name: "alpha".to_owned(),
-        });
-        app.on_net(NetEvent::ToolStarted {
-            call_id: "b".to_owned(),
-            name: "beta".to_owned(),
-        });
+        app.on_net(started("a", "alpha"));
+        app.on_net(started("b", "beta"));
 
         app.on_net(NetEvent::ToolEnded {
             call_id: "b".to_owned(),
@@ -1244,11 +1310,13 @@ mod tests {
                 Block::Tool {
                     call_id: "a".to_owned(),
                     name: "alpha".to_owned(),
+                    args: String::new(),
                     outcome: None,
                 },
                 Block::Tool {
                     call_id: "b".to_owned(),
                     name: "beta".to_owned(),
+                    args: String::new(),
                     outcome: Some("ok"),
                 },
             ]
@@ -1268,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_outcome_renders_as_unknown() {
+    fn a_live_tool_call_carries_its_bash_command_as_the_summary() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -1276,9 +1344,149 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         app.on_net(NetEvent::ToolStarted {
-            call_id: "t".to_owned(),
-            name: "get_time".to_owned(),
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            arguments_json: r#"{"command":"cargo test"}"#.to_owned(),
         });
+
+        assert_eq!(
+            app.transcript.last(),
+            Some(&Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: "cargo test".to_owned(),
+                outcome: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_history_tool_call_carries_its_read_path_as_the_summary() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![HistoryEntry {
+                entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
+                    call_id: "t1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments_json: r#"{"path":"src/main.rs"}"#.to_owned(),
+                })),
+            }],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "read".to_owned(),
+                args: "src/main.rs".to_owned(),
+                outcome: Some("unknown"),
+            }]
+        );
+    }
+
+    #[test]
+    fn unparseable_arguments_leave_the_summary_blank() {
+        assert_eq!(tool_summary("not json"), "");
+        assert_eq!(tool_summary(""), "");
+        assert_eq!(
+            tool_summary(r#"{"count":3}"#),
+            "",
+            "no string field to show"
+        );
+    }
+
+    #[test]
+    fn an_empty_assistant_message_produces_no_block() {
+        let message = prose(Role::Assistant as i32, "", false);
+        assert_eq!(prose_block(message), None, "a text-less tool step");
+
+        let non_empty = prose(Role::Assistant as i32, "hello", false);
+        assert!(prose_block(non_empty).is_some());
+    }
+
+    #[test]
+    fn a_completed_turn_appends_a_cost_block_with_the_reported_usage() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Delta("hello".to_owned()));
+
+        app.on_net(NetEvent::End {
+            partial: false,
+            input_tokens: 2345,
+            output_tokens: 140,
+        });
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Block::Cost {
+                input_tokens: 2345,
+                output_tokens: 140,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_zero_usage_end_appends_no_cost_block() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+
+        app.on_net(end(false));
+
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|block| matches!(block, Block::Cost { .. })),
+            "a steer ack carries zeroed usage"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_appends_no_cost_block() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+
+        app.on_net(NetEvent::Failed {
+            code: "provider".to_owned(),
+            msg: "upstream 500".to_owned(),
+        });
+
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|block| matches!(block, Block::Cost { .. }))
+        );
+    }
+
+    #[test]
+    fn format_tokens_stays_bare_under_a_thousand_and_gains_k_above_it() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(2345), "2.3k");
+    }
+
+    #[test]
+    fn an_unrecognized_outcome_renders_as_unknown() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(started("t", "get_time"));
         app.on_net(NetEvent::ToolEnded {
             call_id: "t".to_owned(),
             outcome: 42,
@@ -1291,6 +1499,7 @@ mod tests {
                 Block::Tool {
                     call_id: "t".to_owned(),
                     name: "get_time".to_owned(),
+                    args: String::new(),
                     outcome: Some("unknown"),
                 },
             ]
@@ -1337,7 +1546,7 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Enter)), None, "queued, not sent");
         assert_eq!(app.queued.len(), 1);
 
-        let next = app.on_net(NetEvent::End { partial: false });
+        let next = app.on_net(end(false));
         assert_eq!(
             next,
             Some(Command::Send {
@@ -1620,16 +1829,13 @@ mod tests {
         live.on_net(NetEvent::Accepted {
             session_id: "s-1".to_owned(),
         });
-        live.on_net(NetEvent::ToolStarted {
-            call_id: "t1".to_owned(),
-            name: "lookup".to_owned(),
-        });
+        live.on_net(started("t1", "lookup"));
         live.on_net(NetEvent::ToolEnded {
             call_id: "t1".to_owned(),
             outcome: ToolOutcome::Ok as i32,
         });
         live.on_net(NetEvent::Delta("answer".to_owned()));
-        live.on_net(NetEvent::End { partial: false });
+        live.on_net(end(false));
 
         let mut reopened = App::new();
         reopened.session_id = Some("s-1".to_owned());
@@ -1665,11 +1871,13 @@ mod tests {
                 Block::Tool {
                     call_id: "a".to_owned(),
                     name: "alpha".to_owned(),
+                    args: String::new(),
                     outcome: Some("unknown"),
                 },
                 Block::Tool {
                     call_id: "b".to_owned(),
                     name: "beta".to_owned(),
+                    args: String::new(),
                     outcome: Some("unknown"),
                 },
             ]

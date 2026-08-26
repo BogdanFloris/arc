@@ -54,6 +54,7 @@ dependencies = [
  "futures",
  "prost-types",
  "ratatui",
+ "serde_json",
  "textwrap",
  "tokio",
 ]

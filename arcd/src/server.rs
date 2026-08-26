@@ -352,12 +352,13 @@ async fn forward(
                 call_id,
                 index,
                 name,
+                arguments_json,
             } => server_frame::Msg::ToolCallStarted(ToolCallStarted {
                 session_id: session_id.clone(),
                 call_id,
                 index,
                 name,
-                arguments_json: String::new(),
+                arguments_json,
             }),
             EngineEvent::ToolCallEnded { call_id, outcome } => {
                 server_frame::Msg::ToolCallEnded(ToolCallEnded {
@@ -1206,7 +1207,7 @@ mod tests {
                     id: "t1".to_owned(),
                     index: 0,
                     name: "lookup".to_owned(),
-                    arguments: "{}".to_owned(),
+                    arguments: r#"{"q":1}"#.to_owned(),
                     provider_roundtrip: Vec::new(),
                 })),
                 Ok(CompletionDelta::Done {
@@ -1262,7 +1263,7 @@ mod tests {
                     call_id: "t1".to_owned(),
                     index: 0,
                     name: "lookup".to_owned(),
-                    arguments_json: String::new(),
+                    arguments_json: r#"{"q":1}"#.to_owned(),
                 }),
                 server_frame::Msg::ToolCallEnded(ToolCallEnded {
                     session_id: session_id.clone(),

@@ -462,6 +462,7 @@ mod tests {
                     call_id: "c1".to_owned(),
                     index: 0,
                     name: "lookup".to_owned(),
+                    arguments_json: r#"{"q":1}"#.to_owned(),
                 },
                 EngineEvent::ToolCallEnded {
                     call_id: "c1".to_owned(),

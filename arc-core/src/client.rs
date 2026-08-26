@@ -37,6 +37,7 @@ pub enum TurnEvent {
         call_id: String,
         index: u32,
         name: String,
+        arguments_json: String,
     },
     ToolCallEnded {
         call_id: String,
@@ -311,6 +312,7 @@ impl Turn<'_> {
                 call_id: started.call_id,
                 index: started.index,
                 name: started.name,
+                arguments_json: started.arguments_json,
             },
             server_frame::Msg::ToolCallEnded(ended) => TurnEvent::ToolCallEnded {
                 call_id: ended.call_id,
@@ -654,7 +656,7 @@ mod tests {
                 call_id: "call-aa".to_owned(),
                 index: 0,
                 name: "memory_search".to_owned(),
-                arguments_json: String::new(),
+                arguments_json: r#"{"query":"budget"}"#.to_owned(),
             })),
             echo(server_frame::Msg::ToolCallEnded(ToolCallEnded {
                 session_id: "s-1".to_owned(),
@@ -685,6 +687,7 @@ mod tests {
                     call_id: "call-aa".to_owned(),
                     index: 0,
                     name: "memory_search".to_owned(),
+                    arguments_json: r#"{"query":"budget"}"#.to_owned(),
                 },
                 TurnEvent::ToolCallEnded {
                     call_id: "call-aa".to_owned(),

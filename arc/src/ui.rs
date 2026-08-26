@@ -5,7 +5,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{App, Block, Mode, Status};
+use crate::app::{App, Block, Mode, Status, format_tokens};
 use crate::{markdown, theme};
 
 const MARGIN: u16 = 2;
@@ -160,9 +160,31 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     push_wrapped(&mut out, text, width, theme::DIM);
                 }
             }
-            Block::Tool { name, outcome, .. } => {
+            Block::Tool {
+                name,
+                args,
+                outcome,
+                ..
+            } => {
                 let state = outcome.unwrap_or("...");
-                out.push(Line::styled(format!("{name} {state}"), theme::DIM));
+                let text = if args.is_empty() {
+                    format!("{name} · {state}")
+                } else {
+                    format!("{name} {args} · {state}")
+                };
+                out.push(Line::styled(elide(&text, width), theme::DIM));
+            }
+            Block::Cost {
+                input_tokens,
+                output_tokens,
+                seconds,
+            } => {
+                let text = format!(
+                    "{} in · {} out · {seconds:.1}s",
+                    format_tokens(*input_tokens),
+                    format_tokens(*output_tokens),
+                );
+                out.push(Line::styled(text, theme::DIM));
             }
         }
     }
