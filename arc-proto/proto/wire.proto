@@ -117,6 +117,7 @@ message ToolCallStarted {
   uint32 index = 3;
   string name = 4;
   reserved 5;
+  string arguments_json = 6;
 }
 
 message ToolCallEnded {
@@ -153,6 +154,7 @@ message HistoryMessage {
 message HistoryToolCall {
   string call_id = 1;
   string name = 2;
+  string arguments_json = 3;
 }
 
 message HistoryToolResult {

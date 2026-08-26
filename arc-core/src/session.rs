@@ -2009,6 +2009,7 @@ mod tests {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
                         call_id: "c1".to_owned(),
                         name: "lookup".to_owned(),
+                        arguments_json: "{}".to_owned(),
                     })),
                 },
                 HistoryEntry {

@@ -721,9 +721,16 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             partial,
             source,
         }),
-        MessageRow::ToolCall { call_id, name, .. } => {
-            history_entry::Entry::ToolCall(HistoryToolCall { call_id, name })
-        }
+        MessageRow::ToolCall {
+            call_id,
+            name,
+            arguments_json,
+            ..
+        } => history_entry::Entry::ToolCall(HistoryToolCall {
+            call_id,
+            name,
+            arguments_json,
+        }),
         MessageRow::ToolResult {
             call_id,
             outcome,

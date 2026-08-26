@@ -654,6 +654,7 @@ mod tests {
                 call_id: "call-aa".to_owned(),
                 index: 0,
                 name: "memory_search".to_owned(),
+                arguments_json: String::new(),
             })),
             echo(server_frame::Msg::ToolCallEnded(ToolCallEnded {
                 session_id: "s-1".to_owned(),

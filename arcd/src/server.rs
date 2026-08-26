@@ -357,6 +357,7 @@ async fn forward(
                 call_id,
                 index,
                 name,
+                arguments_json: String::new(),
             }),
             EngineEvent::ToolCallEnded { call_id, outcome } => {
                 server_frame::Msg::ToolCallEnded(ToolCallEnded {
@@ -1261,6 +1262,7 @@ mod tests {
                     call_id: "t1".to_owned(),
                     index: 0,
                     name: "lookup".to_owned(),
+                    arguments_json: String::new(),
                 }),
                 server_frame::Msg::ToolCallEnded(ToolCallEnded {
                     session_id: session_id.clone(),
@@ -1345,6 +1347,7 @@ mod tests {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
                         call_id: "t1".to_owned(),
                         name: "lookup".to_owned(),
+                        arguments_json: "{}".to_owned(),
                     })),
                 },
                 HistoryEntry {

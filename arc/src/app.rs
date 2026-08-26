@@ -1567,6 +1567,7 @@ mod tests {
             entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
                 call_id: call_id.to_owned(),
                 name: name.to_owned(),
+                arguments_json: String::new(),
             })),
         }
     }

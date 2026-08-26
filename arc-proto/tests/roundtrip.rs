@@ -318,6 +318,7 @@ fn server_frame_arms_round_trip() {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
                         call_id: "call-aa".to_string(),
                         name: "memory_search".to_string(),
+                        arguments_json: String::new(),
                     })),
                 },
                 HistoryEntry {
@@ -355,6 +356,7 @@ fn server_frame_arms_round_trip() {
             call_id: "call-aa".to_string(),
             index: 1,
             name: "memory_search".to_string(),
+            arguments_json: String::new(),
         }),
         server_frame::Msg::ToolCallEnded(ToolCallEnded {
             session_id: "s-01".to_string(),
