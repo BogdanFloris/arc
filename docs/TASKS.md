@@ -146,6 +146,7 @@ Expanded on 2026-08-26, deliberately overriding the move-to-3.1 guidance above: 
 | 6.9 | Picker QoL: `/` filters sessions as you type; times render relative. Compounds with 6.2's titles | — | todo |
 | 6.10 | `Ctrl-j` inserts a newline in the input, so a multi-step brief is written as one | — | todo |
 | 6.11 | `:help`: one dim popup listing the keys. The surface has grown enough that discoverability is real | — | todo |
+| 6.12 | Popup legibility: shared chrome for picker, review, jobs, and help — a plain ASCII border with the popup's name in it, a cleared margin so the transcript never bleeds into the panel, consistent padding. One isolated commit touching rendering only, so it reverts clean if the bare look was better | — | todo |
 
 ## 7. Production
 
