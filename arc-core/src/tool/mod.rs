@@ -1,6 +1,4 @@
-pub mod memory;
-pub mod sessions;
-pub mod time;
+pub mod builtin;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -45,8 +43,23 @@ pub(crate) struct DispatchOutcome {
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
 }
 
+/// Where a tool comes from. A session declares the sources it gets, so a tool
+/// it was never offered is never in its context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolSource {
+    Builtin,
+    /// Resolved from the session provider's own grounding; no tools of ours.
+    Web,
+    Workspace,
+}
+
+impl ToolSource {
+    pub const ALL: [ToolSource; 3] = [ToolSource::Builtin, ToolSource::Web, ToolSource::Workspace];
+}
+
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    fn source(&self) -> ToolSource;
     fn execute(
         &self,
         arguments_json: String,
@@ -81,8 +94,12 @@ impl Registry {
         self.tools.insert(name, tool);
     }
 
-    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+    pub(crate) fn definitions(&self, sources: &[ToolSource]) -> Vec<ToolDefinition> {
+        self.tools
+            .values()
+            .filter(|tool| sources.contains(&tool.source()))
+            .map(|tool| tool.definition())
+            .collect()
     }
 
     #[tracing::instrument(
@@ -131,7 +148,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOutcome, Registry, Tool, ToolReply, TurnContext};
+    use super::{DispatchOutcome, Registry, Tool, ToolReply, ToolSource, TurnContext};
     use crate::provider::ToolDefinition;
     use std::future::Future;
     use std::pin::Pin;
@@ -140,6 +157,7 @@ mod tests {
         name: &'static str,
         content: &'static str,
         ok: bool,
+        source: ToolSource,
     }
 
     impl Tool for Scripted {
@@ -149,6 +167,10 @@ mod tests {
                 description: String::new(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }
+        }
+
+        fn source(&self) -> ToolSource {
+            self.source
         }
 
         fn execute(
@@ -176,6 +198,10 @@ mod tests {
             }
         }
 
+        fn source(&self) -> ToolSource {
+            ToolSource::Builtin
+        }
+
         fn execute(
             &self,
             arguments_json: String,
@@ -196,6 +222,10 @@ mod tests {
             }
         }
 
+        fn source(&self) -> ToolSource {
+            ToolSource::Builtin
+        }
+
         fn execute(
             &self,
             _arguments_json: String,
@@ -213,8 +243,30 @@ mod tests {
         registry
     }
 
+    fn names(registry: &Registry, sources: &[ToolSource]) -> Vec<String> {
+        registry
+            .definitions(sources)
+            .into_iter()
+            .map(|def| def.name)
+            .collect()
+    }
+
     fn scripted(name: &'static str, content: &'static str, ok: bool) -> Box<dyn Tool> {
-        Box::new(Scripted { name, content, ok })
+        sourced(name, content, ok, ToolSource::Builtin)
+    }
+
+    fn sourced(
+        name: &'static str,
+        content: &'static str,
+        ok: bool,
+        source: ToolSource,
+    ) -> Box<dyn Tool> {
+        Box::new(Scripted {
+            name,
+            content,
+            ok,
+            source,
+        })
     }
 
     #[tokio::test]
@@ -321,12 +373,36 @@ mod tests {
             scripted("alpha", "", true),
         ]);
 
-        let names: Vec<String> = registry
-            .definitions()
-            .into_iter()
-            .map(|def| def.name)
-            .collect();
-        assert_eq!(names, ["alpha", "zeta"]);
+        assert_eq!(names(&registry, &ToolSource::ALL), ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn definitions_offers_only_the_sources_asked_for() {
+        let registry = registry(vec![
+            sourced("recall", "", true, ToolSource::Builtin),
+            sourced("read", "", true, ToolSource::Workspace),
+        ]);
+
+        assert_eq!(names(&registry, &[ToolSource::Builtin]), ["recall"]);
+        assert_eq!(names(&registry, &[ToolSource::Workspace]), ["read"]);
+        assert_eq!(names(&registry, &ToolSource::ALL), ["read", "recall"]);
+    }
+
+    #[test]
+    fn no_sources_offers_no_tools() {
+        let registry = registry(vec![scripted("recall", "", true)]);
+
+        assert!(names(&registry, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_web_source_holds_no_tools_of_ours() {
+        let registry = registry(vec![
+            sourced("recall", "", true, ToolSource::Builtin),
+            sourced("read", "", true, ToolSource::Workspace),
+        ]);
+
+        assert!(names(&registry, &[ToolSource::Web]).is_empty());
     }
 
     #[test]

@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Tool, ToolReply, TurnContext, to_json};
 use crate::archive::{Archive, Error};
 use crate::provider::ToolDefinition;
+use crate::tool::{Tool, ToolReply, ToolSource, TurnContext, to_json};
 
 pub struct SessionsSearch {
     archive: Arc<Archive>,
@@ -49,6 +49,10 @@ impl Tool for SessionsSearch {
                 "required": ["query"]
             }),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(
@@ -124,6 +128,10 @@ impl Tool for SessionRead {
                 "required": ["session_id"]
             }),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(

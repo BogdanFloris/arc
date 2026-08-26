@@ -16,7 +16,7 @@ use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking, ToolCall, Usage,
 };
 use crate::store::{self, Store, now_ts};
-use crate::tool::{Registry, TurnContext};
+use crate::tool::{Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
@@ -497,7 +497,8 @@ impl Engine {
             tools: if last_step {
                 Vec::new()
             } else {
-                self.registry.definitions()
+                // Every source until a session declares its own.
+                self.registry.definitions(&ToolSource::ALL)
             },
             seed: None,
         }
@@ -2143,7 +2144,7 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::memory::MemoryWrite));
+        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite));
         let (mut engine, run) = engine_with_tools(&provider, &dir, registry);
 
         let capture = TraceCapture::start();
@@ -2172,6 +2173,10 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({"type": "object"}),
                 }
+            }
+
+            fn source(&self) -> crate::tool::ToolSource {
+                crate::tool::ToolSource::Builtin
             }
 
             fn execute(

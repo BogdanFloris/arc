@@ -10,9 +10,7 @@ use arc_core::secrets::Secrets;
 use arc_core::session::{Engine, Runner};
 use arc_core::store::Store;
 use arc_core::tool::Registry;
-use arc_core::tool::memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
-use arc_core::tool::sessions::{SessionRead, SessionsSearch};
-use arc_core::tool::time::GetTime;
+use arc_core::tool::builtin;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -103,18 +101,14 @@ impl Daemon {
             );
         }
 
-        let mut registry = Registry::new(config.max_tool_result_bytes);
-        registry.register(Box::new(GetTime));
         let archive = Arc::new(
             Archive::open(dirs.index())
                 .with_context(|| format!("opening {} read-only", dirs.index().display()))?,
         );
-        registry.register(Box::new(SessionsSearch::new(Arc::clone(&archive))));
-        registry.register(Box::new(SessionRead::new(Arc::clone(&archive))));
-        registry.register(Box::new(MemoryRead::new(Arc::clone(&archive))));
-        registry.register(Box::new(MemorySearch::new(Arc::clone(&archive))));
-        registry.register(Box::new(MemoryWrite));
-        registry.register(Box::new(MemorySupersede::new(archive)));
+        let mut registry = Registry::new(config.max_tool_result_bytes);
+        for tool in builtin::tools(archive) {
+            registry.register(tool);
+        }
 
         let reads = Arc::new(
             Reader::open(dirs.index())

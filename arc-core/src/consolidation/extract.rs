@@ -9,7 +9,7 @@ use super::{ExtractError, Extractor, SessionSnapshot};
 use crate::memory::index_line;
 use crate::projection::MessageRow;
 use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking};
-use crate::tool::memory::{mint_record, parse_kind};
+use crate::tool::builtin::memory::{mint_record, parse_kind};
 
 pub const PROMPT_VERSION_V1: &str = "v1";
 

@@ -8,10 +8,10 @@ use arc_proto::v1::{
 };
 use serde::Deserialize;
 
-use super::{Tool, ToolReply, TurnContext, to_json};
 use crate::archive::{Archive, Error, MemoryHit};
 use crate::provider::ToolDefinition;
 use crate::store::now_ts;
+use crate::tool::{Tool, ToolReply, ToolSource, TurnContext, to_json};
 
 pub struct MemoryRead {
     archive: Arc<Archive>,
@@ -43,6 +43,10 @@ impl Tool for MemoryRead {
                 "required": ["id"]
             }),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(
@@ -109,6 +113,10 @@ impl Tool for MemorySearch {
                 "required": ["query"]
             }),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(
@@ -213,6 +221,10 @@ impl Tool for MemoryWrite {
         }
     }
 
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
+
     fn execute(
         &self,
         arguments_json: String,
@@ -265,6 +277,10 @@ impl Tool for MemorySupersede {
                 "required": ["id", "kind", "title", "summary", "body"]
             }),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(

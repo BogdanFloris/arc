@@ -19,7 +19,7 @@ use crate::provider::{
 };
 use crate::session::{Engine, EngineEvent, Runner};
 use crate::store::Store;
-use crate::tool::{Registry, Tool, ToolReply, TurnContext};
+use crate::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
 
 #[derive(Debug)]
 pub struct ScriptedProvider {
@@ -277,6 +277,10 @@ impl Tool for Canned {
             description: String::new(),
             parameters: serde_json::json!({"type": "object"}),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(

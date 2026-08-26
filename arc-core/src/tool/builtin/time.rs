@@ -3,8 +3,8 @@ use std::pin::Pin;
 
 use chrono::Local;
 
-use super::{Tool, ToolReply, TurnContext};
 use crate::provider::ToolDefinition;
+use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
 pub struct GetTime;
 
@@ -15,6 +15,10 @@ impl Tool for GetTime {
             description: "Get the current local date and time.".to_owned(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
     }
 
     fn execute(
