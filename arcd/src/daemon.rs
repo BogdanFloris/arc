@@ -7,10 +7,11 @@ use arc_core::orphan;
 use arc_core::projection::{self, Projection, Reader};
 use arc_core::provider::role_label;
 use arc_core::secrets::Secrets;
-use arc_core::session::{Engine, Runner};
+use arc_core::session::{Engine, ProjectSpec, Runner};
 use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
+use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -109,6 +110,9 @@ impl Daemon {
         for tool in builtin::tools(archive) {
             registry.register(tool);
         }
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
 
         let reads = Arc::new(
             Reader::open(dirs.index())
@@ -118,14 +122,7 @@ impl Daemon {
         let projects = config
             .projects
             .iter()
-            .map(|(name, project)| {
-                let sources = project
-                    .sources
-                    .iter()
-                    .map(|source| source.resolve())
-                    .collect();
-                (name.clone(), sources)
-            })
+            .map(|(name, project)| (name.clone(), project_spec(project)))
             .collect();
         let engine = Engine::new(store, registry).with_projects(projects);
 
@@ -283,6 +280,22 @@ fn idle_cutoff_micros(idle: Duration) -> Option<i64> {
     Some(now.saturating_sub(idle))
 }
 
+fn project_spec(project: &crate::config::ProjectConfig) -> ProjectSpec {
+    let sources = project
+        .sources
+        .iter()
+        .map(|source| source.resolve())
+        .collect();
+    let mut grants = vec![Grant::new(project.root.clone(), Mode::ReadWrite)];
+    grants.extend(
+        project
+            .read_only
+            .iter()
+            .map(|root| Grant::new(root.clone(), Mode::ReadOnly)),
+    );
+    ProjectSpec { sources, grants }
+}
+
 fn open_index(path: &Path) -> Result<Projection> {
     let opening = || format!("opening the index at {}", path.display());
     match Projection::open(path) {
@@ -336,6 +349,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::config::{ProjectConfig, ToolSource};
     use crate::dirs::DataDirs;
 
     // port 1 refuses every connection: startup must not reach a provider
@@ -515,6 +529,64 @@ mod tests {
         assert!(
             !strikes.strike("s-x".to_owned()),
             "already skipped: never loud twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_session_gets_the_configured_projects_grants() {
+        let temp = TempDir::new().expect("temp dir");
+        let project_root = temp.path().join("proj");
+        std::fs::create_dir_all(&project_root).expect("mkdir proj");
+        let notes_root = temp.path().join("notes");
+        std::fs::create_dir_all(&notes_root).expect("mkdir notes");
+
+        let mut config = Config::default();
+        config.projects.insert(
+            "arc".to_owned(),
+            ProjectConfig {
+                root: project_root.clone(),
+                read_only: vec![notes_root.clone()],
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+            },
+        );
+        let dirs = DataDirs::new(&temp.path().join("data"));
+        let log_dir = dirs.log().to_path_buf();
+        let daemon = Daemon::start(config, dirs, unreachable_roles()).expect("start");
+
+        let session_id = daemon
+            .engine
+            .lock()
+            .await
+            .create_bound_session(daemon.roles.concierge(), "arc")
+            .expect("create a bound session");
+
+        let log = Log::open(&log_dir).expect("reopen log");
+        let created = log
+            .reader()
+            .expect("reader")
+            .map(|result| result.expect("event"))
+            .find_map(|event| match event.payload {
+                Some(event::Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::SessionCreated(created)),
+                })) if created.session_id == session_id => Some(created),
+                _ => None,
+            })
+            .expect("the bound session was recorded");
+
+        let root = project_root.canonicalize().expect("canon");
+        let notes = notes_root.canonicalize().expect("canon");
+        assert_eq!(
+            created.grants,
+            [
+                arc_proto::v1::WorkspaceGrant {
+                    root: root.to_string_lossy().into_owned(),
+                    read_write: true,
+                },
+                arc_proto::v1::WorkspaceGrant {
+                    root: notes.to_string_lossy().into_owned(),
+                    read_write: false,
+                },
+            ]
         );
     }
 }

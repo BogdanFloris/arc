@@ -2,14 +2,12 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::Workspace;
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -20,13 +18,12 @@ const MIN_TIMEOUT_SECS: u64 = 1;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const ENV_ALLOWLIST: [&str; 5] = ["PATH", "HOME", "USER", "TMPDIR", "LANG"];
 
-pub struct Bash {
-    workspace: Arc<Workspace>,
-}
+#[derive(Default)]
+pub struct Bash;
 
 impl Bash {
-    pub fn new(workspace: Arc<Workspace>) -> Self {
-        Self { workspace }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -67,7 +64,7 @@ impl Tool for Bash {
     fn execute(
         &self,
         arguments_json: String,
-        _ctx: TurnContext,
+        ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         Box::pin(async move {
             let args: BashArgs = match serde_json::from_str(&arguments_json) {
@@ -79,7 +76,12 @@ impl Tool for Bash {
                 }
             };
 
-            let Some(root) = self.workspace.grants.read_write_root() else {
+            let Some(grants) = &ctx.grants else {
+                return ToolReply::error(
+                    "ERROR: no workspace is granted in this session.".to_owned(),
+                );
+            };
+            let Some(root) = grants.read_write_root() else {
                 return ToolReply::error(
                     "ERROR: this session has no writable project root to run in.".to_owned(),
                 );
@@ -269,12 +271,20 @@ mod tests {
     use tempfile::TempDir;
 
     use super::Bash;
-    use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
+    use crate::tool::workspace::{Grant, Grants, Mode};
     use crate::tool::{Tool as _, TurnContext};
 
-    fn workspace_rw(root: &std::path::Path) -> Arc<Workspace> {
-        let grants = Grants::new(vec![Grant::new(root, Mode::ReadWrite)]).expect("grants");
-        Arc::new(Workspace::new(grants))
+    fn ctx(root: &std::path::Path, mode: Mode) -> TurnContext {
+        let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
+        TurnContext {
+            session_id: String::new(),
+            turn_id: String::new(),
+            grants: Some(Arc::new(grants)),
+        }
+    }
+
+    fn ctx_rw(root: &std::path::Path) -> TurnContext {
+        ctx(root, Mode::ReadWrite)
     }
 
     fn args(command: &str) -> String {
@@ -288,11 +298,9 @@ mod tests {
     #[tokio::test]
     async fn an_echo_command_returns_its_stdout_verbatim() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
-        let reply = tool
-            .execute(args("echo hello"), TurnContext::default())
-            .await;
+        let reply = tool.execute(args("echo hello"), ctx_rw(dir.path())).await;
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(reply.content, "hello\n");
@@ -301,9 +309,9 @@ mod tests {
     #[tokio::test]
     async fn a_command_with_no_output_reports_no_output() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
-        let reply = tool.execute(args("true"), TurnContext::default()).await;
+        let reply = tool.execute(args("true"), ctx_rw(dir.path())).await;
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(reply.content, "(no output)");
@@ -312,13 +320,10 @@ mod tests {
     #[tokio::test]
     async fn a_nonzero_exit_is_an_error_naming_the_code_with_both_streams() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
         let reply = tool
-            .execute(
-                args("echo out; echo err >&2; exit 3"),
-                TurnContext::default(),
-            )
+            .execute(args("echo out; echo err >&2; exit 3"), ctx_rw(dir.path()))
             .await;
 
         assert!(!reply.ok);
@@ -335,10 +340,10 @@ mod tests {
     #[tokio::test]
     async fn stderr_noise_with_a_clean_exit_is_ok_but_carries_the_stderr_section() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
         let reply = tool
-            .execute(args("echo warn >&2"), TurnContext::default())
+            .execute(args("echo warn >&2"), ctx_rw(dir.path()))
             .await;
 
         assert!(reply.ok, "{}", reply.content);
@@ -354,12 +359,12 @@ mod tests {
     #[tokio::test]
     async fn the_environment_is_scrubbed_of_everything_but_the_allowlist() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
         unsafe {
             std::env::set_var("ARC_TEST_SECRET", "shh");
         }
 
-        let reply = tool.execute(args("env"), TurnContext::default()).await;
+        let reply = tool.execute(args("env"), ctx_rw(dir.path())).await;
 
         assert!(reply.ok, "{}", reply.content);
         assert!(
@@ -373,12 +378,12 @@ mod tests {
     #[tokio::test]
     async fn xdg_prefixed_variables_pass_through() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
         unsafe {
             std::env::set_var("XDG_ARC_TEST", "1");
         }
 
-        let reply = tool.execute(args("env"), TurnContext::default()).await;
+        let reply = tool.execute(args("env"), ctx_rw(dir.path())).await;
 
         assert!(reply.ok, "{}", reply.content);
         assert!(
@@ -391,9 +396,9 @@ mod tests {
     #[tokio::test]
     async fn the_command_runs_in_the_read_write_root() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
-        let reply = tool.execute(args("pwd"), TurnContext::default()).await;
+        let reply = tool.execute(args("pwd"), ctx_rw(dir.path())).await;
 
         assert!(reply.ok, "{}", reply.content);
         let canonical = dir.path().canonicalize().expect("canonicalize");
@@ -403,12 +408,12 @@ mod tests {
     #[tokio::test]
     async fn stdout_over_the_cap_is_truncated_and_marked() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
         let reply = tool
             .execute(
                 args("head -c 20000 /dev/zero | tr '\\0' 'x'"),
-                TurnContext::default(),
+                ctx_rw(dir.path()),
             )
             .await;
 
@@ -420,10 +425,10 @@ mod tests {
     #[tokio::test]
     async fn a_command_past_its_timeout_is_an_error_naming_the_deadline() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
         let reply = tool
-            .execute(args_with_timeout("sleep 5", 1), TurnContext::default())
+            .execute(args_with_timeout("sleep 5", 1), ctx_rw(dir.path()))
             .await;
 
         assert!(!reply.ok);
@@ -437,13 +442,13 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_kills_the_whole_process_group_and_returns_promptly() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
         let start = Instant::now();
         let reply = tool
             .execute(
                 args_with_timeout("sleep 5; echo late", 1),
-                TurnContext::default(),
+                ctx_rw(dir.path()),
             )
             .await;
         let elapsed = start.elapsed();
@@ -456,21 +461,32 @@ mod tests {
     #[tokio::test]
     async fn no_writable_root_is_a_named_error() {
         let dir = TempDir::new().expect("tmp");
-        let grants = Grants::new(vec![Grant::new(dir.path(), Mode::ReadOnly)]).expect("grants");
-        let tool = Bash::new(Arc::new(Workspace::new(grants)));
+        let tool = Bash::new();
 
-        let reply = tool.execute(args("echo hi"), TurnContext::default()).await;
+        let reply = tool
+            .execute(args("echo hi"), ctx(dir.path(), Mode::ReadOnly))
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("writable"), "{}", reply.content);
     }
 
     #[tokio::test]
+    async fn an_unbound_session_is_a_named_error() {
+        let tool = Bash::new();
+
+        let reply = tool.execute(args("echo hi"), TurnContext::default()).await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("granted"), "{}", reply.content);
+    }
+
+    #[tokio::test]
     async fn a_missing_command_argument_is_an_actionable_error() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
-        let reply = tool.execute("{}".to_owned(), TurnContext::default()).await;
+        let reply = tool.execute("{}".to_owned(), ctx_rw(dir.path())).await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("command"), "{}", reply.content);
@@ -479,9 +495,9 @@ mod tests {
     #[tokio::test]
     async fn an_empty_command_is_an_actionable_error() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
 
-        let reply = tool.execute(args("   "), TurnContext::default()).await;
+        let reply = tool.execute(args("   "), ctx_rw(dir.path())).await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("empty"), "{}", reply.content);
@@ -490,11 +506,11 @@ mod tests {
     #[tokio::test]
     async fn a_background_child_holding_the_pipe_does_not_hang_the_call() {
         let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new(workspace_rw(dir.path()));
+        let tool = Bash::new();
         let started = std::time::Instant::now();
 
         let reply = tool
-            .execute(args("sleep 30 & echo up"), TurnContext::default())
+            .execute(args("sleep 30 & echo up"), ctx_rw(dir.path()))
             .await;
 
         assert!(

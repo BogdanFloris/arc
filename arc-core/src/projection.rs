@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS projection_meta (
     key   TEXT PRIMARY KEY,
     value
 );
+
+CREATE TABLE IF NOT EXISTS session_grants (
+    session_id TEXT    NOT NULL,
+    root       TEXT    NOT NULL,
+    read_write INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS session_grants_by_session ON session_grants (session_id);
 ";
 
 pub(crate) const KIND_MESSAGE: i64 = 0;
@@ -421,6 +429,16 @@ impl Projection {
         Ok(project.flatten())
     }
 
+    pub(crate) fn session_grants(&self, session_id: &str) -> Result<Vec<(String, bool)>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT root, read_write FROM session_grants WHERE session_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         sessions(&self.conn)
     }
@@ -743,6 +761,12 @@ fn insert_session(
             created.role,
         ),
     )?;
+    for grant in &created.grants {
+        tx.execute(
+            "INSERT INTO session_grants (session_id, root, read_write) VALUES (?1, ?2, ?3)",
+            (&created.session_id, &grant.root, grant.read_write),
+        )?;
+    }
     Ok(())
 }
 
@@ -1157,8 +1181,8 @@ mod tests {
         Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
         Role, SessionConsolidated, SessionCreated, SessionEvent, SessionRole, Source,
-        ToolCallIssued, ToolOutcome, ToolResultRecorded, event, memory_event, memory_record,
-        session_event,
+        ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event, memory_event,
+        memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::OptionalExtension;
@@ -1298,6 +1322,7 @@ mod tests {
             "messages_fts_docsize",
             "messages_fts_idx",
             "projection_meta",
+            "session_grants",
             "sessions",
         ]
         .into_iter()
@@ -1390,6 +1415,69 @@ mod tests {
             .expect("apply");
 
         assert_eq!(projection.session_project("s-01").expect("project"), None);
+    }
+
+    fn session_created_with_grants(seq: u64, grants: Vec<WorkspaceGrant>) -> Event {
+        let mut event = session_created(seq);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = event.payload.as_mut()
+        {
+            created.grants = grants;
+        }
+        event
+    }
+
+    #[test]
+    fn a_grantless_session_has_no_recorded_grants() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+
+        assert_eq!(
+            projection.session_grants("s-01").expect("grants"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn session_grants_round_trip_through_replay_in_order() {
+        let dir = TempDir::new().expect("temp dir");
+        let grants = vec![
+            WorkspaceGrant {
+                root: "/home/bogdan/arc".to_owned(),
+                read_write: true,
+            },
+            WorkspaceGrant {
+                root: "/home/bogdan/notes".to_owned(),
+                read_write: false,
+            },
+        ];
+
+        let mut log = Log::open(dir.path()).expect("open log");
+        log.append(session_created_with_grants(0, grants.clone()))
+            .expect("append");
+        drop(log);
+
+        let mut projection = Projection::in_memory().expect("open");
+        let log = Log::open(dir.path()).expect("reopen log");
+        replay(log.reader().expect("reader"), &mut projection).expect("replay");
+
+        assert_eq!(
+            projection.session_grants("s-01").expect("grants"),
+            vec![
+                ("/home/bogdan/arc".to_owned(), true),
+                ("/home/bogdan/notes".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_has_no_grants() {
+        let projection = Projection::in_memory().expect("open");
+        assert_eq!(
+            projection.session_grants("s-ghost").expect("grants"),
+            Vec::new()
+        );
     }
 
     #[test]

@@ -408,7 +408,10 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::EmptyReply => "empty_reply",
         SessionError::RoleMismatch { .. } => "role_mismatch",
         SessionError::Provider(_) => "provider",
-        SessionError::Store(_) | SessionError::Projection(_) => "internal",
+        SessionError::UnknownProject { .. } => "unknown_project",
+        SessionError::Store(_) | SessionError::Projection(_) | SessionError::Grants { .. } => {
+            "internal"
+        }
     }
 }
 

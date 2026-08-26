@@ -4,13 +4,16 @@ pub mod workspace;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::provider::ToolDefinition;
+use crate::tool::workspace::Grants;
 
 #[derive(Debug, Clone, Default)]
 pub struct TurnContext {
     pub session_id: String,
     pub turn_id: String,
+    pub grants: Option<Arc<Grants>>,
 }
 
 pub struct ToolReply {
@@ -322,6 +325,7 @@ mod tests {
         let ctx = TurnContext {
             session_id: "s-77".to_owned(),
             turn_id: "t-42".to_owned(),
+            grants: None,
         };
         let outcome = registry
             .dispatch("where_am_i", "{}".into(), ctx, &ToolSource::ALL)

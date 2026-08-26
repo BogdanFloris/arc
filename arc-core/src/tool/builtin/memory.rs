@@ -644,6 +644,7 @@ mod tests {
                 TurnContext {
                     session_id: "s-live".to_owned(),
                     turn_id: "t-1".to_owned(),
+                    grants: None,
                 },
             )
             .await;

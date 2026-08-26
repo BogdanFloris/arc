@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_proto::v1::{
     MemoryEvent, MessageAppended, Role, SessionCreated, SessionEvent, SessionRole, Source,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
 };
 use arc_proto::v1::{event, memory_event, session_event};
 use futures::StreamExt as _;
@@ -16,9 +17,17 @@ use crate::provider::{
     self, CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking, ToolCall, Usage,
 };
 use crate::store::{self, Store, now_ts};
+use crate::tool::workspace::{Grant, Grants, Mode};
 use crate::tool::{Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
+
+/// What a project offers a session bound to it: the tools and the roots.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSpec {
+    pub sources: Vec<ToolSource>,
+    pub grants: Vec<Grant>,
+}
 
 /// Who is running a turn. Resolved once per role and handed to the engine
 /// with each turn, so one log can serve a conversation and a job at once.
@@ -35,7 +44,7 @@ pub struct Runner {
 pub struct Engine {
     store: Store,
     registry: Registry,
-    projects: BTreeMap<String, Vec<ToolSource>>,
+    projects: BTreeMap<String, ProjectSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +96,16 @@ pub enum Error {
 
     #[error("the model produced no reply")]
     EmptyReply,
+
+    #[error("project {project} is not configured")]
+    UnknownProject { project: String },
+
+    #[error("project {project}: could not resolve its granted roots: {source}")]
+    Grants {
+        project: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Engine {
@@ -98,12 +117,62 @@ impl Engine {
         }
     }
 
-    /// The configured projects: name to declared sources. Written once at
+    /// The configured projects: name to sources and grants. Written once at
     /// startup from config; a session's project resolves through this.
     #[must_use]
-    pub fn with_projects(mut self, projects: BTreeMap<String, Vec<ToolSource>>) -> Self {
+    pub fn with_projects(mut self, projects: BTreeMap<String, ProjectSpec>) -> Self {
         self.projects = projects;
         self
+    }
+
+    /// A new session bound to a project: grants are canonicalized now and
+    /// recorded in the log, so the session keeps them even if config changes.
+    #[tracing::instrument(
+        level = "info",
+        name = "session.create_bound_session",
+        skip_all,
+        fields(project, session_id = tracing::field::Empty)
+    )]
+    pub fn create_bound_session(
+        &mut self,
+        runner: &Runner,
+        project: &str,
+    ) -> Result<String, Error> {
+        let spec = self
+            .projects
+            .get(project)
+            .cloned()
+            .ok_or_else(|| Error::UnknownProject {
+                project: project.to_owned(),
+            })?;
+        let grants = Grants::new(spec.grants).map_err(|source| Error::Grants {
+            project: project.to_owned(),
+            source,
+        })?;
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        tracing::Span::current().record("session_id", session_id.as_str());
+        self.record(
+            Source::User,
+            session_event::Event::SessionCreated(SessionCreated {
+                session_id: session_id.clone(),
+                title: String::new(),
+                provider: runner.provider.name().to_owned(),
+                model: runner.model.clone(),
+                role: runner.role as i32,
+                project: project.to_owned(),
+                budget: None,
+                grants: grants
+                    .canonical_roots()
+                    .iter()
+                    .map(|(root, mode)| WorkspaceGrant {
+                        root: root.to_string_lossy().into_owned(),
+                        read_write: *mode == Mode::ReadWrite,
+                    })
+                    .collect(),
+            }),
+        )?;
+        Ok(session_id)
     }
 
     fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
@@ -115,8 +184,8 @@ impl Engine {
         Ok(match project {
             None => vec![ToolSource::Builtin],
             Some(name) => {
-                if let Some(sources) = self.projects.get(&name) {
-                    sources.clone()
+                if let Some(spec) = self.projects.get(&name) {
+                    spec.sources.clone()
                 } else {
                     // fail closed: a project gone from config grants nothing
                     tracing::warn!(project = %name, "session names a project that is not configured");
@@ -124,6 +193,30 @@ impl Engine {
                 }
             }
         })
+    }
+
+    /// The grants a session was created with, straight from the log: the
+    /// authority even if config has since changed. `None` means unbound.
+    fn grants(&self, session_id: &str, new_session: bool) -> Result<Option<Arc<Grants>>, Error> {
+        if new_session {
+            return Ok(None);
+        }
+        let recorded = self.store.projection().session_grants(session_id)?;
+        if recorded.is_empty() {
+            return Ok(None);
+        }
+        let roots = recorded
+            .into_iter()
+            .map(|(root, read_write)| {
+                let mode = if read_write {
+                    Mode::ReadWrite
+                } else {
+                    Mode::ReadOnly
+                };
+                (PathBuf::from(root), mode)
+            })
+            .collect();
+        Ok(Some(Arc::new(Grants::from_recorded(roots))))
     }
 
     #[tracing::instrument(
@@ -169,6 +262,7 @@ impl Engine {
             self.enforce_pin(runner, &session_id)?;
         }
         let sources = self.sources(&session_id, new_session)?;
+        let grants = self.grants(&session_id, new_session)?;
 
         if new_session {
             self.record(
@@ -232,6 +326,7 @@ impl Engine {
                         text,
                         calls,
                         &sources,
+                        grants.as_ref(),
                         &mut transcript,
                         &mut memory,
                         &events,
@@ -319,6 +414,7 @@ impl Engine {
         text: String,
         mut calls: Vec<ToolCall>,
         sources: &[ToolSource],
+        grants: Option<&Arc<Grants>>,
         transcript: &mut Vec<Message>,
         memory: &mut MemoryCounters,
         events: &mpsc::Sender<EngineEvent>,
@@ -377,6 +473,7 @@ impl Engine {
             let ctx = TurnContext {
                 session_id: session_id.to_owned(),
                 turn_id: turn_id.to_owned(),
+                grants: grants.cloned(),
             };
             let dispatched = self
                 .registry
@@ -736,7 +833,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, Runner};
+    use super::{Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters, ProjectSpec, Runner};
     use crate::log::Log;
     use crate::projection::Projection;
     use crate::provider::{
@@ -749,6 +846,7 @@ mod tests {
         issued, reopened_engine, replay_events, replay_log, resulted, runner, seed_log,
         seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
     };
+    use crate::tool::workspace::{self, Grant, Mode, Workspace};
     use crate::tool::{Registry, ToolSource};
 
     fn seeded_session() -> session_event::Event {
@@ -824,7 +922,7 @@ mod tests {
         provider: &Arc<ScriptedProvider>,
         dir: &TempDir,
         registry: Registry,
-        projects: BTreeMap<String, Vec<ToolSource>>,
+        projects: BTreeMap<String, ProjectSpec>,
     ) -> (Engine, Runner) {
         let log = Log::open(dir.path()).expect("open log");
         let mut projection = Projection::in_memory().expect("open projection");
@@ -2505,7 +2603,10 @@ mod tests {
         let mut projects = BTreeMap::new();
         projects.insert(
             "arc".to_owned(),
-            vec![ToolSource::Builtin, ToolSource::Workspace],
+            ProjectSpec {
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                grants: Vec::new(),
+            },
         );
         let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
         let (tx, _rx) = channel();
@@ -2539,7 +2640,10 @@ mod tests {
         let mut projects = BTreeMap::new();
         projects.insert(
             "arc".to_owned(),
-            vec![ToolSource::Builtin, ToolSource::Workspace],
+            ProjectSpec {
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                grants: Vec::new(),
+            },
         );
         let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
         let (tx, _rx) = channel();
@@ -2579,7 +2683,10 @@ mod tests {
         let mut projects = BTreeMap::new();
         projects.insert(
             "arc".to_owned(),
-            vec![ToolSource::Builtin, ToolSource::Workspace],
+            ProjectSpec {
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                grants: Vec::new(),
+            },
         );
         let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
         let (tx, _rx) = channel();
@@ -2617,5 +2724,263 @@ mod tests {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
         assert_eq!(created.project, "");
+    }
+
+    fn projects_with(
+        name: &str,
+        sources: Vec<ToolSource>,
+        grants: Vec<Grant>,
+    ) -> BTreeMap<String, ProjectSpec> {
+        let mut projects = BTreeMap::new();
+        projects.insert(name.to_owned(), ProjectSpec { sources, grants });
+        projects
+    }
+
+    #[tokio::test]
+    async fn create_bound_session_records_the_project_and_canonical_grants() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).expect("mkdir notes");
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![
+                Grant::new(&root, Mode::ReadWrite),
+                Grant::new(&notes, Mode::ReadOnly),
+            ],
+        ));
+
+        let session_id = engine
+            .create_bound_session(&run, "arc")
+            .expect("create a bound session");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated first, got {:?}", events[0]);
+        };
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(created.project, "arc");
+        assert_eq!(created.role, SessionRole::Concierge as i32);
+        assert_eq!(created.provider, "scripted");
+        assert_eq!(created.model, "test-model");
+        assert_eq!(
+            created.grants,
+            [
+                arc_proto::v1::WorkspaceGrant {
+                    root: root
+                        .canonicalize()
+                        .expect("canon")
+                        .to_string_lossy()
+                        .into_owned(),
+                    read_write: true,
+                },
+                arc_proto::v1::WorkspaceGrant {
+                    root: notes
+                        .canonicalize()
+                        .expect("canon")
+                        .to_string_lossy()
+                        .into_owned(),
+                    read_write: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bound_session_names_an_unknown_project() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (mut engine, run) = engine(&provider, &dir);
+
+        let err = engine
+            .create_bound_session(&run, "ghost")
+            .expect_err("an unconfigured project must be refused");
+
+        assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
+        assert!(err.to_string().contains("ghost"));
+        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+    }
+
+    #[tokio::test]
+    async fn create_bound_session_fails_when_the_root_does_not_exist() {
+        let dir = TempDir::new().expect("temp dir");
+        let missing = dir.path().join("nope");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        let mut engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin],
+            vec![Grant::new(&missing, Mode::ReadWrite)],
+        ));
+
+        let err = engine
+            .create_bound_session(&run, "arc")
+            .expect_err("a missing root must fail at creation");
+
+        assert!(matches!(err, Error::Grants { ref project, .. } if project == "arc"));
+        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+    }
+
+    #[tokio::test]
+    async fn a_bound_sessions_grants_flow_from_the_log_through_the_gate() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("inside.txt"), "hi").expect("write");
+        let elsewhere = TempDir::new().expect("temp dir 2");
+        std::fs::write(elsewhere.path().join("outside.txt"), "nope").expect("write");
+
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "read",
+                    &serde_json::json!({"path": root.join("inside.txt")}).to_string(),
+                )),
+                Ok(call(
+                    "c2",
+                    1,
+                    "read",
+                    &serde_json::json!({"path": elsewhere.path().join("outside.txt")}).to_string(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let mut engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+
+        let session_id = engine
+            .create_bound_session(&run, "arc")
+            .expect("create a bound session");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "read both", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let inside = resulted(&events[4]);
+        let outside = resulted(&events[5]);
+        assert_eq!(inside.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(inside.content, "hi");
+        assert_eq!(outside.outcome, ToolOutcome::Error as i32);
+        assert!(outside.content.contains("outside"), "{}", outside.content);
+    }
+
+    #[tokio::test]
+    async fn recorded_grants_win_over_a_changed_config() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("keep.txt"), "true colors").expect("write");
+        let changed_root = TempDir::new().expect("temp dir 2");
+
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let creating_provider = ScriptedProvider::scripted(vec![]);
+        let (creating_engine, run) = engine_with_tools(&creating_provider, &dir, registry);
+        let mut creating_engine = creating_engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let session_id = creating_engine
+            .create_bound_session(&run, "arc")
+            .expect("create a bound session");
+        drop(creating_engine);
+
+        let mut later_registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            later_registry.register(tool);
+        }
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "read",
+                    &serde_json::json!({"path": root.join("keep.txt")}).to_string(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let projects = projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(changed_root.path(), Mode::ReadWrite)],
+        );
+        let (mut engine, run) =
+            reopened_engine_with_projects(&provider, &dir, later_registry, projects);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, Some(&session_id), "read it", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(
+            result.content, "true colors",
+            "the session kept the grants recorded at creation, not the reconfigured ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_sessions_workspace_call_gets_the_no_workspace_error() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session_with_project("arc")]);
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "read",
+                    &serde_json::json!({"path": "/tmp/x"}).to_string(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("no access"),
+        ]);
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let projects = projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            Vec::new(),
+        );
+        let (mut engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, Some("s-01"), "read it", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("granted"), "{}", result.content);
     }
 }

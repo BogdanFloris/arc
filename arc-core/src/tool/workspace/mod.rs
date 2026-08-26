@@ -39,6 +39,7 @@ pub enum Access {
 }
 
 /// Every path-taking tool goes through `resolve`; a tool that skips it is a bug.
+#[derive(Debug)]
 pub struct Grants {
     roots: Vec<(PathBuf, Mode)>,
 }
@@ -50,6 +51,16 @@ impl Grants {
             .map(|grant| std::fs::canonicalize(&grant.root).map(|root| (root, grant.mode)))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Self { roots })
+    }
+
+    /// Roots recorded in the log are already canonical; a root that has since
+    /// drifted still fails closed because `resolve` canonicalizes the request.
+    pub fn from_recorded(roots: Vec<(PathBuf, Mode)>) -> Grants {
+        Self { roots }
+    }
+
+    pub fn canonical_roots(&self) -> &[(PathBuf, Mode)] {
+        &self.roots
     }
 
     pub fn resolve(&self, path: &str, access: Access) -> Result<PathBuf, String> {
@@ -107,14 +118,18 @@ impl Grants {
 }
 
 pub struct Workspace {
-    grants: Grants,
     reads: Mutex<HashMap<(String, PathBuf), u64>>,
 }
 
+impl Default for Workspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Workspace {
-    pub fn new(grants: Grants) -> Self {
+    pub fn new() -> Self {
         Self {
-            grants,
             reads: Mutex::new(HashMap::new()),
         }
     }
@@ -165,7 +180,7 @@ pub(crate) fn ensure_fresh(
 /// The workspace source: bash, read, write, edit, all gated through `Grants`.
 pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(bash::Bash::new(Arc::clone(&workspace))),
+        Box::new(bash::Bash::new()),
         Box::new(edit::Edit::new(Arc::clone(&workspace))),
         Box::new(read::Read::new(Arc::clone(&workspace))),
         Box::new(write::Write::new(workspace)),
@@ -184,10 +199,7 @@ mod tests {
 
     #[test]
     fn the_workspace_source_is_bash_edit_read_and_write() {
-        let dir = TempDir::new().expect("tmp");
-        let root = proj(&dir);
-        let grants = grants(&root, Mode::ReadWrite);
-        let tools = super::tools(std::sync::Arc::new(Workspace::new(grants)));
+        let tools = super::tools(std::sync::Arc::new(Workspace::new()));
 
         let names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
         assert_eq!(names, ["bash", "edit", "read", "write"]);

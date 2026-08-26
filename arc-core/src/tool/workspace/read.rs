@@ -67,7 +67,12 @@ impl Tool for Read {
                 }
             };
 
-            let resolved = match self.workspace.grants.resolve(&args.path, Access::Read) {
+            let Some(grants) = &ctx.grants else {
+                return ToolReply::error(
+                    "ERROR: no workspace is granted in this session.".to_owned(),
+                );
+            };
+            let resolved = match grants.resolve(&args.path, Access::Read) {
                 Ok(path) => path,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
             };
@@ -145,15 +150,16 @@ mod tests {
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
     use crate::tool::{Registry, Tool as _, ToolSource, TurnContext};
 
-    fn workspace(root: &std::path::Path, mode: Mode) -> Arc<Workspace> {
-        let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
-        Arc::new(Workspace::new(grants))
+    fn workspace() -> Arc<Workspace> {
+        Arc::new(Workspace::new())
     }
 
-    fn ctx(session_id: &str) -> TurnContext {
+    fn ctx(session_id: &str, root: &std::path::Path, mode: Mode) -> TurnContext {
+        let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
         TurnContext {
             session_id: session_id.to_owned(),
             turn_id: String::new(),
+            grants: Some(Arc::new(grants)),
         }
     }
 
@@ -165,11 +171,14 @@ mod tests {
     async fn a_happy_read_returns_the_file_verbatim() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "line one\nline two").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let reply = tool
-            .execute(args(&dir.path().join("f.txt")), ctx("s-1"))
+            .execute(
+                args(&dir.path().join("f.txt")),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+            )
             .await;
 
         assert!(reply.ok, "{}", reply.content);
@@ -177,11 +186,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unbound_session_is_a_named_error() {
+        let dir = TempDir::new().expect("tmp");
+        fs::write(dir.path().join("f.txt"), "hello").expect("write");
+        let tool = Read::new(workspace());
+
+        let reply = tool
+            .execute(args(&dir.path().join("f.txt")), TurnContext::default())
+            .await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("granted"), "{}", reply.content);
+    }
+
+    #[tokio::test]
     async fn a_paginated_window_ends_with_the_continue_marker() {
         let dir = TempDir::new().expect("tmp");
         let lines: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
         fs::write(dir.path().join("f.txt"), lines.join("\n")).expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let request = serde_json::json!({
@@ -190,7 +213,9 @@ mod tests {
             "limit": 3
         })
         .to_string();
-        let reply = tool.execute(request, ctx("s-1")).await;
+        let reply = tool
+            .execute(request, ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(
@@ -203,7 +228,7 @@ mod tests {
     async fn an_offset_past_the_end_of_file_is_a_named_error() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "only line").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let request = serde_json::json!({
@@ -211,7 +236,9 @@ mod tests {
             "offset": 50
         })
         .to_string();
-        let reply = tool.execute(request, ctx("s-1")).await;
+        let reply = tool
+            .execute(request, ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("beyond"), "{}", reply.content);
@@ -222,11 +249,14 @@ mod tests {
     async fn reading_a_directory_is_a_named_error() {
         let dir = TempDir::new().expect("tmp");
         fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let reply = tool
-            .execute(args(&dir.path().join("sub")), ctx("s-1"))
+            .execute(
+                args(&dir.path().join("sub")),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+            )
             .await;
 
         assert!(!reply.ok);
@@ -237,11 +267,14 @@ mod tests {
     async fn non_utf8_bytes_are_a_named_error() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.bin"), [0xff, 0xfe, 0x00, 0xff]).expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let reply = tool
-            .execute(args(&dir.path().join("f.bin")), ctx("s-1"))
+            .execute(
+                args(&dir.path().join("f.bin")),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+            )
             .await;
 
         assert!(!reply.ok);
@@ -251,11 +284,13 @@ mod tests {
     #[tokio::test]
     async fn a_missing_file_is_a_named_error() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(ws);
 
         let path = dir.path().join("nope.txt");
-        let reply = tool.execute(args(&path), ctx("s-1")).await;
+        let reply = tool
+            .execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
 
         assert!(!reply.ok);
         assert!(
@@ -269,11 +304,13 @@ mod tests {
     async fn a_successful_read_records_a_hash_for_the_session() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(Arc::clone(&ws));
 
         let path = dir.path().join("f.txt");
-        let reply = tool.execute(args(&path), ctx("s-1")).await;
+        let reply = tool
+            .execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
         assert!(reply.ok);
 
         let canonical = path.canonicalize().expect("canonicalize");
@@ -284,12 +321,14 @@ mod tests {
     async fn two_sessions_record_independent_hash_entries() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Read::new(Arc::clone(&ws));
 
         let path = dir.path().join("f.txt");
-        tool.execute(args(&path), ctx("s-1")).await;
-        tool.execute(args(&path), ctx("s-2")).await;
+        tool.execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
+        tool.execute(args(&path), ctx("s-2", dir.path(), Mode::ReadOnly))
+            .await;
 
         let canonical = path.canonicalize().expect("canonicalize");
         assert!(ws.recorded_hash("s-1", &canonical).is_some());
@@ -300,7 +339,7 @@ mod tests {
     async fn the_read_tool_dispatches_through_the_registry_by_source() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let mut registry = Registry::new(32 * 1024);
         registry.register(Box::new(Read::new(ws)));
 
@@ -310,14 +349,19 @@ mod tests {
             .dispatch(
                 "read",
                 request.clone(),
-                ctx("s-1"),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
                 &[ToolSource::Workspace],
             )
             .await;
         assert!(present.ok, "{}", present.content);
 
         let absent = registry
-            .dispatch("read", request, ctx("s-1"), &[ToolSource::Builtin])
+            .dispatch(
+                "read",
+                request,
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+                &[ToolSource::Builtin],
+            )
             .await;
         assert!(!absent.ok);
         assert_eq!(

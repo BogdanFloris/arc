@@ -63,7 +63,12 @@ impl Tool for Write {
                 }
             };
 
-            let resolved = match self.workspace.grants.resolve(&args.path, Access::Write) {
+            let Some(grants) = &ctx.grants else {
+                return ToolReply::error(
+                    "ERROR: no workspace is granted in this session.".to_owned(),
+                );
+            };
+            let resolved = match grants.resolve(&args.path, Access::Write) {
                 Ok(path) => path,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
             };
@@ -123,15 +128,16 @@ mod tests {
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
     use crate::tool::{Registry, Tool as _, ToolSource, TurnContext};
 
-    fn workspace(root: &std::path::Path, mode: Mode) -> Arc<Workspace> {
-        let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
-        Arc::new(Workspace::new(grants))
+    fn workspace() -> Arc<Workspace> {
+        Arc::new(Workspace::new())
     }
 
-    fn ctx(session_id: &str) -> TurnContext {
+    fn ctx(session_id: &str, root: &std::path::Path, mode: Mode) -> TurnContext {
+        let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
         TurnContext {
             session_id: session_id.to_owned(),
             turn_id: String::new(),
+            grants: Some(Arc::new(grants)),
         }
     }
 
@@ -146,11 +152,16 @@ mod tests {
     #[tokio::test]
     async fn writing_a_new_file_succeeds_and_its_hash_lets_an_immediate_edit_proceed() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let tool = Write::new(Arc::clone(&ws));
 
         let path = dir.path().join("new.txt");
-        let reply = tool.execute(write_args(&path, "hello"), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, "hello"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
 
         assert!(reply.ok, "{}", reply.content);
         assert!(reply.content.contains("5 bytes"), "{}", reply.content);
@@ -161,14 +172,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unbound_session_is_a_named_error() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Write::new(workspace());
+
+        let path = dir.path().join("new.txt");
+        let reply = tool
+            .execute(write_args(&path, "hello"), TurnContext::default())
+            .await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("granted"), "{}", reply.content);
+    }
+
+    #[tokio::test]
     async fn overwriting_without_a_prior_read_is_refused_with_the_read_first_message() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "original").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let tool = Write::new(ws);
 
         let path = dir.path().join("f.txt");
-        let reply = tool.execute(write_args(&path, "new"), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, "new"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
 
         assert!(!reply.ok);
         assert!(
@@ -183,16 +213,21 @@ mod tests {
     async fn overwriting_after_a_read_succeeds() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "original").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let read_tool = Read::new(Arc::clone(&ws));
         let write_tool = Write::new(Arc::clone(&ws));
 
         let path = dir.path().join("f.txt");
-        let read_reply = read_tool.execute(read_args(&path), ctx("s-1")).await;
+        let read_reply = read_tool
+            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
+            .await;
         assert!(read_reply.ok, "{}", read_reply.content);
 
         let write_reply = write_tool
-            .execute(write_args(&path, "updated"), ctx("s-1"))
+            .execute(
+                write_args(&path, "updated"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
             .await;
 
         assert!(write_reply.ok, "{}", write_reply.content);
@@ -204,17 +239,22 @@ mod tests {
         let dir = TempDir::new().expect("tmp");
         let path = dir.path().join("f.txt");
         fs::write(&path, "original").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let read_tool = Read::new(Arc::clone(&ws));
         let write_tool = Write::new(Arc::clone(&ws));
 
-        let read_reply = read_tool.execute(read_args(&path), ctx("s-1")).await;
+        let read_reply = read_tool
+            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
+            .await;
         assert!(read_reply.ok, "{}", read_reply.content);
 
         fs::write(&path, "changed by someone else").expect("write underneath");
 
         let write_reply = write_tool
-            .execute(write_args(&path, "my update"), ctx("s-1"))
+            .execute(
+                write_args(&path, "my update"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
             .await;
 
         assert!(!write_reply.ok);
@@ -233,11 +273,16 @@ mod tests {
     async fn writing_into_a_read_only_grant_is_the_gates_refusal() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.txt"), "x").expect("write");
-        let ws = workspace(dir.path(), Mode::ReadOnly);
+        let ws = workspace();
         let tool = Write::new(ws);
 
         let path = dir.path().join("f.txt");
-        let reply = tool.execute(write_args(&path, "y"), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, "y"),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+            )
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("read-only"), "{}", reply.content);
@@ -247,11 +292,16 @@ mod tests {
     async fn writing_outside_all_grants_is_refused() {
         let dir = TempDir::new().expect("tmp");
         let elsewhere = TempDir::new().expect("tmp2");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let tool = Write::new(ws);
 
         let path = elsewhere.path().join("f.txt");
-        let reply = tool.execute(write_args(&path, "y"), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, "y"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("outside"), "{}", reply.content);
@@ -260,11 +310,16 @@ mod tests {
     #[tokio::test]
     async fn writing_with_a_nonexistent_parent_is_the_gates_error() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let tool = Write::new(ws);
 
         let path = dir.path().join("missing_dir").join("f.txt");
-        let reply = tool.execute(write_args(&path, "y"), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, "y"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains("parent"), "{}", reply.content);
@@ -273,13 +328,16 @@ mod tests {
     #[tokio::test]
     async fn writing_then_immediately_editing_succeeds_off_the_re_recorded_hash() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let write_tool = Write::new(Arc::clone(&ws));
         let edit_tool = crate::tool::workspace::edit::Edit::new(Arc::clone(&ws));
 
         let path = dir.path().join("f.txt");
         let write_reply = write_tool
-            .execute(write_args(&path, "hello"), ctx("s-1"))
+            .execute(
+                write_args(&path, "hello"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
             .await;
         assert!(write_reply.ok, "{}", write_reply.content);
 
@@ -289,7 +347,9 @@ mod tests {
             "new": "goodbye"
         })
         .to_string();
-        let edit_reply = edit_tool.execute(edit_request, ctx("s-1")).await;
+        let edit_reply = edit_tool
+            .execute(edit_request, ctx("s-1", dir.path(), Mode::ReadWrite))
+            .await;
 
         assert!(edit_reply.ok, "{}", edit_reply.content);
         assert_eq!(fs::read_to_string(&path).expect("read back"), "goodbye");
@@ -298,11 +358,16 @@ mod tests {
     #[tokio::test]
     async fn writing_empty_content_is_allowed() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let tool = Write::new(ws);
 
         let path = dir.path().join("empty.txt");
-        let reply = tool.execute(write_args(&path, ""), ctx("s-1")).await;
+        let reply = tool
+            .execute(
+                write_args(&path, ""),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(fs::read_to_string(&path).expect("read back"), "");
@@ -311,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn the_write_tool_dispatches_through_the_registry_by_source() {
         let dir = TempDir::new().expect("tmp");
-        let ws = workspace(dir.path(), Mode::ReadWrite);
+        let ws = workspace();
         let mut registry = Registry::new(32 * 1024);
         registry.register(Box::new(Write::new(ws)));
 
@@ -322,7 +387,7 @@ mod tests {
             .dispatch(
                 "write",
                 request.clone(),
-                ctx("s-1"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
                 &[ToolSource::Workspace],
             )
             .await;
@@ -330,7 +395,12 @@ mod tests {
 
         fs::remove_file(&path).expect("cleanup");
         let absent = registry
-            .dispatch("write", request, ctx("s-1"), &[ToolSource::Builtin])
+            .dispatch(
+                "write",
+                request,
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+                &[ToolSource::Builtin],
+            )
             .await;
         assert!(!absent.ok);
         assert_eq!(
