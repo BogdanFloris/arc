@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_core::provider::role_label;
+use arc_core::provider::{Usage, role_label};
 use arc_core::session::{DispatchedJob, Engine, Runner};
-use arc_proto::v1::SessionRole;
+use arc_proto::v1::{Budget, SessionRole};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 const EVENT_BUFFER: usize = 64;
@@ -89,12 +90,24 @@ async fn run_job(
     live: Arc<LiveMap>,
 ) {
     let session_id = job.session_id.clone();
-    if !run_turn(&engine, &runner, &session_id, &job.brief).await {
-        finish_after_failure(&live, &mut steer_rx, &session_id);
-        return;
+    let start = Instant::now();
+    let mut spent_tokens: u64 = 0;
+
+    match run_turn(&engine, &runner, &session_id, &job.brief).await {
+        TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
+        TurnOutcome::Failure => {
+            finish_now(&live, &mut steer_rx, &session_id);
+            return;
+        }
     }
 
     loop {
+        if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
+            warn_over_budget(&session_id, &breach);
+            finish_now(&live, &mut steer_rx, &session_id);
+            return;
+        }
+
         let steered = match steer_rx.try_recv() {
             Ok(text) => Some(text),
             Err(mpsc::error::TryRecvError::Disconnected) => None,
@@ -109,16 +122,73 @@ async fn run_job(
             }
         };
         let Some(text) = steered else { break };
-        if !run_turn(&engine, &runner, &session_id, &text).await {
-            finish_after_failure(&live, &mut steer_rx, &session_id);
-            return;
+        match run_turn(&engine, &runner, &session_id, &text).await {
+            TurnOutcome::Success(usage) => spent_tokens += usage_tokens(usage),
+            TurnOutcome::Failure => {
+                finish_now(&live, &mut steer_rx, &session_id);
+                return;
+            }
         }
     }
 }
 
-/// Runs one turn to completion; `true` on success. A failed turn ends the
-/// job, so the caller stops draining steers.
-async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str) -> bool {
+/// A completed turn's outcome. A failed turn ends the job, so the caller
+/// stops draining steers; a successful turn carries whatever usage the
+/// provider reported, which may itself be absent.
+enum TurnOutcome {
+    Success(Option<Usage>),
+    Failure,
+}
+
+fn usage_tokens(usage: Option<Usage>) -> u64 {
+    usage.map_or(0, |usage| {
+        u64::from(usage.input_tokens) + u64::from(usage.output_tokens)
+    })
+}
+
+/// Which dimension of a job's budget it went over, and by how much.
+enum BudgetBreach {
+    Tokens { spent: u64, allowed: u64 },
+    WallClock { elapsed: u64, allowed: u64 },
+}
+
+/// A zero field means that dimension is unlimited.
+fn budget_breach(
+    budget: Option<&Budget>,
+    spent_tokens: u64,
+    elapsed: Duration,
+) -> Option<BudgetBreach> {
+    let budget = budget?;
+    if budget.total_tokens > 0 && spent_tokens >= budget.total_tokens {
+        return Some(BudgetBreach::Tokens {
+            spent: spent_tokens,
+            allowed: budget.total_tokens,
+        });
+    }
+    if budget.wall_clock_seconds > 0 && elapsed.as_secs() >= u64::from(budget.wall_clock_seconds) {
+        return Some(BudgetBreach::WallClock {
+            elapsed: elapsed.as_secs(),
+            allowed: u64::from(budget.wall_clock_seconds),
+        });
+    }
+    None
+}
+
+fn warn_over_budget(session_id: &str, breach: &BudgetBreach) {
+    match breach {
+        BudgetBreach::Tokens { spent, allowed } => warn!(
+            session_id,
+            spent, allowed, "job over its token budget; stopping at the next turn boundary"
+        ),
+        BudgetBreach::WallClock { elapsed, allowed } => warn!(
+            session_id,
+            elapsed, allowed, "job over its wall-clock budget; stopping at the next turn boundary"
+        ),
+    }
+}
+
+/// Runs one turn to completion.
+async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
     let (result, ()) = tokio::join!(
         engine.send_message(runner, Some(session_id), text, events),
@@ -132,23 +202,22 @@ async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str
         Ok(reply) => {
             info!(
                 session_id = %session_id,
+                input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
                 output_tokens = reply.usage.map_or(0, |usage| usage.output_tokens),
                 "job turn completed"
             );
-            true
+            TurnOutcome::Success(reply.usage)
         }
         Err(error) => {
             warn!(session_id = %session_id, %error, "job turn failed");
-            false
+            TurnOutcome::Failure
         }
     }
 }
 
-fn finish_after_failure(
-    live: &LiveMap,
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
-    session_id: &str,
-) {
+/// Ends a job now: removes its live entry and drops whatever steers are
+/// still queued, exactly as a failed turn or an over-budget job must.
+fn finish_now(live: &LiveMap, steer_rx: &mut mpsc::UnboundedReceiver<String>, session_id: &str) {
     live.lock().expect("live").remove(session_id);
     let mut dropped = 0_usize;
     while steer_rx.try_recv().is_ok() {
@@ -157,7 +226,7 @@ fn finish_after_failure(
     if dropped > 0 {
         warn!(
             session_id,
-            dropped, "dropping queued steers after a failed job turn"
+            dropped, "dropping queued steers as the job finishes"
         );
     }
 }
@@ -200,6 +269,7 @@ mod tests {
             session_id: "s-ghost".to_owned(),
             role: SessionRole::Concierge,
             brief: "never runs".to_owned(),
+            budget: None,
         });
         supervisor.shutdown().await;
 
@@ -246,6 +316,7 @@ mod tests {
             session_id: child_id.clone(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
+            budget: None,
         });
         supervisor.shutdown().await;
 
@@ -348,6 +419,7 @@ mod tests {
             session_id: child_id.clone(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
+            budget: None,
         });
 
         // the brief's user message lands as soon as the turn opens, before
@@ -405,6 +477,10 @@ mod tests {
             session_id: child_id.clone(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 100_000,
+                wall_clock_seconds: 0,
+            }),
         });
 
         // both steers are enqueued while the brief turn is still gated, so
@@ -453,6 +529,7 @@ mod tests {
             session_id: child_id.clone(),
             role: SessionRole::Executor,
             brief: "fix the failing test".to_owned(),
+            budget: None,
         });
 
         // queued while the failing turn is still gated open
@@ -469,6 +546,245 @@ mod tests {
             child_user_messages(dir.path(), &child_id),
             [(Role::User, "fix the failing test".to_owned())],
             "the queued steer was dropped, not processed, after the failed turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_budget_smaller_than_the_brief_turns_usage_stops_the_job_after_that_turn() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&notify),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        // usage() reports 8 tokens combined; a cap of 5 is over budget as
+        // soon as the brief turn lands, before any steer is even queued
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 5,
+                wall_clock_seconds: 0,
+            }),
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(
+            supervisor.steer(&child_id, "too late"),
+            "the job is still live when queued"
+        );
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert!(
+            !supervisor.steer(&child_id, "later still"),
+            "the over-budget job removed its live entry"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "working".to_owned()),
+            ],
+            "the brief turn ran to completion; the queued steer was dropped, not processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generous_token_budget_does_not_trip_and_steers_run_normally() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("steer reply")),
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 100_000,
+                wall_clock_seconds: 3600,
+            }),
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "also check the linter"));
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "on it".to_owned()),
+                (Role::User, "also check the linter".to_owned()),
+                (Role::Assistant, "steer reply".to_owned()),
+            ],
+            "a budget with plenty of headroom never trips"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wall_clock_only_budget_stops_the_job_once_elapsed_time_exceeds_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        tokio::time::pause();
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("first".to_owned()))],
+            notify: Arc::clone(&notify),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        // total_tokens: 0 means the token dimension is unlimited; only
+        // wall-clock is enforced
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 0,
+                wall_clock_seconds: 1,
+            }),
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(
+            supervisor.steer(&child_id, "too late"),
+            "the job is still live when queued"
+        );
+        // the job task is gated on a Notify, not a timer, so advancing the
+        // paused clock here only changes what its Instant::elapsed() later
+        // reports, it does not let the task run ahead
+        tokio::time::advance(Duration::from_secs(2)).await;
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert!(
+            !supervisor.steer(&child_id, "later still"),
+            "the over-budget job removed its live entry"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "first".to_owned()),
+            ],
+            "the brief turn ran to completion; the queued steer was dropped, not processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_accumulates_across_turns_and_stops_the_job_once_the_combined_total_crosses_the_cap()
+     {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("first steer done")),
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        // usage() reports 8 tokens per turn: the brief alone (8) stays under
+        // a cap of 10, but the brief plus the first steer (16) crosses it,
+        // so the check before the second steer is what stops the job
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            role: SessionRole::Executor,
+            brief: "fix the failing test".to_owned(),
+            budget: Some(Budget {
+                total_tokens: 10,
+                wall_clock_seconds: 0,
+            }),
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "first steer"));
+        assert!(supervisor.steer(&child_id, "second steer"));
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert!(
+            !supervisor.steer(&child_id, "third steer"),
+            "the over-budget job removed its live entry"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "on it".to_owned()),
+                (Role::User, "first steer".to_owned()),
+                (Role::Assistant, "first steer done".to_owned()),
+            ],
+            "the first steer ran; the second never did once the combined usage crossed the cap"
         );
     }
 }

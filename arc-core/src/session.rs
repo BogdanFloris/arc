@@ -87,6 +87,7 @@ pub struct DispatchedJob {
     pub session_id: String,
     pub role: SessionRole,
     pub brief: String,
+    pub budget: Option<Budget>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,7 +258,8 @@ impl Engine {
         let role = job_request.role;
         let project = job_request.project;
         let brief = job_request.brief;
-        match self.create_bound_session(runner, &project, role, job_request.budget) {
+        let budget = job_request.budget;
+        match self.create_bound_session(runner, &project, role, budget) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
@@ -269,6 +271,7 @@ impl Engine {
                     session_id: child_id,
                     role,
                     brief,
+                    budget,
                 }),
             ),
             Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
@@ -3194,7 +3197,12 @@ mod tests {
                 session_id: child.session_id.clone(),
                 role: SessionRole::Executor,
                 brief: "fix the bug".to_owned(),
-            }]
+                budget: Some(Budget {
+                    total_tokens: 500,
+                    wall_clock_seconds: 600,
+                }),
+            }],
+            "the budget on the job request lands on the dispatched job, matching the child's own recorded budget"
         );
         assert_eq!(
             child.budget,
