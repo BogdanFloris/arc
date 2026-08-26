@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod workspace;
 
 use std::collections::BTreeMap;
 use std::future::Future;
