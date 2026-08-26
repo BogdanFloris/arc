@@ -2,8 +2,9 @@ use arc_proto::v1::{JobInfo, SessionRole, job_info};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block as Panel, Borders, Clear, Paragraph};
 
 use crate::app::{App, Block, Mode, Status, format_tokens};
 use crate::{markdown, theme};
@@ -404,24 +405,56 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Picker) {
-    let sessions = app.picker_rows();
-    let rows = sessions.len() + 1;
-    let width = 64.min(full.width.saturating_sub(4));
-    let height = u16::try_from(rows + 3)
-        .unwrap_or(u16::MAX)
-        .min(full.height.saturating_sub(2));
+const POPUP_BORDER: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+// every popup shares one frame: ASCII border, dim, name in the top rule
+fn popup(frame: &mut Frame, full: Rect, want_width: u16, content: u16, title: &str) -> Rect {
+    let width = want_width.min(full.width.saturating_sub(4));
+    let height = content
+        .saturating_add(2)
+        .min(full.height.saturating_sub(2))
+        .max(3);
     let area = Rect {
-        x: (full.width - width) / 2,
-        y: (full.height - height) / 2,
+        x: (full.width.saturating_sub(width)) / 2,
+        y: (full.height.saturating_sub(height)) / 2,
         width,
         height,
     };
     frame.render_widget(Clear, area);
+    let block = Panel::new()
+        .borders(Borders::ALL)
+        .border_set(POPUP_BORDER)
+        .border_style(theme::ACCENT)
+        .title(Span::styled(format!(" {title} "), theme::ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Picker) {
+    let sessions = app.picker_rows();
+    let rows = sessions.len() + 1;
+    let area = popup(
+        frame,
+        full,
+        64,
+        u16::try_from(rows).unwrap_or(u16::MAX),
+        "sessions",
+    );
+    let width = area.width;
 
     let now = chrono::Utc::now();
-    let mut lines = vec![Line::styled(" sessions", theme::DIM), Line::default()];
-    let visible = (height as usize).saturating_sub(3);
+    let mut lines = Vec::new();
+    let visible = area.height as usize;
     let start = picker.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(TIME_WIDTH + 5);
     for row in start..rows.min(start + visible) {
@@ -447,23 +480,21 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
 
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
     let rows = review.items.len().max(1);
-    let width = 72.min(full.width.saturating_sub(4));
+    let inner_width = 72.min(full.width.saturating_sub(4)).saturating_sub(2);
     let detail = review
         .items
         .get(review.selected)
-        .map_or(0, |entry| detail_height(entry, width));
-    let height = u16::try_from(rows + 3 + detail)
-        .unwrap_or(u16::MAX)
-        .min(full.height.saturating_sub(2));
-    let area = Rect {
-        x: (full.width - width) / 2,
-        y: (full.height - height) / 2,
-        width,
-        height,
-    };
-    frame.render_widget(Clear, area);
+        .map_or(0, |entry| detail_height(entry, inner_width));
+    let area = popup(
+        frame,
+        full,
+        72,
+        u16::try_from(rows + detail).unwrap_or(u16::MAX),
+        "review",
+    );
+    let width = area.width;
 
-    let mut lines = vec![Line::styled(" review", theme::DIM), Line::default()];
+    let mut lines = Vec::new();
     if review.items.is_empty() {
         let word = if review.loaded {
             "nothing to review"
@@ -475,7 +506,7 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         return;
     }
 
-    let visible = (height as usize).saturating_sub(3 + detail);
+    let visible = (area.height as usize).saturating_sub(detail);
     let start = review.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(ID_WIDTH + 5);
     let end = review.items.len().min(start + visible);
@@ -528,19 +559,16 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
 fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
     let footer = usize::from(jobs.confirmation.is_some());
     let rows = jobs.items.len().max(1);
-    let width = 72.min(full.width.saturating_sub(4));
-    let height = u16::try_from(rows + 3 + footer)
-        .unwrap_or(u16::MAX)
-        .min(full.height.saturating_sub(2));
-    let area = Rect {
-        x: (full.width - width) / 2,
-        y: (full.height - height) / 2,
-        width,
-        height,
-    };
-    frame.render_widget(Clear, area);
+    let area = popup(
+        frame,
+        full,
+        72,
+        u16::try_from(rows + footer).unwrap_or(u16::MAX),
+        "jobs",
+    );
+    let width = area.width;
 
-    let mut lines = vec![Line::styled(" jobs", theme::DIM), Line::default()];
+    let mut lines = Vec::new();
     if jobs.items.is_empty() {
         let word = if jobs.loaded {
             "no jobs this daemon"
@@ -555,7 +583,7 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
         return;
     }
 
-    let visible = (height as usize).saturating_sub(3);
+    let visible = (area.height as usize).saturating_sub(footer);
     let start = jobs.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(ID_WIDTH + 5);
     let end = jobs.items.len().min(start + visible);
@@ -652,7 +680,7 @@ const HELP: &[(&str, &[&str])] = &[
 ];
 
 fn draw_help(frame: &mut Frame, full: Rect) {
-    let mut lines = vec![Line::styled(" help", theme::DIM), Line::default()];
+    let mut lines = Vec::new();
     for (i, (group, keys)) in HELP.iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
@@ -663,25 +691,12 @@ fn draw_help(frame: &mut Frame, full: Rect) {
         }
     }
 
-    let width = 60.min(full.width.saturating_sub(4));
-    let max_height = full.height.saturating_sub(2);
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let (height, overflow) = if total > max_height {
-        (max_height, true)
-    } else {
-        (total, false)
-    };
-    if overflow {
-        lines.truncate(height.saturating_sub(1) as usize);
+    let area = popup(frame, full, 60, total, "help");
+    if (area.height as usize) < lines.len() {
+        lines.truncate((area.height as usize).saturating_sub(1));
         lines.push(Line::styled("   ...", theme::DIM));
     }
-    let area = Rect {
-        x: (full.width - width) / 2,
-        y: (full.height - height) / 2,
-        width,
-        height,
-    };
-    frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines), area);
 }
 
