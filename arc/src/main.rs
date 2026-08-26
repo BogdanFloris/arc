@@ -5,6 +5,7 @@
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     clippy::needless_raw_string_hashes,
+    clippy::struct_excessive_bools,
     clippy::too_many_lines
 )]
 

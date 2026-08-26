@@ -94,6 +94,13 @@ pub struct Review {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub selected: usize,
+    /// True while the input line is owned by the filter query.
+    pub filtering: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Jobs {
     pub items: Vec<JobInfo>,
     pub selected: usize,
@@ -158,9 +165,10 @@ pub struct App {
     pending: Option<char>,
     pub session_id: Option<String>,
     pub sessions: Vec<SessionInfo>,
-    pub picker: Option<usize>,
+    pub picker: Option<Picker>,
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
+    pub help: bool,
     pub status: Status,
     pub last_error: Option<String>,
     pub queued: VecDeque<String>,
@@ -173,6 +181,7 @@ pub struct App {
     strip_since: Instant,
     refetch_in_flight: bool,
     steer_stash: Option<String>,
+    picker_filter_stash: Option<String>,
     /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
 }
@@ -191,6 +200,7 @@ impl App {
             picker: None,
             review: None,
             jobs: None,
+            help: false,
             status: Status::Idle,
             last_error: None,
             queued: VecDeque::new(),
@@ -202,6 +212,7 @@ impl App {
             strip_since: Instant::now(),
             refetch_in_flight: false,
             steer_stash: None,
+            picker_filter_stash: None,
             steer_turn_pending: false,
         }
     }
@@ -224,13 +235,8 @@ impl App {
             };
             return;
         }
-        if let Some(selected) = self.picker {
-            let last = self.sessions.len();
-            self.picker = Some(if up {
-                selected.saturating_sub(1)
-            } else {
-                (selected + 1).min(last)
-            });
+        if self.picker.is_some() {
+            self.move_picker_selection(up);
             return;
         }
         self.scroll_back = if up {
@@ -254,6 +260,9 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.on_control(key.code);
+        }
+        if self.help {
+            return self.on_help_key(key.code);
         }
         if self.review.is_some() {
             return self.on_review_key(key.code);
@@ -281,9 +290,17 @@ impl App {
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
             }
+            KeyCode::Char('j') if self.mode == Mode::Insert && self.picker.is_none() => {
+                self.insert_newline();
+            }
             _ => {}
         }
         None
+    }
+
+    fn insert_newline(&mut self) {
+        self.input.insert(self.cursor, '\n');
+        self.cursor += '\n'.len_utf8();
     }
 
     fn on_insert(&mut self, code: KeyCode) -> Option<Command> {
@@ -395,6 +412,7 @@ impl App {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
                     "jobs" => return Some(self.open_jobs()),
+                    "help" => self.help = true,
                     _ => self.last_error = Some("E492".to_owned()),
                 }
             }
@@ -461,6 +479,13 @@ impl App {
         let entry = review.items.remove(review.selected);
         review.selected = review.selected.min(review.items.len().saturating_sub(1));
         Some(entry.id)
+    }
+
+    fn on_help_key(&mut self, code: KeyCode) -> Option<Command> {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.help = false;
+        }
+        None
     }
 
     fn open_jobs(&mut self) -> Command {
@@ -547,16 +572,15 @@ impl App {
     }
 
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
-        let selected = self.picker.expect("picker is open");
-        let last = self.sessions.len();
+        if self.picker.as_ref().expect("picker is open").filtering {
+            return self.on_picker_filter_key(code);
+        }
+        let selected = self.picker.as_ref().expect("picker is open").selected;
         match code {
             KeyCode::Esc => self.picker = None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.picker = Some(selected.saturating_sub(1));
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.picker = Some((selected + 1).min(last));
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_picker_selection(true),
+            KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
+            KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
                 self.picker = None;
@@ -567,15 +591,88 @@ impl App {
         None
     }
 
+    /// The filter query lives in `self.input`, same mechanism as the steer prompt.
+    fn on_picker_filter_key(&mut self, code: KeyCode) -> Option<Command> {
+        match code {
+            KeyCode::Esc => self.cancel_picker_filter(),
+            KeyCode::Enter => return self.open_filtered_session(),
+            KeyCode::Up => self.move_picker_selection(true),
+            KeyCode::Down => self.move_picker_selection(false),
+            _ => {
+                self.edit_input(code);
+                self.clamp_picker_selection();
+            }
+        }
+        None
+    }
+
+    fn start_picker_filter(&mut self) {
+        self.picker_filter_stash = Some(std::mem::take(&mut self.input));
+        self.cursor = 0;
+        self.picker.as_mut().expect("picker is open").filtering = true;
+    }
+
+    fn cancel_picker_filter(&mut self) {
+        self.picker.as_mut().expect("picker is open").filtering = false;
+        self.input = self.picker_filter_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+        self.clamp_picker_selection();
+    }
+
+    fn open_filtered_session(&mut self) -> Option<Command> {
+        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let chosen = self.picker_session(selected).map(|s| s.id.clone());
+        self.picker = None;
+        self.input = self.picker_filter_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+        self.start_session(chosen)
+    }
+
+    fn move_picker_selection(&mut self, up: bool) {
+        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let last = self.picker_rows().len();
+        self.picker.as_mut().expect("picker is open").selected = if up {
+            selected.saturating_sub(1)
+        } else {
+            (selected + 1).min(last)
+        };
+    }
+
+    fn clamp_picker_selection(&mut self) {
+        let last = self.picker_rows().len();
+        let picker = self.picker.as_mut().expect("picker is open");
+        picker.selected = picker.selected.min(last);
+    }
+
     fn open_picker(&mut self) {
         if self.status != Status::Streaming && self.review.is_none() && self.jobs.is_none() {
-            self.picker = Some(0);
+            self.picker = Some(Picker {
+                selected: 0,
+                filtering: false,
+            });
         }
     }
 
     pub fn picker_session(&self, row: usize) -> Option<&SessionInfo> {
+        row.checked_sub(1)
+            .and_then(|i| self.picker_rows().get(i).copied())
+    }
+
+    /// The session list in recency order, narrowed by the active filter query if any.
+    pub fn picker_rows(&self) -> Vec<&SessionInfo> {
         let order = self.by_recency();
-        row.checked_sub(1).and_then(|i| order.get(i).copied())
+        let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
+        if !filtering || self.input.is_empty() {
+            return order;
+        }
+        let needle = self.input.to_lowercase();
+        order
+            .into_iter()
+            .filter(|session| {
+                session.title.to_lowercase().contains(&needle)
+                    || session.preview.to_lowercase().contains(&needle)
+            })
+            .collect()
     }
 
     /// The most recently touched running job, if any; the strip's subject.
@@ -1026,6 +1123,20 @@ mod tests {
             preview: String::new(),
             last_at: None,
         }
+    }
+
+    fn session_with(id: &str, title: &str, preview: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            started_at: None,
+            preview: preview.to_owned(),
+            last_at: None,
+        }
+    }
+
+    fn picker_selected(app: &App) -> Option<usize> {
+        app.picker.as_ref().map(|picker| picker.selected)
     }
 
     fn end(partial: bool) -> NetEvent {
@@ -1790,14 +1901,22 @@ mod tests {
         normal(&mut app, "s");
 
         app.on_scroll(false, PAGE);
-        assert_eq!(app.picker, Some(1), "one row per gesture, not one page");
+        assert_eq!(
+            picker_selected(&app),
+            Some(1),
+            "one row per gesture, not one page"
+        );
         app.on_scroll(false, PAGE);
-        assert_eq!(app.picker, Some(2));
+        assert_eq!(picker_selected(&app), Some(2));
         app.on_scroll(false, PAGE);
-        assert_eq!(app.picker, Some(2), "and it stops at the last session");
+        assert_eq!(
+            picker_selected(&app),
+            Some(2),
+            "and it stops at the last session"
+        );
 
         app.on_scroll(true, PAGE);
-        assert_eq!(app.picker, Some(1));
+        assert_eq!(picker_selected(&app), Some(1));
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
@@ -1820,7 +1939,7 @@ mod tests {
         app.on_net(NetEvent::Sessions(vec![session("old"), session("new")]));
 
         normal(&mut app, "s");
-        assert_eq!(app.picker, Some(0));
+        assert_eq!(picker_selected(&app), Some(0));
         assert_eq!(app.picker_session(1).map(|s| s.id.as_str()), Some("new"));
         assert_eq!(app.picker_session(2).map(|s| s.id.as_str()), Some("old"));
 
@@ -2011,6 +2130,139 @@ mod tests {
         assert_eq!(app.picker, None);
         normal(&mut app, "s");
         assert_eq!(app.picker, None);
+    }
+
+    #[test]
+    fn filter_narrows_the_picker_and_enter_opens_the_narrowed_selection() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("keep-a", "alpha topic", ""),
+            session_with("skip", "beta topic", ""),
+            session_with("keep-b", "", "another alpha mention"),
+        ]));
+        normal(&mut app, "s");
+        assert_eq!(app.on_key(key(KeyCode::Char('/'))), None);
+        typed(&mut app, "alpha");
+
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keep-a", "keep-b"],
+            "only sessions matching the query remain"
+        );
+
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.picker, None);
+        assert_eq!(app.session_id.as_deref(), Some("keep-b"));
+        assert_eq!(
+            command,
+            Some(Command::History {
+                session_id: "keep-b".to_owned()
+            }),
+            "enter opens the row as numbered in the narrowed list"
+        );
+    }
+
+    #[test]
+    fn filter_esc_restores_the_full_list_and_the_draft() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("keep-a", "alpha topic", ""),
+            session_with("skip", "beta topic", ""),
+        ]));
+        app.input = "draft reply".to_owned();
+        app.cursor = app.input.len();
+
+        app.on_key(ctrl('p'));
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "alpha");
+        assert_eq!(app.picker_rows().len(), 1);
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+
+        assert!(
+            !app.picker.as_ref().expect("picker still open").filtering,
+            "esc exits filtering, not the picker"
+        );
+        assert_eq!(app.picker_rows().len(), 2, "the full list is back");
+        assert_eq!(app.input, "draft reply", "the stashed draft comes back");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_in_insert_mode_and_submit_carries_it() {
+        let mut app = App::new();
+        typed(&mut app, "line one");
+        assert_eq!(app.on_key(ctrl('j')), None);
+        typed(&mut app, "line two");
+
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::Send {
+                session_id: None,
+                content: "line one\nline two".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_j_does_nothing_in_cmd_mode() {
+        let mut app = App::new();
+        normal(&mut app, ":review");
+        assert_eq!(app.mode, Mode::Cmd);
+
+        assert_eq!(app.on_key(ctrl('j')), None);
+
+        assert_eq!(app.cmd, "review", "ctrl-j did not touch the command line");
+    }
+
+    #[test]
+    fn ctrl_j_does_nothing_while_steering() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.jobs.as_ref().expect("open").steering.is_some());
+
+        assert_eq!(app.on_key(ctrl('j')), None);
+
+        assert_eq!(app.input, "", "ctrl-j did not touch the steer input");
+    }
+
+    #[test]
+    fn colon_help_opens_the_popup_and_q_closes_it() {
+        let mut app = App::new();
+        normal(&mut app, ":help");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, None);
+        assert!(app.help);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.last_error, None, ":help is a command, not E492");
+
+        assert_eq!(app.on_key(key(KeyCode::Char('q'))), None);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn unknown_keys_in_the_help_popup_do_not_crash() {
+        let mut app = App::new();
+        normal(&mut app, ":help");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.on_key(key(KeyCode::Char('z'))), None);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert!(app.help, "still open");
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        assert!(!app.help, "esc closes it too");
     }
 
     #[test]

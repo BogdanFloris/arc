@@ -51,14 +51,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, inset(body), app);
     draw_rule(frame, rule, app);
     draw_input(frame, inset(input), app);
-    if let Some(selected) = app.picker {
-        draw_picker(frame, frame.area(), app, selected);
+    if let Some(picker) = &app.picker {
+        draw_picker(frame, frame.area(), app, picker);
     }
     if let Some(review) = &app.review {
         draw_review(frame, frame.area(), review);
     }
     if let Some(jobs) = &app.jobs {
         draw_jobs(frame, frame.area(), jobs);
+    }
+    if app.help {
+        draw_help(frame, frame.area());
     }
 }
 
@@ -283,6 +286,39 @@ fn draw_strip(frame: &mut Frame, area: Rect, app: &App, job: &JobInfo) {
 
 const INPUT_ROWS_CAP: u16 = 8;
 
+// walks the char stream once, tracking both the wrapped rows and where the
+// cursor lands, so an embedded newline and a width wrap agree on the row
+fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut col = 0usize;
+    let mut cursor = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '\n' && col == width {
+            rows.push(String::new());
+            col = 0;
+        }
+        if i == cursor_index {
+            cursor = Some((rows.len() - 1, col));
+        }
+        if c == '\n' {
+            rows.push(String::new());
+            col = 0;
+        } else {
+            rows.last_mut().expect("at least one row").push(c);
+            col += 1;
+        }
+    }
+    // a cursor exactly at a full row's end wraps to the row after, even
+    // though that row has no characters in it yet
+    let (cursor_row, cursor_col) = match cursor {
+        Some(pos) => pos,
+        None if col == width => (rows.len(), 0),
+        None => (rows.len() - 1, col),
+    };
+    (rows, cursor_row, cursor_col)
+}
+
 // measured before the layout: the input row has to grow with its wrapped text
 fn input_height(app: &App, frame: Rect) -> u16 {
     let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
@@ -290,15 +326,21 @@ fn input_height(app: &App, frame: Rect) -> u16 {
         .jobs
         .as_ref()
         .is_some_and(|jobs| jobs.steering.is_some());
-    let (prefix, text) = if app.mode == Mode::Cmd {
-        (1, &app.cmd)
+    let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
+    let (prefix, text): (&str, &str) = if app.mode == Mode::Cmd {
+        (":", &app.cmd)
     } else if steering {
-        (3, &app.input)
+        ("s> ", &app.input)
+    } else if filtering {
+        ("/", &app.input)
     } else {
-        (2, &app.input)
+        ("> ", &app.input)
     };
-    let chars = prefix + text.chars().count();
-    let rows = u16::try_from(chars / width + 1).unwrap_or(u16::MAX);
+    let chars: Vec<char> = prefix.chars().chain(text.chars()).collect();
+    let count = chars.len();
+    let (rows, cursor_row, _) = wrap_input(&chars, count, width);
+    let needed = rows.len().max(cursor_row + 1);
+    let rows = u16::try_from(needed).unwrap_or(u16::MAX);
     rows.min(INPUT_ROWS_CAP).min(frame.height / 3).max(1)
 }
 
@@ -307,33 +349,28 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .jobs
         .as_ref()
         .is_some_and(|jobs| jobs.steering.is_some());
+    let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
     } else if steering {
         ("s> ", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
+    } else if filtering {
+        ("/", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
-        let style = if app.picker.is_some() || app.review.is_some() || app.jobs.is_some() {
-            theme::DIM
-        } else {
-            theme::PLAIN
-        };
+        let style =
+            if app.picker.is_some() || app.review.is_some() || app.jobs.is_some() || app.help {
+                theme::DIM
+            } else {
+                theme::PLAIN
+            };
         ("> ", theme::ACCENT, &app.input, style, app.cursor)
     };
 
     let width = (area.width.max(1)) as usize;
     let chars: Vec<char> = prefix.chars().chain(text.chars()).collect();
-    let rows: Vec<String> = chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect();
-    let rows = if rows.is_empty() {
-        vec![String::new()]
-    } else {
-        rows
-    };
+    let cursor_index = prefix.chars().count() + text[..cursor].chars().count();
+    let (rows, cursor_row, cursor_col) = wrap_input(&chars, cursor_index, width);
 
-    let ahead = prefix.chars().count() + text[..cursor].chars().count();
-    let cursor_row = ahead / width;
     let visible = area.height.max(1) as usize;
     let start = (cursor_row + 1).saturating_sub(visible);
 
@@ -358,16 +395,18 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 
     if app.mode == Mode::Cmd
         || steering
-        || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none())
+        || filtering
+        || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none() && !app.help)
     {
-        let col = u16::try_from(ahead % width).unwrap_or(u16::MAX);
-        let row = u16::try_from(cursor_row - start).unwrap_or(u16::MAX);
+        let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
+        let row = u16::try_from(cursor_row.saturating_sub(start)).unwrap_or(u16::MAX);
         frame.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 }
 
-fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
-    let rows = app.sessions.len() + 1;
+fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Picker) {
+    let sessions = app.picker_rows();
+    let rows = sessions.len() + 1;
     let width = 64.min(full.width.saturating_sub(4));
     let height = u16::try_from(rows + 3)
         .unwrap_or(u16::MAX)
@@ -383,15 +422,15 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, selected: usize) {
     let now = chrono::Utc::now();
     let mut lines = vec![Line::styled(" sessions", theme::DIM), Line::default()];
     let visible = (height as usize).saturating_sub(3);
-    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let start = picker.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(TIME_WIDTH + 5);
     for row in start..rows.min(start + visible) {
-        let (prefix, style) = if row == selected {
+        let (prefix, style) = if row == picker.selected {
             (" > ", theme::ACCENT)
         } else {
             ("   ", theme::DIM)
         };
-        let spans = match app.picker_session(row) {
+        let spans = match row.checked_sub(1).and_then(|i| sessions.get(i)) {
             None => vec![Span::styled(format!("{prefix}new session"), style)],
             Some(session) => vec![
                 Span::styled(format!("{prefix}{:<room$}", label(session, room)), style),
@@ -544,6 +583,108 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+// grouped and built from the table below so a changed key and its
+// documentation land in the same diff
+const HELP: &[(&str, &[&str])] = &[
+    (
+        "normal mode",
+        &[
+            "i I a A           insert (before, line start, after, line end)",
+            "h l 0 $           left, right, line start, line end",
+            "w b               word forward / back",
+            "x D dd            delete char / to end / whole line",
+            "j k               scroll transcript",
+            "ctrl-u ctrl-d     page up / down",
+            "G gg              scroll to bottom / top",
+            "s ctrl-p          open the session picker",
+            "ctrl-n            new session",
+            "ctrl-o            toggle thought traces",
+            "ctrl-c            quit",
+            ":                 command mode",
+        ],
+    ),
+    (
+        "insert mode",
+        &[
+            "esc               back to normal mode",
+            "enter             send",
+            "ctrl-j            insert a newline",
+        ],
+    ),
+    (
+        "command mode",
+        &[
+            ":q :q! :qa :quit  quit",
+            ":review           open the review pane",
+            ":jobs             open the jobs pane",
+            ":help             this popup",
+        ],
+    ),
+    (
+        "picker keys",
+        &[
+            "j k               move selection",
+            "/                 filter by title/preview",
+            "enter             open the selected session",
+            "q esc             close (esc also clears an active filter)",
+        ],
+    ),
+    (
+        "review keys",
+        &[
+            "j k               move selection",
+            "a                 accept the selected record",
+            "dd                delete the selected record",
+            "f                 prefill a fix instruction and close",
+            "q esc             close",
+        ],
+    ),
+    (
+        "jobs keys",
+        &[
+            "j k               move selection",
+            "r                 refresh the list",
+            "enter             open the selected job's session",
+            "s                 steer the selected job",
+            "q esc             close",
+        ],
+    ),
+];
+
+fn draw_help(frame: &mut Frame, full: Rect) {
+    let mut lines = vec![Line::styled(" help", theme::DIM), Line::default()];
+    for (i, (group, keys)) in HELP.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(format!(" {group}"), theme::DIM));
+        for key in *keys {
+            lines.push(Line::styled(format!("   {key}"), theme::DIM));
+        }
+    }
+
+    let width = 60.min(full.width.saturating_sub(4));
+    let max_height = full.height.saturating_sub(2);
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let (height, overflow) = if total > max_height {
+        (max_height, true)
+    } else {
+        (total, false)
+    };
+    if overflow {
+        lines.truncate(height.saturating_sub(1) as usize);
+        lines.push(Line::styled("   ...", theme::DIM));
+    }
+    let area = Rect {
+        x: (full.width - width) / 2,
+        y: (full.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn job_subject(job: &JobInfo) -> String {
     if job.title.is_empty() {
         let role = arc_core::provider::role_label(
@@ -648,13 +789,13 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
         return String::new();
     };
 
-    let seconds = (now - at).num_seconds();
+    let seconds = (now - at).num_seconds().max(0);
     match seconds {
-        ..60 => "just now".to_owned(),
-        60..3_600 => format!("{}m ago", seconds / 60),
-        3_600..86_400 => format!("{}h ago", seconds / 3_600),
-        86_400..604_800 => format!("{}d ago", seconds / 86_400),
-        _ => at.with_timezone(&chrono::Local).format("%m-%d").to_string(),
+        ..60 => "now".to_owned(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        86_400..604_800 => format!("{}d", seconds / 86_400),
+        _ => format!("{}w", seconds / 604_800),
     }
 }
 
@@ -662,7 +803,7 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 mod tests {
     use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
 
-    use super::{job_label, label};
+    use super::{job_label, label, last_active, wrap_input};
 
     fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
         SessionInfo {
@@ -672,6 +813,56 @@ mod tests {
             preview: preview.to_owned(),
             last_at: None,
         }
+    }
+
+    fn active_ago(now: chrono::DateTime<chrono::Utc>, seconds_ago: i64) -> SessionInfo {
+        let at = now - chrono::Duration::seconds(seconds_ago);
+        SessionInfo {
+            id: "s".to_owned(),
+            title: String::new(),
+            preview: String::new(),
+            started_at: None,
+            last_at: Some(prost_types::Timestamp {
+                seconds: at.timestamp(),
+                nanos: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn relative_time_formats_by_band() {
+        let now = chrono::Utc::now();
+        assert_eq!(last_active(&active_ago(now, 59), now), "now");
+        assert_eq!(last_active(&active_ago(now, 61 * 60), now), "1h");
+        assert_eq!(last_active(&active_ago(now, 25 * 3_600), now), "1d");
+        assert_eq!(last_active(&active_ago(now, 8 * 86_400), now), "1w");
+    }
+
+    #[test]
+    fn wrap_input_breaks_at_the_width() {
+        let chars: Vec<char> = "abcdef".chars().collect();
+        let (rows, cursor_row, cursor_col) = wrap_input(&chars, chars.len(), 3);
+        assert_eq!(rows, vec!["abc".to_owned(), "def".to_owned()]);
+        assert_eq!(
+            (cursor_row, cursor_col),
+            (2, 0),
+            "a cursor filling a row exactly wraps to a fresh row after it"
+        );
+    }
+
+    #[test]
+    fn wrap_input_starts_a_new_row_on_an_embedded_newline() {
+        let chars: Vec<char> = "ab\ncd".chars().collect();
+        let (rows, ..) = wrap_input(&chars, chars.len(), 10);
+        assert_eq!(rows, vec!["ab".to_owned(), "cd".to_owned()]);
+    }
+
+    #[test]
+    fn a_trailing_newline_adds_an_empty_row_for_the_cursor() {
+        let chars: Vec<char> = "> ab\n".chars().collect();
+        let (rows, cursor_row, cursor_col) = wrap_input(&chars, chars.len(), 10);
+        assert_eq!(rows, vec!["> ab".to_owned(), String::new()]);
+        assert_eq!((cursor_row, cursor_col), (1, 0));
     }
 
     #[test]
