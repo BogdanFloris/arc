@@ -286,8 +286,14 @@ const INPUT_ROWS_CAP: u16 = 8;
 // measured before the layout: the input row has to grow with its wrapped text
 fn input_height(app: &App, frame: Rect) -> u16 {
     let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
+    let steering = app
+        .jobs
+        .as_ref()
+        .is_some_and(|jobs| jobs.steering.is_some());
     let (prefix, text) = if app.mode == Mode::Cmd {
         (1, &app.cmd)
+    } else if steering {
+        (3, &app.input)
     } else {
         (2, &app.input)
     };
@@ -297,8 +303,14 @@ fn input_height(app: &App, frame: Rect) -> u16 {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
+    let steering = app
+        .jobs
+        .as_ref()
+        .is_some_and(|jobs| jobs.steering.is_some());
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
+    } else if steering {
+        ("s> ", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
         let style = if app.picker.is_some() || app.review.is_some() || app.jobs.is_some() {
             theme::DIM
@@ -344,7 +356,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 
-    if app.mode == Mode::Cmd || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none())
+    if app.mode == Mode::Cmd
+        || steering
+        || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none())
     {
         let col = u16::try_from(ahead % width).unwrap_or(u16::MAX);
         let row = u16::try_from(cursor_row - start).unwrap_or(u16::MAX);
@@ -473,9 +487,10 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
 }
 
 fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
+    let footer = usize::from(jobs.confirmation.is_some());
     let rows = jobs.items.len().max(1);
     let width = 72.min(full.width.saturating_sub(4));
-    let height = u16::try_from(rows + 3)
+    let height = u16::try_from(rows + 3 + footer)
         .unwrap_or(u16::MAX)
         .min(full.height.saturating_sub(2));
     let area = Rect {
@@ -494,6 +509,9 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
             "loading"
         };
         lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        if let Some(confirmation) = &jobs.confirmation {
+            lines.push(Line::styled(format!("   {confirmation}"), theme::DIM));
+        }
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -519,6 +537,9 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
             ),
         ];
         lines.push(Line::from(spans));
+    }
+    if let Some(confirmation) = &jobs.confirmation {
+        lines.push(Line::styled(format!("   {confirmation}"), theme::DIM));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

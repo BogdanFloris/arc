@@ -98,6 +98,9 @@ pub struct Jobs {
     pub items: Vec<JobInfo>,
     pub selected: usize,
     pub loaded: bool,
+    /// The job being steered, if the input line is owned by the steer prompt.
+    pub steering: Option<String>,
+    pub confirmation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +172,9 @@ pub struct App {
     pub ambient: Vec<JobInfo>,
     strip_since: Instant,
     refetch_in_flight: bool,
+    steer_stash: Option<String>,
+    /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
+    steer_turn_pending: bool,
 }
 
 impl App {
@@ -195,6 +201,8 @@ impl App {
             ambient: Vec::new(),
             strip_since: Instant::now(),
             refetch_in_flight: false,
+            steer_stash: None,
+            steer_turn_pending: false,
         }
     }
 
@@ -286,6 +294,13 @@ impl App {
                 self.clamp_normal();
             }
             KeyCode::Enter => return self.submit(),
+            _ => self.edit_input(code),
+        }
+        None
+    }
+
+    fn edit_input(&mut self, code: KeyCode) {
+        match code {
             KeyCode::Char(c) => {
                 self.input.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
@@ -307,7 +322,6 @@ impl App {
             KeyCode::End => self.cursor = self.input.len(),
             _ => {}
         }
-        None
     }
 
     fn on_normal(&mut self, code: KeyCode) -> Option<Command> {
@@ -454,21 +468,82 @@ impl App {
             items: Vec::new(),
             selected: 0,
             loaded: false,
+            steering: None,
+            confirmation: None,
         });
         Command::ListJobs
     }
 
     fn on_jobs_key(&mut self, code: KeyCode) -> Option<Command> {
+        if self.jobs.as_ref().expect("jobs is open").steering.is_some() {
+            return self.on_steer_key(code);
+        }
         let jobs = self.jobs.as_mut().expect("jobs is open");
+        jobs.confirmation = None;
         let last = jobs.items.len().saturating_sub(1);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => self.jobs = None,
             KeyCode::Up | KeyCode::Char('k') => jobs.selected = jobs.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => jobs.selected = (jobs.selected + 1).min(last),
             KeyCode::Char('r') => return Some(Command::ListJobs),
+            KeyCode::Enter => {
+                let session_id = self.selected_job();
+                self.jobs = None;
+                return self.start_session(session_id);
+            }
+            KeyCode::Char('s') => {
+                if let Some(session_id) = self.selected_job() {
+                    self.start_steer(session_id);
+                }
+            }
             _ => {}
         }
         None
+    }
+
+    fn selected_job(&self) -> Option<String> {
+        let jobs = self.jobs.as_ref()?;
+        jobs.items
+            .get(jobs.selected)
+            .map(|job| job.session_id.clone())
+    }
+
+    fn start_steer(&mut self, session_id: String) {
+        self.steer_stash = Some(std::mem::take(&mut self.input));
+        self.cursor = 0;
+        self.jobs.as_mut().expect("jobs is open").steering = Some(session_id);
+    }
+
+    fn on_steer_key(&mut self, code: KeyCode) -> Option<Command> {
+        match code {
+            KeyCode::Esc => self.cancel_steer(),
+            KeyCode::Enter => return self.submit_steer(),
+            _ => self.edit_input(code),
+        }
+        None
+    }
+
+    fn cancel_steer(&mut self) {
+        self.jobs.as_mut().expect("jobs is open").steering = None;
+        self.input = self.steer_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+    }
+
+    fn submit_steer(&mut self) -> Option<Command> {
+        let content = self.input.trim().to_owned();
+        if content.is_empty() {
+            return None;
+        }
+        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let session_id = jobs.steering.take()?;
+        jobs.confirmation = Some(format!("steered {}", short_id(&session_id)));
+        self.input = self.steer_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+        self.steer_turn_pending = true;
+        Some(Command::Send {
+            session_id: Some(session_id),
+            content,
+        })
     }
 
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
@@ -582,6 +657,9 @@ impl App {
                 None
             }
             NetEvent::Accepted { session_id } => {
+                if self.steer_turn_pending {
+                    return None;
+                }
                 let created = self.session_id.is_none();
                 self.session_id = Some(session_id);
                 self.transcript.push(Block::Arc {
@@ -653,6 +731,10 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
+                if self.steer_turn_pending {
+                    self.steer_turn_pending = false;
+                    return None;
+                }
                 self.finalize_thinking();
                 if let Some(Block::Arc { partial: p, .. }) = self.transcript.last_mut() {
                     *p = partial;
@@ -670,6 +752,7 @@ impl App {
                 self.turn_over(Status::Idle)
             }
             NetEvent::Failed { code, msg } => {
+                self.steer_turn_pending = false;
                 self.finalize_thinking();
                 self.pop_empty_reply();
                 self.turn_started = None;
@@ -814,6 +897,10 @@ impl App {
 
 fn is_running(job: &JobInfo) -> bool {
     job.state == job_info::State::Running as i32
+}
+
+fn short_id(id: &str) -> &str {
+    &id[id.len().saturating_sub(8)..]
 }
 
 /// The first meaningful string value in the call's arguments: the bash
@@ -2191,6 +2278,135 @@ mod tests {
 
         assert_eq!(command, Some(Command::ListJobs));
         assert!(app.jobs.is_some(), "the pane stays open while it refreshes");
+    }
+
+    #[test]
+    fn enter_on_a_job_row_opens_its_child_session() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
+        app.on_key(key(KeyCode::Char('j')));
+
+        let fetch = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.jobs, None, "the popup closes");
+        assert_eq!(app.session_id.as_deref(), Some("s-b"));
+        assert_eq!(
+            fetch,
+            Some(Command::History {
+                session_id: "s-b".to_owned()
+            }),
+            "the same open path a picker row takes"
+        );
+        assert_eq!(app.transcript, [Block::Note("loading".to_owned())]);
+    }
+
+    #[test]
+    fn s_enters_the_steer_substate_and_typed_chars_land_in_the_input() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.input = "draft reply".to_owned();
+        app.cursor = app.input.len();
+
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None);
+        assert_eq!(app.input, "", "the conversation draft is stashed away");
+        assert_eq!(
+            app.jobs.as_ref().expect("open").steering.as_deref(),
+            Some("s-a")
+        );
+
+        typed(&mut app, "stop and check the tests");
+        assert_eq!(app.input, "stop and check the tests");
+        assert!(app.jobs.is_some(), "the popup stays open while steering");
+    }
+
+    #[test]
+    fn esc_cancels_steering_and_restores_the_stashed_input() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.input = "draft reply".to_owned();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Char('s')));
+        typed(&mut app, "abandoned");
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+
+        assert_eq!(app.input, "draft reply", "the stash comes back");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(
+            app.jobs.as_ref().expect("open").steering.is_none(),
+            "back to browsing the list"
+        );
+    }
+
+    #[test]
+    fn submitting_a_steer_sends_to_the_jobs_session_not_the_open_one() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
+        app.session_id = Some("s-open".to_owned());
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('s')));
+        typed(&mut app, "pause and summarize");
+
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::Send {
+                session_id: Some("s-b".to_owned()),
+                content: "pause and summarize".to_owned()
+            })
+        );
+        assert_eq!(
+            app.session_id.as_deref(),
+            Some("s-open"),
+            "the open conversation never moved"
+        );
+        assert!(app.jobs.is_some(), "the popup stays open");
+        assert!(app.jobs.as_ref().expect("open").steering.is_none());
+    }
+
+    #[test]
+    fn the_confirmation_line_appears_after_submit_and_clears_on_the_next_key() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.on_key(key(KeyCode::Char('s')));
+        typed(&mut app, "go on");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            Some("steered s-a")
+        );
+
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
+    }
+
+    #[test]
+    fn a_steer_accepted_and_end_do_not_touch_the_open_conversation() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.session_id = Some("s-open".to_owned());
+        app.transcript.push(Block::You("earlier".to_owned()));
+        app.on_key(key(KeyCode::Char('s')));
+        typed(&mut app, "go on");
+        app.on_key(key(KeyCode::Enter));
+
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-a".to_owned(),
+        });
+        let next = app.on_net(end(false));
+
+        assert_eq!(next, None);
+        assert_eq!(app.session_id.as_deref(), Some("s-open"));
+        assert_eq!(app.transcript, [Block::You("earlier".to_owned())]);
+        assert_eq!(app.status, Status::Idle);
     }
 
     #[test]
