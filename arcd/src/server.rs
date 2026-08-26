@@ -16,7 +16,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
 use prost_types::Timestamp;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -30,7 +30,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn serve(
     listener: TcpListener,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
     runner: Runner,
     reads: Arc<Reader>,
     shutdown: impl Future<Output = ()> + Send,
@@ -84,7 +84,7 @@ async fn drain(connections: &mut JoinSet<()>) {
 async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
     runner: Runner,
     reads: Arc<Reader>,
     mut closing: watch::Receiver<bool>,
@@ -152,7 +152,7 @@ async fn told_to_close(closing: &mut watch::Receiver<bool>) {
 )]
 async fn request(
     ws: &mut Socket,
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     runner: &Runner,
     reads: &Reader,
     frame: ClientFrame,
@@ -186,7 +186,7 @@ async fn request(
 
 async fn send_message(
     ws: &mut Socket,
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     runner: &Runner,
     request_id: u64,
     send: SendMessage,
@@ -194,13 +194,11 @@ async fn send_message(
     let (events, rx) = mpsc::channel(EVENT_BUFFER);
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
-    let mut engine = engine.lock().await;
     // forward has to run alongside the engine or the event channel fills
     let (result, connected) = tokio::join!(
         engine.send_message(runner, session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),
     );
-    drop(engine);
 
     if !connected {
         return ControlFlow::Break(());
@@ -296,39 +294,39 @@ async fn review_list(
 
 async fn review_accept(
     ws: &mut Socket,
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
-    let done = engine.lock().await.store_mut().review_accept(record_id);
+    let done = engine.review_accept(record_id);
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
 async fn review_delete(
     ws: &mut Socket,
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     request_id: u64,
     record_id: &str,
 ) -> ControlFlow<()> {
-    let done = engine.lock().await.store_mut().review_delete(record_id);
+    let done = engine.review_delete(record_id);
     flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
 }
 
-fn verdict_msg(done: Result<(), StoreError>, record_id: &str) -> server_frame::Msg {
+fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame::Msg {
     match done {
         Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
             session_id: String::new(),
         }),
         Err(error) => {
             warn!(%error, record_id, "review verdict failed");
-            error_frame(store_error_code(&error), &error)
+            error_frame(review_error_code(&error), &error)
         }
     }
 }
 
-fn store_error_code(error: &StoreError) -> &'static str {
+fn review_error_code(error: &SessionError) -> &'static str {
     match error {
-        StoreError::UnknownRecord { .. } => "unknown_record",
+        SessionError::Store(StoreError::UnknownRecord { .. }) => "unknown_record",
         _ => "internal",
     }
 }
@@ -618,15 +616,9 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, signal) = oneshot::channel();
-            let server = tokio::spawn(serve(
-                listener,
-                Arc::new(Mutex::new(engine)),
-                runner,
-                reads,
-                async {
-                    let _ = signal.await;
-                },
-            ));
+            let server = tokio::spawn(serve(listener, Arc::new(engine), runner, reads, async {
+                let _ = signal.await;
+            }));
 
             Self {
                 addr,
@@ -1206,8 +1198,10 @@ mod tests {
         harness.stop().await;
     }
 
+    // different sessions now run concurrently (see arc_core::session's engine
+    // tests); this only checks two connections never cross their replies
     #[tokio::test]
-    async fn two_connections_are_serialized_and_both_get_their_own_reply() {
+    async fn two_connections_get_their_own_reply_and_never_cross() {
         let mut harness = Harness::start(Script::Echo).await;
         let mut first = harness.connect().await;
         let mut second = harness.connect().await;

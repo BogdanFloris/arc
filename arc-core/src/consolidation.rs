@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::future::Future;
 
 use arc_proto::v1::memory_event;
-use tokio::sync::Mutex;
 
 use crate::session::Engine;
 use crate::store;
@@ -76,7 +75,7 @@ pub enum Outcome {
     )
 )]
 pub async fn run_pass<E: Extractor>(
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
@@ -118,22 +117,19 @@ pub async fn run_pass<E: Extractor>(
 }
 
 async fn pass<E: Extractor>(
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     extractor: &E,
     idle_cutoff_micros: i64,
     prompt_version: &str,
     skip: &HashSet<String>,
 ) -> Result<Outcome, Error> {
-    let snapshot = {
-        let engine = engine.lock().await;
-        engine
-            .store()
-            .snapshot_for_consolidation(idle_cutoff_micros, skip)?
-    };
+    let snapshot =
+        engine.with_store(|store| store.snapshot_for_consolidation(idle_cutoff_micros, skip))?;
     let Some(snapshot) = snapshot else {
         return Ok(Outcome::NothingDue);
     };
 
+    // the store is not locked during extraction: it can take minutes
     let events = extractor
         .extract(&snapshot)
         .await
@@ -151,13 +147,9 @@ async fn pass<E: Extractor>(
         .filter(|event| matches!(event, memory_event::Event::RecordSuperseded(_)))
         .count();
 
-    // re-locked, not held: extraction can take minutes
-    let committed = {
-        let mut engine = engine.lock().await;
-        engine
-            .store_mut()
-            .commit_consolidation(&snapshot, events, prompt_version)?
-    };
+    // one store-lock scope: the re-check and the append are atomic together
+    let committed = engine
+        .with_store_mut(|store| store.commit_consolidation(&snapshot, events, prompt_version))?;
     Ok(if committed {
         Outcome::Consolidated {
             session_id: snapshot.session_id,
@@ -182,7 +174,6 @@ mod tests {
         memory_record, session_event,
     };
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
 
     use super::{ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, run_pass};
     use crate::projection::Projection;
@@ -245,11 +236,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -287,11 +275,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -309,20 +294,14 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
 
         let snapshot = engine
-            .lock()
-            .await
-            .store()
-            .snapshot_for_consolidation(ALL_IDLE, &HashSet::new())
+            .with_store(|store| store.snapshot_for_consolidation(ALL_IDLE, &HashSet::new()))
             .expect("snapshot")
             .expect("the session is due");
         assert_eq!(snapshot.session_id, reply.session_id);
@@ -331,17 +310,14 @@ mod tests {
 
         let (tx, _rx) = channel();
         engine
-            .lock()
-            .await
             .send_message(&run, Some(&reply.session_id), "more", tx)
             .await
             .expect("send");
 
         let committed = engine
-            .lock()
-            .await
-            .store_mut()
-            .commit_consolidation(&snapshot, vec![created_record("mr-x")], "")
+            .with_store_mut(|store| {
+                store.commit_consolidation(&snapshot, vec![created_record("mr-x")], "")
+            })
             .expect("commit");
 
         assert!(!committed, "the stale snapshot must not commit");
@@ -358,10 +334,7 @@ mod tests {
             );
         }
         let due = engine
-            .lock()
-            .await
-            .store()
-            .due_for_consolidation(ALL_IDLE)
+            .with_store(|store| store.due_for_consolidation(ALL_IDLE))
             .expect("due");
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].latest_seq, 4, "coverage will span the new turn");
@@ -372,11 +345,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -433,11 +403,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -486,11 +453,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -514,11 +478,8 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "hi", tx)
             .await
             .expect("send");
@@ -539,21 +500,15 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         for text in ["hi", "yo"] {
             let (tx, _rx) = channel();
             engine
-                .lock()
-                .await
                 .send_message(&run, None, text, tx)
                 .await
                 .expect("send");
         }
         let due = engine
-            .lock()
-            .await
-            .store()
-            .due_for_consolidation(ALL_IDLE)
+            .with_store(|store| store.due_for_consolidation(ALL_IDLE))
             .expect("due");
         assert_eq!(due.len(), 2);
 

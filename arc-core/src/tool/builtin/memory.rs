@@ -477,7 +477,7 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let (mut engine, run) =
+        let (engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
 
@@ -522,7 +522,7 @@ mod tests {
             done_reply("saved it"),
             done_reply("hello again"),
         ]);
-        let (mut engine, run) =
+        let (engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
         let reply = engine
@@ -559,7 +559,7 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let (mut engine, run) =
+        let (engine, run) =
             engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
         let (tx, _rx) = channel();
         let reply = engine
@@ -602,7 +602,7 @@ mod tests {
             done_reply("hello again"),
         ]);
         let registry = registry(vec![Box::new(MemorySupersede::new(archive_at(&dir)))]);
-        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
         let reply = engine
             .send_message(&run, None, "I moved to Y", tx)

@@ -388,7 +388,6 @@ mod tests {
 
     use crate::provider::Thinking;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
 
     use super::{
         ModelExtractor, PROMPT_V1, PROMPT_VERSION_V1, TOOL_SNIPPET, TRANSCRIPT_BUDGET,
@@ -471,11 +470,8 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "remember: keep replies short", tx)
             .await
             .expect("send");
@@ -551,8 +547,6 @@ mod tests {
 
         let (tx, _rx) = channel();
         engine
-            .lock()
-            .await
             .send_message(&run, Some(&reply.session_id), "hi again", tx)
             .await
             .expect("second send");
@@ -591,11 +585,8 @@ mod tests {
             ),
         ]);
         let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let engine = Mutex::new(engine);
         let (tx, _rx) = channel();
         let reply = engine
-            .lock()
-            .await
             .send_message(&run, None, "I moved to Y", tx)
             .await
             .expect("send");

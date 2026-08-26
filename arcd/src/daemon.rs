@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -57,7 +56,7 @@ pub struct Daemon {
     config: Config,
     dirs: DataDirs,
 
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
 
     reads: Arc<Reader>,
 
@@ -130,7 +129,7 @@ impl Daemon {
         Ok(Self {
             config,
             dirs,
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(engine),
             reads,
             roles,
         })
@@ -188,7 +187,7 @@ const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
 fn consolidation_task(
     config: ConsolidationConfig,
     archivist: &Runner,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
         info!("consolidation disabled");
@@ -224,7 +223,7 @@ fn consolidation_task(
 }
 
 async fn tick_once<E: Extractor>(
-    engine: &Mutex<Engine>,
+    engine: &Engine,
     extractor: &E,
     cutoff: i64,
     strikes: &mut Strikes,
@@ -451,7 +450,7 @@ mod tests {
         let daemon = Daemon::start(Config::default(), dirs, unreachable_roles())
             .expect("start over a stale index");
 
-        let sessions = daemon.engine.lock().await.sessions().expect("sessions");
+        let sessions = daemon.engine.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s-01");
     }
@@ -604,8 +603,6 @@ mod tests {
 
         let session_id = daemon
             .engine
-            .lock()
-            .await
             .create_bound_session(
                 daemon.roles.concierge(),
                 "arc",

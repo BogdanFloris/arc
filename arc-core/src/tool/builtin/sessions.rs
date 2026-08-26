@@ -288,7 +288,7 @@ mod tests {
             done_reply("we said gruvbox with an orange accent"),
         ]);
         let registry = search_registry(&dir);
-        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine
@@ -324,7 +324,7 @@ mod tests {
             done_reply("answered from history"),
         ]);
         let registry = search_registry(&dir);
-        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         let reply = engine
@@ -370,7 +370,7 @@ mod tests {
             done_reply("found it in the tool output"),
         ]);
         let registry = search_registry(&dir);
-        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine
@@ -413,7 +413,7 @@ mod tests {
             done_reply("noted"),
         ]);
         let registry = search_registry(&dir);
-        let (mut engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
 
         engine

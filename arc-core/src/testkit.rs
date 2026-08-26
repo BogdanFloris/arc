@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use arc_proto::v1::{Role, SessionRole, memory_event, session_event};
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream;
 use tempfile::TempDir;
@@ -21,16 +22,33 @@ use crate::session::{Engine, EngineEvent, Runner};
 use crate::store::Store;
 use crate::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
 
+/// One scripted response to a `complete` call. `Gated` lets a test stall a
+/// stream mid-turn: it yields `before`, then waits on `notify`, then yields
+/// `after` — so another session's turn can be driven to completion in between.
+#[derive(Debug)]
+pub enum Step {
+    Immediate(Vec<Result<CompletionDelta, ProviderError>>),
+    Gated {
+        before: Vec<Result<CompletionDelta, ProviderError>>,
+        notify: Arc<tokio::sync::Notify>,
+        after: Vec<Result<CompletionDelta, ProviderError>>,
+    },
+}
+
 #[derive(Debug)]
 pub struct ScriptedProvider {
-    script: Mutex<VecDeque<Vec<Result<CompletionDelta, ProviderError>>>>,
+    script: Mutex<VecDeque<Step>>,
     captured: Mutex<Vec<CompletionRequest>>,
 }
 
 impl ScriptedProvider {
     pub fn scripted(calls: Vec<Vec<Result<CompletionDelta, ProviderError>>>) -> Arc<Self> {
+        Self::scripted_steps(calls.into_iter().map(Step::Immediate).collect())
+    }
+
+    pub fn scripted_steps(steps: Vec<Step>) -> Arc<Self> {
         Arc::new(Self {
-            script: Mutex::new(calls.into()),
+            script: Mutex::new(steps.into()),
             captured: Mutex::new(Vec::new()),
         })
     }
@@ -50,13 +68,30 @@ impl Provider for ScriptedProvider {
         request: CompletionRequest,
     ) -> BoxFuture<'_, Result<CompletionStream, ProviderError>> {
         self.captured.lock().expect("captured").push(request);
-        let items = self
+        let step = self
             .script
             .lock()
             .expect("script")
             .pop_front()
             .expect("script exhausted");
-        Box::pin(async move { Ok(Box::pin(stream::iter(items)) as CompletionStream) })
+        Box::pin(async move {
+            let stream: CompletionStream = match step {
+                Step::Immediate(items) => Box::pin(stream::iter(items)),
+                Step::Gated {
+                    before,
+                    notify,
+                    after,
+                } => Box::pin(
+                    stream::iter(before)
+                        .chain(
+                            stream::once(async move { notify.notified().await })
+                                .filter_map(|()| async { None }),
+                        )
+                        .chain(stream::iter(after)),
+                ),
+            };
+            Ok(stream)
+        })
     }
 }
 
@@ -408,7 +443,7 @@ mod tests {
             done_reply("second reply"),
         ]);
         let dir = TempDir::new().expect("temp dir");
-        let (mut engine, run) =
+        let (engine, run) =
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, mut rx) = channel();
 
