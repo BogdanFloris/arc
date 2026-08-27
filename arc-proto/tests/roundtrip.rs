@@ -304,6 +304,8 @@ fn server_frame_arms_round_trip() {
                 started_at: Some(ts()),
                 preview: "hello arc".to_string(),
                 last_at: Some(ts()),
+                role: SessionRole::Executor as i32,
+                project: "arc".to_string(),
             }],
         }),
         server_frame::Msg::SessionHistory(SessionHistory {

@@ -16,6 +16,8 @@ message SessionInfo {
   google.protobuf.Timestamp started_at = 3;
   string preview = 4;
   google.protobuf.Timestamp last_at = 5;
+  SessionRole role = 6;
+  string project = 7;
 }
 
 message ListSessions {}
