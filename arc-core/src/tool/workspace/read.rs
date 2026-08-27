@@ -8,7 +8,8 @@ use super::{Access, Workspace};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
-const DEFAULT_LIMIT: usize = 400;
+const DEFAULT_LIMIT: usize = 2000;
+const MAX_BYTES: usize = 48 * 1024;
 
 pub struct Read {
     workspace: Arc<Workspace>,
@@ -33,15 +34,16 @@ impl Tool for Read {
             name: "read".to_owned(),
             description: "Read a file's contents. path must be absolute. Large files page: \
                           offset is the 1-based first line to return, limit caps how many \
-                          lines come back (default 400). A page that does not reach the end \
-                          of the file ends with a marker naming the offset to continue from."
+                          lines come back (default 2000, capped at 48KiB regardless of limit). \
+                          A page that does not reach the end of the file ends with a marker \
+                          naming the offset to continue from."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute path to the file."},
                     "offset": {"type": "integer", "description": "1-based first line to return."},
-                    "limit": {"type": "integer", "description": "Max lines to return. Default 400."}
+                    "limit": {"type": "integer", "description": "Max lines to return. Default 2000."}
                 },
                 "required": ["path"]
             }),
@@ -127,7 +129,19 @@ fn page(text: &str, offset: Option<usize>, limit: Option<usize>) -> Result<Strin
         ));
     }
     let limit = limit.unwrap_or(DEFAULT_LIMIT).max(1);
-    let last = (first + limit - 1).min(total);
+    let line_cap = (first + limit - 1).min(total);
+
+    // the byte cap wins if it's hit first; always keep at least one line
+    let mut last = first;
+    let mut bytes = lines[first - 1].len();
+    for next_line in (first + 1)..=line_cap {
+        let grown = bytes + 1 + lines[next_line - 1].len();
+        if grown > MAX_BYTES {
+            break;
+        }
+        bytes = grown;
+        last = next_line;
+    }
     let body = lines[first - 1..last].join("\n");
 
     if first == 1 && last == total {
@@ -222,6 +236,44 @@ mod tests {
         assert_eq!(
             reply.content,
             "line 1\nline 2\nline 3\n[lines 1-3 of 10; continue with offset=4]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_byte_cap_truncates_before_the_line_limit_on_a_line_boundary() {
+        let dir = TempDir::new().expect("tmp");
+        // each line is 1KiB; 100 lines is well past the 48KiB cap
+        let lines: Vec<String> = (1..=100)
+            .map(|n| format!("{n:04}-{}", "x".repeat(1020)))
+            .collect();
+        fs::write(dir.path().join("f.txt"), lines.join("\n")).expect("write");
+        let ws = workspace();
+        let tool = Read::new(ws);
+
+        let request = serde_json::json!({
+            "path": dir.path().join("f.txt"),
+            "offset": 1,
+            "limit": 100
+        })
+        .to_string();
+        let reply = tool
+            .execute(request, ctx("s-1", dir.path(), Mode::ReadOnly))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(
+            reply.content.len() <= 48 * 1024 + 64,
+            "the body plus marker should sit near the byte cap: {}",
+            reply.content.len()
+        );
+        assert!(
+            reply.content.starts_with("0001-"),
+            "cuts on a line boundary, not mid-line"
+        );
+        assert!(
+            reply.content.contains("of 100; continue with offset="),
+            "{}",
+            reply.content
         );
     }
 

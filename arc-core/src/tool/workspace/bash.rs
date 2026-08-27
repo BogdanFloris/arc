@@ -39,9 +39,10 @@ impl Tool for Bash {
             name: "bash".to_owned(),
             description: "Run a shell command with bash in the project's root. The \
                           environment is scrubbed to a small allowlist; no secrets pass \
-                          through. Output is capped at 16 KiB per stream. Commands default to \
-                          a 120s timeout (max 600); raise timeout_secs for one that \
-                          legitimately runs long."
+                          through. Output is capped at 16 KiB per stream, keeping the tail \
+                          (errors usually land at the end). Commands default to a 120s \
+                          timeout (max 600); raise timeout_secs for one that legitimately \
+                          runs long."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -192,38 +193,43 @@ fn scrub_env(cmd: &mut Command) {
 #[derive(Default)]
 struct Captured {
     text: String,
-    truncated: bool,
+    // bytes dropped from the front to hold the tail within the cap; 0 means whole
+    dropped: usize,
+}
+
+// not str::is_char_boundary: the buffer as a whole may not be valid UTF-8
+// (binary output, or a multi-byte char split across a chunk), so this only
+// asks whether `byte` could start a new UTF-8 sequence.
+fn starts_a_char(byte: u8) -> bool {
+    byte & 0b1100_0000 != 0b1000_0000
 }
 
 async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> Captured {
-    let mut buf = Vec::new();
-    let mut truncated = false;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut dropped: usize = 0;
     let mut chunk = [0u8; 8192];
     loop {
         let n = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        if buf.len() < MAX_CAPTURE_BYTES {
-            let take = (MAX_CAPTURE_BYTES - buf.len()).min(n);
-            buf.extend_from_slice(&chunk[..take]);
-            if take < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_CAPTURE_BYTES {
+            let overflow = buf.len() - MAX_CAPTURE_BYTES;
+            let cut = (overflow..buf.len())
+                .find(|&i| starts_a_char(buf[i]))
+                .unwrap_or(buf.len());
+            dropped += cut;
+            buf.drain(..cut);
         }
     }
     let text = match std::str::from_utf8(&buf) {
         Ok(text) => text.to_owned(),
-        Err(error) => {
-            truncated = true;
-            std::str::from_utf8(&buf[..error.valid_up_to()])
-                .expect("valid_up_to bounds valid utf8")
-                .to_owned()
-        }
+        Err(error) => std::str::from_utf8(&buf[..error.valid_up_to()])
+            .expect("valid_up_to bounds valid utf8")
+            .to_owned(),
     };
-    Captured { text, truncated }
+    Captured { text, dropped }
 }
 
 fn reply_for(status: std::process::ExitStatus, stdout: &Captured, stderr: &Captured) -> ToolReply {
@@ -232,7 +238,7 @@ fn reply_for(status: std::process::ExitStatus, stdout: &Captured, stderr: &Captu
         let content = if stdout.text.is_empty() {
             "(no output)".to_owned()
         } else {
-            mark(&stdout.text, stdout.truncated)
+            mark(&stdout.text, stdout.dropped)
         };
         return ToolReply::ok(content);
     }
@@ -255,17 +261,17 @@ fn compose(header: Option<&str>, stdout: &Captured, stderr: &Captured) -> String
     if let Some(header) = header {
         parts.push(header.to_owned());
     }
-    parts.push(mark(&stdout.text, stdout.truncated));
+    parts.push(mark(&stdout.text, stdout.dropped));
     if !stderr.text.is_empty() {
         parts.push("--- stderr ---".to_owned());
-        parts.push(mark(&stderr.text, stderr.truncated));
+        parts.push(mark(&stderr.text, stderr.dropped));
     }
     parts.join("\n")
 }
 
-fn mark(text: &str, truncated: bool) -> String {
-    if truncated {
-        format!("{text} [truncated]")
+fn mark(text: &str, dropped: usize) -> String {
+    if dropped > 0 {
+        format!("[first {dropped} bytes dropped]\n{text}")
     } else {
         text.to_owned()
     }
@@ -439,8 +445,29 @@ mod tests {
             .await;
 
         assert!(reply.ok, "{}", reply.content);
-        assert!(reply.content.contains("[truncated]"), "{}", reply.content);
+        assert!(reply.content.contains("bytes dropped"), "{}", reply.content);
         assert!(reply.content.len() < 20_000, "{}", reply.content.len());
+    }
+
+    #[tokio::test]
+    async fn truncation_keeps_the_tail_so_a_trailing_error_survives() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(
+                args("head -c 20000 /dev/zero | tr '\\0' 'x'; echo; echo ERROR: something broke"),
+                ctx_rw(dir.path()),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(reply.content.contains("bytes dropped"), "{}", reply.content);
+        assert!(
+            reply.content.trim_end().ends_with("ERROR: something broke"),
+            "the tail survives truncation: {}",
+            reply.content
+        );
     }
 
     #[tokio::test]
