@@ -128,6 +128,10 @@ pub(super) async fn handback_crashed(ctx: &HandbackCtx<'_>, job: &DispatchedJob)
     record_handback(ctx, job, Some("the job crashed")).await;
 }
 
+pub(super) async fn handback_cancelled(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+    record_handback(ctx, job, Some("cancelled by the user")).await;
+}
+
 pub(super) async fn handback_over_budget(
     ctx: &HandbackCtx<'_>,
     job: &DispatchedJob,

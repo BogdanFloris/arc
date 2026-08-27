@@ -251,6 +251,12 @@ async fn request(
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
         Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
+        Some(client_frame::Msg::CancelJob(cancel)) => {
+            cancel_job(ws, supervisor, frame.request_id, &cancel.session_id).await
+        }
+        Some(client_frame::Msg::DropSteers(drop)) => {
+            drop_steers(ws, supervisor, frame.request_id, &drop.session_id).await
+        }
         // no reply frame: the subscription's frames are the notifications,
         // pushed from the connection loop's select, not from here
         Some(client_frame::Msg::Subscribe(_)) => {
@@ -429,6 +435,38 @@ async fn list_jobs(ws: &mut Socket, supervisor: &Supervisor, request_id: u64) ->
     flow(send_frame(ws, request_id, msg).await)
 }
 
+async fn cancel_job(
+    ws: &mut Socket,
+    supervisor: &Supervisor,
+    request_id: u64,
+    session_id: &str,
+) -> ControlFlow<()> {
+    let msg = if supervisor.cancel(session_id) {
+        server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: session_id.to_owned(),
+        })
+    } else {
+        error_frame("unknown_job", format!("no live job named {session_id}"))
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+async fn drop_steers(
+    ws: &mut Socket,
+    supervisor: &Supervisor,
+    request_id: u64,
+    session_id: &str,
+) -> ControlFlow<()> {
+    let msg = if supervisor.drop_steers(session_id) {
+        server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: session_id.to_owned(),
+        })
+    } else {
+        error_frame("unknown_job", format!("no live job named {session_id}"))
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
 async fn review_list(
     ws: &mut Socket,
     reads: &Reader,
@@ -580,6 +618,8 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
         Some(client_frame::Msg::Subscribe(_)) => "subscribe",
+        Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
+        Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
         None => "unknown",
     }
 }
@@ -625,11 +665,11 @@ mod tests {
     use arc_core::store::Store;
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
-        Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult,
-        ListJobs, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
-        MemoryReviewDelete, MemoryReviewList, Notification, Role, SessionCreated, SessionEvent,
-        SessionRole, Source, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
-        notification, session_event,
+        CancelJob, DropSteers, Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall,
+        HistoryToolResult, ListJobs, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Notification, Role,
+        SessionCreated, SessionEvent, SessionRole, Source, Subscribe, ToolOutcome, event, job_info,
+        memory_event, memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -2099,6 +2139,187 @@ mod tests {
             2,
             "the steer never reached the engine: the concierge ran only its own two turns"
         );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_job_on_a_live_job_is_accepted_and_hands_back_cancelled() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+
+        // never notified: the turn stalls until the cancel drops it
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: gate,
+            after: Vec::new(),
+        }]) as Arc<dyn Provider>;
+
+        let mut harness = Harness::with_executor_provider(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_provider,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        let accepted = next_frame(&mut ws).await;
+        let parent_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        run_turn_to_end(&mut ws, 1).await;
+
+        let child_id = dispatched_child_id(&harness);
+        wait_for_child_message_count(&harness, &child_id, 1).await;
+
+        let mut cancel_ws = harness.connect().await;
+        send(
+            &mut cancel_ws,
+            2,
+            client_frame::Msg::CancelJob(CancelJob {
+                session_id: child_id.clone(),
+            }),
+        )
+        .await;
+        let answer = next_frame(&mut cancel_ws).await;
+        assert_eq!(answer.request_id, 2);
+        match answer.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, child_id),
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+
+        harness.drain_jobs().await;
+
+        let parent_handback = harness
+            .logged_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == parent_id => {
+                    Some(m.content)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the cancelled handback landed in the parent");
+        assert!(
+            parent_handback.contains("stopped: cancelled by the user"),
+            "got: {parent_handback}"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_job_on_an_unknown_session_is_an_honest_error() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::CancelJob(CancelJob {
+                session_id: "s-unknown".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn drop_steers_on_a_live_job_with_queued_steers_is_accepted() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&gate),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]) as Arc<dyn Provider>;
+
+        let mut harness = Harness::with_executor_provider(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            executor_provider,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 1).await;
+
+        let child_id = dispatched_child_id(&harness);
+        wait_for_child_message_count(&harness, &child_id, 1).await;
+
+        let mut steer_ws = harness.connect().await;
+        send(&mut steer_ws, 2, say(&child_id, "also check the linter")).await;
+        next_frame(&mut steer_ws).await; // MessageAccepted
+        next_frame(&mut steer_ws).await; // StreamEnd
+
+        let mut drop_ws = harness.connect().await;
+        send(
+            &mut drop_ws,
+            3,
+            client_frame::Msg::DropSteers(DropSteers {
+                session_id: child_id.clone(),
+            }),
+        )
+        .await;
+        let answer = next_frame(&mut drop_ws).await;
+        assert_eq!(answer.request_id, 3);
+        match answer.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, child_id),
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+
+        gate.notify_one();
+        harness.drain_jobs().await;
+
+        let child_messages: Vec<_> = harness
+            .logged_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == child_id => {
+                    Some(m.content)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_messages,
+            ["fix the failing test".to_owned(), "working".to_owned()],
+            "the dropped steer never ran"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn drop_steers_on_an_unknown_session_is_an_honest_error() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::DropSteers(DropSteers {
+                session_id: "s-unknown".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
 
         harness.stop().await;
     }

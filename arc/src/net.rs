@@ -104,6 +104,10 @@ async fn handle(
             verdict(client.review_delete(&record_id).await, events)
         }
         Command::ListJobs => list_jobs(&mut client, events).await,
+        Command::CancelJob { session_id } => verdict(client.cancel_job(&session_id).await, events),
+        Command::DropSteers { session_id } => {
+            verdict(client.drop_steers(&session_id).await, events)
+        }
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
         Command::Yank(_) => Ok(()),
     };

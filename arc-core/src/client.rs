@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
 use arc_proto::v1::{
-    ClientFrame, FetchHistory, JobInfo, ListJobs, ListSessions, MemoryReviewAccept,
-    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification, SendMessage, ServerFrame,
-    SessionHistory, SessionInfo, Subscribe, client_frame, server_frame,
+    CancelJob, ClientFrame, DropSteers, FetchHistory, JobInfo, ListJobs, ListSessions,
+    MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification,
+    SendMessage, ServerFrame, SessionHistory, SessionInfo, Subscribe, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -199,6 +199,26 @@ impl Client {
             }),
             other => Err(unexpected("JobList", &other)),
         }
+    }
+
+    #[tracing::instrument(name = "client.cancel_job", skip_all, fields(session_id))]
+    pub async fn cancel_job(&mut self, session_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::CancelJob(CancelJob {
+                session_id: session_id.to_owned(),
+            }))
+            .await?;
+        self.verdict_ack(id).await
+    }
+
+    #[tracing::instrument(name = "client.drop_steers", skip_all, fields(session_id))]
+    pub async fn drop_steers(&mut self, session_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::DropSteers(DropSteers {
+                session_id: session_id.to_owned(),
+            }))
+            .await?;
+        self.verdict_ack(id).await
     }
 
     async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
@@ -548,6 +568,8 @@ mod tests {
             title: String::new(),
             tool_steps: 3,
             idle_seconds: 1,
+            parent_session: "s-parent".to_owned(),
+            queued_steers: 2,
         };
         let list = server_frame::Msg::JobList(arc_proto::v1::JobList {
             jobs: vec![job.clone()],

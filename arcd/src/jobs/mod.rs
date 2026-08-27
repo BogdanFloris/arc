@@ -13,7 +13,7 @@ use std::time::Duration;
 use arc_core::provider::role_label;
 use arc_core::session::{ContinuedJob, DispatchedJob, Engine, Runner};
 use arc_proto::v1::{JobInfo, Notification, SessionRole};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -24,7 +24,18 @@ use status::{JobState, JobStatuses, notify_job_changed};
 use turn::run_job;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-type LiveMap = Mutex<HashMap<String, mpsc::UnboundedSender<String>>>;
+
+/// A live job's handles: the steer queue's write end, a cancel signal
+/// (row 6.39), and a drop-queued-steers signal (row 6.33). All three share
+/// the entry's lifetime — inserted together on spawn, removed together
+/// when the job task itself finishes.
+struct LiveJob {
+    steer_tx: mpsc::UnboundedSender<String>,
+    cancel: watch::Sender<bool>,
+    drop_tx: mpsc::UnboundedSender<()>,
+}
+
+type LiveMap = Mutex<HashMap<String, LiveJob>>;
 type Handles = Mutex<Vec<JoinHandle<()>>>;
 
 /// Runs the jobs `dispatch` created. One tokio task per job, driven to
@@ -129,7 +140,40 @@ impl Supervisor {
     /// live and the message was enqueued; `false` otherwise, meaning the
     /// caller should fall through to a normal turn.
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
-        steer_live(&self.live, session_id, text)
+        let queued = steer_live(&self.live, session_id, text);
+        if queued {
+            if let Some(info) = self.statuses.record_steer_queued(session_id) {
+                notify_job_changed(self.notifier.as_ref(), &self.engine, info);
+            }
+        }
+        queued
+    }
+
+    /// Cancels a live job (row 6.39): drops its running turn, drains
+    /// whatever's queued, and hands back that the user stopped it. `false`
+    /// if the job isn't live — the same honest signal `steer` gives for an
+    /// unknown or already-finished job.
+    pub fn cancel(&self, session_id: &str) -> bool {
+        let live = self.live.lock().expect("live");
+        let Some(job) = live.get(session_id) else {
+            return false;
+        };
+        let _ = job.cancel.send(true);
+        true
+    }
+
+    /// Empties a live job's queued steers (row 6.33) without touching its
+    /// running turn. Only signals the request here: the job's own task owns
+    /// the queue, so it drains it and reports the fresh count itself — a
+    /// steer that queues between this call and that drain must never be
+    /// silently discarded. `false` if the job isn't live.
+    pub fn drop_steers(&self, session_id: &str) -> bool {
+        let live = self.live.lock().expect("live");
+        let Some(job) = live.get(session_id) else {
+            return false;
+        };
+        let _ = job.drop_tx.send(());
+        true
     }
 
     /// The runner a job of this role is dispatched with — the same map,
@@ -292,6 +336,8 @@ fn spawn_job_checked(
         runner.system = Some(job_system_prompt(root));
     }
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (drop_tx, drop_rx) = mpsc::unbounded_channel();
     {
         let mut live_guard = live.lock().expect("live");
         if guard_absent && live_guard.contains_key(&job.session_id) {
@@ -301,7 +347,14 @@ fn spawn_job_checked(
             );
             return false;
         }
-        live_guard.insert(job.session_id.clone(), steer_tx);
+        live_guard.insert(
+            job.session_id.clone(),
+            LiveJob {
+                steer_tx,
+                cancel: cancel_tx,
+                drop_tx,
+            },
+        );
     }
     let info = statuses.start(&job, initial_spent_tokens);
     notify_job_changed(notifier, engine, info);
@@ -310,6 +363,8 @@ fn spawn_job_checked(
         Arc::clone(engine),
         runner,
         steer_rx,
+        cancel_rx,
+        drop_rx,
         Arc::clone(live),
         Arc::clone(statuses),
         notifier.cloned(),
@@ -335,6 +390,8 @@ fn spawn_watched(
     engine: Arc<Engine>,
     runner: Runner,
     steer_rx: mpsc::UnboundedReceiver<String>,
+    cancel_rx: watch::Receiver<bool>,
+    drop_rx: mpsc::UnboundedReceiver<()>,
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
@@ -351,6 +408,8 @@ fn spawn_watched(
             runner,
             job,
             steer_rx,
+            cancel_rx,
+            drop_rx,
             Arc::clone(&live),
             Arc::clone(&statuses),
             notifier.clone(),
@@ -391,7 +450,7 @@ fn spawn_watched(
 fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
     let live = live.lock().expect("live");
     live.get(session_id)
-        .is_some_and(|sender| sender.send(text.to_owned()).is_ok())
+        .is_some_and(|job| job.steer_tx.send(text.to_owned()).is_ok())
 }
 
 /// Routes one `ContinuedJob`: a steer if the job is still live, or a resume
@@ -400,6 +459,9 @@ fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
 /// produce one: a user turn, a handback turn, and a job's own turn.
 fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
     if steer_live(ctx.live, &cont.session_id, &cont.message) {
+        if let Some(info) = ctx.statuses.record_steer_queued(&cont.session_id) {
+            notify_job_changed(ctx.notifier, ctx.engine, info);
+        }
         info!(session_id = %cont.session_id, "continue_job queued into the live job");
         return;
     }
@@ -1105,9 +1167,16 @@ mod tests {
 
         // stands in for a first resume already holding this session's slot
         let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
-        live.lock()
-            .expect("live")
-            .insert("s-child".to_owned(), steer_tx);
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
+        live.lock().expect("live").insert(
+            "s-child".to_owned(),
+            LiveJob {
+                steer_tx,
+                cancel: cancel_tx,
+                drop_tx,
+            },
+        );
 
         let spawned = spawn_job_checked(
             DispatchedJob {
@@ -1190,5 +1259,140 @@ mod tests {
             )],
             "the crash reads as a normal stopped handback"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_live_job_hands_back_cancelled_exactly_once_and_goes_terminal() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        // never notified: the turn stalls until the cancel drops it
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: gate,
+            after: Vec::new(),
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.cancel(&child_id), "the job is live");
+        supervisor.shutdown().await;
+
+        let job = only_job(supervisor.list());
+        assert_eq!(
+            job.state,
+            job_info::State::Failed as i32,
+            "cancel is a failed-like terminal state"
+        );
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id),
+            [(
+                Role::User,
+                format!("Job {child_id} stopped: cancelled by the user.\n{NO_REPLY}")
+            )],
+            "the cancelled handback lands exactly once"
+        );
+        assert!(
+            !supervisor.cancel(&child_id),
+            "already terminal; nothing left to cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_drops_its_queued_steers_with_a_warning() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: gate,
+            after: Vec::new(),
+        }]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "too late"));
+        assert!(supervisor.cancel(&child_id));
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [(Role::User, "fix the failing test".to_owned())],
+            "the queued steer never ran"
+        );
+        assert!(
+            !supervisor.steer(&child_id, "still too late"),
+            "the job already ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_job_is_an_honest_no_op() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert!(
+            !supervisor.cancel(&child_id),
+            "the job already finished cleanly"
+        );
+        assert!(!supervisor.cancel("s-never-existed"), "an unknown session");
     }
 }

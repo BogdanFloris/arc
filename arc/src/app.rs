@@ -31,6 +31,12 @@ pub enum Command {
         record_id: String,
     },
     ListJobs,
+    CancelJob {
+        session_id: String,
+    },
+    DropSteers {
+        session_id: String,
+    },
     Yank(String),
 }
 
@@ -627,7 +633,7 @@ impl App {
         let last = jobs.items.len().saturating_sub(1);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => self.jobs = None,
-            KeyCode::Up | KeyCode::Char('k') => jobs.selected = jobs.selected.saturating_sub(1),
+            KeyCode::Up => jobs.selected = jobs.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => jobs.selected = (jobs.selected + 1).min(last),
             KeyCode::Char('r') => return Some(Command::ListJobs),
             KeyCode::Enter => {
@@ -640,9 +646,40 @@ impl App {
                     self.start_steer(session_id);
                 }
             }
+            KeyCode::Char('k') => return self.cancel_selected_job(),
+            KeyCode::Char('d') => return self.drop_selected_steers(),
             _ => {}
         }
         None
+    }
+
+    /// `k` on a running row (row 6.39): stops the job through the
+    /// supervisor and leaves a footer note either way, mirroring `s`'s
+    /// plumbing — the confirmation is set optimistically here, before the
+    /// command even reaches the wire.
+    fn cancel_selected_job(&mut self) -> Option<Command> {
+        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let job = jobs.items.get(jobs.selected)?;
+        if !is_running(job) {
+            jobs.confirmation = Some("not running".to_owned());
+            return None;
+        }
+        let session_id = job.session_id.clone();
+        jobs.confirmation = Some(format!("cancelled {}", short_id(&session_id)));
+        Some(Command::CancelJob { session_id })
+    }
+
+    /// `d` on a running row with queued steers (row 6.33): a no-op, no
+    /// footer note, when there's nothing queued to drop.
+    fn drop_selected_steers(&mut self) -> Option<Command> {
+        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let job = jobs.items.get(jobs.selected)?;
+        if !is_running(job) || job.queued_steers == 0 {
+            return None;
+        }
+        let session_id = job.session_id.clone();
+        jobs.confirmation = Some(format!("dropped {}", job.queued_steers));
+        Some(Command::DropSteers { session_id })
     }
 
     fn selected_job(&self) -> Option<String> {
@@ -808,9 +845,16 @@ impl App {
             .collect()
     }
 
-    /// The most recently touched running job, if any; the strip's subject.
+    /// The most recently touched job the open session dispatched that's
+    /// still running (row 6.38); the strip's subject. No open session, or
+    /// none of its children running, means no strip line — the `:jobs`
+    /// popup stays global, only this ambient line scopes.
     pub fn strip_job(&self) -> Option<&JobInfo> {
-        self.ambient.iter().rev().find(|job| is_running(job))
+        let parent = self.session_id.as_deref()?;
+        self.ambient
+            .iter()
+            .rev()
+            .find(|job| is_running(job) && job.parent_session == parent)
     }
 
     pub fn running_job_count(&self) -> usize {
@@ -2907,6 +2951,8 @@ mod tests {
             title: String::new(),
             tool_steps: 0,
             idle_seconds: 0,
+            parent_session: String::new(),
+            queued_steers: 0,
         }
     }
 
@@ -2948,7 +2994,26 @@ mod tests {
     }
 
     #[test]
-    fn j_and_k_move_the_job_selection_within_bounds() {
+    fn the_jobs_popup_lists_every_job_regardless_of_which_session_is_open() {
+        use arc_proto::v1::job_info::State;
+
+        let mine = job_of("s-mine", "s-open", State::Running);
+        let unrelated = job_of("s-other", "s-elsewhere", State::Running);
+        let mut app = App::new();
+        app.session_id = Some("s-open".to_owned());
+        normal(&mut app, ":jobs");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::JobItems(vec![mine.clone(), unrelated.clone()]));
+
+        assert_eq!(
+            app.jobs.as_ref().expect("open").items,
+            [mine, unrelated],
+            "the popup is unscoped: only the ambient strip filters by parent_session"
+        );
+    }
+
+    #[test]
+    fn j_and_up_move_the_job_selection_within_bounds() {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![
@@ -2964,9 +3029,9 @@ mod tests {
             1,
             "j stops at the last row"
         );
-        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Up));
         assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
-        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Up));
         assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
     }
 
@@ -3090,6 +3155,76 @@ mod tests {
     }
 
     #[test]
+    fn k_on_a_running_row_sends_cancel_job_and_confirms_in_the_footer() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+
+        let command = app.on_key(key(KeyCode::Char('k')));
+
+        assert_eq!(
+            command,
+            Some(Command::CancelJob {
+                session_id: "s-a".to_owned()
+            })
+        );
+        assert_eq!(
+            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            Some("cancelled s-a")
+        );
+        assert!(app.jobs.is_some(), "the popup stays open");
+    }
+
+    #[test]
+    fn k_on_a_terminal_row_is_a_no_op_with_a_footer_note() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Finished)]);
+
+        let command = app.on_key(key(KeyCode::Char('k')));
+
+        assert_eq!(command, None, "nothing to cancel on a finished job");
+        assert_eq!(
+            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            Some("not running")
+        );
+    }
+
+    #[test]
+    fn d_on_a_row_with_queued_steers_sends_drop_steers_and_confirms_the_count() {
+        use arc_proto::v1::job_info::State;
+
+        let mut queued = job("s-a", State::Running);
+        queued.queued_steers = 2;
+        let mut app = jobsview(vec![queued]);
+
+        let command = app.on_key(key(KeyCode::Char('d')));
+
+        assert_eq!(
+            command,
+            Some(Command::DropSteers {
+                session_id: "s-a".to_owned()
+            })
+        );
+        assert_eq!(
+            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            Some("dropped 2")
+        );
+    }
+
+    #[test]
+    fn d_on_a_row_with_no_queued_steers_is_a_footer_no_op() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+
+        let command = app.on_key(key(KeyCode::Char('d')));
+
+        assert_eq!(command, None);
+        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
+    }
+
+    #[test]
     fn a_steer_accepted_and_end_do_not_touch_the_open_conversation() {
         use arc_proto::v1::job_info::State;
 
@@ -3150,16 +3285,31 @@ mod tests {
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
+    fn job_of(
+        session_id: &str,
+        parent_session: &str,
+        state: arc_proto::v1::job_info::State,
+    ) -> JobInfo {
+        let mut job = job(session_id, state);
+        job.parent_session = parent_session.to_owned();
+        job
+    }
+
     #[test]
     fn job_changed_populates_the_strip_and_a_second_push_replaces_not_appends() {
         use arc_proto::v1::job_info::State;
 
         let mut app = App::new();
-        app.on_net(NetEvent::JobChanged(job("s-1", State::Running)));
+        app.session_id = Some("s-parent".to_owned());
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-1",
+            "s-parent",
+            State::Running,
+        )));
         assert_eq!(app.ambient.len(), 1);
         assert_eq!(app.strip_job().map(|j| j.session_id.as_str()), Some("s-1"));
 
-        let mut updated = job("s-1", State::Running);
+        let mut updated = job_of("s-1", "s-parent", State::Running);
         updated.spent_tokens = 99;
         app.on_net(NetEvent::JobChanged(updated));
 
@@ -3176,8 +3326,17 @@ mod tests {
         use arc_proto::v1::job_info::State;
 
         let mut app = App::new();
-        app.on_net(NetEvent::JobChanged(job("s-1", State::Running)));
-        app.on_net(NetEvent::JobChanged(job("s-2", State::Finished)));
+        app.session_id = Some("s-parent".to_owned());
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-1",
+            "s-parent",
+            State::Running,
+        )));
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-2",
+            "s-parent",
+            State::Finished,
+        )));
         assert_eq!(
             app.strip_job().map(|j| j.session_id.as_str()),
             Some("s-1"),
@@ -3185,7 +3344,11 @@ mod tests {
         );
         assert_eq!(app.running_job_count(), 1);
 
-        app.on_net(NetEvent::JobChanged(job("s-3", State::Running)));
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-3",
+            "s-parent",
+            State::Running,
+        )));
         assert_eq!(
             app.strip_job().map(|j| j.session_id.as_str()),
             Some("s-3"),
@@ -3195,11 +3358,59 @@ mod tests {
     }
 
     #[test]
+    fn the_strip_picks_the_open_sessions_own_child_over_a_more_recent_unrelated_job() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = App::new();
+        app.session_id = Some("s-parent".to_owned());
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-mine",
+            "s-parent",
+            State::Running,
+        )));
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-other",
+            "s-elsewhere",
+            State::Running,
+        )));
+
+        assert_eq!(
+            app.strip_job().map(|j| j.session_id.as_str()),
+            Some("s-mine"),
+            "a more recently touched job scoped to a different session never wins"
+        );
+    }
+
+    #[test]
+    fn no_open_session_means_no_strip_job() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = App::new();
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-1",
+            "s-parent",
+            State::Running,
+        )));
+
+        assert_eq!(app.session_id, None);
+        assert_eq!(
+            app.strip_job(),
+            None,
+            "nothing is open to scope the strip to"
+        );
+    }
+
+    #[test]
     fn no_running_jobs_means_no_strip_job() {
         use arc_proto::v1::job_info::State;
 
         let mut app = App::new();
-        app.on_net(NetEvent::JobChanged(job("s-1", State::Finished)));
+        app.session_id = Some("s-parent".to_owned());
+        app.on_net(NetEvent::JobChanged(job_of(
+            "s-1",
+            "s-parent",
+            State::Finished,
+        )));
         assert_eq!(app.strip_job(), None);
         assert_eq!(app.running_job_count(), 0);
     }

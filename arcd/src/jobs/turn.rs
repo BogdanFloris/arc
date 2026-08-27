@@ -6,12 +6,13 @@ use std::time::Duration;
 use arc_core::provider::Usage;
 use arc_core::session::{ContinuedJob, DispatchedJob, Engine, EngineEvent, Runner};
 use arc_proto::v1::{Budget, Notification, SessionRole};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::handback::{
-    Handback, HandbackCtx, handback_clean, handback_failed, handback_over_budget,
+    Handback, HandbackCtx, handback_cancelled, handback_clean, handback_failed,
+    handback_over_budget,
 };
 use super::status::{JobState, JobStatuses, notify_job_changed};
 use super::{Handles, LiveMap, route_continues, spawn_dispatched};
@@ -22,12 +23,23 @@ pub(super) const EVENT_BUFFER: usize = 64;
 /// goes quiet without closing would otherwise hold the job open forever.
 const JOB_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Why a job's turn loop stopped short of a clean finish: both read the
+/// same terminal `JobState::Failed`, so only the handback text tells them
+/// apart (the caller wired to `k` gets a distinct reason from a genuine
+/// provider failure).
+enum EndReason {
+    Failed,
+    Cancelled,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_job(
     engine: Arc<Engine>,
     runner: Runner,
     job: DispatchedJob,
     mut steer_rx: mpsc::UnboundedReceiver<String>,
+    mut cancel_rx: watch::Receiver<bool>,
+    mut drop_rx: mpsc::UnboundedReceiver<()>,
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
@@ -50,7 +62,17 @@ pub(super) async fn run_job(
         handback: handback.as_ref(),
     };
 
-    match run_turn(&ctx, &runner, &session_id, &job.brief).await {
+    match run_turn(
+        &ctx,
+        &runner,
+        &session_id,
+        &job.brief,
+        &mut steer_rx,
+        &mut drop_rx,
+        &mut cancel_rx,
+    )
+    .await
+    {
         TurnOutcome::Success {
             usage,
             jobs,
@@ -64,19 +86,26 @@ pub(super) async fn run_job(
             route_continues(&ctx, continues);
         }
         TurnOutcome::Failure => {
-            finish_now(&live, &mut steer_rx, &session_id);
-            if let Some(info) = statuses.finish(&session_id, JobState::Failed, start.elapsed()) {
-                notify_job_changed(notifier.as_ref(), &engine, info);
-            }
-            handback_failed(&ctx, &job).await;
+            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
+            return;
+        }
+        TurnOutcome::Cancelled => {
+            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
             return;
         }
     }
 
     loop {
+        drain_dropped_steers(&mut drop_rx, &mut steer_rx, &ctx, &session_id);
+
+        if *cancel_rx.borrow() {
+            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
+            return;
+        }
+
         if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
             warn_over_budget(&session_id, &breach);
-            finish_now(&live, &mut steer_rx, &session_id);
+            finish_now(&live, &mut steer_rx, &statuses, &session_id);
             if let Some(info) = statuses.finish(&session_id, JobState::OverBudget, start.elapsed())
             {
                 notify_job_changed(notifier.as_ref(), &engine, info);
@@ -99,7 +128,20 @@ pub(super) async fn run_job(
             }
         };
         let Some(text) = steered else { break };
-        match run_turn(&ctx, &runner, &session_id, &text).await {
+        if let Some(info) = statuses.record_steer_consumed(&session_id) {
+            notify_job_changed(notifier.as_ref(), &engine, info);
+        }
+        match run_turn(
+            &ctx,
+            &runner,
+            &session_id,
+            &text,
+            &mut steer_rx,
+            &mut drop_rx,
+            &mut cancel_rx,
+        )
+        .await
+        {
             TurnOutcome::Success {
                 usage,
                 jobs,
@@ -113,12 +155,11 @@ pub(super) async fn run_job(
                 route_continues(&ctx, continues);
             }
             TurnOutcome::Failure => {
-                finish_now(&live, &mut steer_rx, &session_id);
-                if let Some(info) = statuses.finish(&session_id, JobState::Failed, start.elapsed())
-                {
-                    notify_job_changed(notifier.as_ref(), &engine, info);
-                }
-                handback_failed(&ctx, &job).await;
+                end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
+                return;
+            }
+            TurnOutcome::Cancelled => {
+                end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
                 return;
             }
         }
@@ -130,9 +171,31 @@ pub(super) async fn run_job(
     handback_clean(&ctx, &job).await;
 }
 
-/// A completed turn's outcome. A failed turn ends the job, so the caller
-/// stops draining steers; a successful turn carries whatever usage the
-/// provider reported, which may itself be absent.
+/// Shared tail for a turn loop stopping short of a clean finish: drains
+/// whatever's queued, marks the job terminal, and hands back the reason.
+async fn end_job(
+    ctx: &HandbackCtx<'_>,
+    job: &DispatchedJob,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    start: Instant,
+    reason: EndReason,
+) {
+    finish_now(ctx.live, steer_rx, ctx.statuses, &job.session_id);
+    if let Some(info) = ctx
+        .statuses
+        .finish(&job.session_id, JobState::Failed, start.elapsed())
+    {
+        notify_job_changed(ctx.notifier, ctx.engine, info);
+    }
+    match reason {
+        EndReason::Failed => handback_failed(ctx, job).await,
+        EndReason::Cancelled => handback_cancelled(ctx, job).await,
+    }
+}
+
+/// A completed turn's outcome. A failed or cancelled turn ends the job, so
+/// the caller stops draining steers; a successful turn carries whatever
+/// usage the provider reported, which may itself be absent.
 enum TurnOutcome {
     Success {
         usage: Option<Usage>,
@@ -140,6 +203,7 @@ enum TurnOutcome {
         continues: Vec<ContinuedJob>,
     },
     Failure,
+    Cancelled,
 }
 
 fn usage_tokens(usage: Option<Usage>) -> u64 {
@@ -218,15 +282,33 @@ fn handle_job_event(
     *deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
 }
 
+/// One completed poll of `run_turn`'s select loop: either the send future
+/// resolved, or it timed out silent, or a cancel landed (row 6.39). Kept
+/// distinct from `TurnOutcome` because the caller still needs to log each
+/// case with its own message before collapsing them.
+enum RawOutcome {
+    Sent(Result<arc_core::session::Reply, arc_core::session::Error>),
+    SilentTimeout,
+    Cancelled,
+}
+
 /// Runs one turn to completion, failing it if the engine goes quiet for
-/// `JOB_SILENCE_TIMEOUT` with no events. A pending tool call suspends the
-/// timeout instead of tripping it: bash alone is allowed to run silent for
-/// up to its own 600s cap, so a tool call in flight is activity, not stall.
+/// `JOB_SILENCE_TIMEOUT` with no events, or if `cancel_rx` fires. A pending
+/// tool call suspends the timeout instead of tripping it: bash alone is
+/// allowed to run silent for up to its own 600s cap, so a tool call in
+/// flight is activity, not stall. A cancel drops `send` mid-await — the
+/// same shape a crash leaves — instead of waiting the turn out. A
+/// `DropSteers` request lands here too, so it empties the queue without
+/// waiting for a long turn to finish first.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     ctx: &HandbackCtx<'_>,
     runner: &Runner,
     session_id: &str,
     text: &str,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    drop_rx: &mut mpsc::UnboundedReceiver<()>,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
     let send = ctx
@@ -236,8 +318,12 @@ async fn run_turn(
 
     let mut deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
     let mut pending_tool_calls: u32 = 0;
+    // once a sender's gone, stop polling it: an already-closed channel
+    // would otherwise resolve immediately forever and spin the select loop
+    let mut cancel_live = true;
+    let mut drop_live = true;
 
-    let result = loop {
+    let outcome = loop {
         tokio::select! {
             result = &mut send => {
                 // the engine can complete a fully-scripted turn with events
@@ -245,7 +331,7 @@ async fn run_turn(
                 while let Ok(event) = rx.try_recv() {
                     handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
                 }
-                break Some(result);
+                break RawOutcome::Sent(result);
             }
             event = rx.recv() => {
                 // send_message drops its sender exactly as it returns, so a
@@ -253,12 +339,20 @@ async fn run_turn(
                 let Some(event) = event else { continue };
                 handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
             }
-            () = tokio::time::sleep_until(deadline), if pending_tool_calls == 0 => break None,
+            () = tokio::time::sleep_until(deadline), if pending_tool_calls == 0 => break RawOutcome::SilentTimeout,
+            changed = cancel_rx.changed(), if cancel_live => match changed {
+                Ok(()) => break RawOutcome::Cancelled,
+                Err(_) => cancel_live = false,
+            },
+            dropped = drop_rx.recv(), if drop_live => match dropped {
+                Some(()) => drop_queued_steers(steer_rx, ctx, session_id),
+                None => drop_live = false,
+            },
         }
     };
 
-    match result {
-        Some(Ok(reply)) => {
+    match outcome {
+        RawOutcome::Sent(Ok(reply)) => {
             info!(
                 session_id = %session_id,
                 input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
@@ -271,14 +365,14 @@ async fn run_turn(
                 continues: reply.continues,
             }
         }
-        Some(Err(error)) => {
+        RawOutcome::Sent(Err(error)) => {
             warn!(session_id = %session_id, %error, "job turn failed");
             TurnOutcome::Failure
         }
         // dropping `send` here abandons the turn mid-flight, the same shape
         // as a crash: any durable but unresolved tool call is left for the
         // orphan-repair a restart already needs, not fixed up here
-        None => {
+        RawOutcome::SilentTimeout => {
             warn!(
                 session_id = %session_id,
                 timeout_secs = JOB_SILENCE_TIMEOUT.as_secs(),
@@ -286,17 +380,68 @@ async fn run_turn(
             );
             TurnOutcome::Failure
         }
+        RawOutcome::Cancelled => {
+            info!(session_id = %session_id, "job turn cancelled by the user");
+            TurnOutcome::Cancelled
+        }
     }
 }
 
-/// Ends a job now: removes its live entry and drops whatever steers are
-/// still queued, exactly as a failed turn or an over-budget job must.
-fn finish_now(live: &LiveMap, steer_rx: &mut mpsc::UnboundedReceiver<String>, session_id: &str) {
+/// Physically empties the steer queue and reports the fresh (zero) count.
+/// Draining and counting happen together — the job's own task is the only
+/// reader of `steer_rx` — so a steer that queues after the request is never
+/// caught in the same net.
+fn drop_queued_steers(
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    ctx: &HandbackCtx<'_>,
+    session_id: &str,
+) {
+    let mut dropped = 0_usize;
+    while steer_rx.try_recv().is_ok() {
+        dropped += 1;
+    }
+    if dropped > 0 {
+        warn!(session_id, dropped, "dropping queued steers on request");
+    }
+    if let Some(info) = ctx.statuses.drop_queued(session_id) {
+        notify_job_changed(ctx.notifier, ctx.engine, info);
+    }
+}
+
+/// Whether any `DropSteers` request has landed since the last check
+/// (row 6.33); a no-op unless one has. The mid-turn select handles a
+/// request seen while a turn is in flight — this is only for the window
+/// between turns, in `run_job`'s own loop.
+fn drain_dropped_steers(
+    drop_rx: &mut mpsc::UnboundedReceiver<()>,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    ctx: &HandbackCtx<'_>,
+    session_id: &str,
+) {
+    let mut requested = false;
+    while drop_rx.try_recv().is_ok() {
+        requested = true;
+    }
+    if requested {
+        drop_queued_steers(steer_rx, ctx, session_id);
+    }
+}
+
+/// Ends a job now: removes its live entry, drops whatever steers are still
+/// queued, and zeroes the visible count — exactly as a failed, cancelled,
+/// or over-budget job must.
+fn finish_now(
+    live: &LiveMap,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    statuses: &JobStatuses,
+    session_id: &str,
+) {
     live.lock().expect("live").remove(session_id);
     let mut dropped = 0_usize;
     while steer_rx.try_recv().is_ok() {
         dropped += 1;
     }
+    statuses.drop_queued(session_id);
     if dropped > 0 {
         warn!(
             session_id,

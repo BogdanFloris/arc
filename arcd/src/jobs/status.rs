@@ -63,6 +63,10 @@ struct JobStatus {
     /// the strip's idle readout counts from; the client ticks it forward
     /// locally between pushes.
     last_engine_event: Instant,
+    /// The session that dispatched it (row 6.38): scopes the ambient strip.
+    parent_session: String,
+    /// `steer`/`continue_job` messages waiting for their own turn (row 6.33).
+    queued_steers: u32,
 }
 
 impl JobStatus {
@@ -90,6 +94,8 @@ impl JobStatus {
             tool_steps: self.tool_steps,
             idle_seconds: u32::try_from(self.last_engine_event.elapsed().as_secs())
                 .unwrap_or(u32::MAX),
+            parent_session: self.parent_session.clone(),
+            queued_steers: self.queued_steers,
         }
     }
 }
@@ -134,6 +140,8 @@ impl JobStatuses {
             finished_at: None,
             tool_steps: 0,
             last_engine_event: Instant::now(),
+            parent_session: job.parent_session.clone(),
+            queued_steers: 0,
         };
         let info = entry.to_job_info(&job.session_id);
         self.entries
@@ -157,6 +165,32 @@ impl JobStatuses {
         let entry = entries.get_mut(session_id)?;
         entry.tool_steps += 1;
         entry.last_engine_event = Instant::now();
+        Some(entry.to_job_info(session_id))
+    }
+
+    /// A steer or a live `continue_job` landed in the job's queue (row
+    /// 6.33), returning the fresh info so the caller can broadcast it.
+    pub(super) fn record_steer_queued(&self, session_id: &str) -> Option<JobInfo> {
+        let mut entries = self.entries.lock().expect("statuses");
+        let entry = entries.get_mut(session_id)?;
+        entry.queued_steers += 1;
+        Some(entry.to_job_info(session_id))
+    }
+
+    /// A queued steer was picked up to run as the job's next turn.
+    pub(super) fn record_steer_consumed(&self, session_id: &str) -> Option<JobInfo> {
+        let mut entries = self.entries.lock().expect("statuses");
+        let entry = entries.get_mut(session_id)?;
+        entry.queued_steers = entry.queued_steers.saturating_sub(1);
+        Some(entry.to_job_info(session_id))
+    }
+
+    /// Zeroes the queued count outright: a drop, a cancel, or the job
+    /// ending with steers still queued.
+    pub(super) fn drop_queued(&self, session_id: &str) -> Option<JobInfo> {
+        let mut entries = self.entries.lock().expect("statuses");
+        let entry = entries.get_mut(session_id)?;
+        entry.queued_steers = 0;
         Some(entry.to_job_info(session_id))
     }
 
@@ -234,10 +268,13 @@ mod tests {
     use arc_core::tool::workspace::{Grant, Mode};
     use tempfile::TempDir;
 
+    use arc_proto::v1::Role;
+
     use crate::jobs::Supervisor;
     use crate::jobs::tests_common::testkit::{
-        GatedTool, child_session, engine_for_project, engine_for_project_notified, executor_runner,
-        job_changed, only_job, wait_for_message_count,
+        GatedTool, child_session, child_user_messages, engine_for_project,
+        engine_for_project_notified, executor_runner, job_changed, only_job,
+        wait_for_message_count,
     };
 
     #[tokio::test]
@@ -906,5 +943,138 @@ mod tests {
             job_info::State::Finished as i32
         );
         supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_steers_count_tracks_queueing_and_consuming() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("steer reply")),
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "also check the linter"));
+        assert_eq!(
+            only_job(supervisor.list()).queued_steers,
+            1,
+            "the count tracks the queue"
+        );
+
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            only_job(supervisor.list()).queued_steers,
+            0,
+            "consuming the queued steer cleared it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_steers_zeroes_the_count_immediately_and_pushes_job_changed() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
+            notify: Arc::clone(&notify),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "first"));
+        assert!(supervisor.steer(&child_id, "second"));
+        let mut job = job_changed(&mut notifications).await;
+        while job.queued_steers != 2 {
+            job = job_changed(&mut notifications).await;
+        }
+
+        // the job is still gated mid-turn: the drop's count and push land
+        // without waiting for the turn to finish
+        assert!(supervisor.drop_steers(&child_id));
+        let dropped_push = job_changed(&mut notifications).await;
+        assert_eq!(
+            dropped_push.queued_steers, 0,
+            "the drop pushed the zeroed count right away"
+        );
+
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &child_id),
+            [
+                (Role::User, "fix the failing test".to_owned()),
+                (Role::Assistant, "on it".to_owned()),
+            ],
+            "neither dropped steer ever ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_steers_on_an_unknown_job_is_an_honest_no_op() {
+        let dir = TempDir::new().expect("temp dir");
+        let engine = Arc::new(Engine::new(
+            Store::new(
+                Log::open(dir.path()).expect("open log"),
+                Projection::in_memory().expect("open projection"),
+            ),
+            Registry::new(512),
+        ));
+        let supervisor = Supervisor::new(engine, BTreeMap::new());
+
+        assert!(!supervisor.drop_steers("s-never-existed"));
     }
 }

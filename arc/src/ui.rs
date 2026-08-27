@@ -779,10 +779,13 @@ const HELP: &[(&str, &[&str])] = &[
     (
         "jobs keys",
         &[
-            "j k               move selection",
+            "j down            move selection down",
+            "up                move selection up",
             "r                 refresh the list",
             "enter             open the selected job's session",
             "s                 steer the selected job",
+            "k                 cancel the selected job (if running)",
+            "d                 drop its queued steers (if any)",
             "q esc             close",
         ],
     ),
@@ -828,11 +831,16 @@ fn job_label(job: &JobInfo) -> String {
     } else {
         format_tokens(job.budget_tokens)
     };
-    format!(
+    let mut label = format!(
         "{state} {subject} {}/{budget} tok {}s",
         format_tokens(job.spent_tokens),
         job.elapsed_seconds
-    )
+    );
+    if job.queued_steers > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(label, " · {} queued", job.queued_steers);
+    }
+    label
 }
 
 fn job_state_word(state: i32) -> &'static str {
@@ -1063,6 +1071,8 @@ mod tests {
             title: title.to_owned(),
             tool_steps: 0,
             idle_seconds: 0,
+            parent_session: String::new(),
+            queued_steers: 0,
         }
     }
 
@@ -1086,6 +1096,16 @@ mod tests {
         assert_eq!(
             job_label(&with_budget),
             "running executor/arc 441.3k/500.0k tok 5s"
+        );
+    }
+
+    #[test]
+    fn a_jobs_row_appends_the_queued_count_when_nonzero() {
+        let mut with_queue = job(SessionRole::Executor, "arc", "");
+        with_queue.queued_steers = 2;
+        assert_eq!(
+            job_label(&with_queue),
+            "running executor/arc 12/- tok 5s · 2 queued"
         );
     }
 }
