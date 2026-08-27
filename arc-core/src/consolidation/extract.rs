@@ -519,6 +519,9 @@ mod tests {
                 partial: false,
                 turn_id: "t-1".to_owned(),
                 source: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
             }],
             latest_seq: 1,
             memory_index,
@@ -825,6 +828,9 @@ mod tests {
             partial: false,
             turn_id: "t-1".to_owned(),
             source: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 0,
         });
         let prompt = title_prompt(&snapshot).expect("both roles present");
         assert!(prompt.starts_with("User: hi\nAssistant: "));
@@ -963,6 +969,9 @@ mod tests {
                 partial: false,
                 turn_id: "t".to_owned(),
                 source: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
             },
             MessageRow::ToolCall {
                 call_id: "c1".to_owned(),

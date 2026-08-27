@@ -152,6 +152,7 @@ mod tests {
                 content: content.to_owned(),
                 partial: false,
                 turn_id: turn.to_owned(),
+                ..Default::default()
             }),
         )
     }

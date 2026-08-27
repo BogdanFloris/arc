@@ -24,6 +24,10 @@ use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource
 
 const MAX_TOOL_STEPS: usize = 8;
 
+fn elapsed_ms_since(start: std::time::Instant) -> u32 {
+    u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
 /// What a project offers a session bound to it: the tools and the roots.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectSpec {
@@ -432,6 +436,7 @@ impl Engine {
                 content,
                 partial: false,
                 turn_id: uuid::Uuid::new_v4().to_string(),
+                ..Default::default()
             }),
         )?;
         Ok(())
@@ -596,6 +601,7 @@ impl Engine {
                 content: content.to_owned(),
                 partial: false,
                 turn_id: turn_id.clone(),
+                ..Default::default()
             }),
         )?;
 
@@ -688,6 +694,7 @@ impl Engine {
             .await;
 
         let span = tracing::Span::current();
+        let turn_start = std::time::Instant::now();
         let (mut transcript, system) = self.open_turn(runner, session_id)?;
         let mut total_usage: Option<Usage> = None;
         let mut steps = 0;
@@ -732,7 +739,15 @@ impl Engine {
                     .await?;
                 }
                 Ending::Done(_) => {
-                    let seq = self.append_reply(session_id, turn_id, &text, false)?;
+                    let elapsed_ms = elapsed_ms_since(turn_start);
+                    let seq = self.append_reply(
+                        session_id,
+                        turn_id,
+                        &text,
+                        false,
+                        total_usage,
+                        elapsed_ms,
+                    )?;
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
@@ -749,7 +764,15 @@ impl Engine {
                     break Err(Error::EmptyReply);
                 }
                 Ending::Cut => {
-                    let seq = self.append_reply(session_id, turn_id, &text, true)?;
+                    let elapsed_ms = elapsed_ms_since(turn_start);
+                    let seq = self.append_reply(
+                        session_id,
+                        turn_id,
+                        &text,
+                        true,
+                        total_usage,
+                        elapsed_ms,
+                    )?;
                     span.record("outcome", "partial");
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
@@ -763,7 +786,15 @@ impl Engine {
                 }
                 Ending::Failed(error) => {
                     if !text.is_empty() {
-                        let seq = self.append_reply(session_id, turn_id, &text, true)?;
+                        let elapsed_ms = elapsed_ms_since(turn_start);
+                        let seq = self.append_reply(
+                            session_id,
+                            turn_id,
+                            &text,
+                            true,
+                            total_usage,
+                            elapsed_ms,
+                        )?;
                         span.record("assistant_seq", seq);
                     }
                     span.record("outcome", "error");
@@ -834,6 +865,7 @@ impl Engine {
                     content: text.clone(),
                     partial: false,
                     turn_id: turn_id.to_owned(),
+                    ..Default::default()
                 }),
             )?;
             transcript.push(Message::Text {
@@ -1030,7 +1062,10 @@ impl Engine {
         turn_id: &str,
         text: &str,
         partial: bool,
+        usage: Option<Usage>,
+        elapsed_ms: u32,
     ) -> Result<u64, Error> {
+        let usage = usage.unwrap_or_default();
         self.record(
             Source::Model,
             session_event::Event::MessageAppended(MessageAppended {
@@ -1039,6 +1074,9 @@ impl Engine {
                 content: text.to_owned(),
                 partial,
                 turn_id: turn_id.to_owned(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                elapsed_ms,
             }),
         )
     }
@@ -1335,6 +1373,7 @@ mod tests {
             content: content.to_owned(),
             partial: false,
             turn_id: "t-01".to_owned(),
+            ..Default::default()
         })
     }
 
@@ -1368,6 +1407,7 @@ mod tests {
                 content: content.to_owned(),
                 partial: false,
                 source: source as i32,
+                ..Default::default()
             })),
         }
     }
@@ -1384,8 +1424,37 @@ mod tests {
                 content: content.to_owned(),
                 partial,
                 source: source as i32,
+                ..Default::default()
             })),
         }
+    }
+
+    fn assistant_entry_with_usage(
+        content: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::Message(HistoryMessage {
+                role: Role::Assistant as i32,
+                content: content.to_owned(),
+                partial: false,
+                source: Source::Model as i32,
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            })),
+        }
+    }
+
+    // elapsed_ms is wall time, not worth pinning down in a scripted test
+    fn ignoring_elapsed(mut entries: Vec<HistoryEntry>) -> Vec<HistoryEntry> {
+        for entry in &mut entries {
+            if let Some(history_entry::Entry::Message(message)) = &mut entry.entry {
+                message.elapsed_ms = 0;
+            }
+        }
+        entries
     }
 
     fn seeded_session_with_project(project: &str) -> session_event::Event {
@@ -1817,6 +1886,7 @@ mod tests {
                     content: "from the future".to_owned(),
                     partial: false,
                     turn_id: String::new(),
+                    ..Default::default()
                 }),
             )
             .expect("record");
@@ -2210,6 +2280,7 @@ mod tests {
                     content: "from the future".to_owned(),
                     partial: false,
                     turn_id: "t-01".to_owned(),
+                    ..Default::default()
                 }),
                 seeded_call("c1", 0),
                 session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
@@ -2358,6 +2429,59 @@ mod tests {
         assert_eq!(issued(&events[3]).call_id, "s");
         assert_eq!(appended(&events[5]).content, "final");
         assert_eq!(step_text.turn_id, appended(&events[5]).turn_id);
+    }
+
+    #[tokio::test]
+    async fn a_multi_tool_step_turn_stamps_usage_only_on_the_final_append() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(CompletionDelta::Text("checking".to_owned())),
+                Ok(call("s", 0, "alpha", "{}")),
+                Ok(tool_stop()),
+            ],
+            done_reply("final"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                input_tokens: 6,
+                output_tokens: 10
+            }),
+            "usage accumulates across both completion steps"
+        );
+
+        let events = replay_log(dir.path());
+        let user = appended(&events[1]);
+        let step_text = appended(&events[2]);
+        let final_text = appended(&events[5]);
+
+        assert_eq!(
+            (user.input_tokens, user.output_tokens, user.elapsed_ms),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                step_text.input_tokens,
+                step_text.output_tokens,
+                step_text.elapsed_ms
+            ),
+            (0, 0, 0),
+            "the intermediate tool-step assistant append stays zero"
+        );
+        assert_eq!(
+            (final_text.input_tokens, final_text.output_tokens),
+            (6, 10),
+            "only the turn's final assistant append carries the accumulated usage"
+        );
     }
 
     #[tokio::test]
@@ -4219,11 +4343,11 @@ mod tests {
         assert_eq!(last.content, "the concierge reacts");
 
         assert_eq!(
-            engine.transcript(&reply.session_id).expect("transcript"),
+            ignoring_elapsed(engine.transcript(&reply.session_id).expect("transcript")),
             [
                 prose_entry(Role::User as i32, "hi", false),
-                prose_entry(Role::Assistant as i32, "first", false),
-                prose_entry(Role::Assistant as i32, "the concierge reacts", false),
+                assistant_entry_with_usage("first", 3, 5),
+                assistant_entry_with_usage("the concierge reacts", 3, 5),
             ],
             "no user message was appended for the handback turn"
         );
@@ -4545,21 +4669,25 @@ mod tests {
             .expect("the slow turn completes once released");
 
         assert_eq!(
-            engine
-                .transcript(&fast_reply.session_id)
-                .expect("transcript"),
+            ignoring_elapsed(
+                engine
+                    .transcript(&fast_reply.session_id)
+                    .expect("transcript")
+            ),
             [
                 prose_entry(Role::User as i32, "fast please", false),
-                prose_entry(Role::Assistant as i32, "fast done", false),
+                assistant_entry_with_usage("fast done", 3, 5),
             ]
         );
         assert_eq!(
-            engine
-                .transcript(&slow_reply.session_id)
-                .expect("transcript"),
+            ignoring_elapsed(
+                engine
+                    .transcript(&slow_reply.session_id)
+                    .expect("transcript")
+            ),
             [
                 prose_entry(Role::User as i32, "slow please", false),
-                prose_entry(Role::Assistant as i32, "slow startslow end", false),
+                assistant_entry_with_usage("slow startslow end", 3, 5),
             ],
             "the gate held the reply together; nothing from the fast session leaked in"
         );
@@ -4627,12 +4755,12 @@ mod tests {
         assert_eq!(first_reply.session_id, session_id);
         assert_eq!(second_reply.session_id, session_id);
         assert_eq!(
-            engine.transcript(&session_id).expect("transcript"),
+            ignoring_elapsed(engine.transcript(&session_id).expect("transcript")),
             [
                 prose_entry(Role::User as i32, "one", false),
-                prose_entry(Role::Assistant as i32, "first startfirst end", false),
+                assistant_entry_with_usage("first startfirst end", 3, 5),
                 prose_entry(Role::User as i32, "two", false),
-                prose_entry(Role::Assistant as i32, "second reply", false),
+                assistant_entry_with_usage("second reply", 3, 5),
             ],
             "the two turns land whole, in order, with nothing interleaved"
         );

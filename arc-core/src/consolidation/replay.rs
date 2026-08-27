@@ -318,6 +318,7 @@ mod tests {
                 content: content.to_owned(),
                 partial: false,
                 turn_id: format!("{session_id}-t1"),
+                ..Default::default()
             })),
         })
     }

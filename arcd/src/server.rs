@@ -1120,6 +1120,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_carries_the_final_replys_usage_and_elapsed() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _, _) = turn(&mut ws, 1).await;
+
+        let answer = history(&mut ws, 2, &session_id).await;
+
+        let messages: Vec<&HistoryMessage> = answer
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.entry.as_ref() {
+                Some(history_entry::Entry::Message(m)) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            (messages[0].input_tokens, messages[0].output_tokens),
+            (0, 0),
+            "the user row carries no usage"
+        );
+        assert_eq!(
+            (messages[1].input_tokens, messages[1].output_tokens),
+            (usage().input_tokens, usage().output_tokens),
+            "the final assistant row carries the turn's reported usage"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
     async fn listed_sessions_preview_their_first_user_message() {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
@@ -1371,9 +1404,10 @@ mod tests {
                 Role::Assistant => Source::Model as i32,
                 _ => Source::User as i32,
             },
+            ..Default::default()
         };
         assert_eq!(
-            answer.entries,
+            answer.entries[..3],
             [
                 HistoryEntry {
                     entry: Some(history_entry::Entry::Message(prose(Role::User, "hi"))),
@@ -1392,13 +1426,21 @@ mod tests {
                         truncated: false,
                     })),
                 },
-                HistoryEntry {
-                    entry: Some(history_entry::Entry::Message(prose(
-                        Role::Assistant,
-                        "answer"
-                    ))),
-                },
             ]
+        );
+        let Some(history_entry::Entry::Message(final_message)) = &answer.entries[3].entry else {
+            panic!(
+                "expected the final assistant message, got {:?}",
+                answer.entries[3]
+            );
+        };
+        assert_eq!(final_message.role, Role::Assistant as i32);
+        assert_eq!(final_message.content, "answer");
+        assert_eq!(final_message.source, Source::Model as i32);
+        assert_eq!(
+            (final_message.input_tokens, final_message.output_tokens),
+            (2 * usage().input_tokens, 2 * usage().output_tokens),
+            "usage accumulates across both completion steps"
         );
         assert_eq!(
             said(&answer),

@@ -232,6 +232,7 @@ mod tests {
             content: content.to_owned(),
             partial: false,
             turn_id: String::new(),
+            ..Default::default()
         })
     }
 

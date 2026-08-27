@@ -541,8 +541,9 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, reply.session_id);
         let turn_id = user.turn_id.clone();
+        let rows = fresh.messages(&reply.session_id).expect("messages");
         assert_eq!(
-            fresh.messages(&reply.session_id).expect("messages"),
+            rows[..3],
             [
                 MessageRow::Message {
                     role: Role::User as i32,
@@ -550,6 +551,9 @@ mod tests {
                     partial: false,
                     turn_id: turn_id.clone(),
                     source: Source::User as i32,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    elapsed_ms: 0,
                 },
                 MessageRow::ToolCall {
                     call_id: "c1".to_owned(),
@@ -566,14 +570,30 @@ mod tests {
                     truncated: false,
                     turn_id: turn_id.clone(),
                 },
-                MessageRow::Message {
-                    role: Role::Assistant as i32,
-                    content: "final text".to_owned(),
-                    partial: false,
-                    turn_id,
-                    source: Source::Model as i32,
-                },
             ]
+        );
+        let MessageRow::Message {
+            role,
+            content,
+            partial,
+            turn_id: final_turn_id,
+            source,
+            input_tokens,
+            output_tokens,
+            elapsed_ms: _,
+        } = &rows[3]
+        else {
+            panic!("expected the final assistant message, got {:?}", rows[3]);
+        };
+        assert_eq!(*role, Role::Assistant as i32);
+        assert_eq!(content, "final text");
+        assert!(!partial);
+        assert_eq!(final_turn_id, &turn_id);
+        assert_eq!(*source, Source::Model as i32);
+        assert_eq!(
+            (*input_tokens, *output_tokens),
+            (6, 10),
+            "usage accumulated across both completion steps"
         );
 
         let (tx, _rx) = channel();

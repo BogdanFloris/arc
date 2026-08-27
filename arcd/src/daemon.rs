@@ -596,6 +596,7 @@ mod tests {
                 content: "hello".to_owned(),
                 partial: false,
                 turn_id: format!("{session_id}-t1"),
+                ..Default::default()
             }),
         ];
         for event in events {

@@ -16,7 +16,8 @@ use crate::log;
 
 // bump on any SCHEMA change; the daemon deletes the index and replays
 // 9: messages gained the source column
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+// 10: messages gained input_tokens, output_tokens, elapsed_ms
+pub(crate) const SCHEMA_VERSION: u32 = 10;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -50,7 +51,10 @@ CREATE TABLE IF NOT EXISTS messages (
     truncated      INTEGER,
     ts             INTEGER,
     provider_roundtrip BLOB,
-    source         INTEGER
+    source         INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    elapsed_ms     INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
@@ -144,6 +148,9 @@ pub enum MessageRow {
         partial: bool,
         turn_id: String,
         source: i32,
+        input_tokens: u32,
+        output_tokens: u32,
+        elapsed_ms: u32,
     },
     ToolCall {
         call_id: String,
@@ -574,6 +581,13 @@ impl Projection {
     }
 }
 
+// NULL (pre-existing events) or an out-of-range value both read as absent
+fn nonneg_u32(value: Option<i64>) -> u32 {
+    value
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
 fn bad_column(index: usize, message: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
@@ -644,7 +658,7 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
     let mut stmt = conn.prepare(
         "SELECT kind, role, content, partial, turn_id,
                 call_id, call_index, name, arguments_json, outcome, truncated,
-                provider_roundtrip, source
+                provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms
          FROM messages WHERE session_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
@@ -654,6 +668,9 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
             partial: row.get(3)?,
             turn_id: row.get(4)?,
             source: row.get::<_, Option<i32>>(12)?.unwrap_or(0),
+            input_tokens: nonneg_u32(row.get::<_, Option<i64>>(13)?),
+            output_tokens: nonneg_u32(row.get::<_, Option<i64>>(14)?),
+            elapsed_ms: nonneg_u32(row.get::<_, Option<i64>>(15)?),
         }),
         KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
             call_id: row.get(5)?,
@@ -714,12 +731,18 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             content,
             partial,
             source,
+            input_tokens,
+            output_tokens,
+            elapsed_ms,
             ..
         } => history_entry::Entry::Message(HistoryMessage {
             role,
             content,
             partial,
             source,
+            input_tokens,
+            output_tokens,
+            elapsed_ms,
         }),
         MessageRow::ToolCall {
             call_id,
@@ -845,8 +868,9 @@ fn insert_message(
     appended: &MessageAppended,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts, source,
+                                input_tokens, output_tokens, elapsed_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             &appended.session_id,
             seq_param(event.seq)?,
@@ -857,6 +881,9 @@ fn insert_message(
             appended.partial,
             epoch_micros(event.ts.as_ref()),
             event.source,
+            appended.input_tokens,
+            appended.output_tokens,
+            appended.elapsed_ms,
         ],
     )?;
     index_content(tx, event.seq, &appended.content)
@@ -1282,6 +1309,7 @@ mod tests {
                     content: content.to_string(),
                     partial: false,
                     turn_id: String::new(),
+                    ..Default::default()
                 })),
             })),
         }
@@ -1680,6 +1708,9 @@ mod tests {
                     partial: false,
                     turn_id: "t-01".to_string(),
                     source: Source::User as i32,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    elapsed_ms: 0,
                 },
                 MessageRow::ToolCall {
                     call_id: "c-a".to_string(),
@@ -1729,6 +1760,9 @@ mod tests {
                 partial: true,
                 turn_id: String::new(),
                 source: Source::User as i32,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
             }
         );
         assert_eq!(
@@ -1740,6 +1774,58 @@ mod tests {
                 truncated: true,
                 turn_id: "t-01".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_message_appended_with_usage_populates_the_usage_columns() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut log = Log::open(dir.path()).expect("open log");
+        log.append(session_created(0)).expect("append");
+        log.append(message_appended(1, "hi")).expect("append");
+        let mut costed = message_appended(2, "the answer");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(m)),
+        })) = &mut costed.payload
+        {
+            m.role = Role::Assistant as i32;
+            m.input_tokens = 2345;
+            m.output_tokens = 140;
+            m.elapsed_ms = 1500;
+        }
+        log.append(costed).expect("append");
+
+        let mut projection = Projection::in_memory().expect("open");
+        replay(log.reader().expect("reader"), &mut projection).expect("replay");
+
+        let rows = projection.messages("s-01").expect("messages");
+        assert_eq!(
+            rows[0],
+            MessageRow::Message {
+                role: Role::User as i32,
+                content: "hi".to_string(),
+                partial: false,
+                turn_id: String::new(),
+                source: Source::User as i32,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
+            },
+            "a zero-usage event leaves zeros"
+        );
+        assert_eq!(
+            rows[1],
+            MessageRow::Message {
+                role: Role::Assistant as i32,
+                content: "the answer".to_string(),
+                partial: false,
+                turn_id: String::new(),
+                source: Source::User as i32,
+                input_tokens: 2345,
+                output_tokens: 140,
+                elapsed_ms: 1500,
+            },
+            "the event's usage lands in the columns"
         );
     }
 
@@ -2843,6 +2929,7 @@ mod tests {
                     content: "spoken".to_string(),
                     partial: false,
                     turn_id: String::new(),
+                    ..Default::default()
                 })),
             })),
         }

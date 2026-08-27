@@ -266,6 +266,7 @@ mod tests {
                     content: content.to_string(),
                     partial: false,
                     turn_id: String::new(),
+                    ..Default::default()
                 })),
             })),
         }

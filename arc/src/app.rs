@@ -1092,7 +1092,20 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
     for entry in entries {
         match entry.entry {
             Some(history_entry::Entry::Message(message)) => {
-                blocks.extend(prose_block(message));
+                let input_tokens = message.input_tokens;
+                let output_tokens = message.output_tokens;
+                let elapsed_ms = message.elapsed_ms;
+                if let Some(block) = prose_block(message) {
+                    let is_arc = matches!(block, Block::Arc { .. });
+                    blocks.push(block);
+                    if is_arc && (input_tokens != 0 || output_tokens != 0) {
+                        blocks.push(Block::Cost {
+                            input_tokens,
+                            output_tokens,
+                            seconds: elapsed_ms as f32 / 1000.0,
+                        });
+                    }
+                }
             }
             Some(history_entry::Entry::ToolCall(call)) => blocks.push(Block::Tool {
                 call_id: call.call_id,
@@ -2003,6 +2016,22 @@ mod tests {
             content: content.to_owned(),
             partial,
             source: 0,
+            ..Default::default()
+        }
+    }
+
+    fn prose_with_usage(
+        role: i32,
+        content: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+        elapsed_ms: u32,
+    ) -> HistoryMessage {
+        HistoryMessage {
+            input_tokens,
+            output_tokens,
+            elapsed_ms,
+            ..prose(role, content, false)
         }
     }
 
@@ -2059,6 +2088,81 @@ mod tests {
                 }
             ],
             "user and model render, partial included; a system message has no speaker to be"
+        );
+    }
+
+    #[test]
+    fn history_renders_a_cost_block_after_an_assistant_row_carrying_usage() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![
+                prose_entry(Role::User as i32, "hi", false),
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::Message(prose_with_usage(
+                        Role::Assistant as i32,
+                        "hello there",
+                        2345,
+                        140,
+                        1500,
+                    ))),
+                },
+            ],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("hi".to_owned()),
+                Block::Arc {
+                    text: "hello there".to_owned(),
+                    partial: false
+                },
+                Block::Cost {
+                    input_tokens: 2345,
+                    output_tokens: 140,
+                    seconds: 1.5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn history_renders_no_cost_block_for_a_zero_usage_row() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![prose_entry(Role::Assistant as i32, "hello there", false)],
+        });
+
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|block| matches!(block, Block::Cost { .. })),
+            "zero usage renders no cost line"
+        );
+    }
+
+    #[test]
+    fn history_renders_no_cost_block_for_a_system_row_even_with_usage() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![HistoryEntry {
+                entry: Some(history_entry::Entry::Message(HistoryMessage {
+                    source: Source::System as i32,
+                    ..prose_with_usage(Role::User as i32, "a handback note", 10, 20, 30)
+                })),
+            }],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [Block::System("a handback note".to_owned())],
+            "a system row never grows a cost line, even carrying stray usage"
         );
     }
 
