@@ -8,6 +8,10 @@ build:
 build-release:
     cargo build --workspace --release
 
+# Rebuild and restart together so the running daemon never drifts behind the code.
+deploy: build-release
+    systemctl --user restart arcd
+
 test:
     cargo test --workspace
 
