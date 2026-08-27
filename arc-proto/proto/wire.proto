@@ -50,7 +50,20 @@ message ClientFrame {
     MemoryReviewDelete memory_review_delete = 16;
     ListJobs list_jobs = 17;
     Subscribe subscribe = 18;
+    CancelJob cancel_job = 19;
+    DropSteers drop_steers = 20;
   }
+}
+
+// Stops a live job outright: drops its running turn, drains any queued
+// steers, and hands back that the user cancelled it.
+message CancelJob {
+  string session_id = 1;
+}
+
+// Empties a live job's queued steers without touching its running turn.
+message DropSteers {
+  string session_id = 1;
 }
 
 // The response stream to a Subscribe never ends: Notification frames carry
@@ -99,6 +112,10 @@ message JobInfo {
   // wall-clock seconds since the job's last engine event (delta,
   // reasoning, or tool activity); the strip ticks this forward locally
   uint32 idle_seconds = 11;
+  // the session that dispatched it, for scoping the ambient strip
+  string parent_session = 12;
+  // steer/continue_job messages waiting for their own turn
+  uint32 queued_steers = 13;
 }
 
 message JobList {
