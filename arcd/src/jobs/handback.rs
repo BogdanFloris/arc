@@ -129,7 +129,12 @@ pub(super) async fn handback_crashed(ctx: &HandbackCtx<'_>, job: &DispatchedJob)
 }
 
 pub(super) async fn handback_cancelled(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
-    record_handback(ctx, job, Some("cancelled by the user")).await;
+    record_handback(
+        ctx,
+        job,
+        Some("cancelled by the user. The user chose to stop this work — do not dispatch or continue it again unless they ask"),
+    )
+    .await;
 }
 
 pub(super) async fn handback_over_budget(

@@ -1307,7 +1307,10 @@ mod tests {
             child_user_messages(dir.path(), &parent_id),
             [(
                 Role::User,
-                format!("Job {child_id} stopped: cancelled by the user.\n{NO_REPLY}")
+                format!(
+                    "Job {child_id} stopped: cancelled by the user. The user chose to stop \
+                     this work — do not dispatch or continue it again unless they ask.\n{NO_REPLY}"
+                )
             )],
             "the cancelled handback lands exactly once"
         );
