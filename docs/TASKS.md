@@ -173,6 +173,9 @@ Expanded on 2026-08-26, deliberately overriding the move-to-3.1 guidance above: 
 | 6.36 | `arcd/src/jobs.rs` is 3,419 lines and the executor pages it 120–400 lines per `read` call: both models spent 15+ steps just seeing the supervisor before touching it — half a 64-step turn on one file, every time. Split it into agent-sized modules (supervisor, watchdog, steering, handback are already distinct machines living in one file). The codebase being navigable by its own executor is a phase requirement, not a style preference | — | todo |
 | 6.37 | A resumed job's spent counter restarts at zero (6.16 noted it, live use vetoed it: a two-turn job read `0 tok` for twenty minutes while spending 100k+). 6.22 made per-turn usage durable, so seed the counter from the child session's summed usage on resume instead of accepting the reset | — | todo |
 | 6.38 | The strip scopes to the open session: watching a job session, the strip redundantly lists that same job — it should list the session's own children (what this session dispatched), which is also the right meaning in a concierge conversation. Bogdan's call from live use | — | todo |
+| 6.39 | A job can be cancelled from the TUI. When the 6.29 job went bad the only lever was restarting the daemon: `:jobs` has no kill key, budgets are suspended, and the concierge's autonomy re-nudges a failed job. A `k` on the jobs row that stops the task through the supervisor and hands back "stopped: cancelled" | — | todo |
+| 6.40 | Jobs do not commit. The 6.29 executor ran `git commit` on a detached HEAD because the brief said "schema stays its own commit" — it tangled the colocated repo and its work needed salvage by hand. The rule (leave changes uncommitted for review) is words in the dispatch brief description; briefs must stop naming commit discipline | — | todo |
+| 6.41 | Executor parity investigation — why pi is faster and cleaner on the same model, measured not guessed. Three confirmed harness gaps: the executor has no system prompt at all (`system: None` — the brief is its only steering, where every surveyed harness front-loads workflow guidance); reasoning is discarded between steps by design, so a thinking model re-derives its plan every step; and Go reported no cached-token field in any probe, so each step may pay full prompt processing over a growing context. Measure caching on a real transcript, draft a minimal executor system prompt, test reasoning replay on the compat API — then decide what lands | — | todo |
 
 ## 7. Production
 
@@ -182,6 +185,15 @@ Expanded on 2026-08-26, deliberately overriding the move-to-3.1 guidance above: 
 | 7.2 | Installed for real: systemd user unit enabled, release binary on a stable path, runtime state surviving a rebuild of the machine. Phase 1 left the unit installed but not enabled. Move runtime state out of the repository to XDG paths — `~/.local/state/arc/` for the log, index, and secrets, `~/.config/arc/arc.toml` for config — so that arcd's own keys stop living inside a project root the workspace tools can be granted. DESIGN.md and AGENTS.md already name the installed layout; this task is the code and the migration | — | todo |
 | 7.3 | Account for token use and latency by role from existing spans. Use the measurements to replace published-rate estimates in `providers.md`. | — | todo |
 | 7.4 | Phase 1 leftovers: `log::Error::Io` field doc, a retention policy for `data/traces/`, and the `TraceCapture` test flake (a `set_default` race across parallel test threads, ~1/100). | — | todo |
+
+## 8. The archivist's review queue
+
+Opened 2026-08-27 after live use showed the reviewer producing tens of duplicate candidates and facts the record index already holds. Consolidation is disabled in config (`[consolidation] enabled = false`) until this section is worked — the log keeps everything, so nothing is lost by pausing extraction.
+
+| # | Task | Assignee | Status |
+|---|------|----------|--------|
+| 8.1 | Diagnose the duplicate flood: is it the sidecar model, the extraction prompt, or missing dedup against the existing record index? Read the actual candidates from the paused queue before changing anything — the failure evidence is already durable | — | todo |
+| 8.2 | Whatever 8.1 finds: dedup against the index at extraction time, a better prompt, or a stronger archivist model. One fix, measured against the same transcript that produced the flood | — | todo |
 
 ## State at the end of 2026-08-26
 
