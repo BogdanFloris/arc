@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,6 +11,34 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+
+use crate::identity;
+
+/// Under ~200 tokens: where the job is and what its final message is for,
+/// not a methodology essay. Pi-style: the model already knows how to code.
+fn job_preamble(root: &Path) -> String {
+    format!(
+        "You are a coding agent inside ARC's harness, working non-interactively \
+         in {}. Four workspace tools are available: read, write, edit, bash. Be \
+         concise. Show file paths clearly. When you are done, your final message \
+         is the job's report.",
+        root.display()
+    )
+}
+
+/// The preamble, plus the project's `AGENTS.md` verbatim if it has one.
+/// Built once at spawn so it stays byte-stable for the job's lifetime.
+fn job_system_prompt(root: &Path) -> String {
+    let preamble = job_preamble(root);
+    match identity::load(&root.join("AGENTS.md")) {
+        Ok(Some(agents)) => format!("{preamble}\n\n{agents}"),
+        Ok(None) => preamble,
+        Err(error) => {
+            warn!(root = %root.display(), %error, "could not read AGENTS.md; using the preamble only");
+            preamble
+        }
+    }
+}
 
 const EVENT_BUFFER: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -74,6 +103,7 @@ impl Handback {
 struct HandbackCtx<'a> {
     engine: &'a Arc<Engine>,
     runners: &'a BTreeMap<SessionRole, Runner>,
+    projects: &'a BTreeMap<String, PathBuf>,
     live: &'a Arc<LiveMap>,
     statuses: &'a Arc<JobStatuses>,
     notifier: Option<&'a broadcast::Sender<Notification>>,
@@ -86,6 +116,9 @@ struct HandbackCtx<'a> {
 pub struct Supervisor {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
+    /// Project name to root path, so a dispatched job's system prompt can
+    /// read `<root>/AGENTS.md`. A project absent here gets no system prompt.
+    projects: BTreeMap<String, PathBuf>,
     handles: Arc<Handles>,
     /// `session_id` -> steer sender, for jobs currently running. `steer`
     /// sends under this lock; a job task removes its own entry under the
@@ -103,12 +136,21 @@ impl Supervisor {
         Self {
             engine,
             runners,
+            projects: BTreeMap::new(),
             handles: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(Mutex::new(HashMap::new())),
             statuses: Arc::new(JobStatuses::new()),
             notifier: None,
             handback: None,
         }
+    }
+
+    /// Project roots a dispatched job's system prompt is built from. Absent,
+    /// job runners get no system prompt at all.
+    #[must_use]
+    pub fn with_projects(mut self, projects: BTreeMap<String, PathBuf>) -> Self {
+        self.projects = projects;
+        self
     }
 
     /// Wires the daemon's broadcast spine: job state transitions then also
@@ -134,6 +176,7 @@ impl Supervisor {
             job,
             &self.engine,
             &self.runners,
+            &self.projects,
             &self.live,
             &self.statuses,
             self.notifier.as_ref(),
@@ -188,6 +231,7 @@ impl Supervisor {
         let ctx = HandbackCtx {
             engine: &self.engine,
             runners: &self.runners,
+            projects: &self.projects,
             live: &self.live,
             statuses: &self.statuses,
             notifier: self.notifier.as_ref(),
@@ -229,6 +273,7 @@ fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
             job,
             ctx.engine,
             ctx.runners,
+            ctx.projects,
             ctx.live,
             ctx.statuses,
             ctx.notifier,
@@ -246,10 +291,12 @@ fn route_continues(ctx: &HandbackCtx<'_>, continues: Vec<ContinuedJob>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_job(
     job: DispatchedJob,
     engine: &Arc<Engine>,
     runners: &BTreeMap<SessionRole, Runner>,
+    projects: &BTreeMap<String, PathBuf>,
     live: &Arc<LiveMap>,
     statuses: &Arc<JobStatuses>,
     notifier: Option<&broadcast::Sender<Notification>>,
@@ -257,7 +304,7 @@ fn spawn_job(
     handles: &Arc<Handles>,
 ) {
     spawn_job_checked(
-        job, engine, runners, live, statuses, notifier, handback, handles, false,
+        job, engine, runners, projects, live, statuses, notifier, handback, handles, false,
     );
 }
 
@@ -272,6 +319,7 @@ fn spawn_job_checked(
     job: DispatchedJob,
     engine: &Arc<Engine>,
     runners: &BTreeMap<SessionRole, Runner>,
+    projects: &BTreeMap<String, PathBuf>,
     live: &Arc<LiveMap>,
     statuses: &Arc<JobStatuses>,
     notifier: Option<&broadcast::Sender<Notification>>,
@@ -279,7 +327,7 @@ fn spawn_job_checked(
     handles: &Arc<Handles>,
     guard_absent: bool,
 ) -> bool {
-    let Some(runner) = runners.get(&job.role).cloned() else {
+    let Some(mut runner) = runners.get(&job.role).cloned() else {
         warn!(
             session_id = %job.session_id,
             role = role_label(job.role),
@@ -287,6 +335,9 @@ fn spawn_job_checked(
         );
         return false;
     };
+    if let Some(root) = projects.get(&job.project) {
+        runner.system = Some(job_system_prompt(root));
+    }
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     {
         let mut live_guard = live.lock().expect("live");
@@ -310,6 +361,7 @@ fn spawn_job_checked(
         Arc::clone(statuses),
         notifier.cloned(),
         runners.clone(),
+        projects.clone(),
         handback.cloned(),
         Arc::clone(handles),
     );
@@ -334,6 +386,7 @@ fn spawn_watched(
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
     runners: BTreeMap<SessionRole, Runner>,
+    projects: BTreeMap<String, PathBuf>,
     handback: Option<Arc<Handback>>,
     handles: Arc<Handles>,
 ) -> JoinHandle<()> {
@@ -349,6 +402,7 @@ fn spawn_watched(
             Arc::clone(&statuses),
             notifier.clone(),
             runners.clone(),
+            projects.clone(),
             handback.clone(),
             Arc::clone(&handles),
         ));
@@ -369,6 +423,7 @@ fn spawn_watched(
             let ctx = HandbackCtx {
                 engine: &engine,
                 runners: &runners,
+                projects: &projects,
                 live: &live,
                 statuses: &statuses,
                 notifier: notifier.as_ref(),
@@ -407,6 +462,7 @@ fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
         },
         ctx.engine,
         ctx.runners,
+        ctx.projects,
         ctx.live,
         ctx.statuses,
         ctx.notifier,
@@ -429,6 +485,7 @@ async fn run_job(
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
     runners: BTreeMap<SessionRole, Runner>,
+    projects: BTreeMap<String, PathBuf>,
     handback: Option<Arc<Handback>>,
     handles: Arc<Handles>,
 ) {
@@ -438,6 +495,7 @@ async fn run_job(
     let ctx = HandbackCtx {
         engine: &engine,
         runners: &runners,
+        projects: &projects,
         live: &live,
         statuses: &statuses,
         notifier: notifier.as_ref(),
@@ -731,6 +789,7 @@ async fn run_one_handback_turn(
                     job,
                     ctx.engine,
                     ctx.runners,
+                    ctx.projects,
                     ctx.live,
                     ctx.statuses,
                     ctx.notifier,
@@ -1184,6 +1243,130 @@ mod tests {
         assert_eq!(child_messages[0].content, "fix the failing test");
         assert_eq!(child_messages[1].role, Role::Assistant as i32);
         assert_eq!(child_messages[1].content, "on it");
+    }
+
+    #[tokio::test]
+    async fn a_spawned_jobs_system_prompt_carries_the_preamble_and_agents_md() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Project rules\n\nUse jj, not git.\n",
+        )
+        .expect("write AGENTS.md");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let system = executor_provider.requests()[0]
+            .system
+            .clone()
+            .expect("a job runner gets a system prompt");
+        assert!(
+            system.contains("coding agent") && system.contains(&root.display().to_string()),
+            "{system}"
+        );
+        assert!(system.contains("Use jj, not git."), "{system}");
+    }
+
+    #[tokio::test]
+    async fn a_project_without_agents_md_gets_the_preamble_only() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let system = executor_provider.requests()[0]
+            .system
+            .clone()
+            .expect("a job runner gets a system prompt even with no AGENTS.md");
+        assert_eq!(system, job_preamble(&root));
+    }
+
+    #[tokio::test]
+    async fn a_jobs_system_prompt_is_byte_identical_across_its_turns() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("AGENTS.md"), "Keep commits small.\n").expect("write AGENTS.md");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("steer reply")),
+        ]);
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "also check the linter"));
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        let requests = executor_provider.requests();
+        assert_eq!(requests.len(), 2, "the initial turn and the steered turn");
+        assert_eq!(
+            requests[0].system, requests[1].system,
+            "the system prompt is built once at spawn, not per turn"
+        );
     }
 
     fn child_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
@@ -3062,6 +3245,7 @@ mod tests {
             },
             &engine,
             &runners,
+            &BTreeMap::new(),
             &live,
             &statuses,
             None,

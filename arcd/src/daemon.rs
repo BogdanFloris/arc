@@ -192,8 +192,15 @@ impl Daemon {
             (SessionRole::Executor, self.roles.executor().clone()),
             (SessionRole::Archivist, self.roles.archivist().clone()),
         ]);
+        let project_roots = self
+            .config
+            .projects
+            .iter()
+            .map(|(name, project)| (name.clone(), project.root.clone()))
+            .collect();
         let supervisor = Arc::new(
             Supervisor::new(Arc::clone(&self.engine), job_runners)
+                .with_projects(project_roots)
                 .with_notifier(self.notifier.clone())
                 .with_concierge(self.roles.concierge().clone()),
         );
