@@ -885,6 +885,10 @@ impl App {
     }
 
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
+        // any live event proves the socket is back; only another disconnect says otherwise
+        if self.status == Status::Disconnected && !matches!(event, NetEvent::Disconnected { .. }) {
+            self.status = Status::Idle;
+        }
         match event {
             NetEvent::Sessions(sessions) => {
                 self.sessions = sessions;
@@ -2040,6 +2044,43 @@ mod tests {
             }),
             "the queued message drives the reconnect attempt"
         );
+    }
+
+    #[test]
+    fn disconnecting_sets_the_status_and_it_persists_with_no_queue() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Disconnected {
+            reason: "the daemon closed the connection".to_owned(),
+        });
+        assert_eq!(app.status, Status::Disconnected);
+    }
+
+    #[test]
+    fn a_browsing_reply_clears_the_disconnected_status() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Disconnected {
+            reason: "the daemon closed the connection".to_owned(),
+        });
+        assert_eq!(app.status, Status::Disconnected);
+
+        app.on_net(NetEvent::Sessions(Vec::new()));
+        assert_eq!(
+            app.status,
+            Status::Idle,
+            "a successful command proves the reconnect worked"
+        );
+    }
+
+    #[test]
+    fn another_disconnect_leaves_the_status_disconnected() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Disconnected {
+            reason: "first".to_owned(),
+        });
+        app.on_net(NetEvent::Disconnected {
+            reason: "second".to_owned(),
+        });
+        assert_eq!(app.status, Status::Disconnected);
     }
 
     #[test]

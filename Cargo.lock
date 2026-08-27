@@ -53,11 +53,13 @@ dependencies = [
  "crossterm",
  "expect-test",
  "futures",
+ "prost",
  "prost-types",
  "ratatui",
  "serde_json",
  "textwrap",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

@@ -258,3 +258,137 @@ async fn send(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use arc_proto::v1::{
+        ClientFrame, JobInfo, JobList, ServerFrame, SessionList, client_frame, server_frame,
+    };
+    use futures::{SinkExt as _, StreamExt as _};
+    use prost::Message as _;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    use super::*;
+
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    async fn expect_frame(ws: &mut WebSocketStream<tokio::net::TcpStream>) -> ClientFrame {
+        loop {
+            match ws
+                .next()
+                .await
+                .expect("a client frame")
+                .expect("no io error")
+            {
+                WsMessage::Binary(bytes) => return ClientFrame::decode(bytes).expect("decode"),
+                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                other => panic!("expected a binary frame, got {other:?}"),
+            }
+        }
+    }
+
+    async fn reply(
+        ws: &mut WebSocketStream<tokio::net::TcpStream>,
+        request_id: u64,
+        msg: server_frame::Msg,
+    ) {
+        let frame = ServerFrame {
+            request_id,
+            msg: Some(msg),
+        };
+        ws.send(WsMessage::binary(frame.encode_to_vec()))
+            .await
+            .expect("send");
+    }
+
+    async fn next_event(events: &mut mpsc::UnboundedReceiver<NetEvent>) -> NetEvent {
+        tokio::time::timeout(PATIENCE, events.recv())
+            .await
+            .expect("an event arrives within PATIENCE")
+            .expect("the event channel stays open")
+    }
+
+    // a daemon restart looks like: the same address answers, but a fresh
+    // accept — the client must re-dial and re-subscribe on its own
+    #[tokio::test]
+    async fn a_browsing_command_reconnects_after_the_daemon_restarts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("local addr"));
+
+        let job = JobInfo {
+            session_id: "s-job".to_owned(),
+            ..Default::default()
+        };
+        let job_for_server = job.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept 1");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake 1");
+            assert!(matches!(
+                expect_frame(&mut ws).await.msg,
+                Some(client_frame::Msg::Subscribe(_))
+            ));
+            let list = expect_frame(&mut ws).await;
+            assert!(matches!(list.msg, Some(client_frame::Msg::ListSessions(_))));
+            reply(
+                &mut ws,
+                list.request_id,
+                server_frame::Msg::SessionList(SessionList { sessions: vec![] }),
+            )
+            .await;
+            ws.close(None).await.expect("close conn 1");
+            drop(ws);
+
+            let (stream, _) = listener.accept().await.expect("accept 2");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake 2");
+            assert!(
+                matches!(
+                    expect_frame(&mut ws).await.msg,
+                    Some(client_frame::Msg::Subscribe(_))
+                ),
+                "the reconnect re-subscribes before the command runs"
+            );
+            let jobs = expect_frame(&mut ws).await;
+            assert!(matches!(jobs.msg, Some(client_frame::Msg::ListJobs(_))));
+            reply(
+                &mut ws,
+                jobs.request_id,
+                server_frame::Msg::JobList(JobList {
+                    jobs: vec![job_for_server],
+                }),
+            )
+            .await;
+        });
+
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        tokio::spawn(run(url, command_rx, event_tx));
+
+        commands.send(Command::List).expect("net task alive");
+        assert_eq!(next_event(&mut events).await, NetEvent::Sessions(vec![]));
+        assert!(
+            matches!(next_event(&mut events).await, NetEvent::Disconnected { .. }),
+            "the daemon closing the socket surfaces on its own, with no command in flight"
+        );
+
+        commands.send(Command::ListJobs).expect("net task alive");
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::JobItems(vec![job]),
+            "a browsing command, not a send, drove the reconnect"
+        );
+
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("server finishes within PATIENCE")
+            .expect("server task");
+    }
+}

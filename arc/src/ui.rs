@@ -299,7 +299,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     let mut words: Vec<Span> = Vec::new();
     match app.status {
         Status::Streaming => words.push(Span::styled(" streaming", theme::DIM)),
-        Status::Disconnected => words.push(Span::styled(" disconnected", theme::ERROR)),
+        Status::Disconnected => words.push(Span::styled(" disconnected", theme::DIM)),
         Status::Idle => {
             if let Some(code) = &app.last_error {
                 words.push(Span::styled(format!(" {code}"), theme::ERROR));
