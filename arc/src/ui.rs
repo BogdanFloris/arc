@@ -185,8 +185,8 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             } => {
                 let text = format!(
                     "{} in · {} out · {seconds:.1}s",
-                    format_tokens(*input_tokens),
-                    format_tokens(*output_tokens),
+                    format_tokens(u64::from(*input_tokens)),
+                    format_tokens(u64::from(*output_tokens)),
                 );
                 out.push(Line::styled(text, theme::DIM));
             }
@@ -276,10 +276,10 @@ fn draw_strip(frame: &mut Frame, area: Rect, app: &App, job: &JobInfo) {
     let count = app.running_job_count();
     let noun = if count == 1 { "job" } else { "jobs" };
     let text = format!(
-        " {count} {noun} · {} {} · {:.1}k tok · {}s",
+        " {count} {noun} · {} {} · {} tok · {}s",
         job_subject(job),
         job_state_word(job.state),
-        job.spent_tokens as f64 / 1000.0,
+        format_tokens(job.spent_tokens),
         app.strip_elapsed_seconds(job),
     );
     frame.render_widget(Line::styled(text, theme::DIM), area);
@@ -718,11 +718,12 @@ fn job_label(job: &JobInfo) -> String {
     let budget = if job.budget_tokens == 0 {
         "-".to_owned()
     } else {
-        job.budget_tokens.to_string()
+        format_tokens(job.budget_tokens)
     };
     format!(
         "{state} {subject} {}/{budget} tok {}s",
-        job.spent_tokens, job.elapsed_seconds
+        format_tokens(job.spent_tokens),
+        job.elapsed_seconds
     )
 }
 
@@ -917,5 +918,16 @@ mod tests {
     fn a_jobs_row_shows_the_title_in_place_of_role_and_project() {
         let job = job(SessionRole::Executor, "arc", "Fix the failing test");
         assert_eq!(job_label(&job), "running Fix the failing test 12/- tok 5s");
+    }
+
+    #[test]
+    fn a_jobs_row_compacts_large_token_counts_like_the_strip() {
+        let mut with_budget = job(SessionRole::Executor, "arc", "");
+        with_budget.spent_tokens = 441_266;
+        with_budget.budget_tokens = 500_000;
+        assert_eq!(
+            job_label(&with_budget),
+            "running executor/arc 441.3k/500.0k tok 5s"
+        );
     }
 }

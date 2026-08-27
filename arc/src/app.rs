@@ -1028,11 +1028,11 @@ fn tool_summary(arguments_json: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn format_tokens(n: u32) -> String {
+pub fn format_tokens(n: u64) -> String {
     if n < 1000 {
         n.to_string()
     } else {
-        format!("{:.1}k", f64::from(n) / 1000.0)
+        format!("{:.1}k", n as f64 / 1000.0)
     }
 }
 
