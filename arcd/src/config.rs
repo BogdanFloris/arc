@@ -86,6 +86,10 @@ pub enum RoleProvider {
 pub struct ProjectConfig {
     pub root: PathBuf,
 
+    /// One line grounding what this project is, for `dispatch`'s schema.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<PathBuf>,
 
@@ -386,6 +390,7 @@ mod tests {
                 "arc".to_owned(),
                 ProjectConfig {
                     root: PathBuf::from("/home/bogdan/arc"),
+                    description: "ARC's own implementation repo".to_owned(),
                     read_only: vec![PathBuf::from("/home/bogdan/notes")],
                     sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 },
@@ -522,6 +527,34 @@ sources   = ["builtin", "workspace"]
         assert_eq!(
             project.sources,
             [ToolSource::Builtin, ToolSource::Workspace]
+        );
+    }
+
+    #[test]
+    fn a_project_description_is_optional_and_defaults_to_empty() {
+        let config = parse(
+            r#"
+[projects.arc]
+root    = "/home/bogdan/arc"
+sources = []
+"#,
+        );
+        assert_eq!(config.projects["arc"].description, "");
+    }
+
+    #[test]
+    fn a_project_description_is_carried_through() {
+        let config = parse(
+            r#"
+[projects.arc]
+root        = "/home/bogdan/arc"
+description = "ARC's own implementation repo"
+sources     = []
+"#,
+        );
+        assert_eq!(
+            config.projects["arc"].description,
+            "ARC's own implementation repo"
         );
     }
 

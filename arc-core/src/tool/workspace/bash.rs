@@ -37,7 +37,7 @@ impl Tool for Bash {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_owned(),
-            description: "Run a shell command with bash in the project's writable root. The \
+            description: "Run a shell command with bash in the project's root. The \
                           environment is scrubbed to a small allowlist; no secrets pass \
                           through. Output is capped at 16 KiB per stream. Commands default to \
                           a 120s timeout (max 600); raise timeout_secs for one that \
@@ -81,9 +81,9 @@ impl Tool for Bash {
                     "ERROR: no workspace is granted in this session.".to_owned(),
                 );
             };
-            let Some(root) = grants.read_write_root() else {
+            let Some(root) = grants.project_root() else {
                 return ToolReply::error(
-                    "ERROR: this session has no writable project root to run in.".to_owned(),
+                    "ERROR: this session has no project root to run in.".to_owned(),
                 );
             };
 
@@ -459,16 +459,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_writable_root_is_a_named_error() {
+    async fn a_read_only_root_is_still_where_bash_runs() {
         let dir = TempDir::new().expect("tmp");
         let tool = Bash::new();
 
         let reply = tool
-            .execute(args("echo hi"), ctx(dir.path(), Mode::ReadOnly))
+            .execute(args("pwd"), ctx(dir.path(), Mode::ReadOnly))
             .await;
 
+        assert!(reply.ok, "{}", reply.content);
+        let canonical = dir.path().canonicalize().expect("canonicalize");
+        assert_eq!(reply.content.trim_end(), canonical.to_str().expect("utf8"));
+    }
+
+    #[tokio::test]
+    async fn no_grants_at_all_is_a_named_error() {
+        let tool = Bash::new();
+        let grants = crate::tool::workspace::Grants::new(Vec::new()).expect("empty grants");
+        let ctx = TurnContext {
+            session_id: String::new(),
+            turn_id: String::new(),
+            grants: Some(Arc::new(grants)),
+        };
+
+        let reply = tool.execute(args("echo hi"), ctx).await;
+
         assert!(!reply.ok);
-        assert!(reply.content.contains("writable"), "{}", reply.content);
+        assert!(reply.content.contains("project root"), "{}", reply.content);
     }
 
     #[tokio::test]

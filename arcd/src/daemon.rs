@@ -317,10 +317,15 @@ fn idle_cutoff_micros(idle: Duration) -> Option<i64> {
     Some(now.saturating_sub(idle))
 }
 
-/// What `dispatch` may bind a job to: every configured project, plus the
-/// scratch project if a project is literally named `scratch`.
-fn dispatch_projects(config: &Config) -> (Vec<String>, Option<String>) {
-    let names = config.projects.keys().cloned().collect();
+/// What `dispatch` may bind a job to: every configured project's name and
+/// description, plus the scratch project if a project is literally named
+/// `scratch`.
+fn dispatch_projects(config: &Config) -> (Vec<(String, String)>, Option<String>) {
+    let names = config
+        .projects
+        .iter()
+        .map(|(name, project)| (name.clone(), project.description.clone()))
+        .collect();
     let scratch = config
         .projects
         .contains_key("scratch")
@@ -400,9 +405,10 @@ mod tests {
     use crate::config::{ProjectConfig, ToolSource};
     use crate::dirs::DataDirs;
 
-    fn project_config(root: &str) -> ProjectConfig {
+    fn project_config(root: &str, description: &str) -> ProjectConfig {
         ProjectConfig {
             root: std::path::PathBuf::from(root),
+            description: description.to_owned(),
             read_only: Vec::new(),
             sources: vec![ToolSource::Builtin],
         }
@@ -411,16 +417,23 @@ mod tests {
     #[test]
     fn dispatch_projects_lists_every_project_and_finds_the_scratch_one() {
         let mut config = Config::default();
+        config.projects.insert(
+            "arc".to_owned(),
+            project_config("/tmp/arc", "ARC's own implementation repo"),
+        );
         config
             .projects
-            .insert("arc".to_owned(), project_config("/tmp/arc"));
-        config
-            .projects
-            .insert("scratch".to_owned(), project_config("/tmp/scratch"));
+            .insert("scratch".to_owned(), project_config("/tmp/scratch", ""));
 
         let (names, scratch) = dispatch_projects(&config);
 
-        assert_eq!(names, ["arc", "scratch"]);
+        assert_eq!(
+            names,
+            [
+                ("arc".to_owned(), "ARC's own implementation repo".to_owned()),
+                ("scratch".to_owned(), String::new()),
+            ]
+        );
         assert_eq!(scratch, Some("scratch".to_owned()));
     }
 
@@ -429,11 +442,11 @@ mod tests {
         let mut config = Config::default();
         config
             .projects
-            .insert("arc".to_owned(), project_config("/tmp/arc"));
+            .insert("arc".to_owned(), project_config("/tmp/arc", ""));
 
         let (names, scratch) = dispatch_projects(&config);
 
-        assert_eq!(names, ["arc"]);
+        assert_eq!(names, [("arc".to_owned(), String::new())]);
         assert_eq!(scratch, None);
     }
 
@@ -630,6 +643,7 @@ mod tests {
             "arc".to_owned(),
             ProjectConfig {
                 root: project_root.clone(),
+                description: String::new(),
                 read_only: vec![notes_root.clone()],
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
             },

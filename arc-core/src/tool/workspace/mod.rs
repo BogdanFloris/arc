@@ -108,12 +108,11 @@ impl Grants {
         Ok(canonical)
     }
 
-    /// The bash tool's working directory: the first grant it can write to.
-    pub fn read_write_root(&self) -> Option<&Path> {
-        self.roots
-            .iter()
-            .find(|(_, mode)| *mode == Mode::ReadWrite)
-            .map(|(root, _)| root.as_path())
+    /// The bash tool's working directory: the project root, whatever its
+    /// mode. `bash` ignores grant modes (DESIGN §4.3), so an analyze job's
+    /// read-only root is still where it runs, not an error.
+    pub fn project_root(&self) -> Option<&Path> {
+        self.roots.first().map(|(root, _)| root.as_path())
     }
 }
 

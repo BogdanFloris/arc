@@ -1629,6 +1629,7 @@ mod tests {
             "role": "executor",
             "project": "arc",
             "brief": "fix the failing test",
+            "intent": "implement",
             "budget_tokens": 0,
             "budget_minutes": 0,
         })
@@ -1665,7 +1666,7 @@ mod tests {
 
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec!["arc".to_owned()],
+            vec![("arc".to_owned(), String::new())],
             None,
         )));
         let project_dir = TempDir::new().expect("project dir");
@@ -1746,6 +1747,7 @@ mod tests {
             "role": "archivist",
             "project": "arc",
             "brief": "file this away",
+            "intent": "implement",
             "budget_tokens": 0,
             "budget_minutes": 0,
         })
@@ -1775,7 +1777,7 @@ mod tests {
 
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec!["arc".to_owned()],
+            vec![("arc".to_owned(), String::new())],
             None,
         )));
         let project_dir = TempDir::new().expect("project dir");
@@ -1834,6 +1836,7 @@ mod tests {
             "role": "executor",
             "project": "arc",
             "brief": brief,
+            "intent": "implement",
             "budget_tokens": 0,
             "budget_minutes": 0,
         })
@@ -1882,7 +1885,7 @@ mod tests {
     fn dispatch_registry_and_projects() -> (Registry, TempDir, BTreeMap<String, ProjectSpec>) {
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec!["arc".to_owned()],
+            vec![("arc".to_owned(), String::new())],
             None,
         )));
         let project_dir = TempDir::new().expect("project dir");

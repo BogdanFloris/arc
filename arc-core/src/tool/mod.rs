@@ -27,6 +27,15 @@ pub struct JobRequest {
     pub project: String,
     pub brief: String,
     pub budget: Option<Budget>,
+    pub intent: Intent,
+}
+
+/// What a dispatched job may do to its workspace. `Analyze` records the
+/// project root grant read-only; `Implement` leaves it read-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    Analyze,
+    Implement,
 }
 
 /// A validated request to continue an existing job. Mirrors `JobRequest`:

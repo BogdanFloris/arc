@@ -20,7 +20,7 @@ use crate::provider::{
 };
 use crate::store::{self, Store, now_ts};
 use crate::tool::workspace::{Grant, Grants, Mode};
-use crate::tool::{ContinueRequest, DispatchOutcome, Registry, ToolSource, TurnContext};
+use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
 
@@ -222,18 +222,31 @@ impl Engine {
     /// are what the new session is pinned to, which is `runner.role` for a
     /// session the runner starts for itself but differs for a dispatched
     /// job, where the runner is the dispatching parent, not the child.
-    #[tracing::instrument(
-        level = "info",
-        name = "session.create_bound_session",
-        skip_all,
-        fields(project, session_id = tracing::field::Empty)
-    )]
     pub fn create_bound_session(
         &self,
         runner: &Runner,
         project: &str,
         role: SessionRole,
         budget: Option<Budget>,
+    ) -> Result<String, Error> {
+        self.create_bound_session_with_intent(runner, project, role, budget, Intent::Implement)
+    }
+
+    /// Same as `create_bound_session`, but `Intent::Analyze` records the
+    /// project root grant read-only instead of read-write.
+    #[tracing::instrument(
+        level = "info",
+        name = "session.create_bound_session",
+        skip_all,
+        fields(project, session_id = tracing::field::Empty)
+    )]
+    fn create_bound_session_with_intent(
+        &self,
+        runner: &Runner,
+        project: &str,
+        role: SessionRole,
+        budget: Option<Budget>,
+        intent: Intent,
     ) -> Result<String, Error> {
         let spec = self
             .projects
@@ -242,7 +255,14 @@ impl Engine {
             .ok_or_else(|| Error::UnknownProject {
                 project: project.to_owned(),
             })?;
-        let grants = Grants::new(spec.grants).map_err(|source| Error::Grants {
+        let mut grant_specs = spec.grants;
+        if intent == Intent::Analyze {
+            // all of them, not grants[0]: ordering is convention, not contract
+            for grant in &mut grant_specs {
+                grant.mode = Mode::ReadOnly;
+            }
+        }
+        let grants = Grants::new(grant_specs).map_err(|source| Error::Grants {
             project: project.to_owned(),
             source,
         })?;
@@ -291,7 +311,8 @@ impl Engine {
         let project = job_request.project;
         let brief = job_request.brief;
         let budget = job_request.budget;
-        match self.create_bound_session(runner, &project, role, budget) {
+        let intent = job_request.intent;
+        match self.create_bound_session_with_intent(runner, &project, role, budget, intent) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
@@ -1264,7 +1285,7 @@ mod tests {
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
-    use crate::tool::{JobRequest, Registry, Tool, ToolReply, ToolSource, TurnContext};
+    use crate::tool::{Intent, JobRequest, Registry, Tool, ToolReply, ToolSource, TurnContext};
 
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
@@ -3493,11 +3514,12 @@ mod tests {
         assert!(result.content.contains("granted"), "{}", result.content);
     }
 
-    fn dispatch_args(role: &str, project: &str, brief: &str) -> String {
+    fn dispatch_args(role: &str, project: &str, brief: &str, intent: &str) -> String {
         serde_json::json!({
             "role": role,
             "project": project,
             "brief": brief,
+            "intent": intent,
         })
         .to_string()
     }
@@ -3514,14 +3536,17 @@ mod tests {
                     "c1",
                     0,
                     "dispatch",
-                    &dispatch_args("executor", "arc", "fix the bug"),
+                    &dispatch_args("executor", "arc", "fix the bug", "implement"),
                 )),
                 Ok(tool_stop()),
             ],
             done_reply("dispatched"),
         ]);
         let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(vec!["arc".to_owned()], None)));
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
         let (engine, run) = engine_with_tools(&provider, &dir, registry);
         let engine = engine.with_projects(projects_with(
             "arc",
@@ -3564,7 +3589,8 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 read_write: true,
-            }]
+            }],
+            "implement records the root grant read-write, as before"
         );
         let child_id = child.session_id.clone();
 
@@ -3595,6 +3621,138 @@ mod tests {
             .send_message(&executor_run, Some(&child_id), "go", tx)
             .await
             .expect("an executor runner continues the dispatched child");
+    }
+
+    #[tokio::test]
+    async fn an_analyze_dispatch_records_the_root_grant_read_only_but_still_allows_read() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("f.txt"), b"x").expect("write f.txt");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "check consistency", "analyze"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(child) = &events[3] else {
+            panic!("expected the child SessionCreated, got {:?}", events[3]);
+        };
+        assert_eq!(
+            child.grants,
+            [arc_proto::v1::WorkspaceGrant {
+                root: root
+                    .canonicalize()
+                    .expect("canon")
+                    .to_string_lossy()
+                    .into_owned(),
+                read_write: false,
+            }],
+            "analyze records the project root read-only, not the configured read-write"
+        );
+
+        let grants = workspace::Grants::from_recorded(vec![(
+            root.canonicalize().expect("canon"),
+            Mode::ReadOnly,
+        )]);
+        let target = root.join("f.txt");
+        let target = target.to_str().expect("utf8");
+        grants
+            .resolve(target, workspace::Access::Read)
+            .expect("read is still allowed under an analyze grant");
+        let err = grants
+            .resolve(target, workspace::Access::Write)
+            .expect_err("write is refused under an analyze grant");
+        assert!(err.contains("read-only"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_analyze_job_still_carries_its_recorded_read_only_grant() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "check consistency", "analyze"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(child) = &events[3] else {
+            panic!("expected the child SessionCreated, got {:?}", events[3]);
+        };
+        let child_id = child.session_id.clone();
+
+        // config here still says read-write; a resumed job goes by its own
+        // recorded grant, not by re-resolving the project (5.1's rule)
+        let (reopened, _) = reopened_engine(
+            &ScriptedProvider::scripted(vec![]),
+            &dir,
+            Registry::new(512),
+        );
+        let reopened = reopened.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let grants = reopened
+            .grants(&child_id, false)
+            .expect("grants lookup")
+            .expect("a bound job carries grants");
+        assert_eq!(
+            grants.canonical_roots().to_vec(),
+            vec![(root.canonicalize().expect("canon"), Mode::ReadOnly)]
+        );
     }
 
     fn continue_job_args(session_id: &str, message: &str) -> String {
@@ -4191,6 +4349,7 @@ mod tests {
                             project: "ghost".to_owned(),
                             brief: "do it".to_owned(),
                             budget: None,
+                            intent: Intent::Implement,
                         }),
                         continue_request: None,
                     }

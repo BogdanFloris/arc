@@ -2670,6 +2670,7 @@ mod tests {
             "role": "executor",
             "project": "arc",
             "brief": "second link",
+            "intent": "implement",
             "budget_tokens": 0,
             "budget_minutes": 0,
         })
@@ -2693,7 +2694,7 @@ mod tests {
 
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec!["arc".to_owned()],
+            vec![("arc".to_owned(), String::new())],
             None,
         )));
         let log = Log::open(dir.path()).expect("open log");
@@ -2786,6 +2787,7 @@ mod tests {
             "role": "executor",
             "project": "arc",
             "brief": "grandchild work",
+            "intent": "implement",
         })
         .to_string();
 
@@ -2804,7 +2806,7 @@ mod tests {
 
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec!["arc".to_owned()],
+            vec![("arc".to_owned(), String::new())],
             None,
         )));
         let log = Log::open(dir.path()).expect("open log");
