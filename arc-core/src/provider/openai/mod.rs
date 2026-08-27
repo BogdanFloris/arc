@@ -5,8 +5,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Serialize;
 
 use crate::provider::{
-    CompletionRequest, CompletionStream, Error, Message, Provider, ToolDefinition, failure,
-    stream as delta_stream,
+    CompletionRequest, CompletionStream, Error, Message, Provider, Thinking, ToolDefinition,
+    failure, stream as delta_stream,
 };
 use arc_proto::v1::Role;
 
@@ -116,6 +116,8 @@ struct Payload<'a> {
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -206,7 +208,19 @@ impl<'a> Payload<'a> {
             },
             tools: request.tools.iter().map(wire_tool).collect(),
             seed: request.seed,
+            reasoning_effort: reasoning_effort(request.thinking),
         })
+    }
+}
+
+// Default omits the field: OpenCode Go's measured wire shape, byte-stable for cache hits
+fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
+    match thinking {
+        Thinking::Default => None,
+        Thinking::Minimal => Some("none"),
+        Thinking::Low => Some("low"),
+        Thinking::Medium => Some("medium"),
+        Thinking::High => Some("high"),
     }
 }
 
@@ -403,6 +417,43 @@ mod tests {
         let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
         assert_eq!(body.get("tools"), None, "{body}");
         assert_eq!(body.get("seed"), None, "unset seed sends no key: {body}");
+    }
+
+    #[tokio::test]
+    async fn default_thinking_omits_reasoning_effort_for_wire_stability() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body.get("reasoning_effort"),
+            None,
+            "the live executor config has no thinking key; the wire shape must not move: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn minimal_thinking_maps_to_reasoning_effort_none() {
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.thinking = Thinking::Minimal;
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["reasoning_effort"], "none", "{body}");
+    }
+
+    #[tokio::test]
+    async fn low_thinking_maps_to_reasoning_effort_low() {
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.thinking = Thinking::Low;
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["reasoning_effort"], "low", "{body}");
     }
 
     #[tokio::test]
