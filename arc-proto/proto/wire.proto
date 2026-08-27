@@ -93,6 +93,12 @@ message JobInfo {
   uint32 elapsed_seconds = 7;
   uint32 budget_seconds = 8;
   string title = 9;
+  // tool-call steps completed so far, one per issued call; 0 until the
+  // first tool step, so the strip can tell "thinking" from "working"
+  uint32 tool_steps = 10;
+  // wall-clock seconds since the job's last engine event (delta,
+  // reasoning, or tool activity); the strip ticks this forward locally
+  uint32 idle_seconds = 11;
 }
 
 message JobList {
