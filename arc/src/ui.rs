@@ -1,7 +1,7 @@
 use arc_proto::v1::{JobInfo, SessionRole, job_info};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Panel, Borders, Clear, Paragraph};
@@ -76,17 +76,55 @@ fn inset(area: Rect) -> Rect {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = area.height as usize;
-    let lines = transcript_lines(app, area.width as usize);
+    let (lines, bounds) = transcript_layout(app, area.width as usize);
     let max_back = lines.len().saturating_sub(height);
     app.scroll_back = app.scroll_back.min(max_back);
 
+    if let Some(boundary) = app.visual_boundary() {
+        bring_into_view(app, &bounds, boundary, lines.len(), height, max_back);
+    }
+
     let end = lines.len() - app.scroll_back;
     let start = end.saturating_sub(height);
+    let selected = app.visual_range().and_then(|(lo, hi)| {
+        let from = bounds.get(lo)?.0;
+        let to = bounds.get(hi)?.1;
+        Some(from..to)
+    });
     // pad the top so a short transcript still sits on the bottom
     let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
-    visible.extend_from_slice(&lines[start..end]);
+    visible.extend((start..end).map(|i| {
+        if selected.as_ref().is_some_and(|r| r.contains(&i)) {
+            lines[i]
+                .clone()
+                .patch_style(Style::new().add_modifier(Modifier::REVERSED))
+        } else {
+            lines[i].clone()
+        }
+    }));
     frame.render_widget(Paragraph::new(visible), area);
     draw_scrollbar(frame, area, lines.len(), height, app.scroll_back);
+}
+
+// keeps the boundary block's first line on screen
+fn bring_into_view(
+    app: &mut App,
+    bounds: &[(usize, usize)],
+    boundary: usize,
+    total: usize,
+    height: usize,
+    max_back: usize,
+) {
+    let Some(&(block_start, _)) = bounds.get(boundary) else {
+        return;
+    };
+    let end = total.saturating_sub(app.scroll_back);
+    let start = end.saturating_sub(height);
+    if block_start < start {
+        app.scroll_back = total.saturating_sub(block_start + height).min(max_back);
+    } else if block_start >= end {
+        app.scroll_back = total.saturating_sub(block_start + 1).min(max_back);
+    }
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, height: usize, scroll_back: usize) {
@@ -108,8 +146,10 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, height: usize, sc
     }
 }
 
-fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+// rendered lines, plus each block's (start, end) line range
+fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
+    let mut bounds = Vec::with_capacity(app.transcript.len());
     let last = app.transcript.len().saturating_sub(1);
     let mut previous: Option<&Block> = None;
     for (i, block) in app.transcript.iter().enumerate() {
@@ -118,6 +158,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             out.push(Line::default());
         }
         previous = Some(block);
+        let block_start = out.len();
         match block {
             Block::You(text) => {
                 out.push(Line::styled("you", theme::DIM));
@@ -191,8 +232,9 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::styled(text, theme::DIM));
             }
         }
+        bounds.push((block_start, out.len()));
     }
-    out
+    (out, bounds)
 }
 
 fn activity(block: &Block) -> bool {
@@ -238,6 +280,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     }
     let mode = match app.mode {
         Mode::Insert => "-- insert ",
+        Mode::Visual => "-- visual ",
         Mode::Normal | Mode::Cmd => "",
     };
     let mut words: Vec<Span> = Vec::new();
@@ -461,24 +504,55 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     let start = picker.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(TIME_WIDTH + 5);
     for row in start..rows.min(start + visible) {
-        let (prefix, style) = if row == picker.selected {
-            (" > ", theme::ACCENT)
-        } else {
-            ("   ", theme::DIM)
-        };
+        let prefix = if row == picker.selected { " > " } else { "   " };
         let spans = match row.checked_sub(1).and_then(|i| sessions.get(i)) {
-            None => vec![Span::styled(format!("{prefix}new session"), style)],
-            Some(session) => vec![
-                Span::styled(format!("{prefix}{:<room$}", label(session, room)), style),
-                Span::styled(
-                    format!("  {:>TIME_WIDTH$}", last_active(session, now)),
-                    theme::DIM,
-                ),
-            ],
+            None => {
+                let style = if row == picker.selected {
+                    theme::ACCENT
+                } else {
+                    theme::DIM
+                };
+                vec![Span::styled(format!("{prefix}new session"), style)]
+            }
+            Some(session) => {
+                let job = crate::app::is_job_session(session);
+                let style = if job {
+                    theme::DIM
+                } else if row == picker.selected {
+                    theme::ACCENT
+                } else {
+                    theme::DIM
+                };
+                vec![
+                    Span::styled(
+                        format!("{prefix}{:<room$}", picker_label(session, room, job)),
+                        style,
+                    ),
+                    Span::styled(
+                        format!("  {:>TIME_WIDTH$}", last_active(session, now)),
+                        theme::DIM,
+                    ),
+                ]
+            }
         };
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+// a job's role/project tag rides after its title
+fn picker_label(session: &arc_proto::v1::SessionInfo, room: usize, job: bool) -> String {
+    if !job {
+        return label(session, room);
+    }
+    let role = SessionRole::try_from(session.role).unwrap_or(SessionRole::Unspecified);
+    let tag = format!(
+        " {}/{}",
+        arc_core::provider::role_label(role),
+        session.project
+    );
+    let base_room = room.saturating_sub(tag.chars().count());
+    format!("{}{tag}", label(session, base_room))
 }
 
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
@@ -628,12 +702,23 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-u ctrl-d     page up / down",
             "G gg              scroll to bottom / top",
             "s ctrl-p          open the session picker",
-            "y                 yank the last reply",
+            "y                 yank the last reply (V for a range)",
+            "Y                 yank the whole conversation",
+            "V                 visual mode: select a block range",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces",
             "ctrl-c            quit",
             ":                 command mode",
+        ],
+    ),
+    (
+        "visual mode",
+        &[
+            "j k               move the selection boundary",
+            "gg G              selection to the first / last block",
+            "y                 yank the selection",
+            "esc               back to normal mode",
         ],
     ),
     (
@@ -658,6 +743,7 @@ const HELP: &[(&str, &[&str])] = &[
         &[
             "j k               move selection",
             "/                 filter by title/preview",
+            "a                 toggle showing dispatched jobs",
             "enter             open the selected session",
             "q esc             close (esc also clears an active filter)",
         ],
@@ -824,7 +910,7 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 mod tests {
     use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
 
-    use super::{job_label, label, last_active, wrap_input};
+    use super::{job_label, label, last_active, picker_label, wrap_input};
 
     fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
         SessionInfo {
@@ -833,6 +919,8 @@ mod tests {
             started_at: None,
             preview: preview.to_owned(),
             last_at: None,
+            role: 0,
+            project: String::new(),
         }
     }
 
@@ -847,6 +935,8 @@ mod tests {
                 seconds: at.timestamp(),
                 nanos: 0,
             }),
+            role: 0,
+            project: String::new(),
         }
     }
 
@@ -896,6 +986,18 @@ mod tests {
     fn a_picker_row_falls_back_to_the_preview_without_a_title() {
         let session = session("s-01", "", "what color for the accent?");
         assert_eq!(label(&session, 40), "what color for the accent?");
+    }
+
+    #[test]
+    fn a_job_row_in_the_picker_keeps_its_title_and_gains_a_role_project_tag() {
+        let mut job = session("s-01", "Fix the flaky test", "");
+        job.role = SessionRole::Executor as i32;
+        job.project = "arc".to_owned();
+
+        assert_eq!(
+            picker_label(&job, 40, true),
+            "Fix the flaky test executor/arc"
+        );
     }
 
     fn job(role: SessionRole, project: &str, title: &str) -> JobInfo {

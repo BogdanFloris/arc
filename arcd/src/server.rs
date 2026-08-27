@@ -590,6 +590,8 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         started_at: summary.started_at.map(timestamp),
         preview: summary.preview.clone(),
         last_at: summary.last_at.map(timestamp),
+        role: summary.role,
+        project: summary.project.clone().unwrap_or_default(),
     }
 }
 
@@ -1061,6 +1063,24 @@ mod tests {
         );
 
         harness.stop().await;
+    }
+
+    #[test]
+    fn session_info_carries_role_and_project() {
+        let summary = SessionSummary {
+            id: "s-1".to_string(),
+            title: String::new(),
+            started_at: None,
+            preview: String::new(),
+            last_at: None,
+            role: SessionRole::Executor as i32,
+            project: Some("arc".to_string()),
+        };
+
+        let info = session_info(&summary);
+
+        assert_eq!(info.role, SessionRole::Executor as i32);
+        assert_eq!(info.project, "arc");
     }
 
     #[tokio::test]

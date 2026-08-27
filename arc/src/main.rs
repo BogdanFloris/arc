@@ -128,7 +128,7 @@ fn yank(text: &str) {
 fn set_cursor_style(mode: Mode) {
     let style = match mode {
         Mode::Insert | Mode::Cmd => SetCursorStyle::SteadyBar,
-        Mode::Normal => SetCursorStyle::SteadyBlock,
+        Mode::Normal | Mode::Visual => SetCursorStyle::SteadyBlock,
     };
     let mut out = std::io::stdout();
     let _ = crossterm::execute!(out, style);

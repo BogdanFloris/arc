@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, Source, ToolOutcome, history_entry,
-    job_info,
+    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, SessionRole, Source, ToolOutcome,
+    history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -99,6 +99,8 @@ pub struct Picker {
     pub selected: usize,
     /// True while the input line is owned by the filter query.
     pub filtering: bool,
+    /// True once `a` reveals dispatched job sessions alongside conversations.
+    pub show_all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +157,7 @@ pub enum Mode {
     Normal,
     Insert,
     Cmd,
+    Visual,
 }
 
 pub struct App {
@@ -187,6 +190,10 @@ pub struct App {
     picker_filter_stash: Option<String>,
     /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
+    /// The transcript index visual mode never moves: where `V` was pressed.
+    visual_anchor: usize,
+    /// The transcript index `j`/`k`/`gg`/`G` move; the selection spans it to the anchor.
+    visual_boundary: usize,
 }
 
 impl App {
@@ -219,6 +226,8 @@ impl App {
             previous_session: None,
             picker_filter_stash: None,
             steer_turn_pending: false,
+            visual_anchor: 0,
+            visual_boundary: 0,
         }
     }
 
@@ -283,6 +292,7 @@ impl App {
             Mode::Insert => self.on_insert(key.code),
             Mode::Normal => self.on_normal(key.code),
             Mode::Cmd => self.on_cmd(key.code),
+            Mode::Visual => self.on_visual(key.code),
         }
     }
 
@@ -400,6 +410,8 @@ impl App {
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
+            KeyCode::Char('V') if self.status != Status::Streaming => self.enter_visual(),
+            KeyCode::Char('Y') if self.status != Status::Streaming => return self.yank_all(),
             KeyCode::Char(':') => {
                 self.cmd.clear();
                 self.mode = Mode::Cmd;
@@ -415,6 +427,79 @@ impl App {
             _ => None,
         });
         if let Some(text) = reply {
+            self.yank_note = Some("yanked".to_owned());
+            Some(Command::Yank(text))
+        } else {
+            self.yank_note = Some("nothing to yank".to_owned());
+            None
+        }
+    }
+
+    fn enter_visual(&mut self) {
+        let Some(last) = self.transcript.len().checked_sub(1) else {
+            return;
+        };
+        self.pending = None;
+        self.visual_anchor = last;
+        self.visual_boundary = last;
+        self.mode = Mode::Visual;
+    }
+
+    fn on_visual(&mut self, code: KeyCode) -> Option<Command> {
+        if let Some(pending) = self.pending.take() {
+            if pending == 'g' && code == KeyCode::Char('g') {
+                self.visual_boundary = 0;
+            }
+            return None;
+        }
+        match code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char('j') => {
+                self.visual_boundary = (self.visual_boundary + 1).min(self.visual_anchor);
+            }
+            KeyCode::Char('k') => self.visual_boundary = self.visual_boundary.saturating_sub(1),
+            KeyCode::Char('G') => self.visual_boundary = self.visual_anchor,
+            KeyCode::Char('g') => self.pending = Some('g'),
+            KeyCode::Char('y') => return self.yank_visual(),
+            _ => {}
+        }
+        None
+    }
+
+    /// The selected block range, low to high; only meaningful in visual mode.
+    pub fn visual_range(&self) -> Option<(usize, usize)> {
+        if self.mode != Mode::Visual {
+            return None;
+        }
+        let last = self.transcript.len().checked_sub(1)?;
+        let anchor = self.visual_anchor.min(last);
+        let boundary = self.visual_boundary.min(last);
+        Some((anchor.min(boundary), anchor.max(boundary)))
+    }
+
+    /// The boundary block index the selection is currently anchored to by the cursor.
+    pub fn visual_boundary(&self) -> Option<usize> {
+        if self.mode != Mode::Visual || self.transcript.is_empty() {
+            return None;
+        }
+        Some(self.visual_boundary.min(self.transcript.len() - 1))
+    }
+
+    fn yank_visual(&mut self) -> Option<Command> {
+        let range = self.visual_range();
+        self.mode = Mode::Normal;
+        let (lo, hi) = range?;
+        let text = format_yank(&self.transcript[lo..=hi]);
+        self.finish_yank(text)
+    }
+
+    fn yank_all(&mut self) -> Option<Command> {
+        let text = format_yank(&self.transcript);
+        self.finish_yank(text)
+    }
+
+    fn finish_yank(&mut self, text: Option<String>) -> Option<Command> {
+        if let Some(text) = text {
             self.yank_note = Some("yanked".to_owned());
             Some(Command::Yank(text))
         } else {
@@ -607,6 +692,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_picker_selection(true),
             KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
             KeyCode::Char('/') => self.start_picker_filter(),
+            KeyCode::Char('a') => self.toggle_picker_show_all(),
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
                 self.picker = None;
@@ -630,6 +716,12 @@ impl App {
             }
         }
         None
+    }
+
+    fn toggle_picker_show_all(&mut self) {
+        let picker = self.picker.as_mut().expect("picker is open");
+        picker.show_all = !picker.show_all;
+        picker.selected = 0;
     }
 
     fn start_picker_filter(&mut self) {
@@ -675,6 +767,7 @@ impl App {
             self.picker = Some(Picker {
                 selected: 0,
                 filtering: false,
+                show_all: false,
             });
         }
     }
@@ -684,9 +777,15 @@ impl App {
             .and_then(|i| self.picker_rows().get(i).copied())
     }
 
-    /// The session list in recency order, narrowed by the active filter query if any.
+    /// The session list in recency order, narrowed to conversations unless
+    /// `a` revealed jobs too, then narrowed further by the filter query if any.
     pub fn picker_rows(&self) -> Vec<&SessionInfo> {
-        let order = self.by_recency();
+        let show_all = self.picker.as_ref().is_some_and(|picker| picker.show_all);
+        let order: Vec<&SessionInfo> = self
+            .by_recency()
+            .into_iter()
+            .filter(|session| show_all || !is_job_session(session))
+            .collect();
         let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
         if !filtering || self.input.is_empty() {
             return order;
@@ -785,6 +884,10 @@ impl App {
                     self.transcript = history_blocks(entries);
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
+                    // a rebuilt transcript can dangle a stale selection
+                    if self.mode == Mode::Visual {
+                        self.mode = Mode::Normal;
+                    }
                 }
                 None
             }
@@ -980,6 +1083,10 @@ impl App {
     fn pop_empty_reply(&mut self) {
         if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty()) {
             self.transcript.pop();
+            // a shrunk transcript can dangle a selection
+            if self.mode == Mode::Visual {
+                self.mode = Mode::Normal;
+            }
         }
     }
 
@@ -1031,8 +1138,34 @@ fn is_running(job: &JobInfo) -> bool {
     job.state == job_info::State::Running as i32
 }
 
+pub fn is_job_session(session: &SessionInfo) -> bool {
+    matches!(
+        SessionRole::try_from(session.role),
+        Ok(SessionRole::Executor | SessionRole::Archivist)
+    )
+}
+
 fn short_id(id: &str) -> &str {
     &id[id.len().saturating_sub(8)..]
+}
+
+/// You/Arc/System blocks, headered and blank-line separated; everything else is skipped.
+fn format_yank(blocks: &[Block]) -> Option<String> {
+    let parts: Vec<String> = blocks.iter().filter_map(block_yank_text).collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn block_yank_text(block: &Block) -> Option<String> {
+    match block {
+        Block::You(text) => Some(format!("you: {text}")),
+        Block::Arc { text, .. } => Some(format!("arc: {text}")),
+        Block::System(text) => Some(format!("system: {text}")),
+        Block::Thought { .. }
+        | Block::Tool { .. }
+        | Block::Cost { .. }
+        | Block::Note(_)
+        | Block::Fault { .. } => None,
+    }
 }
 
 /// The first meaningful string value in the call's arguments: the bash
@@ -1170,6 +1303,8 @@ mod tests {
             started_at: None,
             preview: String::new(),
             last_at: None,
+            role: 0,
+            project: String::new(),
         }
     }
 
@@ -1180,6 +1315,16 @@ mod tests {
             started_at: None,
             preview: preview.to_owned(),
             last_at: None,
+            role: 0,
+            project: String::new(),
+        }
+    }
+
+    fn job_session(id: &str, title: &str, role: SessionRole, project: &str) -> SessionInfo {
+        SessionInfo {
+            role: role as i32,
+            project: project.to_owned(),
+            ..session_with(id, title, "")
         }
     }
 
@@ -1923,6 +2068,8 @@ mod tests {
                     nanos: 0,
                 }),
                 last_at: last.map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
+                role: 0,
+                project: String::new(),
             }
         }
 
@@ -2331,6 +2478,61 @@ mod tests {
         assert_eq!(app.picker_rows().len(), 2, "the full list is back");
         assert_eq!(app.input, "draft reply", "the stashed draft comes back");
         assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn the_picker_hides_job_sessions_until_a_reveals_them() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session("conv"),
+            job_session("job", "", SessionRole::Executor, "arc"),
+        ]));
+        normal(&mut app, "s");
+
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["conv"],
+            "a dispatched job is not a conversation"
+        );
+
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.picker_rows().len(), 2, "a reveals the job too");
+
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.picker_rows().len(), 1, "a toggles back off");
+    }
+
+    #[test]
+    fn the_filter_narrows_within_the_current_toggle_state() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("conv", "alpha talk", ""),
+            job_session("job", "alpha job", SessionRole::Archivist, "arc"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "alpha");
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["conv"],
+            "the job stays hidden while filtering"
+        );
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "alpha");
+        assert_eq!(
+            app.picker_rows().len(),
+            2,
+            "with jobs shown, the filter matches both"
+        );
     }
 
     #[test]
@@ -3131,5 +3333,167 @@ mod tests {
         app.on_key(key(KeyCode::Char('j')));
 
         assert_eq!(app.yank_note, None);
+    }
+
+    fn conversation() -> App {
+        let mut app = App::new();
+        app.transcript.push(Block::You("first question".to_owned()));
+        app.transcript.push(Block::Arc {
+            text: "first answer".to_owned(),
+            partial: false,
+        });
+        app.transcript.push(Block::Tool {
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            args: "ls".to_owned(),
+            outcome: Some("ok"),
+        });
+        app.transcript.push(Block::Cost {
+            input_tokens: 10,
+            output_tokens: 20,
+            seconds: 1.0,
+        });
+        app.transcript
+            .push(Block::You("second question".to_owned()));
+        app.transcript.push(Block::Arc {
+            text: "second answer".to_owned(),
+            partial: false,
+        });
+        app.on_key(key(KeyCode::Esc));
+        app
+    }
+
+    #[test]
+    fn v_then_y_yanks_only_the_last_block() {
+        let mut app = conversation();
+
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.mode, Mode::Visual);
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            command,
+            Some(Command::Yank("arc: second answer".to_owned()))
+        );
+        assert_eq!(app.mode, Mode::Normal, "y exits visual mode");
+        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
+    }
+
+    #[test]
+    fn v_k_y_yanks_the_last_two_blocks() {
+        let mut app = conversation();
+
+        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('k')));
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            command,
+            Some(Command::Yank(
+                "you: second question\n\narc: second answer".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn v_gg_y_yanks_from_the_first_block() {
+        let mut app = conversation();
+
+        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('g')));
+        app.on_key(key(KeyCode::Char('g')));
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            command,
+            Some(Command::Yank(
+                "you: first question\n\narc: first answer\n\nyou: second question\n\narc: second answer"
+                    .to_owned()
+            )),
+            "tools and costs between them are skipped"
+        );
+    }
+
+    #[test]
+    fn v_gg_g_returns_the_boundary_to_the_last_block() {
+        let mut app = conversation();
+
+        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('g')));
+        app.on_key(key(KeyCode::Char('g')));
+        app.on_key(key(KeyCode::Char('G')));
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            command,
+            Some(Command::Yank("arc: second answer".to_owned())),
+            "G snaps back to the anchor"
+        );
+    }
+
+    #[test]
+    fn shift_y_yanks_the_whole_conversation_skipping_tools_and_costs() {
+        let mut app = conversation();
+
+        let command = app.on_key(key(KeyCode::Char('Y')));
+
+        assert_eq!(
+            command,
+            Some(Command::Yank(
+                "you: first question\n\narc: first answer\n\nyou: second question\n\narc: second answer"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(app.mode, Mode::Normal, "Y never enters visual mode");
+    }
+
+    #[test]
+    fn esc_leaves_visual_mode_without_yanking() {
+        let mut app = conversation();
+        app.on_key(key(KeyCode::Char('V')));
+
+        let command = app.on_key(key(KeyCode::Esc));
+
+        assert_eq!(command, None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_history_rebuild_while_in_visual_exits_it() {
+        let mut app = conversation();
+        app.session_id = Some("s-1".to_owned());
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.mode, Mode::Visual);
+
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![prose_entry(Role::User as i32, "fresh", false)],
+        });
+
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn v_is_ignored_while_streaming() {
+        let mut app = conversation();
+        app.status = Status::Streaming;
+
+        assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn v_is_ignored_while_a_popup_is_open() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.transcript.push(Block::Arc {
+            text: "hello".to_owned(),
+            partial: false,
+        });
+
+        assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
+        assert_ne!(app.mode, Mode::Visual);
     }
 }

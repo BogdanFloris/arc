@@ -138,6 +138,8 @@ pub struct SessionSummary {
     pub started_at: Option<i64>,
     pub preview: String,
     pub last_at: Option<i64>,
+    pub role: i32,
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,7 +641,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                           WHERE m.session_id = s.id AND m.kind = ?2 AND m.role = ?1
                           ORDER BY m.seq LIMIT 1), ''),
                 (SELECT MAX(m.ts) FROM messages m
-                 WHERE m.session_id = s.id AND m.kind = ?2)
+                 WHERE m.session_id = s.id AND m.kind = ?2),
+                s.role, s.project
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -649,6 +652,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
             started_at: row.get(2)?,
             preview: row.get(3)?,
             last_at: row.get(4)?,
+            role: row.get(5)?,
+            project: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -1944,9 +1949,28 @@ mod tests {
                 started_at: Some(200_000_000),
                 preview: String::new(),
                 last_at: None,
+                role: SessionRole::Unspecified as i32,
+                project: None,
             }
         );
         assert_eq!(sessions[0].started_at, None);
+    }
+
+    #[test]
+    fn a_sessions_summary_carries_its_role_and_project() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut created = session_created(0);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = created.payload.as_mut()
+        {
+            created.project = "arc".to_string();
+        }
+        projection.apply(&created).expect("apply");
+
+        let summary = &projection.sessions().expect("sessions")[0];
+        assert_eq!(summary.role, SessionRole::Executor as i32);
+        assert_eq!(summary.project.as_deref(), Some("arc"));
     }
 
     #[test]
