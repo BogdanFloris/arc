@@ -132,6 +132,14 @@ pub enum Block {
         done: bool,
         open: bool,
     },
+    /// A job's handback: `subject` is the `Job {id} finished.` header line,
+    /// `body` the child's summary. Folded like a thought — one dim line
+    /// until ctrl-o opens it.
+    Handback {
+        subject: String,
+        body: String,
+        open: bool,
+    },
     Tool {
         call_id: String,
         name: String,
@@ -1069,13 +1077,18 @@ impl App {
     }
 
     fn toggle_thought(&mut self) {
-        let any_open = self
-            .transcript
-            .iter()
-            .any(|block| matches!(block, Block::Thought { open: true, .. }));
+        let any_open = self.transcript.iter().any(|block| {
+            matches!(
+                block,
+                Block::Thought { open: true, .. } | Block::Handback { open: true, .. }
+            )
+        });
         for block in &mut self.transcript {
-            if let Block::Thought { open, .. } = block {
-                *open = !any_open;
+            match block {
+                Block::Thought { open, .. } | Block::Handback { open, .. } => {
+                    *open = !any_open;
+                }
+                _ => {}
             }
         }
     }
@@ -1149,6 +1162,42 @@ fn short_id(id: &str) -> &str {
     &id[id.len().saturating_sub(8)..]
 }
 
+/// The first line of a handback reads `Job {id} finished.` or
+/// `Job {id} stopped: {reason}.`; what follows is the child's summary.
+fn handback_parts(content: &str) -> Option<(String, String)> {
+    let mut lines = content.splitn(2, '\n');
+    let head = lines.next()?.trim_end();
+    let rest = lines.next()?;
+    if !handback_subject(head) {
+        return None;
+    }
+    Some((head.to_owned(), rest.to_owned()))
+}
+
+/// Matches `Job {uuid} finished.` or `Job {uuid} stopped: {reason}.` — the
+/// exact shape `record_handback` writes. Anything looser would fold prose.
+fn handback_subject(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Job ") else {
+        return false;
+    };
+    if let Some(id) = rest.strip_suffix(" finished.") {
+        return is_uuid_like(id);
+    }
+    match rest.strip_suffix('.') {
+        None => false,
+        Some(rest) => match rest.split_once(" stopped: ") {
+            Some((id, reason)) => is_uuid_like(id) && !reason.is_empty(),
+            None => false,
+        },
+    }
+}
+
+/// A session id: hex digits and dashes, 32–36 chars (`record_handback`
+/// embeds a bare uuid). Tight enough that prose never matches.
+fn is_uuid_like(text: &str) -> bool {
+    (32..=36).contains(&text.len()) && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
 /// You/Arc/System blocks, headered and blank-line separated; everything else is skipped.
 fn format_yank(blocks: &[Block]) -> Option<String> {
     let parts: Vec<String> = blocks.iter().filter_map(block_yank_text).collect();
@@ -1161,6 +1210,7 @@ fn block_yank_text(block: &Block) -> Option<String> {
         Block::Arc { text, .. } => Some(format!("arc: {text}")),
         Block::System(text) => Some(format!("system: {text}")),
         Block::Thought { .. }
+        | Block::Handback { .. }
         | Block::Tool { .. }
         | Block::Cost { .. }
         | Block::Note(_)
@@ -1208,6 +1258,13 @@ fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
 fn prose_block(message: HistoryMessage) -> Option<Block> {
     // handbacks ride the user role for the model; the display tells the truth
     if message.source == Source::System as i32 {
+        if let Some((subject, body)) = handback_parts(&message.content) {
+            return Some(Block::Handback {
+                subject,
+                body,
+                open: false,
+            });
+        }
         return Some(Block::System(message.content));
     }
     match Role::try_from(message.role) {
@@ -3216,6 +3273,139 @@ mod tests {
         assert_eq!(
             block,
             Block::System("Job s-x finished.\nAll good.".to_owned())
+        );
+    }
+
+    const JOB_ID: &str = "c1a4a9e7-d2b8-4f60-91e3-b5a7c9d1e3f5";
+
+    fn handback_message(content: &str) -> HistoryMessage {
+        HistoryMessage {
+            source: Source::System as i32,
+            ..prose(Role::User as i32, content, false)
+        }
+    }
+
+    fn handback_entry(content: &str) -> HistoryEntry {
+        HistoryEntry {
+            entry: Some(history_entry::Entry::Message(handback_message(content))),
+        }
+    }
+
+    #[test]
+    fn a_handback_history_row_lands_as_one_folded_block() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![handback_entry(&format!(
+                "Job {JOB_ID} finished.\nfixed the flaky test"
+            ))],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [Block::Handback {
+                subject: format!("Job {JOB_ID} finished."),
+                body: "fixed the flaky test".to_owned(),
+                open: false,
+            }],
+            "a handback starts folded"
+        );
+    }
+
+    #[test]
+    fn a_stopped_handback_keeps_the_reason_in_its_subject() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![handback_entry(&format!(
+                "Job {JOB_ID} stopped: token budget exhausted (500/400).\npartial work"
+            ))],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [Block::Handback {
+                subject: format!("Job {JOB_ID} stopped: token budget exhausted (500/400)."),
+                body: "partial work".to_owned(),
+                open: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn system_rows_without_the_handback_shape_stay_system_blocks() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![
+                handback_entry("consolidation wrote three memories."),
+                handback_entry("Job finished.\nno id in the header"),
+                handback_entry(&format!("Job {JOB_ID} finished.")),
+            ],
+        });
+
+        assert_eq!(
+            app.transcript,
+            [
+                Block::System("consolidation wrote three memories.".to_owned()),
+                Block::System("Job finished.\nno id in the header".to_owned()),
+                Block::System(format!("Job {JOB_ID} finished.")),
+            ],
+            "prose that merely mentions jobs must not fold away"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_thoughts_and_handbacks_together() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("checking the failing case".to_owned()));
+        app.on_net(NetEvent::Delta("done".to_owned()));
+        app.transcript.push(
+            prose_block(handback_message(&format!(
+                "Job {JOB_ID} finished.\nall green"
+            )))
+            .expect("handback block"),
+        );
+
+        app.on_key(ctrl('o'));
+        assert!(
+            matches!(&app.transcript[1], Block::Thought { open: true, .. }),
+            "ctrl-o opens the thought"
+        );
+        assert!(
+            matches!(&app.transcript[3], Block::Handback { open: true, .. }),
+            "and the handback with it"
+        );
+
+        app.on_key(ctrl('o'));
+        assert!(matches!(
+            &app.transcript[1],
+            Block::Thought { open: false, .. }
+        ));
+        assert!(matches!(
+            &app.transcript[3],
+            Block::Handback { open: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_handback_is_yank_invisible_like_other_activity() {
+        assert_eq!(
+            block_yank_text(&Block::Handback {
+                subject: format!("Job {JOB_ID} finished."),
+                body: "all green".to_owned(),
+                open: true,
+            }),
+            None,
+            "yanking the conversation never scoops up job machinery"
         );
     }
 

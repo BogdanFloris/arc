@@ -205,6 +205,19 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                     push_wrapped(&mut out, text, width, theme::DIM);
                 }
             }
+            Block::Handback {
+                subject,
+                body,
+                open,
+            } => {
+                out.push(Line::styled(
+                    elide(&format!("± {subject}"), width),
+                    theme::DIM,
+                ));
+                if *open {
+                    push_wrapped(&mut out, body, width, theme::DIM);
+                }
+            }
             Block::Tool {
                 name,
                 args,
@@ -707,7 +720,7 @@ const HELP: &[(&str, &[&str])] = &[
             "V                 visual mode: select a block range",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
-            "ctrl-o            toggle thought traces",
+            "ctrl-o            toggle thought traces / handback summaries",
             "ctrl-c            quit",
             ":                 command mode",
         ],
