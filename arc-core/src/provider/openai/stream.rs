@@ -14,6 +14,9 @@ pub(super) struct Parser {
     building: BTreeMap<u32, Building>,
 
     stop: Option<Stop>,
+
+    // endpoints repeat usage on many chunks; log the hit once
+    cache_logged: bool,
 }
 
 impl FrameParser for Parser {
@@ -60,6 +63,17 @@ impl FrameParser for Parser {
             }
         }
 
+        if let Some(usage) = &usage {
+            let cached = usage.prompt_tokens_details.cached_tokens;
+            if cached > 0 && !self.cache_logged {
+                self.cache_logged = true;
+                tracing::info!(
+                    counter.cached_tokens = cached,
+                    counter.prompt_tokens = usage.prompt_tokens,
+                    "prompt cache hit"
+                );
+            }
+        }
         Ok(Deltas {
             items,
             usage: usage.as_ref().map(UsageJson::usage),
@@ -223,14 +237,6 @@ struct PromptTokensDetailsJson {
 
 impl UsageJson {
     fn usage(&self) -> Usage {
-        let cached = self.prompt_tokens_details.cached_tokens;
-        if cached > 0 {
-            tracing::info!(
-                counter.cached_tokens = cached,
-                counter.prompt_tokens = self.prompt_tokens,
-                "prompt cache hit"
-            );
-        }
         Usage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
