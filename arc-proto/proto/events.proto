@@ -48,6 +48,8 @@ message SessionCreated {
   string project = 8;
   Budget budget = 9;
   repeated WorkspaceGrant grants = 10;
+  // the dispatching parent, set only for a job session's own creation
+  string dispatched_by = 11;
 }
 
 message MessageAppended {

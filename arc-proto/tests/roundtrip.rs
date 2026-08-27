@@ -52,6 +52,7 @@ fn session_created_event() -> Event {
                         read_write: false,
                     },
                 ],
+                dispatched_by: "s-parent".to_string(),
             })),
         })),
     }
