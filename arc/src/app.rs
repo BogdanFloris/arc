@@ -2855,6 +2855,8 @@ mod tests {
             elapsed_seconds: 5,
             budget_seconds: 0,
             title: String::new(),
+            tool_steps: 0,
+            idle_seconds: 0,
         }
     }
 

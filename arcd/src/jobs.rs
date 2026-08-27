@@ -932,6 +932,9 @@ impl JobStatus {
                 .as_ref()
                 .map_or(0, |budget| budget.wall_clock_seconds),
             title: String::new(),
+            // zeros until 6.29 wires step and idle tracking
+            tool_steps: 0,
+            idle_seconds: 0,
         }
     }
 }

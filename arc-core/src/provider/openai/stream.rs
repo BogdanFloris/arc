@@ -193,10 +193,26 @@ struct UsageJson {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetailsJson,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetailsJson {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 impl UsageJson {
     fn usage(&self) -> Usage {
+        let cached = self.prompt_tokens_details.cached_tokens;
+        if cached > 0 {
+            tracing::info!(
+                counter.cached_tokens = cached,
+                counter.prompt_tokens = self.prompt_tokens,
+                "prompt cache hit"
+            );
+        }
         Usage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,

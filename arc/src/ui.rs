@@ -1024,6 +1024,8 @@ mod tests {
             elapsed_seconds: 5,
             budget_seconds: 0,
             title: title.to_owned(),
+            tool_steps: 0,
+            idle_seconds: 0,
         }
     }
 
