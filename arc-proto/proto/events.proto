@@ -56,6 +56,10 @@ message MessageAppended {
   string content = 3;
   bool partial = 4;
   string turn_id = 5;
+  // the turn's usage and wall time, stamped only on its final assistant message
+  uint32 input_tokens = 6;
+  uint32 output_tokens = 7;
+  uint32 elapsed_ms = 8;
 }
 
 message ToolCallIssued {

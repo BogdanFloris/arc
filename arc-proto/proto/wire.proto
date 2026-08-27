@@ -149,6 +149,9 @@ message HistoryMessage {
   bool partial = 3;
   // who wrote it: a handback is SYSTEM where the user's words are USER
   Source source = 4;
+  uint32 input_tokens = 5;
+  uint32 output_tokens = 6;
+  uint32 elapsed_ms = 7;
 }
 
 message HistoryToolCall {

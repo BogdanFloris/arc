@@ -69,6 +69,9 @@ fn message_appended_event() -> Event {
                 content: "hello arc".to_string(),
                 partial: false,
                 turn_id: "t-01".to_string(),
+                input_tokens: 12,
+                output_tokens: 34,
+                elapsed_ms: 5600,
             })),
         })),
     }
@@ -312,6 +315,9 @@ fn server_frame_arms_round_trip() {
                         content: "hello arc".to_string(),
                         partial: false,
                         source: 0,
+                        input_tokens: 12,
+                        output_tokens: 34,
+                        elapsed_ms: 5600,
                     })),
                 },
                 HistoryEntry {
