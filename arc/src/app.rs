@@ -895,11 +895,14 @@ impl App {
                 entries,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    self.transcript = history_blocks(entries);
+                    let rebuilt = history_blocks(entries);
+                    // append-only rebuilds keep the selection valid
+                    let appended_only = rebuilt.len() >= self.transcript.len()
+                        && rebuilt.starts_with(&self.transcript);
+                    self.transcript = rebuilt;
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
-                    // a rebuilt transcript can dangle a stale selection
-                    if self.mode == Mode::Visual {
+                    if self.mode == Mode::Visual && !appended_only {
                         self.mode = Mode::Normal;
                     }
                 }
@@ -3670,6 +3673,35 @@ mod tests {
         });
 
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn an_append_only_rebuild_keeps_visual_mode() {
+        let mut app = conversation();
+        app.session_id = Some("s-1".to_owned());
+        let base = vec![
+            prose_entry(Role::User as i32, "hi", false),
+            prose_entry(Role::Assistant as i32, "hello", false),
+        ];
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: base.clone(),
+        });
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.mode, Mode::Visual);
+
+        let mut grown = base;
+        grown.push(prose_entry(Role::User as i32, "one more", false));
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: grown,
+        });
+
+        assert_eq!(
+            app.mode,
+            Mode::Visual,
+            "an append-only rebuild keeps the selection"
+        );
     }
 
     #[test]
