@@ -52,6 +52,10 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 - Tests live with the code; projection logic must have replay tests (log in → state out, deterministic).
 - Runtime state under the configured data directory — `data/` in a checkout, `~/.local/state/arc/` once installed. Never write outside it at runtime.
 
+## Version control
+
+The repo is jj, colocated with git. Use `jj`; never run git write commands — a git commit on the detached HEAD makes history jj only half-adopts. The working copy is shared with other work: commit only the paths your task touched (`jj commit <paths> -m "..."`). Commit when the task says to commit; otherwise leave changes in the working copy for review.
+
 ## Commit style
 
 Small, single-purpose commits: `<crate>: <imperative summary>` (e.g. `arc-core: add event log segment writer`). Schema changes are their own commit, separate from code that uses them.
