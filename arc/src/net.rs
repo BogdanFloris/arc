@@ -104,6 +104,8 @@ async fn handle(
             verdict(client.review_delete(&record_id).await, events)
         }
         Command::ListJobs => list_jobs(&mut client, events).await,
+        // main.rs writes the OSC 52 sequence itself; this never reaches the socket
+        Command::Yank(_) => Ok(()),
     };
     match result {
         Ok(()) => Some(client),

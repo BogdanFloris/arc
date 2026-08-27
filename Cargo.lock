@@ -48,6 +48,7 @@ dependencies = [
  "anyhow",
  "arc-core",
  "arc-proto",
+ "base64",
  "chrono",
  "crossterm",
  "expect-test",

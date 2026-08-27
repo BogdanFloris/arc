@@ -31,6 +31,7 @@ pub enum Command {
         record_id: String,
     },
     ListJobs,
+    Yank(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +172,7 @@ pub struct App {
     pub help: bool,
     pub status: Status,
     pub last_error: Option<String>,
+    pub yank_note: Option<String>,
     pub queued: VecDeque<String>,
     thinking_since: Option<Instant>,
     turn_started: Option<Instant>,
@@ -204,6 +206,7 @@ impl App {
             help: false,
             status: Status::Idle,
             last_error: None,
+            yank_note: None,
             queued: VecDeque::new(),
             thinking_since: None,
             turn_started: None,
@@ -249,6 +252,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
+        self.yank_note = None;
         match key.code {
             KeyCode::PageUp => {
                 self.on_scroll(true, PAGE);
@@ -393,6 +397,9 @@ impl App {
             KeyCode::Char('k') => self.scroll_back = self.scroll_back.saturating_add(1),
             KeyCode::Char('G') => self.scroll_back = 0,
             KeyCode::Char('s') => self.open_picker(),
+            KeyCode::Char('y') if self.status != Status::Streaming => {
+                return self.yank_last_reply();
+            }
             KeyCode::Char(':') => {
                 self.cmd.clear();
                 self.mode = Mode::Cmd;
@@ -400,6 +407,20 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn yank_last_reply(&mut self) -> Option<Command> {
+        let reply = self.transcript.iter().rev().find_map(|block| match block {
+            Block::Arc { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        if let Some(text) = reply {
+            self.yank_note = Some("yanked".to_owned());
+            Some(Command::Yank(text))
+        } else {
+            self.yank_note = Some("nothing to yank".to_owned());
+            None
+        }
     }
 
     fn on_cmd(&mut self, code: KeyCode) -> Option<Command> {
@@ -2916,5 +2937,95 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.on_key(ctrl('t')), None);
         assert_eq!(app.session_id, None);
+    }
+
+    #[test]
+    fn y_yanks_the_last_reply() {
+        let mut app = App::new();
+        app.transcript.push(Block::You("hi".to_owned()));
+        app.transcript.push(Block::Arc {
+            text: "hello there".to_owned(),
+            partial: false,
+        });
+        app.on_key(key(KeyCode::Esc));
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(command, Some(Command::Yank("hello there".to_owned())));
+        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
+    }
+
+    #[test]
+    fn y_yanks_a_partial_reply_too() {
+        let mut app = App::new();
+        app.transcript.push(Block::Arc {
+            text: "cut off mid".to_owned(),
+            partial: true,
+        });
+        app.on_key(key(KeyCode::Esc));
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(command, Some(Command::Yank("cut off mid".to_owned())));
+    }
+
+    #[test]
+    fn y_with_no_reply_yet_is_a_no_op_with_a_footer_note() {
+        let mut app = App::new();
+        app.transcript.push(Block::You("hi".to_owned()));
+        app.on_key(key(KeyCode::Esc));
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(command, None);
+        assert_eq!(app.yank_note.as_deref(), Some("nothing to yank"));
+    }
+
+    #[test]
+    fn y_is_ignored_while_streaming() {
+        let mut app = App::new();
+        app.transcript.push(Block::Arc {
+            text: "hello".to_owned(),
+            partial: false,
+        });
+        app.on_key(key(KeyCode::Esc));
+        app.status = Status::Streaming;
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(command, None);
+        assert_eq!(app.yank_note, None);
+    }
+
+    #[test]
+    fn y_is_ignored_while_a_popup_is_open() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running)]);
+        app.transcript.push(Block::Arc {
+            text: "hello".to_owned(),
+            partial: false,
+        });
+
+        let command = app.on_key(key(KeyCode::Char('y')));
+
+        assert_eq!(command, None);
+        assert_eq!(app.yank_note, None);
+    }
+
+    #[test]
+    fn the_yank_note_clears_on_the_next_key() {
+        let mut app = App::new();
+        app.transcript.push(Block::Arc {
+            text: "hello".to_owned(),
+            partial: false,
+        });
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
+
+        app.on_key(key(KeyCode::Char('j')));
+
+        assert_eq!(app.yank_note, None);
     }
 }

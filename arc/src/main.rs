@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Result;
+use base64::Engine as _;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt as _;
@@ -100,8 +101,10 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
             _ = clock.tick(), if app.has_running_job() => None,
         };
 
-        if let Some(command) = command {
-            commands.send(command).expect("connection task alive");
+        match command {
+            Some(Command::Yank(text)) => yank(&text),
+            Some(command) => commands.send(command).expect("connection task alive"),
+            None => {}
         }
         if app.mode != cursor {
             cursor = app.mode;
@@ -109,6 +112,17 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
         }
     }
     Ok(())
+}
+
+// OSC 52 to the same stdout ratatui draws through, not a separate handle
+fn yank(text: &str) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    let _ = crossterm::execute!(
+        out,
+        crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
+    );
+    let _ = out.flush();
 }
 
 fn set_cursor_style(mode: Mode) {

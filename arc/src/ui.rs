@@ -250,6 +250,9 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+    if let Some(note) = &app.yank_note {
+        words.push(Span::styled(format!(" {note}"), theme::DIM));
+    }
     if !app.queued.is_empty() {
         words.push(Span::styled(
             format!(" +{} queued", app.queued.len()),
@@ -625,6 +628,7 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-u ctrl-d     page up / down",
             "G gg              scroll to bottom / top",
             "s ctrl-p          open the session picker",
+            "y                 yank the last reply",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces",
