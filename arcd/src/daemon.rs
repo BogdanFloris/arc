@@ -204,6 +204,8 @@ impl Daemon {
                 .with_notifier(self.notifier.clone())
                 .with_concierge(self.roles.concierge().clone()),
         );
+        // after orphan repair (already done in `start`), before serving
+        supervisor.repair_restart_handbacks().await;
 
         server::serve(
             listener,
@@ -513,6 +515,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 })),
             })),
         })
@@ -596,6 +599,7 @@ mod tests {
                 project: String::new(),
                 budget: None,
                 grants: Vec::new(),
+                dispatched_by: String::new(),
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),

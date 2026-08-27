@@ -147,6 +147,17 @@ pub enum Error {
         serving: String,
     },
 
+    #[error(
+        "session {session_id} was recorded on {pinned}; the {role} now runs {serving}. \
+         Dispatch a fresh job instead."
+    )]
+    ModelMismatch {
+        session_id: String,
+        pinned: String,
+        role: String,
+        serving: String,
+    },
+
     #[error("the model produced no reply")]
     EmptyReply,
 
@@ -243,11 +254,20 @@ impl Engine {
         role: SessionRole,
         budget: Option<Budget>,
     ) -> Result<String, Error> {
-        self.create_bound_session_with_intent(runner, project, role, budget, Intent::Implement)
+        self.create_bound_session_with_intent(
+            runner,
+            project,
+            role,
+            budget,
+            Intent::Implement,
+            None,
+        )
     }
 
     /// Same as `create_bound_session`, but `Intent::Analyze` records the
-    /// project root grant read-only instead of read-write.
+    /// project root grant read-only instead of read-write. `dispatched_by`
+    /// is the parent recorded on a job's own creation (DESIGN.md/6.34); a
+    /// session the runner starts for itself passes `None`.
     #[tracing::instrument(
         level = "info",
         name = "session.create_bound_session",
@@ -261,6 +281,7 @@ impl Engine {
         role: SessionRole,
         budget: Option<Budget>,
         intent: Intent,
+        dispatched_by: Option<&str>,
     ) -> Result<String, Error> {
         let spec = self
             .projects
@@ -307,6 +328,7 @@ impl Engine {
                         read_write: *mode == Mode::ReadWrite,
                     })
                     .collect(),
+                dispatched_by: dispatched_by.unwrap_or_default().to_owned(),
             }),
         )?;
         Ok(session_id)
@@ -326,7 +348,14 @@ impl Engine {
         let brief = job_request.brief;
         let budget = job_request.budget;
         let intent = job_request.intent;
-        match self.create_bound_session_with_intent(runner, &project, role, budget, intent) {
+        match self.create_bound_session_with_intent(
+            runner,
+            &project,
+            role,
+            budget,
+            intent,
+            Some(parent_session),
+        ) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
@@ -356,6 +385,7 @@ impl Engine {
     /// identity.
     fn continue_job(
         &self,
+        runner: &Runner,
         parent_session: &str,
         request: ContinueRequest,
     ) -> (ToolOutcome, String, Option<ContinuedJob>) {
@@ -385,6 +415,9 @@ impl Engine {
                 None,
             );
         };
+        if let Some(error) = self.identity_mismatch(runner, role, &request.session_id) {
+            return (ToolOutcome::Error, format!("ERROR: {error}"), None);
+        }
         let project = self
             .with_store(|store| store.projection().session_project(&request.session_id))
             .ok()
@@ -473,6 +506,43 @@ impl Engine {
     pub fn session_role(&self, session_id: &str) -> Result<Option<SessionRole>, Error> {
         let raw = self.with_store(|store| store.projection().session_role(session_id))?;
         Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
+    }
+
+    /// A session's summed input+output tokens across every message it
+    /// carries (row 6.37): what a resumed job's spent counter seeds from
+    /// instead of restarting at zero.
+    pub fn session_usage_tokens(&self, session_id: &str) -> Result<u64, Error> {
+        Ok(self.with_store(|store| store.projection().session_token_total(session_id))?)
+    }
+
+    /// Job sessions left dispatched-but-unconcluded by the last restart
+    /// (row 6.34): executor/archivist sessions with a recorded parent and no
+    /// handback message in that parent yet. A job session created before
+    /// 6.34 has no recorded parent and cannot be found here.
+    pub fn unfinished_jobs(&self) -> Result<Vec<DispatchedJob>, Error> {
+        let candidates = self.with_store(|store| store.projection().parented_job_sessions())?;
+        let mut unfinished = Vec::new();
+        for (session_id, parent_session, role) in candidates {
+            let Ok(role) = SessionRole::try_from(role) else {
+                continue;
+            };
+            let concluded = self.with_store(|store| {
+                store
+                    .projection()
+                    .parent_has_handback_for(&parent_session, &session_id)
+            })?;
+            if !concluded {
+                unfinished.push(DispatchedJob {
+                    session_id,
+                    parent_session,
+                    role,
+                    project: String::new(),
+                    brief: String::new(),
+                    budget: None,
+                });
+            }
+        }
+        Ok(unfinished)
     }
 
     fn sources(&self, session_id: &str, new_session: bool) -> Result<Vec<ToolSource>, Error> {
@@ -599,6 +669,7 @@ impl Engine {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 }),
             )?;
         }
@@ -951,7 +1022,8 @@ impl Engine {
                 }
                 (outcome, content)
             } else if let Some(continue_request) = continue_request {
-                let (outcome, content, cont) = self.continue_job(session_id, continue_request);
+                let (outcome, content, cont) =
+                    self.continue_job(runner, session_id, continue_request);
                 if let Some(cont) = cont {
                     continues.push(cont);
                 }
@@ -999,16 +1071,54 @@ impl Engine {
 
     fn enforce_pin(&self, runner: &Runner, session_id: &str) -> Result<(), Error> {
         match self.with_store(|store| store.projection().session_role(session_id))? {
-            Some(pinned) if pinned == runner.role as i32 => Ok(()),
             // sessions logged before roles exist stay unpinned
-            Some(pinned) if pinned == SessionRole::Unspecified as i32 => Ok(()),
-            Some(pinned) => Err(Error::RoleMismatch {
-                session_id: session_id.to_owned(),
-                pinned: role_name(pinned),
-                serving: provider::role_label(runner.role).to_owned(),
-            }),
+            Some(pinned) if pinned == SessionRole::Unspecified as i32 => return Ok(()),
+            Some(pinned) if pinned != runner.role as i32 => {
+                return Err(Error::RoleMismatch {
+                    session_id: session_id.to_owned(),
+                    pinned: role_name(pinned),
+                    serving: provider::role_label(runner.role).to_owned(),
+                });
+            }
+            Some(_) | None => {}
+        }
+        match self.identity_mismatch(runner, runner.role, session_id) {
+            Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// The 3.2 pin's model half (row 6.32): `role`'s identity right now
+    /// against what `session_id` was recorded on. `None` if they match, the
+    /// session predates provider/model stamping, or the session is unknown —
+    /// mirrors how an `Unspecified` recorded role stays unpinned.
+    fn identity_mismatch(
+        &self,
+        runner: &Runner,
+        role: SessionRole,
+        session_id: &str,
+    ) -> Option<Error> {
+        let recorded = self
+            .with_store(|store| store.projection().session_identity(session_id))
+            .ok()
+            .flatten()?;
+        if recorded.0.is_empty() && recorded.1.is_empty() {
+            return None;
+        }
+        let current = self
+            .role_identities
+            .get(&role)
+            .cloned()
+            .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
+        if recorded == current {
+            return None;
+        }
+        Some(Error::ModelMismatch {
+            session_id: session_id.to_owned(),
+            pinned: identity_label(&recorded.0, &recorded.1),
+            role: provider::role_label(role).to_owned(),
+            serving: identity_label(&current.0, &current.1),
+        })
     }
 
     // stable first, volatile after: everything here is prefix the provider caches,
@@ -1165,6 +1275,14 @@ fn role_name(role: i32) -> String {
     match SessionRole::try_from(role) {
         Ok(role) => provider::role_label(role).to_owned(),
         Err(_) => format!("unknown role {role}"),
+    }
+}
+
+fn identity_label(provider: &str, model: &str) -> String {
+    if provider.is_empty() {
+        model.to_owned()
+    } else {
+        format!("{provider}/{model}")
     }
 }
 
@@ -1384,6 +1502,7 @@ mod tests {
             project: String::new(),
             budget: None,
             grants: Vec::new(),
+            dispatched_by: String::new(),
         })
     }
 
@@ -1488,6 +1607,7 @@ mod tests {
             project: project.to_owned(),
             budget: None,
             grants: Vec::new(),
+            dispatched_by: String::new(),
         })
     }
 
@@ -1673,6 +1793,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -1895,6 +2016,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 }),
             )
             .expect("record");
@@ -3921,12 +4043,14 @@ mod tests {
         assert!(result.content.contains("arc"), "{}", result.content);
 
         // the role-mismatch pin keys on the recorded role, not the runner
-        // that created the session, so an executor runner can continue it
+        // that created the session, so a same-identity executor runner
+        // (matching what an unconfigured role_identities map recorded: the
+        // dispatching runner's own provider and model) can continue it
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
         let executor_run = Runner {
             role: SessionRole::Executor,
             provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
-            model: "exec-model".to_owned(),
+            model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
         };
@@ -4231,6 +4355,192 @@ mod tests {
         assert!(result.content.contains("not a job"), "{}", result.content);
     }
 
+    fn unstamped_session(id: &str, role: SessionRole) -> session_event::Event {
+        session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+            session_id: id.to_owned(),
+            title: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            role: role as i32,
+            project: String::new(),
+            budget: None,
+            grants: Vec::new(),
+            dispatched_by: String::new(),
+        })
+    }
+
+    fn session_recorded_on(
+        id: &str,
+        role: SessionRole,
+        provider: &str,
+        model: &str,
+    ) -> session_event::Event {
+        session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+            session_id: id.to_owned(),
+            title: String::new(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            role: role as i32,
+            project: String::new(),
+            budget: None,
+            grants: Vec::new(),
+            dispatched_by: String::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn continue_job_refuses_when_the_recorded_model_no_longer_matches_the_role() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::builtin::continue_job::ContinueJob));
+        let (engine, bootstrap_run) =
+            engine_with_tools(&ScriptedProvider::scripted(vec![]), &dir, registry);
+        let engine = engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_identities(BTreeMap::from([(
+                SessionRole::Executor,
+                ("scripted".to_owned(), "model-a".to_owned()),
+            )]));
+        let child_id = engine
+            .create_bound_session(&bootstrap_run, "arc", SessionRole::Executor, None)
+            .expect("create the child durably, recorded on model-a");
+
+        // config changed since: the executor role now runs a different model
+        let engine = engine.with_role_identities(BTreeMap::from([(
+            SessionRole::Executor,
+            ("scripted".to_owned(), "model-b".to_owned()),
+        )]));
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "continue_job",
+                    &continue_job_args(&child_id, "keep going"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("noted"),
+        ]);
+        let run = runner(&provider);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "continue it", tx)
+            .await
+            .expect("a refused continue_job fails the call, not the turn");
+
+        assert!(
+            reply.continues.is_empty(),
+            "the mismatch refuses the resume"
+        );
+        let events = replay_log(dir.path());
+        let result = tool_result(&events);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("model-a"), "{}", result.content);
+        assert!(result.content.contains("model-b"), "{}", result.content);
+        assert!(result.content.contains("executor"), "{}", result.content);
+        assert!(result.content.contains("fresh job"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn send_message_refuses_a_session_recorded_on_a_different_model() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![session_recorded_on(
+                "s-01",
+                SessionRole::Executor,
+                "scripted",
+                "model-a",
+            )],
+        );
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
+        let executor_run = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "model-b".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
+        let (tx, _rx) = channel();
+
+        let error = engine
+            .send_message(&executor_run, Some("s-01"), "resume", tx)
+            .await
+            .expect_err("a model mismatch refuses the resume");
+
+        assert!(
+            matches!(error, Error::ModelMismatch { .. }),
+            "expected ModelMismatch, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("model-a"), "{message}");
+        assert!(message.contains("model-b"), "{message}");
+        assert!(
+            provider.requests().is_empty(),
+            "a refused turn never reaches the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_recorded_before_model_stamping_stays_resumable() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![unstamped_session("s-01", SessionRole::Executor)]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
+        let executor_run = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "model-b".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&executor_run, Some("s-01"), "resume", tx)
+            .await
+            .expect("a session logged before provider/model stamping stays unpinned");
+    }
+
+    #[tokio::test]
+    async fn send_message_on_a_matching_model_resumes_untouched() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![session_recorded_on(
+                "s-01",
+                SessionRole::Executor,
+                "scripted",
+                "model-a",
+            )],
+        );
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
+        let executor_run = Runner {
+            role: SessionRole::Executor,
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            model: "model-a".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+        };
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&executor_run, Some("s-01"), "resume", tx)
+            .await
+            .expect("the same recorded identity resumes without a refusal");
+    }
+
     #[tokio::test]
     async fn record_handback_appends_a_system_sourced_message_visible_in_the_parents_log() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
@@ -4499,6 +4809,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],

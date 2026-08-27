@@ -222,6 +222,7 @@ mod tests {
             project: String::new(),
             budget: None,
             grants: Vec::new(),
+            dispatched_by: String::new(),
         })
     }
 

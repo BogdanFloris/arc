@@ -241,6 +241,42 @@ impl Supervisor {
         route_continue(&ctx, cont);
     }
 
+    /// Startup repair (row 6.34): every job session left dispatched-but-
+    /// unconcluded when the daemon last died gets a "stopped: restarted"
+    /// handback now, through the same `record_handback` path a live job's
+    /// own ending uses — parent turn guard, narration turn, all of it. Runs
+    /// once, after orphan repair and before serving; idempotent across
+    /// repeated restarts, since a job already handed back is found
+    /// concluded and skipped. A job session that predates 6.34 has no
+    /// recorded parent and cannot be found here.
+    pub async fn repair_restart_handbacks(&self) {
+        let unfinished = match self.engine.unfinished_jobs() {
+            Ok(unfinished) => unfinished,
+            Err(error) => {
+                warn!(%error, "could not scan for unconcluded jobs at startup; skipping restart repair");
+                return;
+            }
+        };
+        let ctx = HandbackCtx {
+            engine: &self.engine,
+            runners: &self.runners,
+            projects: &self.projects,
+            live: &self.live,
+            statuses: &self.statuses,
+            notifier: self.notifier.as_ref(),
+            handles: &self.handles,
+            handback: self.handback.as_ref(),
+        };
+        for job in unfinished {
+            info!(
+                session_id = %job.session_id,
+                parent_session = %job.parent_session,
+                "handing back a job left unfinished by the last restart"
+            );
+            record_handback(&ctx, &job, Some("the daemon restarted")).await;
+        }
+    }
+
     /// Gives outstanding jobs a grace period to finish, then abandons them.
     /// Loops the drain to a fixed point: a job's own turn, or a handback
     /// turn it triggers, can spawn further jobs (chains, DESIGN.md §4.1),
@@ -304,7 +340,7 @@ fn spawn_job(
     handles: &Arc<Handles>,
 ) {
     spawn_job_checked(
-        job, engine, runners, projects, live, statuses, notifier, handback, handles, false,
+        job, engine, runners, projects, live, statuses, notifier, handback, handles, false, 0,
     );
 }
 
@@ -326,6 +362,7 @@ fn spawn_job_checked(
     handback: Option<&Arc<Handback>>,
     handles: &Arc<Handles>,
     guard_absent: bool,
+    initial_spent_tokens: u64,
 ) -> bool {
     let Some(mut runner) = runners.get(&job.role).cloned() else {
         warn!(
@@ -350,7 +387,7 @@ fn spawn_job_checked(
         }
         live_guard.insert(job.session_id.clone(), steer_tx);
     }
-    let info = statuses.start(&job);
+    let info = statuses.start(&job, initial_spent_tokens);
     notify_job_changed(notifier, engine, info);
     let handle = spawn_watched(
         job,
@@ -451,6 +488,11 @@ fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
         return;
     }
     let session_id = cont.session_id.clone();
+    // a resume's strip counter seeds from durable usage, not zero (row 6.37)
+    let initial_spent_tokens = ctx.engine.session_usage_tokens(&session_id).unwrap_or_else(|error| {
+        warn!(session_id, %error, "could not read the job's durable usage; resuming its counter at zero");
+        0
+    });
     let resumed = spawn_job_checked(
         DispatchedJob {
             session_id: cont.session_id,
@@ -469,6 +511,7 @@ fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
         ctx.handback,
         ctx.handles,
         true,
+        initial_spent_tokens,
     );
     if resumed {
         info!(session_id, "continue_job resumed a finished job");
@@ -1064,12 +1107,15 @@ impl JobStatuses {
         self.ordinal.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn start(&self, job: &DispatchedJob) -> JobInfo {
+    /// `initial_spent_tokens` seeds a resumed job's strip counter from its
+    /// durable usage (row 6.37) instead of restarting at zero; a fresh
+    /// dispatch passes 0.
+    fn start(&self, job: &DispatchedJob, initial_spent_tokens: u64) -> JobInfo {
         let entry = JobStatus {
             role: job.role,
             project: job.project.clone(),
             state: JobState::Running,
-            spent_tokens: 0,
+            spent_tokens: initial_spent_tokens,
             budget: job.budget,
             started: Instant::now(),
             elapsed: None,
@@ -1167,8 +1213,8 @@ mod tests {
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, tool_stop, tools,
-        usage,
+        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, seed_log,
+        tool_stop, tools, usage,
     };
     use arc_core::tool::workspace::{Grant, Mode};
     use arc_core::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
@@ -1210,11 +1256,13 @@ mod tests {
         }
     }
 
+    // "test-model": matches what a bootstrap/concierge runner's own identity
+    // records for a child, since these engines never configure role_identities
     fn executor_runner(provider: &Arc<ScriptedProvider>) -> Runner {
         Runner {
             role: SessionRole::Executor,
             provider: Arc::clone(provider) as Arc<dyn Provider>,
-            model: "exec-model".to_owned(),
+            model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
         }
@@ -1510,6 +1558,137 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn seeded_session(
+        id: &str,
+        role: SessionRole,
+        dispatched_by: &str,
+    ) -> arc_proto::v1::session_event::Event {
+        arc_proto::v1::session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+            session_id: id.to_owned(),
+            title: String::new(),
+            provider: "scripted".to_owned(),
+            model: "test-model".to_owned(),
+            role: role as i32,
+            project: "arc".to_owned(),
+            budget: None,
+            grants: Vec::new(),
+            dispatched_by: dispatched_by.to_owned(),
+        })
+    }
+
+    fn seeded_message(
+        session_id: &str,
+        role: Role,
+        content: &str,
+    ) -> arc_proto::v1::session_event::Event {
+        arc_proto::v1::session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+            session_id: session_id.to_owned(),
+            role: role as i32,
+            content: content.to_owned(),
+            partial: false,
+            turn_id: "t-01".to_owned(),
+            ..Default::default()
+        })
+    }
+
+    /// An engine over a log seeded before this call, as a restart sees it:
+    /// opened fresh and replayed into a fresh index, no engine-driven append
+    /// in between.
+    fn reopened_arc_engine(dir: &TempDir) -> Arc<Engine> {
+        let log = Log::open(dir.path()).expect("open log");
+        let mut projection = Projection::in_memory().expect("open projection");
+        arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
+            .expect("replay");
+        Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)))
+    }
+
+    #[tokio::test]
+    async fn restart_repair_hands_back_an_unconcluded_dispatched_job_once() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                seeded_session("s-parent", SessionRole::Concierge, ""),
+                seeded_session("s-child", SessionRole::Executor, "s-parent"),
+                seeded_message("s-child", Role::User, "fix the bug"),
+                seeded_message("s-child", Role::Assistant, "half done"),
+            ],
+        );
+
+        let engine = reopened_arc_engine(&dir);
+        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        supervisor.repair_restart_handbacks().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), "s-parent"),
+            [(
+                Role::User,
+                "Job s-child stopped: the daemon restarted.\nhalf done".to_owned()
+            )],
+            "the unconcluded job gets exactly one restart handback"
+        );
+
+        // a second restart replays the same seeded log plus the handback
+        // just appended; it must not hand back a second time
+        let engine = reopened_arc_engine(&dir);
+        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        supervisor.repair_restart_handbacks().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), "s-parent").len(),
+            1,
+            "idempotent: a repaired job must not hand back twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_repair_leaves_a_cleanly_concluded_job_untouched() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                seeded_session("s-parent", SessionRole::Concierge, ""),
+                seeded_session("s-child", SessionRole::Executor, "s-parent"),
+                seeded_message("s-child", Role::User, "fix the bug"),
+                seeded_message("s-child", Role::Assistant, "all done"),
+                seeded_message("s-parent", Role::User, "Job s-child finished.\nall done"),
+            ],
+        );
+
+        let engine = reopened_arc_engine(&dir);
+        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        supervisor.repair_restart_handbacks().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), "s-parent"),
+            [(Role::User, "Job s-child finished.\nall done".to_owned())],
+            "a cleanly concluded job gets no extra handback"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_repair_skips_a_parentless_job_session() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                // predates 6.34: no recorded dispatched_by
+                seeded_session("s-child", SessionRole::Executor, ""),
+                seeded_message("s-child", Role::User, "fix the bug"),
+            ],
+        );
+
+        let engine = reopened_arc_engine(&dir);
+        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        supervisor.repair_restart_handbacks().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), "s-child"),
+            [(Role::User, "fix the bug".to_owned())],
+            "a parentless job session predates 6.34 and cannot be repaired"
+        );
     }
 
     /// Polls the log rather than sleeping a fixed duration: waits for actual
@@ -3433,6 +3612,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resumed_jobs_first_status_push_seeds_spent_tokens_from_durable_usage() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider =
+            ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("linted too")]);
+
+        let (notifier, mut notifications) = broadcast::channel(64);
+        let engine = engine_for_project_notified(&dir, &root, notifier.clone());
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor =
+            Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier.clone());
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+        // usage() reports 8 tokens combined, spent by the first (only) turn
+        assert_eq!(
+            engine.session_usage_tokens(&child_id).expect("usage"),
+            8,
+            "the durable usage this resume should seed from"
+        );
+        while notifications.try_recv().is_ok() {}
+
+        supervisor.continue_job(ContinuedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            message: "also check the linter".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+        });
+        let first_push = job_changed(&mut notifications).await;
+
+        assert_eq!(first_push.session_id, child_id);
+        assert_eq!(first_push.state, job_info::State::Running as i32);
+        assert_eq!(
+            first_push.spent_tokens, 8,
+            "the resume's first push carries the summed durable usage, not zero"
+        );
+
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn spawn_job_checked_with_guard_absent_skips_a_session_already_live() {
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
@@ -3468,6 +3703,7 @@ mod tests {
             None,
             &handles,
             true,
+            0,
         );
 
         assert!(

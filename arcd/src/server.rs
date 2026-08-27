@@ -561,6 +561,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
         SessionError::RoleMismatch { .. } => "role_mismatch",
+        SessionError::ModelMismatch { .. } => "model_mismatch",
         SessionError::Provider(_) => "provider",
         SessionError::UnknownProject { .. } => "unknown_project",
         SessionError::Store(_) | SessionError::Projection(_) | SessionError::Grants { .. } => {
@@ -786,7 +787,7 @@ mod tests {
             let executor_runner = Runner {
                 role: SessionRole::Executor,
                 provider: executor_provider,
-                model: "executor-model".to_owned(),
+                model: "test-model".to_owned(),
                 thinking: Thinking::Default,
                 system: None,
             };
@@ -819,10 +820,22 @@ mod tests {
                 .expect("replay");
             let provider = MockProvider::new(script);
             let (notifier, _receiver) = broadcast::channel(256);
+            // mirrors daemon.rs: a dispatched job records the role's own
+            // runner, not the dispatching concierge's
+            let role_identities = job_runners
+                .iter()
+                .map(|(role, runner)| {
+                    (
+                        *role,
+                        (runner.provider.name().to_owned(), runner.model.clone()),
+                    )
+                })
+                .collect();
             let engine = Arc::new(
                 Engine::new(Store::new(log, projection), registry)
                     .with_projects(projects)
-                    .with_notifier(notifier.clone()),
+                    .with_notifier(notifier.clone())
+                    .with_role_identities(role_identities),
             );
             let runner = Runner {
                 role: SessionRole::Concierge,
@@ -1211,6 +1224,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 })),
             })),
         };
@@ -2400,7 +2414,7 @@ mod tests {
         let executor_runner = Runner {
             role: SessionRole::Executor,
             provider: Arc::clone(&executor_provider) as Arc<dyn Provider>,
-            model: "executor-model".to_owned(),
+            model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
         };

@@ -17,7 +17,8 @@ use crate::log;
 // bump on any SCHEMA change; the daemon deletes the index and replays
 // 9: messages gained the source column
 // 10: messages gained input_tokens, output_tokens, elapsed_ms
-pub(crate) const SCHEMA_VERSION: u32 = 10;
+// 11: sessions gained provider, model columns
+pub(crate) const SCHEMA_VERSION: u32 = 11;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -32,7 +33,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     title          TEXT,
     started_at     INTEGER,
     consolidated_through INTEGER,
-    role           INTEGER NOT NULL DEFAULT 0
+    role           INTEGER NOT NULL DEFAULT 0,
+    provider       TEXT,
+    model          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -444,6 +447,24 @@ impl Projection {
         Ok(project.flatten())
     }
 
+    /// The provider and model a session was recorded on. `None` for an
+    /// unknown session; `Some(("", ""))` for one logged before 5.3 stamped
+    /// them — absent, like an `Unspecified` role, means unpinned.
+    pub(crate) fn session_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String)>, Error> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT provider, model FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(provider, model)| (provider.unwrap_or_default(), model.unwrap_or_default())))
+    }
+
     pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
         let title: Option<String> = self
             .conn
@@ -483,6 +504,67 @@ impl Projection {
             row.get::<_, String>(0)
         })?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// Job sessions with a recorded dispatching parent: `(session_id,
+    /// parent_session, role)`. A job session created before 6.34 has no
+    /// recorded parent and is absent here — it cannot be repaired.
+    pub(crate) fn parented_job_sessions(&self) -> Result<Vec<(String, String, i32)>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_session, role FROM sessions
+             WHERE parent_session IS NOT NULL AND role IN (?1, ?2)",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                arc_proto::v1::SessionRole::Executor as i32,
+                arc_proto::v1::SessionRole::Archivist as i32
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether `parent_session_id` already carries a handback message for
+    /// `child_session_id` (`record_handback`'s `"Job {id} finished/stopped"`
+    /// prefix, system-sourced) — a job already concluded must not be handed
+    /// back a second time.
+    pub(crate) fn parent_has_handback_for(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<bool, Error> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages
+                 WHERE session_id = ?1 AND kind = ?2 AND source = ?3
+                   AND content LIKE 'Job ' || ?4 || ' %'
+             )",
+            rusqlite::params![
+                parent_session_id,
+                KIND_MESSAGE,
+                arc_proto::v1::Source::System as i32,
+                child_session_id
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// A job session's summed usage across every message it carries: what a
+    /// resumed job's spent counter seeds from, instead of restarting at zero.
+    pub(crate) fn session_token_total(&self, session_id: &str) -> Result<u64, Error> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0)
+             FROM messages WHERE session_id = ?1 AND kind = ?2",
+            rusqlite::params![session_id, KIND_MESSAGE],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(total).unwrap_or(0))
     }
 
     pub(crate) fn due_for_consolidation(
@@ -808,14 +890,18 @@ fn insert_session(
     created: &SessionCreated,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO sessions (id, parent_session, fork_point, project, title, started_at, role)
-         VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5)",
+        "INSERT INTO sessions
+             (id, parent_session, fork_point, project, title, started_at, role, provider, model)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             &created.session_id,
+            (!created.dispatched_by.is_empty()).then_some(&created.dispatched_by),
             (!created.project.is_empty()).then_some(&created.project),
             &created.title,
             epoch_micros(event.ts.as_ref()),
             created.role,
+            (!created.provider.is_empty()).then_some(&created.provider),
+            (!created.model.is_empty()).then_some(&created.model),
         ),
     )?;
     for grant in &created.grants {
@@ -1297,6 +1383,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 })),
             })),
         }
@@ -1898,6 +1985,7 @@ mod tests {
                     project: String::new(),
                     budget: None,
                     grants: Vec::new(),
+                    dispatched_by: String::new(),
                 })),
             })),
         }
