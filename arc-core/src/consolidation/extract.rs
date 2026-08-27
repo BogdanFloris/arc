@@ -179,6 +179,7 @@ impl Extractor for ModelExtractor {
             messages: vec![Message::Text {
                 role: Role::User,
                 content: render_input(session),
+                reasoning: None,
             }],
             tools: Vec::new(),
             seed: Some(
@@ -219,6 +220,7 @@ impl Extractor for ModelExtractor {
             messages: vec![Message::Text {
                 role: Role::User,
                 content: prompt,
+                reasoning: None,
             }],
             tools: Vec::new(),
             seed: Some(
@@ -610,7 +612,7 @@ mod tests {
         let request = &provider.requests()[2];
         assert_eq!(request.system.as_deref(), Some(PROMPT_V1));
         assert!(request.tools.is_empty());
-        let [Message::Text { role, content }] = request.messages.as_slice() else {
+        let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
             panic!("expected one user message, got {:?}", request.messages);
         };
         assert_eq!(*role, Role::User);

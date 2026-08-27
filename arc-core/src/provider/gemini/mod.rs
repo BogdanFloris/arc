@@ -246,7 +246,7 @@ fn contents(messages: &[Message]) -> Result<Vec<Content<'_>>, Error> {
 
     for message in messages {
         match message {
-            Message::Text { role, content } => {
+            Message::Text { role, content, .. } => {
                 let role = match role {
                     Role::User => "user",
                     Role::Assistant => "model",
@@ -270,7 +270,7 @@ fn contents(messages: &[Message]) -> Result<Vec<Content<'_>>, Error> {
                     }],
                 });
             }
-            Message::ToolCalls(calls) => {
+            Message::ToolCalls { calls, .. } => {
                 let mut parts = Vec::with_capacity(calls.len());
                 for call in calls {
                     names.insert(call.id.as_str(), call.name.as_str());
@@ -374,6 +374,7 @@ mod tests {
         let json = body(&request(vec![Message::Text {
             role: Role::User,
             content: "hi".to_owned(),
+            reasoning: None,
         }]));
 
         assert_eq!(json["systemInstruction"]["parts"][0]["text"], "Be terse.");
@@ -394,6 +395,7 @@ mod tests {
         let json = body(&request(vec![Message::Text {
             role: Role::Assistant,
             content: "sure".to_owned(),
+            reasoning: None,
         }]));
 
         assert_eq!(json["contents"][0]["role"], "model");
@@ -401,7 +403,10 @@ mod tests {
 
     #[test]
     fn a_call_carries_its_signature_and_object_arguments() {
-        let json = body(&request(vec![Message::ToolCalls(vec![call(b"EmYKZAER")])]));
+        let json = body(&request(vec![Message::ToolCalls {
+            calls: vec![call(b"EmYKZAER")],
+            reasoning: None,
+        }]));
 
         let part = &json["contents"][0]["parts"][0];
         assert_eq!(part["thoughtSignature"], "EmYKZAER");
@@ -416,7 +421,10 @@ mod tests {
     #[test]
     fn a_result_names_the_function_its_call_named() {
         let json = body(&request(vec![
-            Message::ToolCalls(vec![call(b"sig")]),
+            Message::ToolCalls {
+                calls: vec![call(b"sig")],
+                reasoning: None,
+            },
             Message::ToolResult {
                 call_id: "call_2418851".to_owned(),
                 content: "2026-08-24T14:00:00Z".to_owned(),
@@ -442,7 +450,10 @@ mod tests {
             ..call(b"sig")
         };
         let json = body(&request(vec![
-            Message::ToolCalls(vec![call(b"sig"), second]),
+            Message::ToolCalls {
+                calls: vec![call(b"sig"), second],
+                reasoning: None,
+            },
             Message::ToolResult {
                 call_id: "call_2418851".to_owned(),
                 content: "a".to_owned(),
@@ -479,7 +490,10 @@ mod tests {
 
     #[test]
     fn round_trip_data_that_is_not_text_is_refused_before_the_wire() {
-        let request = request(vec![Message::ToolCalls(vec![call(&[0xff, 0xfe])])]);
+        let request = request(vec![Message::ToolCalls {
+            calls: vec![call(&[0xff, 0xfe])],
+            reasoning: None,
+        }]);
 
         let Err(err) = Payload::new(&request) else {
             panic!("invalid utf-8 is not a signature");
@@ -492,6 +506,7 @@ mod tests {
         let mut plain = request(vec![Message::Text {
             role: Role::User,
             content: "hi".to_owned(),
+            reasoning: None,
         }]);
         plain.thinking = Thinking::Default;
 

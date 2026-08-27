@@ -53,7 +53,7 @@ pub struct Runner {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub thinking: Thinking,
-    /// The identity file. Concierge only: a job has no voice to pay for.
+    /// The concierge's identity file, or a job's spawn-built preamble.
     pub system: Option<String>,
 }
 
@@ -722,7 +722,7 @@ impl Engine {
                 sources,
             );
 
-            let (ending, text, calls) = self
+            let (ending, text, reasoning, calls) = self
                 .run_completion(runner, request, events, &mut total_usage)
                 .await?;
 
@@ -735,6 +735,7 @@ impl Engine {
                         session_id,
                         turn_id,
                         text,
+                        reasoning,
                         calls,
                         sources,
                         grants,
@@ -821,9 +822,10 @@ impl Engine {
         request: CompletionRequest,
         events: &mpsc::Sender<EngineEvent>,
         total_usage: &mut Option<Usage>,
-    ) -> Result<(Ending, String, Vec<ToolCall>), Error> {
+    ) -> Result<(Ending, String, String, Vec<ToolCall>), Error> {
         let mut stream = runner.provider.complete(request).await?;
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls = Vec::new();
         let ending = loop {
             match stream.next().await {
@@ -832,6 +834,7 @@ impl Engine {
                     let _ = events.send(EngineEvent::Delta(chunk)).await;
                 }
                 Some(Ok(CompletionDelta::Reasoning(chunk))) => {
+                    reasoning.push_str(&chunk);
                     let _ = events.send(EngineEvent::Reasoning(chunk)).await;
                 }
                 Some(Ok(CompletionDelta::ToolCall(call))) => calls.push(call),
@@ -845,7 +848,7 @@ impl Engine {
                 None => break Ending::Cut,
             }
         };
-        Ok((ending, text, calls))
+        Ok((ending, text, reasoning, calls))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -855,6 +858,7 @@ impl Engine {
         session_id: &str,
         turn_id: &str,
         text: String,
+        reasoning: String,
         mut calls: Vec<ToolCall>,
         sources: &[ToolSource],
         grants: Option<&Arc<Grants>>,
@@ -880,6 +884,7 @@ impl Engine {
             transcript.push(Message::Text {
                 role: Role::Assistant,
                 content: text,
+                reasoning: None,
             });
         }
 
@@ -982,7 +987,10 @@ impl Engine {
             results.push((call.id.clone(), content));
         }
 
-        transcript.push(Message::ToolCalls(calls));
+        transcript.push(Message::ToolCalls {
+            calls,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        });
         for (call_id, content) in results {
             transcript.push(Message::ToolResult { call_id, content });
         }
@@ -1186,6 +1194,7 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                     messages.push(Message::Text {
                         role: mapped,
                         content: content.clone(),
+                        reasoning: None,
                     });
                 } else {
                     tracing::warn!(role, "skipping history message with an unmappable role");
@@ -1236,7 +1245,10 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                     answered.push(call);
                 }
                 if !answered.is_empty() {
-                    messages.push(Message::ToolCalls(answered));
+                    messages.push(Message::ToolCalls {
+                        calls: answered,
+                        reasoning: None,
+                    });
                     messages.append(&mut step_results);
                 }
             }
@@ -1959,7 +1971,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(!requests[1].tools.is_empty(), "tools stay offered");
         assert_eq!(requests[1].messages.len(), 3);
-        let Message::ToolCalls(calls) = &requests[1].messages[1] else {
+        let Message::ToolCalls { calls, .. } = &requests[1].messages[1] else {
             panic!("expected the calls, got {:?}", requests[1].messages[1]);
         };
         assert_eq!(calls[0].id, "srv1");
@@ -2045,7 +2057,7 @@ mod tests {
             .messages
             .iter()
             .find_map(|message| match message {
-                Message::ToolCalls(calls) => Some(calls.clone()),
+                Message::ToolCalls { calls, .. } => Some(calls.clone()),
                 _ => None,
             })
             .expect("the rebuilt transcript replays the call");
@@ -2084,7 +2096,7 @@ mod tests {
         assert_eq!(resulted(&events[5]).call_id, "b");
 
         let requests = provider.requests();
-        let Message::ToolCalls(calls) = &requests[1].messages[1] else {
+        let Message::ToolCalls { calls, .. } = &requests[1].messages[1] else {
             panic!("expected the calls");
         };
         assert_eq!(calls.len(), 2);
@@ -2214,7 +2226,7 @@ mod tests {
             .expect("send");
 
         let messages = &provider.requests()[0].messages;
-        let Message::ToolCalls(calls) = &messages[1] else {
+        let Message::ToolCalls { calls, .. } = &messages[1] else {
             panic!("expected the calls, got {:?}", messages[1]);
         };
         assert_eq!(
@@ -2265,10 +2277,12 @@ mod tests {
                 Message::Text {
                     role: Role::User,
                     content: "question".to_owned(),
+                    reasoning: None,
                 },
                 Message::Text {
                     role: Role::User,
                     content: "again".to_owned(),
+                    reasoning: None,
                 },
             ],
             "the unanswered call and the unclaimed result stay out"
@@ -2359,14 +2373,18 @@ mod tests {
                 Message::Text {
                     role: Role::User,
                     content: "question".to_owned(),
+                    reasoning: None,
                 },
-                Message::ToolCalls(vec![ToolCall {
-                    id: "c1".to_owned(),
-                    index: 0,
-                    name: "lookup".to_owned(),
-                    arguments: r#"{"q":1}"#.to_owned(),
-                    provider_roundtrip: Vec::new(),
-                }]),
+                Message::ToolCalls {
+                    calls: vec![ToolCall {
+                        id: "c1".to_owned(),
+                        index: 0,
+                        name: "lookup".to_owned(),
+                        arguments: r#"{"q":1}"#.to_owned(),
+                        provider_roundtrip: Vec::new(),
+                    }],
+                    reasoning: None,
+                },
                 Message::ToolResult {
                     call_id: "c1".to_owned(),
                     content: "found it".to_owned(),
@@ -2374,12 +2392,15 @@ mod tests {
                 Message::Text {
                     role: Role::Assistant,
                     content: "final text".to_owned(),
+                    reasoning: None,
                 },
                 Message::Text {
                     role: Role::User,
                     content: "again".to_owned(),
+                    reasoning: None,
                 },
-            ]
+            ],
+            "reasoning never survives a reopen: the log-rebuilt transcript has none"
         );
     }
 
@@ -2587,6 +2608,32 @@ mod tests {
         let events = replay_log(dir.path());
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
+    }
+
+    #[tokio::test]
+    async fn a_steps_reasoning_replays_on_the_next_steps_request() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(CompletionDelta::Reasoning("checking the time".to_owned())),
+                Ok(call("t1", 0, "clock", "{}")),
+                Ok(tool_stop()),
+            ],
+            done_reply("it is noon"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("clock", "noon", true)]));
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "what time is it?", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        let Message::ToolCalls { reasoning, .. } = &requests[1].messages[1] else {
+            panic!("expected the calls, got {:?}", requests[1].messages[1]);
+        };
+        assert_eq!(reasoning.as_deref(), Some("checking the time"));
     }
 
     #[tokio::test]

@@ -129,11 +129,15 @@ enum WireMessage<'a> {
     Text {
         role: &'static str,
         content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<&'a str>,
     },
 
     ToolCalls {
         role: &'static str,
         tool_calls: Vec<WireToolCall<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<&'a str>,
     },
 
     ToolResult {
@@ -182,12 +186,15 @@ impl<'a> Payload<'a> {
             .map(|content| WireMessage::Text {
                 role: "system",
                 content,
+                reasoning_content: None,
             });
 
+        // DeepSeek 400s or degrades without reasoning_content once tools are offered
+        let emit_reasoning = !request.tools.is_empty();
         let turns: Vec<WireMessage> = request
             .messages
             .iter()
-            .map(wire_message)
+            .map(|message| wire_message(message, emit_reasoning))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -214,10 +221,14 @@ fn wire_tool(tool: &ToolDefinition) -> WireTool<'_> {
     }
 }
 
-fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
-    let (role, content) = match message {
-        Message::Text { role, content } => (role, content),
-        Message::ToolCalls(calls) => {
+fn wire_message(message: &Message, emit_reasoning: bool) -> Result<WireMessage<'_>, Error> {
+    let (role, content, reasoning) = match message {
+        Message::Text {
+            role,
+            content,
+            reasoning,
+        } => (role, content, reasoning),
+        Message::ToolCalls { calls, reasoning } => {
             return Ok(WireMessage::ToolCalls {
                 role: "assistant",
                 tool_calls: calls
@@ -231,6 +242,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
                         },
                     })
                     .collect(),
+                reasoning_content: emit_reasoning.then(|| reasoning.as_deref().unwrap_or("")),
             });
         }
         Message::ToolResult { call_id, content } => {
@@ -256,7 +268,13 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, Error> {
             ));
         }
     };
-    Ok(WireMessage::Text { role, content })
+    let reasoning_content =
+        (emit_reasoning && role == "assistant").then(|| reasoning.as_deref().unwrap_or(""));
+    Ok(WireMessage::Text {
+        role,
+        content,
+        reasoning_content,
+    })
 }
 
 #[cfg(test)]
@@ -281,6 +299,7 @@ mod tests {
                 .map(|(role, content)| Message::Text {
                     role: *role,
                     content: (*content).to_owned(),
+                    reasoning: None,
                 })
                 .collect(),
             tools: Vec::new(),
@@ -432,16 +451,77 @@ mod tests {
         );
     }
 
+    fn a_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "get_time".to_owned(),
+            description: "Current time".to_owned(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_is_empty_string_for_an_assistant_message_with_no_reasoning() {
+        let mut req = request(None, &[(Role::User, "hi"), (Role::Assistant, "re: hi")]);
+        req.tools = vec![a_tool()];
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_is_omitted_when_the_request_has_no_tools() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(
+            template,
+            request(None, &[(Role::User, "hi"), (Role::Assistant, "re: hi")]),
+        )
+        .await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["messages"][1].get("reasoning_content"), None, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_calls_message_carries_its_own_reasoning() {
+        let mut req = request(None, &[(Role::User, "what time is it?")]);
+        req.tools = vec![a_tool()];
+        req.messages.push(Message::ToolCalls {
+            calls: vec![ToolCall {
+                id: "VB3c1GM6".to_owned(),
+                index: 0,
+                name: "get_time".to_owned(),
+                arguments: "{}".to_owned(),
+                provider_roundtrip: Vec::new(),
+            }],
+            reasoning: Some("checking the clock".to_owned()),
+        });
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            "checking the clock"
+        );
+    }
+
     #[tokio::test]
     async fn tool_calls_and_their_results_go_back_as_history() {
         let mut req = request(None, &[(Role::User, "what time is it?")]);
-        req.messages.push(Message::ToolCalls(vec![ToolCall {
-            id: "VB3c1GM6".to_owned(),
-            index: 0,
-            name: "get_time".to_owned(),
-            arguments: "{}".to_owned(),
-            provider_roundtrip: Vec::new(),
-        }]));
+        req.messages.push(Message::ToolCalls {
+            calls: vec![ToolCall {
+                id: "VB3c1GM6".to_owned(),
+                index: 0,
+                name: "get_time".to_owned(),
+                arguments: "{}".to_owned(),
+                provider_roundtrip: Vec::new(),
+            }],
+            reasoning: None,
+        });
         req.messages.push(Message::ToolResult {
             call_id: "VB3c1GM6".to_owned(),
             content: "2026-08-14T09:12:00Z".to_owned(),

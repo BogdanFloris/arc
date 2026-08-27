@@ -78,11 +78,22 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    Text { role: Role, content: String },
+    Text {
+        role: Role,
+        content: String,
+        // DeepSeek requires this replayed on the next request; never logged
+        reasoning: Option<String>,
+    },
 
-    ToolCalls(Vec<ToolCall>),
+    ToolCalls {
+        calls: Vec<ToolCall>,
+        reasoning: Option<String>,
+    },
 
-    ToolResult { call_id: String, content: String },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +303,7 @@ mod tests {
             messages: vec![Message::Text {
                 role: Role::User,
                 content: "hello".to_owned(),
+                reasoning: None,
             }],
             tools: Vec::new(),
             seed: None,

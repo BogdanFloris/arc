@@ -45,11 +45,11 @@ impl FrameParser for Parser {
         };
 
         let mut items = Vec::new();
-        for choice in choices {
-            if let Some(content) = choice.delta.content.filter(|it| !it.is_empty()) {
+        for mut choice in choices {
+            if let Some(content) = choice.delta.content.take().filter(|it| !it.is_empty()) {
                 items.push(CompletionDelta::Text(content));
             }
-            if let Some(thinking) = choice.delta.reasoning_content.filter(|it| !it.is_empty()) {
+            if let Some(thinking) = choice.delta.reasoning() {
                 items.push(CompletionDelta::Reasoning(thinking));
             }
             for call in choice.delta.tool_calls {
@@ -161,9 +161,27 @@ struct Delta {
 
     reasoning_content: Option<String>,
 
+    reasoning: Option<String>,
+
+    reasoning_text: Option<String>,
+
     // OpenCode Go sends an explicit `"tool_calls": null` on prose chunks
     #[serde(default, deserialize_with = "null_as_empty")]
     tool_calls: Vec<ToolCallJson>,
+}
+
+impl Delta {
+    // first non-empty alias wins; some endpoints duplicate across fields
+    fn reasoning(&mut self) -> Option<String> {
+        [
+            self.reasoning_content.take(),
+            self.reasoning.take(),
+            self.reasoning_text.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|it| !it.is_empty())
+    }
 }
 
 fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<ToolCallJson>, D::Error>
@@ -563,6 +581,32 @@ mod tests {
             panic!("expected one malformed-stream error, got {seen:?}");
         };
         assert!(message.contains("get_time"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn the_reasoning_alias_decodes_like_reasoning_content() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let seen = ok(vec![body.as_bytes().to_vec()]).await;
+        assert!(
+            seen.contains(&CompletionDelta::Reasoning("thinking".to_owned())),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_both_reasoning_fields_counts_once() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"a\",\"reasoning\":\"b\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let seen = ok(vec![body.as_bytes().to_vec()]).await;
+        let gathered = gather(seen);
+        assert_eq!(gathered.reasoning, "a");
     }
 
     #[tokio::test]

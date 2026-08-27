@@ -118,7 +118,7 @@ pub fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
 
 pub fn turn(message: &Message) -> (Role, &str) {
     match message {
-        Message::Text { role, content } => (*role, content.as_str()),
+        Message::Text { role, content, .. } => (*role, content.as_str()),
         other => panic!("expected a text message, got {other:?}"),
     }
 }
@@ -608,14 +608,18 @@ mod tests {
                 Message::Text {
                     role: Role::User,
                     content: "question".to_owned(),
+                    reasoning: None,
                 },
-                Message::ToolCalls(vec![ToolCall {
-                    id: "c1".to_owned(),
-                    index: 0,
-                    name: "lookup".to_owned(),
-                    arguments: r#"{"q":1}"#.to_owned(),
-                    provider_roundtrip: Vec::new(),
-                }]),
+                Message::ToolCalls {
+                    calls: vec![ToolCall {
+                        id: "c1".to_owned(),
+                        index: 0,
+                        name: "lookup".to_owned(),
+                        arguments: r#"{"q":1}"#.to_owned(),
+                        provider_roundtrip: Vec::new(),
+                    }],
+                    reasoning: None,
+                },
                 Message::ToolResult {
                     call_id: "c1".to_owned(),
                     content: "found it".to_owned(),
@@ -623,10 +627,12 @@ mod tests {
                 Message::Text {
                     role: Role::Assistant,
                     content: "final text".to_owned(),
+                    reasoning: None,
                 },
                 Message::Text {
                     role: Role::User,
                     content: "again".to_owned(),
+                    reasoning: None,
                 },
             ]
         );

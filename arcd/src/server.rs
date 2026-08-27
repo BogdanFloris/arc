@@ -688,6 +688,7 @@ mod tests {
                                 Message::Text {
                                     role: Role::User,
                                     content,
+                                    ..
                                 } => Some(content.clone()),
                                 _ => None,
                             })
@@ -1049,7 +1050,7 @@ mod tests {
             .messages
             .iter()
             .map(|m| match m {
-                Message::Text { role, content } => (*role, content.as_str()),
+                Message::Text { role, content, .. } => (*role, content.as_str()),
                 other => panic!("expected a text message, got {other:?}"),
             })
             .collect();
