@@ -22,9 +22,12 @@ impl Tool for ContinueJob {
         ToolDefinition {
             name: "continue_job".to_owned(),
             description: "Continues a dispatched job: queued if it is still running, resumed \
-                          with its full context if it finished. Use it to correct course or \
-                          ask for more instead of dispatching a fresh job that starts from \
-                          nothing."
+                          with its full context if it finished. Use it to change course or \
+                          add work — and when new work belongs to a job that already ran, \
+                          continue that job instead of dispatching a fresh one that starts \
+                          from nothing. Never call it to fetch a result: the reply arrives \
+                          on its own as a handback when the job finishes, this call returns \
+                          only an acknowledgment, and each message costs a full job turn."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -73,7 +76,11 @@ impl Tool for ContinueJob {
                 );
             }
             ToolReply {
-                content: format!("Continuing job {}.", args.session_id),
+                content: format!(
+                    "Continuing job {}. Its reply arrives later as a handback; do not call \
+                     continue_job again to fetch it.",
+                    args.session_id
+                ),
                 ok: true,
                 memory_events: Vec::new(),
                 job_request: None,

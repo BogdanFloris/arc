@@ -296,7 +296,9 @@ impl Engine {
                 ToolOutcome::Ok,
                 format!(
                     "Dispatched {} into {project} as session {child_id}. The job is \
-                     running; its summary will arrive here when it finishes.",
+                     running; its summary will arrive here as a handback when it \
+                     finishes. Do not call continue_job to ask for status or results — \
+                     each message costs the job a full turn. End this reply and wait.",
                     provider::role_label(role)
                 ),
                 Some(DispatchedJob {
@@ -355,7 +357,11 @@ impl Engine {
             .unwrap_or_default();
         (
             ToolOutcome::Ok,
-            format!("Continuing job {}.", request.session_id),
+            format!(
+                "Continuing job {}. Its reply arrives later as a handback; do not call \
+                 continue_job again to fetch it.",
+                request.session_id
+            ),
             Some(ContinuedJob {
                 session_id: request.session_id,
                 parent_session: parent_session.to_owned(),
