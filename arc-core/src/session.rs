@@ -23,6 +23,15 @@ use crate::tool::workspace::{Grant, Grants, Mode};
 use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
+// a coding turn explores and edits; 8 forced a nudge ratchet
+const MAX_EXECUTOR_TOOL_STEPS: usize = 64;
+
+fn max_tool_steps(role: SessionRole) -> usize {
+    match role {
+        SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
+        _ => MAX_TOOL_STEPS,
+    }
+}
 
 fn elapsed_ms_since(start: std::time::Instant) -> u32 {
     u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX)
@@ -704,7 +713,7 @@ impl Engine {
 
         let reply = loop {
             // the last step offers no tools, so the model has to answer
-            let last_step = steps >= MAX_TOOL_STEPS;
+            let last_step = steps >= max_tool_steps(runner.role);
             let request = self.completion_request(
                 runner,
                 system.clone(),
@@ -2518,6 +2527,39 @@ mod tests {
         );
         let events = replay_log(dir.path());
         assert_eq!(appended(events.last().expect("events")).content, "enough");
+        assert!(!reply.partial);
+    }
+
+    #[tokio::test]
+    async fn an_executor_turn_runs_past_the_concierge_step_cap() {
+        let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS + 4)
+            .map(|step| {
+                vec![
+                    Ok(call(&format!("c{step}"), 0, "alpha", "{}")),
+                    Ok(tool_stop()),
+                ]
+            })
+            .collect();
+        script.push(done_reply("done"));
+        let provider = ScriptedProvider::scripted(script);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let run = Runner {
+            role: SessionRole::Executor,
+            ..run
+        };
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), MAX_TOOL_STEPS + 5);
+        assert!(
+            requests.iter().all(|r| !r.tools.is_empty()),
+            "no forced tool-less completion before the executor cap"
+        );
         assert!(!reply.partial);
     }
 
