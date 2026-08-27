@@ -503,7 +503,7 @@ async fn run_job(
         handback: handback.as_ref(),
     };
 
-    match run_turn(&engine, &runner, &session_id, &job.brief).await {
+    match run_turn(&ctx, &runner, &session_id, &job.brief).await {
         TurnOutcome::Success {
             usage,
             jobs,
@@ -552,7 +552,7 @@ async fn run_job(
             }
         };
         let Some(text) = steered else { break };
-        match run_turn(&engine, &runner, &session_id, &text).await {
+        match run_turn(&ctx, &runner, &session_id, &text).await {
             TurnOutcome::Success {
                 usage,
                 jobs,
@@ -862,13 +862,49 @@ fn warn_over_budget(session_id: &str, breach: &BudgetBreach) {
     }
 }
 
+/// One engine event for a job's running turn: a started tool call counts a
+/// step and broadcasts the strip's new state; every event refreshes the
+/// idle clock and the silence deadline. Shared by the live recv and the
+/// post-send drain, which exists because a fully-scripted turn can finish
+/// with events still buffered.
+fn handle_job_event(
+    event: &EngineEvent,
+    pending_tool_calls: &mut u32,
+    deadline: &mut Instant,
+    ctx: &HandbackCtx<'_>,
+    session_id: &str,
+) {
+    match event {
+        EngineEvent::ToolCallStarted { .. } => {
+            *pending_tool_calls += 1;
+            if let Some(info) = ctx.statuses.record_tool_step(session_id) {
+                notify_job_changed(ctx.notifier, ctx.engine, info);
+            }
+        }
+        EngineEvent::ToolCallEnded { .. } => {
+            *pending_tool_calls = pending_tool_calls.saturating_sub(1);
+            ctx.statuses.touch_engine(session_id);
+        }
+        _ => ctx.statuses.touch_engine(session_id),
+    }
+    debug!(session_id = %session_id, ?event, "job event");
+    *deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
+}
+
 /// Runs one turn to completion, failing it if the engine goes quiet for
 /// `JOB_SILENCE_TIMEOUT` with no events. A pending tool call suspends the
 /// timeout instead of tripping it: bash alone is allowed to run silent for
 /// up to its own 600s cap, so a tool call in flight is activity, not stall.
-async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str) -> TurnOutcome {
+async fn run_turn(
+    ctx: &HandbackCtx<'_>,
+    runner: &Runner,
+    session_id: &str,
+    text: &str,
+) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
-    let send = engine.send_message(runner, Some(session_id), text, events);
+    let send = ctx
+        .engine
+        .send_message(runner, Some(session_id), text, events);
     tokio::pin!(send);
 
     let mut deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
@@ -876,20 +912,19 @@ async fn run_turn(engine: &Engine, runner: &Runner, session_id: &str, text: &str
 
     let result = loop {
         tokio::select! {
-            result = &mut send => break Some(result),
+            result = &mut send => {
+                // the engine can complete a fully-scripted turn with events
+                // still buffered; drain them so fast tools count as steps
+                while let Ok(event) = rx.try_recv() {
+                    handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
+                }
+                break Some(result);
+            }
             event = rx.recv() => {
                 // send_message drops its sender exactly as it returns, so a
                 // `None` here means `send` is already ready on the next poll
                 let Some(event) = event else { continue };
-                match &event {
-                    EngineEvent::ToolCallStarted { .. } => pending_tool_calls += 1,
-                    EngineEvent::ToolCallEnded { .. } => {
-                        pending_tool_calls = pending_tool_calls.saturating_sub(1);
-                    }
-                    _ => {}
-                }
-                debug!(session_id = %session_id, ?event, "job event");
-                deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
+                handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
             }
             () = tokio::time::sleep_until(deadline), if pending_tool_calls == 0 => break None,
         }
@@ -967,6 +1002,13 @@ struct JobStatus {
     /// Wall-clock instant of the terminal transition, for `TERMINAL_TTL`
     /// aging; `None` while the job is running.
     finished_at: Option<Instant>,
+    /// Tool calls issued so far, one per started call; 0 reads as
+    /// "thinking" in the strip until the first tool step.
+    tool_steps: u32,
+    /// The latest engine event — delta, reasoning, or a tool call — that
+    /// the strip's idle readout counts from; the client ticks it forward
+    /// locally between pushes.
+    last_engine_event: Instant,
 }
 
 impl JobStatus {
@@ -991,9 +1033,9 @@ impl JobStatus {
                 .as_ref()
                 .map_or(0, |budget| budget.wall_clock_seconds),
             title: String::new(),
-            // zeros until 6.29 wires step and idle tracking
-            tool_steps: 0,
-            idle_seconds: 0,
+            tool_steps: self.tool_steps,
+            idle_seconds: u32::try_from(self.last_engine_event.elapsed().as_secs())
+                .unwrap_or(u32::MAX),
         }
     }
 }
@@ -1033,6 +1075,8 @@ impl JobStatuses {
             elapsed: None,
             ordinal: self.next_ordinal(),
             finished_at: None,
+            tool_steps: 0,
+            last_engine_event: Instant::now(),
         };
         let info = entry.to_job_info(&job.session_id);
         self.entries
@@ -1047,6 +1091,24 @@ impl JobStatuses {
         let entry = entries.get_mut(session_id)?;
         entry.spent_tokens = spent_tokens;
         Some(entry.to_job_info(session_id))
+    }
+
+    /// Counts an issued tool call and touches the idle clock, returning the
+    /// fresh info so the turn loop can broadcast the strip's new state.
+    fn record_tool_step(&self, session_id: &str) -> Option<JobInfo> {
+        let mut entries = self.entries.lock().expect("statuses");
+        let entry = entries.get_mut(session_id)?;
+        entry.tool_steps += 1;
+        entry.last_engine_event = Instant::now();
+        Some(entry.to_job_info(session_id))
+    }
+
+    /// Resets the idle clock on any engine event; no broadcast, since the
+    /// strip ticks the seconds forward locally between pushes.
+    fn touch_engine(&self, session_id: &str) {
+        if let Some(entry) = self.entries.lock().expect("statuses").get_mut(session_id) {
+            entry.last_engine_event = Instant::now();
+        }
     }
 
     fn finish(&self, session_id: &str, state: JobState, elapsed: Duration) -> Option<JobInfo> {
@@ -1105,7 +1167,8 @@ mod tests {
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, tool_stop, usage,
+        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, tool_stop, tools,
+        usage,
     };
     use arc_core::tool::workspace::{Grant, Mode};
     use arc_core::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
@@ -2566,6 +2629,159 @@ mod tests {
         }
         assert_eq!(job.session_id, child_id);
         assert_eq!(job.spent_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn each_tool_step_broadcasts_a_job_changed_that_counts_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        // two issued calls in one round: Started hits for both land before
+        // either tool runs, so the pushes count 1 then 2
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "lookup", "{}")),
+                Ok(call("c2", 1, "lookup", "{}")),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(
+                Store::new(log, projection),
+                tools(&[("lookup", "found it", true)]),
+            )
+            .with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: Vec::new(),
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
+                },
+            )]))
+            .with_notifier(notifier.clone()),
+        );
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "run two tools".to_owned(),
+            budget: None,
+        });
+
+        let mut job = job_changed(&mut notifications).await;
+        assert_eq!(job.tool_steps, 0, "the spawn push is still thinking");
+        let mut step_pushes = Vec::new();
+        loop {
+            job = job_changed(&mut notifications).await;
+            if job.tool_steps > 0 {
+                step_pushes.push(job.tool_steps);
+                assert_eq!(job.idle_seconds, 0, "the push follows the step event");
+            }
+            if job.state == job_info::State::Finished as i32 {
+                break;
+            }
+        }
+        assert!(
+            step_pushes.contains(&1) && step_pushes.contains(&2),
+            "{step_pushes:?}"
+        );
+        assert_eq!(job.tool_steps, 2, "the job's final state keeps the count");
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_seconds_count_the_wall_clock_since_the_last_engine_event() {
+        tokio::time::pause();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let tool_gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Immediate(vec![Ok(call("c1", 0, "slow_tool", "{}")), Ok(tool_stop())]),
+            Step::Immediate(done_reply("done after the slow tool")),
+        ]);
+        let (notifier, mut notifications) = broadcast::channel(16);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(GatedTool {
+            notify: Arc::clone(&tool_gate),
+        }));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry)
+                .with_projects(BTreeMap::from([(
+                    "arc".to_owned(),
+                    ProjectSpec {
+                        sources: Vec::new(),
+                        grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                        command_prefix: Vec::new(),
+                    },
+                )]))
+                .with_notifier(notifier.clone()),
+        );
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "run the slow tool".to_owned(),
+            budget: None,
+        });
+
+        // the step push lands while the tool is still gated, then the clock
+        // runs on with no engine events: idle must grow with it
+        let mut job = job_changed(&mut notifications).await;
+        while job.tool_steps == 0 {
+            job = job_changed(&mut notifications).await;
+        }
+        assert_eq!(job.idle_seconds, 0);
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert_eq!(
+            only_job(supervisor.list()).idle_seconds,
+            8,
+            "no engine events for eight seconds reads as eight idle"
+        );
+
+        tool_gate.notify_one();
+        loop {
+            job = job_changed(&mut notifications).await;
+            if job.state == job_info::State::Finished as i32 {
+                break;
+            }
+        }
+        assert_eq!(
+            job.idle_seconds, 0,
+            "the tool's end event reset the idle clock"
+        );
+        assert_eq!(
+            only_job(supervisor.list()).state,
+            job_info::State::Finished as i32
+        );
+        supervisor.shutdown().await;
     }
 
     fn last_assistant(dir: &std::path::Path, session_id: &str) -> Option<String> {

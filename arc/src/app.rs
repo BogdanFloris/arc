@@ -826,6 +826,12 @@ impl App {
         u64::from(job.elapsed_seconds) + self.strip_since.elapsed().as_secs()
     }
 
+    /// The job's idle seconds, ticked forward locally since the last push,
+    /// the same clock the elapsed readout shares.
+    pub fn strip_idle_seconds(&self, job: &JobInfo) -> u64 {
+        u64::from(job.idle_seconds) + self.strip_since.elapsed().as_secs()
+    }
+
     pub fn by_recency(&self) -> Vec<&SessionInfo> {
         let mut order: Vec<&SessionInfo> = self.sessions.iter().collect();
         order.sort_by(|a, b| activity(b).cmp(&activity(a)).then_with(|| a.id.cmp(&b.id)));

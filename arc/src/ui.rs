@@ -332,16 +332,21 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
 // running jobs only: a finished job's evidence is its handback in the
 // conversation, not a line that lingers here
 fn draw_strip(frame: &mut Frame, area: Rect, app: &App, job: &JobInfo) {
+    frame.render_widget(Line::styled(strip_label(app, job), theme::DIM), area);
+}
+
+fn strip_label(app: &App, job: &JobInfo) -> String {
     let count = app.running_job_count();
     let noun = if count == 1 { "job" } else { "jobs" };
-    let text = format!(
-        " {count} {noun} · {} {} · {} tok · {}s",
+    format!(
+        " {count} {noun} · {} {} · {} tok · {}s · step {} - {}s ago",
         job_subject(job),
         job_state_word(job.state),
         format_tokens(job.spent_tokens),
         app.strip_elapsed_seconds(job),
-    );
-    frame.render_widget(Line::styled(text, theme::DIM), area);
+        job.tool_steps,
+        app.strip_idle_seconds(job),
+    )
 }
 
 const INPUT_ROWS_CAP: u16 = 8;
@@ -923,7 +928,7 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 mod tests {
     use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
 
-    use super::{job_label, label, last_active, picker_label, wrap_input};
+    use super::{job_label, label, last_active, picker_label, strip_label, wrap_input};
 
     fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
         SessionInfo {
@@ -1010,6 +1015,38 @@ mod tests {
         assert_eq!(
             picker_label(&job, 40, true),
             "Fix the flaky test executor/arc"
+        );
+    }
+
+    #[test]
+    fn the_strip_label_shows_the_step_count_and_idle_seconds() {
+        use crate::app::{App, NetEvent};
+
+        let mut app = App::new();
+        let mut job = job(SessionRole::Executor, "arc", "Fix the flaky test");
+        job.tool_steps = 12;
+        job.idle_seconds = 6;
+        app.on_net(NetEvent::JobChanged(job.clone()));
+
+        assert_eq!(
+            strip_label(&app, &job),
+            " 1 job · Fix the flaky test running · 12 tok · 5s · step 12 - 6s ago"
+        );
+    }
+
+    #[test]
+    fn a_strip_step_of_zero_reads_as_thinking() {
+        use crate::app::{App, NetEvent};
+
+        let mut app = App::new();
+        let mut job = job(SessionRole::Executor, "arc", "");
+        job.tool_steps = 0;
+        job.idle_seconds = 3;
+        app.on_net(NetEvent::JobChanged(job.clone()));
+
+        assert_eq!(
+            strip_label(&app, &job),
+            " 1 job · executor/arc running · 12 tok · 5s · step 0 - 3s ago"
         );
     }
 
