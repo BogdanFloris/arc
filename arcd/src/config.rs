@@ -94,6 +94,10 @@ pub struct ProjectConfig {
     pub read_only: Vec<PathBuf>,
 
     pub sources: Vec<ToolSource>,
+
+    /// Wraps `bash`'s child invocation, e.g. `["nix", "develop", "-c"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_prefix: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -393,6 +397,7 @@ mod tests {
                     description: "ARC's own implementation repo".to_owned(),
                     read_only: vec![PathBuf::from("/home/bogdan/notes")],
                     sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                    command_prefix: vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()],
                 },
             )]),
         };
@@ -555,6 +560,34 @@ sources     = []
         assert_eq!(
             config.projects["arc"].description,
             "ARC's own implementation repo"
+        );
+    }
+
+    #[test]
+    fn a_project_command_prefix_is_optional_and_defaults_to_empty() {
+        let config = parse(
+            r#"
+[projects.arc]
+root    = "/home/bogdan/arc"
+sources = []
+"#,
+        );
+        assert!(config.projects["arc"].command_prefix.is_empty());
+    }
+
+    #[test]
+    fn a_project_command_prefix_is_carried_through() {
+        let config = parse(
+            r#"
+[projects.arc]
+root           = "/home/bogdan/arc"
+sources        = []
+command_prefix = ["nix", "develop", "-c"]
+"#,
+        );
+        assert_eq!(
+            config.projects["arc"].command_prefix,
+            ["nix", "develop", "-c"]
         );
     }
 

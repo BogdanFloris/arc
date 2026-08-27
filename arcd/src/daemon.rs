@@ -346,7 +346,11 @@ fn project_spec(project: &crate::config::ProjectConfig) -> ProjectSpec {
             .iter()
             .map(|root| Grant::new(root.clone(), Mode::ReadOnly)),
     );
-    ProjectSpec { sources, grants }
+    ProjectSpec {
+        sources,
+        grants,
+        command_prefix: project.command_prefix.clone(),
+    }
 }
 
 fn open_index(path: &Path) -> Result<Projection> {
@@ -411,7 +415,27 @@ mod tests {
             description: description.to_owned(),
             read_only: Vec::new(),
             sources: vec![ToolSource::Builtin],
+            command_prefix: Vec::new(),
         }
+    }
+
+    #[test]
+    fn project_spec_carries_the_configured_command_prefix() {
+        let mut config = project_config("/tmp/arc", "");
+        config.command_prefix = vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()];
+
+        let spec = project_spec(&config);
+
+        assert_eq!(spec.command_prefix, ["nix", "develop", "-c"]);
+    }
+
+    #[test]
+    fn project_spec_defaults_to_no_command_prefix() {
+        let config = project_config("/tmp/arc", "");
+
+        let spec = project_spec(&config);
+
+        assert!(spec.command_prefix.is_empty());
     }
 
     #[test]
@@ -646,6 +670,7 @@ mod tests {
                 description: String::new(),
                 read_only: vec![notes_root.clone()],
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                command_prefix: Vec::new(),
             },
         );
         let dirs = DataDirs::new(&temp.path().join("data"));

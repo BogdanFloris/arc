@@ -98,14 +98,22 @@ impl Tool for Bash {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
 
-            run(&args.command, root, timeout_secs).await
+            run(&args.command, root, timeout_secs, &ctx.command_prefix).await
         })
     }
 }
 
-async fn run(command: &str, cwd: &Path, timeout_secs: u64) -> ToolReply {
-    let mut cmd = Command::new("bash");
-    cmd.args(["--noprofile", "--norc", "-c", command]);
+async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[String]) -> ToolReply {
+    let bash_args = ["bash", "--noprofile", "--norc", "-c", command];
+    let (program, mut cmd) = if let Some((wrapper, rest)) = command_prefix.split_first() {
+        let mut cmd = Command::new(wrapper);
+        cmd.args(rest).args(bash_args);
+        (wrapper.as_str(), cmd)
+    } else {
+        let mut cmd = Command::new("bash");
+        cmd.args(&bash_args[1..]);
+        ("bash", cmd)
+    };
     cmd.current_dir(cwd);
     scrub_env(&mut cmd);
     // CLIs block on an open stdin.
@@ -118,7 +126,7 @@ async fn run(command: &str, cwd: &Path, timeout_secs: u64) -> ToolReply {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return ToolReply::error(format!("ERROR: could not start bash ({error})."));
+            return ToolReply::error(format!("ERROR: could not start {program} ({error})."));
         }
     };
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
@@ -275,16 +283,29 @@ mod tests {
     use crate::tool::{Tool as _, TurnContext};
 
     fn ctx(root: &std::path::Path, mode: Mode) -> TurnContext {
+        ctx_with_prefix(root, mode, Vec::new())
+    }
+
+    fn ctx_with_prefix(
+        root: &std::path::Path,
+        mode: Mode,
+        command_prefix: Vec<String>,
+    ) -> TurnContext {
         let grants = Grants::new(vec![Grant::new(root, mode)]).expect("grants");
         TurnContext {
             session_id: String::new(),
             turn_id: String::new(),
             grants: Some(Arc::new(grants)),
+            command_prefix,
         }
     }
 
     fn ctx_rw(root: &std::path::Path) -> TurnContext {
         ctx(root, Mode::ReadWrite)
+    }
+
+    fn ctx_rw_with_prefix(root: &std::path::Path, command_prefix: Vec<String>) -> TurnContext {
+        ctx_with_prefix(root, Mode::ReadWrite, command_prefix)
     }
 
     fn args(command: &str) -> String {
@@ -480,6 +501,7 @@ mod tests {
             session_id: String::new(),
             turn_id: String::new(),
             grants: Some(Arc::new(grants)),
+            command_prefix: Vec::new(),
         };
 
         let reply = tool.execute(args("echo hi"), ctx).await;
@@ -535,5 +557,76 @@ mod tests {
             "the call must return once bash exits, not when the orphan dies"
         );
         assert!(reply.content.contains("up"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn an_empty_prefix_runs_bash_directly_as_before() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(
+                args("echo hello"),
+                ctx_with_prefix(dir.path(), Mode::ReadWrite, Vec::new()),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(reply.content, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn a_prefix_wraps_the_child_and_produces_the_same_output() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(
+                args("echo hello"),
+                ctx_rw_with_prefix(dir.path(), vec!["env".to_owned()]),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(reply.content, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn a_nonexistent_wrapper_binary_is_a_named_error() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(
+                args("echo hi"),
+                ctx_rw_with_prefix(dir.path(), vec!["arc-no-such-wrapper".to_owned()]),
+            )
+            .await;
+
+        assert!(!reply.ok);
+        assert!(
+            reply.content.contains("arc-no-such-wrapper"),
+            "{}",
+            reply.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_a_sleeping_child_under_a_prefix() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let start = Instant::now();
+        let reply = tool
+            .execute(
+                args_with_timeout("sleep 5; echo late", 1),
+                ctx_rw_with_prefix(dir.path(), vec!["env".to_owned()]),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(!reply.ok);
+        assert!(!reply.content.contains("late"), "{}", reply.content);
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 }

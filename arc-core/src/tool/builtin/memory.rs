@@ -651,6 +651,7 @@ mod tests {
                     session_id: "s-live".to_owned(),
                     turn_id: "t-1".to_owned(),
                     grants: None,
+                    command_prefix: Vec::new(),
                 },
             )
             .await;

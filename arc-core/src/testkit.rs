@@ -337,6 +337,35 @@ impl Tool for Canned {
     }
 }
 
+/// Echoes `ctx.command_prefix` back as its reply, joined by commas, so tests
+/// can see what a real turn resolved without a subprocess.
+pub struct PrefixEcho {
+    pub name: &'static str,
+    pub source: ToolSource,
+}
+
+impl Tool for PrefixEcho {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn source(&self) -> ToolSource {
+        self.source
+    }
+
+    fn execute(
+        &self,
+        _arguments_json: String,
+        ctx: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+        Box::pin(async move { ToolReply::ok(ctx.command_prefix.join(",")) })
+    }
+}
+
 pub fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
     let mut registry = Registry::new(512);
     for &(name, content, ok) in entries {

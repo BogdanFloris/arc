@@ -1678,6 +1678,7 @@ mod tests {
                     project_dir.path(),
                     arc_core::tool::workspace::Mode::ReadWrite,
                 )],
+                command_prefix: Vec::new(),
             },
         )]);
 
@@ -1789,6 +1790,7 @@ mod tests {
                     project_dir.path(),
                     arc_core::tool::workspace::Mode::ReadWrite,
                 )],
+                command_prefix: Vec::new(),
             },
         )]);
 
@@ -1897,6 +1899,7 @@ mod tests {
                     project_dir.path(),
                     arc_core::tool::workspace::Mode::ReadWrite,
                 )],
+                command_prefix: Vec::new(),
             },
         )]);
         (registry, project_dir, projects)
@@ -2319,6 +2322,7 @@ mod tests {
                             &root,
                             arc_core::tool::workspace::Mode::ReadWrite,
                         )],
+                        command_prefix: Vec::new(),
                     },
                 )]))
                 .with_notifier(notifier.clone()),

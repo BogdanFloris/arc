@@ -1134,6 +1134,7 @@ mod tests {
                     ProjectSpec {
                         sources: Vec::new(),
                         grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                        command_prefix: Vec::new(),
                     },
                 )]),
             ),
@@ -1206,6 +1207,7 @@ mod tests {
                     ProjectSpec {
                         sources: Vec::new(),
                         grants: vec![Grant::new(root, Mode::ReadWrite)],
+                        command_prefix: Vec::new(),
                     },
                 )]),
             ),
@@ -1226,6 +1228,7 @@ mod tests {
                     ProjectSpec {
                         sources: Vec::new(),
                         grants: vec![Grant::new(root, Mode::ReadWrite)],
+                        command_prefix: Vec::new(),
                     },
                 )]))
                 .with_notifier(notifier),
@@ -2705,6 +2708,7 @@ mod tests {
                 ProjectSpec {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
                 },
             )])),
         );
@@ -2817,6 +2821,7 @@ mod tests {
                 ProjectSpec {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
                 },
             )])),
         );
@@ -3093,6 +3098,7 @@ mod tests {
                 ProjectSpec {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
                 },
             )])),
         );
@@ -3370,6 +3376,7 @@ mod tests {
                 ProjectSpec {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
                 },
             )])),
         );

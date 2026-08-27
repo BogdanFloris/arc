@@ -29,6 +29,7 @@ const MAX_TOOL_STEPS: usize = 8;
 pub struct ProjectSpec {
     pub sources: Vec<ToolSource>,
     pub grants: Vec<Grant>,
+    pub command_prefix: Vec<String>,
 }
 
 /// Who is running a turn. Resolved once per role and handed to the engine
@@ -480,6 +481,24 @@ impl Engine {
         })
     }
 
+    /// The `bash` wrapper argv for a session's project, re-derived from
+    /// config each turn like `sources`: never recorded in the log.
+    fn command_prefix(&self, session_id: &str, new_session: bool) -> Result<Vec<String>, Error> {
+        let project = if new_session {
+            None
+        } else {
+            self.with_store(|store| store.projection().session_project(session_id))?
+        };
+        Ok(match project {
+            None => Vec::new(),
+            Some(name) => self
+                .projects
+                .get(&name)
+                .map(|spec| spec.command_prefix.clone())
+                .unwrap_or_default(),
+        })
+    }
+
     /// The grants a session was created with, straight from the log: the
     /// authority even if config has since changed. `None` means unbound.
     fn grants(&self, session_id: &str, new_session: bool) -> Result<Option<Arc<Grants>>, Error> {
@@ -552,6 +571,7 @@ impl Engine {
         }
         let sources = self.sources(&session_id, new_session)?;
         let grants = self.grants(&session_id, new_session)?;
+        let command_prefix = self.command_prefix(&session_id, new_session)?;
 
         if new_session {
             self.record(
@@ -585,6 +605,7 @@ impl Engine {
             &turn_id,
             &sources,
             grants.as_ref(),
+            &command_prefix,
             &events,
         )
         .await
@@ -631,6 +652,7 @@ impl Engine {
         self.enforce_pin(runner, session_id)?;
         let sources = self.sources(session_id, false)?;
         let grants = self.grants(session_id, false)?;
+        let command_prefix = self.command_prefix(session_id, false)?;
 
         self.drive_turn(
             runner,
@@ -638,6 +660,7 @@ impl Engine {
             &turn_id,
             &sources,
             grants.as_ref(),
+            &command_prefix,
             &events,
         )
         .await
@@ -647,6 +670,7 @@ impl Engine {
     /// opens the transcript, drives tool steps and dispatch, and appends the
     /// reply. The caller has already taken the turn guard and resolved
     /// sources/grants; this only reads and appends from `turn_id` onward.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_turn(
         &self,
         runner: &Runner,
@@ -654,6 +678,7 @@ impl Engine {
         turn_id: &str,
         sources: &[ToolSource],
         grants: Option<&Arc<Grants>>,
+        command_prefix: &[String],
         events: &mpsc::Sender<EngineEvent>,
     ) -> Result<Reply, Error> {
         let _ = events
@@ -697,6 +722,7 @@ impl Engine {
                         calls,
                         sources,
                         grants,
+                        command_prefix,
                         &mut transcript,
                         &mut memory,
                         &mut jobs,
@@ -792,6 +818,7 @@ impl Engine {
         mut calls: Vec<ToolCall>,
         sources: &[ToolSource],
         grants: Option<&Arc<Grants>>,
+        command_prefix: &[String],
         transcript: &mut Vec<Message>,
         memory: &mut MemoryCounters,
         jobs: &mut Vec<DispatchedJob>,
@@ -854,6 +881,7 @@ impl Engine {
                 session_id: session_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 grants: grants.cloned(),
+                command_prefix: command_prefix.to_vec(),
             };
             let DispatchOutcome {
                 content,
@@ -1278,10 +1306,10 @@ mod tests {
     };
     use crate::store::{self, Store};
     use crate::testkit::{
-        Canned, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying, channel,
-        counter_samples, done_reply, drain, engine, engine_with_tools, engine_with_tools_at,
-        issued, reopened_engine, replay_events, replay_log, resulted, runner, seed_log,
-        seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
+        Canned, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying,
+        channel, counter_samples, done_reply, drain, engine, engine_with_tools,
+        engine_with_tools_at, issued, reopened_engine, replay_events, replay_log, resulted, runner,
+        seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
@@ -3100,6 +3128,7 @@ mod tests {
             ProjectSpec {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
+                command_prefix: Vec::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -3123,6 +3152,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_project_bound_session_gets_its_configured_command_prefix_in_turn_context() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(&dir, vec![seeded_session_with_project("arc")]);
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "prefix", "{}")), Ok(tool_stop())],
+            done_reply("done"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(PrefixEcho {
+            name: "prefix",
+            source: ToolSource::Workspace,
+        }));
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "arc".to_owned(),
+            ProjectSpec {
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                grants: Vec::new(),
+                command_prefix: vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()],
+            },
+        );
+        let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, Some("s-01"), "run it", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.content, "nix,develop,-c");
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_gets_an_empty_command_prefix_in_turn_context() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "prefix", "{}")), Ok(tool_stop())],
+            done_reply("done"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(PrefixEcho {
+            name: "prefix",
+            source: ToolSource::Builtin,
+        }));
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "arc".to_owned(),
+            ProjectSpec {
+                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
+                grants: Vec::new(),
+                command_prefix: vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()],
+            },
+        );
+        let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "run it", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.content, "");
+    }
+
+    #[tokio::test]
     async fn an_unbound_session_denies_a_workspace_tool_and_the_turn_still_completes() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![
@@ -3137,6 +3235,7 @@ mod tests {
             ProjectSpec {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
+                command_prefix: Vec::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -3180,6 +3279,7 @@ mod tests {
             ProjectSpec {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
+                command_prefix: Vec::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -3226,7 +3326,14 @@ mod tests {
         grants: Vec<Grant>,
     ) -> BTreeMap<String, ProjectSpec> {
         let mut projects = BTreeMap::new();
-        projects.insert(name.to_owned(), ProjectSpec { sources, grants });
+        projects.insert(
+            name.to_owned(),
+            ProjectSpec {
+                sources,
+                grants,
+                command_prefix: Vec::new(),
+            },
+        );
         projects
     }
 

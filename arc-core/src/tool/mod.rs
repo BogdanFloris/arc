@@ -16,6 +16,7 @@ pub struct TurnContext {
     pub session_id: String,
     pub turn_id: String,
     pub grants: Option<Arc<Grants>>,
+    pub command_prefix: Vec<String>,
 }
 
 /// A validated request to start a job. The tool that builds one never starts
@@ -371,6 +372,7 @@ mod tests {
             session_id: "s-77".to_owned(),
             turn_id: "t-42".to_owned(),
             grants: None,
+            command_prefix: Vec::new(),
         };
         let outcome = registry
             .dispatch("where_am_i", "{}".into(), ctx, &ToolSource::ALL)

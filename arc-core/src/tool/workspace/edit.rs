@@ -171,6 +171,7 @@ mod tests {
             session_id: session_id.to_owned(),
             turn_id: String::new(),
             grants: Some(Arc::new(grants)),
+            command_prefix: Vec::new(),
         }
     }
 
