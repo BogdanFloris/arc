@@ -158,16 +158,12 @@ impl RoleConfig {
         }
         match (self.provider, self.thinking) {
             (_, Thinking::Default)
-            | (RoleProvider::Gemini, _)
+            | (RoleProvider::Gemini | RoleProvider::OpenAiCompat, _)
             | (RoleProvider::Local, Thinking::Minimal) => {}
             (RoleProvider::Local, level) => bail!(
                 "role `{name}`: the sidecar reads `/no_think` out of the prompt and has no `{}` level; \
                  use `minimal` or leave it unset",
                 level.label()
-            ),
-            (RoleProvider::OpenAiCompat, _) => bail!(
-                "role `{name}`: no openai_compat endpoint is known to accept `reasoning_effort`, \
-                 and an unknown field is a 400; measure one before configuring it"
             ),
         }
         if let Some(endpoint) = &self.endpoint {
@@ -502,6 +498,22 @@ provider = "local"
             err.contains("executor") && err.contains("endpoint"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn an_openai_compat_role_accepts_a_thinking_level() {
+        let config = parse(
+            "[roles.executor]\nprovider = \"openai_compat\"\nmodel = \"deepseek-v4-flash\"\nendpoint = \"http://127.0.0.1:4096\"\nthinking = \"minimal\"\n",
+        );
+        let executor = config
+            .roles
+            .executor
+            .as_ref()
+            .expect("executor is configured");
+        assert_eq!(executor.thinking, Thinking::Minimal);
+
+        let text = toml::to_string(&config).expect("serializes");
+        assert_eq!(toml::from_str::<Config>(&text).expect("parses"), config);
     }
 
     #[test]
