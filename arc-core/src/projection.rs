@@ -738,6 +738,188 @@ impl Reader {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RebuildError {
+    #[error("reading the log: {0}")]
+    Log(#[from] log::Error),
+    #[error("replaying the log: {0}")]
+    Replay(#[from] ReplayError),
+    #[error("comparing the index: {0}")]
+    Index(#[from] Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildReport {
+    pub schema_version_live: Option<u32>,
+    pub schema_version_replayed: Option<u32>,
+    pub tables: Vec<TableDiff>,
+}
+
+impl RebuildReport {
+    pub fn is_clean(&self) -> bool {
+        self.schema_version_live == self.schema_version_replayed
+            && self.tables.iter().all(|table| table.divergence.is_none())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDiff {
+    pub table: &'static str,
+    pub rows_live: usize,
+    pub rows_replayed: usize,
+    pub divergence: Option<RowDivergence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowDivergence {
+    pub key: String,
+    pub live: Option<Vec<String>>,
+    pub replayed: Option<Vec<String>>,
+}
+
+struct TableSpec {
+    table: &'static str,
+    key_columns: usize,
+    select: &'static str,
+}
+
+// every column named explicitly and ordered by a stable key, so two
+// independently-built databases compare byte-for-byte as text; FTS tables
+// are derived from messages and carry nothing of their own to verify
+const REBUILD_TABLES: &[TableSpec] = &[
+    TableSpec {
+        table: "sessions",
+        key_columns: 1,
+        select: "SELECT id, parent_session, fork_point, project, title, started_at, \
+                 consolidated_through, role, provider, model, source \
+                 FROM sessions ORDER BY id",
+    },
+    TableSpec {
+        table: "messages",
+        key_columns: 2,
+        select: "SELECT session_id, seq, kind, turn_id, role, content, partial, call_id, \
+                 call_index, name, arguments_json, outcome, truncated, ts, \
+                 provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms \
+                 FROM messages ORDER BY session_id, seq",
+    },
+    TableSpec {
+        table: "memory_records",
+        key_columns: 1,
+        select: "SELECT id, kind, namespace, title, summary, body, links, provenance, \
+                 status, superseded_by, created_seq, last_event_seq, changed_at, reviewed_at \
+                 FROM memory_records ORDER BY id",
+    },
+    TableSpec {
+        table: "session_grants",
+        key_columns: 2,
+        select: "SELECT session_id, rowid, root, read_write \
+                 FROM session_grants ORDER BY session_id, rowid",
+    },
+];
+
+/// Replays the log into a fresh in-memory projection and diffs it against
+/// the live index under one read transaction, so a running daemon can't
+/// hand back a torn view mid-comparison.
+pub fn rebuild(log_dir: &Path, index_path: &Path) -> Result<RebuildReport, RebuildError> {
+    let mut replayed = Projection::in_memory()?;
+    let reader = log::LogReader::new(log::discover_segments(log_dir)?);
+    replay(reader, &mut replayed)?;
+
+    let mut live_conn = Connection::open_with_flags(
+        index_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(opened(index_path))?;
+    let live_tx = live_conn.transaction().map_err(Error::from)?;
+
+    let schema_version_live = read_schema_version(&live_tx)?;
+    let schema_version_replayed = read_schema_version(&replayed.conn)?;
+
+    let mut tables = Vec::with_capacity(REBUILD_TABLES.len());
+    for spec in REBUILD_TABLES {
+        tables.push(diff_table(spec, &live_tx, &replayed.conn)?);
+    }
+
+    Ok(RebuildReport {
+        schema_version_live,
+        schema_version_replayed,
+        tables,
+    })
+}
+
+fn read_schema_version(conn: &Connection) -> Result<Option<u32>, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM projection_meta WHERE key = ?1",
+            (SCHEMA_VERSION_KEY,),
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn diff_table(
+    spec: &TableSpec,
+    live: &Connection,
+    replayed: &Connection,
+) -> Result<TableDiff, Error> {
+    let live_rows = fetch_rows(live, spec.select)?;
+    let replayed_rows = fetch_rows(replayed, spec.select)?;
+    let rows_live = live_rows.len();
+    let rows_replayed = replayed_rows.len();
+
+    let mut divergence = None;
+    for i in 0..rows_live.max(rows_replayed) {
+        let live_row = live_rows.get(i);
+        let replayed_row = replayed_rows.get(i);
+        if live_row != replayed_row {
+            let key = live_row
+                .or(replayed_row)
+                .map(|row| row[..spec.key_columns].join(","))
+                .unwrap_or_default();
+            divergence = Some(RowDivergence {
+                key,
+                live: live_row.cloned(),
+                replayed: replayed_row.cloned(),
+            });
+            break;
+        }
+    }
+
+    Ok(TableDiff {
+        table: spec.table,
+        rows_live,
+        rows_replayed,
+        divergence,
+    })
+}
+
+fn fetch_rows(conn: &Connection, select: &str) -> Result<Vec<Vec<String>>, Error> {
+    let mut stmt = conn.prepare(select)?;
+    let columns = stmt.column_count();
+    let rows = stmt.query_map([], |row| {
+        (0..columns)
+            .map(|i| row.get::<_, rusqlite::types::Value>(i).map(value_text))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn value_text(value: rusqlite::types::Value) -> String {
+    use std::fmt::Write as _;
+
+    use rusqlite::types::Value;
+    match value {
+        Value::Null => "NULL".to_owned(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Text(s) => s,
+        Value::Blob(bytes) => bytes.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        }),
+    }
+}
+
 pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> {
     let mut stmt = conn.prepare(
         "SELECT s.id, coalesce(s.title, ''), s.started_at,
@@ -1377,7 +1559,7 @@ mod tests {
         memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
-    use rusqlite::OptionalExtension;
+    use rusqlite::{Connection, OptionalExtension};
     use tempfile::TempDir;
 
     use super::{
@@ -3589,5 +3771,169 @@ mod tests {
             panic!("expected a message entry");
         };
         assert_eq!(message.source, Source::System as i32);
+    }
+
+    fn build_rebuild_log(dir: &Path) -> Log {
+        let mut log = Log::open(dir).expect("open log");
+        log.append(session_created_with_grants(
+            0,
+            vec![WorkspaceGrant {
+                root: "/home/bogdan/arc".to_owned(),
+                read_write: true,
+            }],
+        ))
+        .expect("append");
+        log.append(message_appended(1, "hello")).expect("append");
+        log.append(tool_call(2, "c-a", 0, "{}")).expect("append");
+        log.append(tool_result(
+            3,
+            "c-a",
+            ToolOutcome::Ok as i32,
+            "found",
+            false,
+        ))
+        .expect("append");
+        log.append(mem_created(4, record("mr-1", "title", "summary")))
+            .expect("append");
+        log
+    }
+
+    fn build_live_index(log_dir: &Path, index_path: &Path) {
+        let mut projection = Projection::open(index_path).expect("open live index");
+        let log = Log::open(log_dir).expect("reopen log");
+        replay(log.reader().expect("reader"), &mut projection).expect("replay");
+    }
+
+    #[test]
+    fn rebuild_reports_identical_state_with_matching_counts() {
+        let log_dir = TempDir::new().expect("log dir");
+        build_rebuild_log(log_dir.path());
+        let index_dir = TempDir::new().expect("index dir");
+        let index_path = index_dir.path().join("index.db");
+        build_live_index(log_dir.path(), &index_path);
+
+        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
+
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.schema_version_live, report.schema_version_replayed);
+        let counts: Vec<(&str, usize)> = report
+            .tables
+            .iter()
+            .map(|table| (table.table, table.rows_live))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("sessions", 1),
+                ("messages", 3),
+                ("memory_records", 1),
+                ("session_grants", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mutated_row_is_reported_as_a_divergence() {
+        let log_dir = TempDir::new().expect("log dir");
+        build_rebuild_log(log_dir.path());
+        let index_dir = TempDir::new().expect("index dir");
+        let index_path = index_dir.path().join("index.db");
+        build_live_index(log_dir.path(), &index_path);
+        {
+            let conn = Connection::open(&index_path).expect("reopen for sabotage");
+            conn.execute(
+                "UPDATE sessions SET title = 'tampered' WHERE id = 's-01'",
+                [],
+            )
+            .expect("mutate");
+        }
+
+        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
+
+        assert!(!report.is_clean());
+        let sessions = report
+            .tables
+            .iter()
+            .find(|table| table.table == "sessions")
+            .expect("sessions table");
+        let divergence = sessions.divergence.as_ref().expect("divergence");
+        assert_eq!(divergence.key, "s-01");
+        assert_ne!(divergence.live, divergence.replayed);
+    }
+
+    #[test]
+    fn an_extra_live_row_is_a_divergence_not_a_panic() {
+        let log_dir = TempDir::new().expect("log dir");
+        build_rebuild_log(log_dir.path());
+        let index_dir = TempDir::new().expect("index dir");
+        let index_path = index_dir.path().join("index.db");
+        build_live_index(log_dir.path(), &index_path);
+        {
+            let conn = Connection::open(&index_path).expect("reopen for sabotage");
+            conn.execute(
+                "INSERT INTO memory_records
+                     (id, kind, namespace, title, summary, body, links, status,
+                      created_seq, last_event_seq)
+                 VALUES ('mr-extra', 0, 'global', 'extra', 'extra', 'extra', '[]', 0, 999, 999)",
+                [],
+            )
+            .expect("insert extra row");
+        }
+
+        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
+
+        assert!(!report.is_clean());
+        let memory_records = report
+            .tables
+            .iter()
+            .find(|table| table.table == "memory_records")
+            .expect("memory_records table");
+        assert_eq!(memory_records.rows_live, 2);
+        assert_eq!(memory_records.rows_replayed, 1);
+        assert!(memory_records.divergence.is_some());
+    }
+
+    #[test]
+    fn a_schema_version_mismatch_is_a_reported_divergence() {
+        let log_dir = TempDir::new().expect("log dir");
+        build_rebuild_log(log_dir.path());
+        let index_dir = TempDir::new().expect("index dir");
+        let index_path = index_dir.path().join("index.db");
+        build_live_index(log_dir.path(), &index_path);
+        {
+            let conn = Connection::open(&index_path).expect("reopen for sabotage");
+            conn.execute(
+                "UPDATE projection_meta SET value = ?1 WHERE key = 'schema_version'",
+                [i64::from(super::SCHEMA_VERSION) - 1],
+            )
+            .expect("age the version");
+        }
+
+        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
+
+        assert!(!report.is_clean());
+        assert_eq!(report.schema_version_live, Some(super::SCHEMA_VERSION - 1));
+        assert_eq!(report.schema_version_replayed, Some(super::SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn a_missing_live_index_is_an_error_not_a_panic() {
+        let log_dir = TempDir::new().expect("log dir");
+        build_rebuild_log(log_dir.path());
+        let missing = log_dir.path().join("does-not-exist.db");
+
+        let err = super::rebuild(log_dir.path(), &missing).expect_err("missing index");
+        assert!(matches!(err, super::RebuildError::Index(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_missing_log_dir_is_an_error_not_a_panic() {
+        let index_dir = TempDir::new().expect("index dir");
+        let index_path = index_dir.path().join("index.db");
+        drop(Projection::open(&index_path).expect("create empty index"));
+        let missing_log = index_dir.path().join("no-such-log");
+
+        let err = super::rebuild(&missing_log, &index_path).expect_err("missing log dir");
+        assert!(matches!(err, super::RebuildError::Log(_)), "{err:?}");
     }
 }

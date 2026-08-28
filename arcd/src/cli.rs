@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Run,
+    Rebuild,
     MemoryReplay {
         prompt: String,
         against: Option<String>,
@@ -27,11 +28,14 @@ pub const DEFAULT_CONFIG: &str = "data/arc.toml";
 
 pub const USAGE: &str = "\
 usage: arcd run [--config <path>]
+       arcd rebuild [--config <path>]
        arcd memory-replay --prompt <version> [--against <version>]
                           [--session <id>]... [--config <path>]
 
 commands:
   run             start the daemon (default)
+  rebuild         replay the log into a fresh index and diff it against the
+                  live one, read-only
   memory-replay   re-run a consolidation prompt version over the log and
                   report the resulting memory state, read-only
 
@@ -45,6 +49,7 @@ options:
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Name {
     Run,
+    Rebuild,
     MemoryReplay,
 }
 
@@ -89,6 +94,7 @@ where
             }
             Some("--session") => sessions.push(value(&mut args, "--session")?),
             Some("run") if command.is_none() => command = Some(Name::Run),
+            Some("rebuild") if command.is_none() => command = Some(Name::Rebuild),
             Some("memory-replay") if command.is_none() => command = Some(Name::MemoryReplay),
             _ => {
                 let shown = arg.to_string_lossy().into_owned();
@@ -101,13 +107,15 @@ where
         }
     }
 
-    let command = match command.unwrap_or(Name::Run) {
-        Name::Run => {
-            if prompt.is_some() || against.is_some() || !sessions.is_empty() {
-                return Err("--prompt, --against, and --session are for memory-replay".to_owned());
-            }
-            Command::Run
-        }
+    let name = command.unwrap_or(Name::Run);
+    if !matches!(name, Name::MemoryReplay)
+        && (prompt.is_some() || against.is_some() || !sessions.is_empty())
+    {
+        return Err("--prompt, --against, and --session are for memory-replay".to_owned());
+    }
+    let command = match name {
+        Name::Run => Command::Run,
+        Name::Rebuild => Command::Rebuild,
         Name::MemoryReplay => Command::MemoryReplay {
             prompt: prompt.ok_or_else(|| "memory-replay needs --prompt <version>".to_owned())?,
             against,
@@ -191,6 +199,28 @@ mod tests {
             }
         );
         assert_eq!(cli.config, PathBuf::from("/etc/arc.toml"));
+    }
+
+    #[test]
+    fn rebuild_parses() {
+        let cli = ok(&["arcd", "rebuild"]);
+        assert_eq!(cli.command, Command::Rebuild);
+        assert_eq!(cli.config, PathBuf::from("data/arc.toml"));
+
+        assert_eq!(
+            ok(&["arcd", "--config", "/etc/arc.toml", "rebuild"]).config,
+            PathBuf::from("/etc/arc.toml")
+        );
+    }
+
+    #[test]
+    fn rebuild_flag_misuse_is_a_usage_error() {
+        for args in [
+            vec!["arcd", "rebuild", "--prompt", "v1"],
+            vec!["arcd", "rebuild", "extra"],
+        ] {
+            assert!(parse(args.clone()).is_err(), "{args:?} should not parse");
+        }
     }
 
     #[test]

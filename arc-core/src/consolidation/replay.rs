@@ -116,6 +116,7 @@ pub async fn run(
         records = tracing::field::Empty,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn run_version(
     provider: &Arc<dyn Provider>,
     model: &str,

@@ -220,6 +220,7 @@ fn record_properties(namespaces: &[String]) -> serde_json::Value {
 }
 
 // 1.3 measured optional fields being silently dropped; required-with-escape
+#[allow(clippy::result_large_err)]
 fn resolve_namespace(
     namespace: Option<&str>,
     namespaces: &[String],
