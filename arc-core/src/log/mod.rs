@@ -23,6 +23,7 @@ pub enum Error {
 
     #[error("log segment {path}: {source}")]
     Io {
+        /// The segment file the failed operation touched.
         path: PathBuf,
         source: std::io::Error,
     },

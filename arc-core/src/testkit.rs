@@ -396,15 +396,23 @@ pub fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
     registry
 }
 
+// spans from spawned threads land on the global default, so two parallel
+// captures can steal each other's records; one at a time is the fix
+static TRACE_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct TraceCapture {
     _dir: TempDir,
     path: PathBuf,
     guard: tracing::subscriber::DefaultGuard,
+    _exclusive: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TraceCapture {
     pub fn start() -> Self {
         use tracing_subscriber::prelude::*;
+        let exclusive = TRACE_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().expect("trace dir");
         let (layer, path) = crate::trace::perfetto(dir.path(), "test").expect("trace file");
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -413,12 +421,18 @@ impl TraceCapture {
             _dir: dir,
             path,
             guard,
+            _exclusive: exclusive,
         }
     }
 
     pub fn finish(self) -> arc_proto::perfetto::Trace {
         use prost::Message as _;
-        let Self { _dir, path, guard } = self;
+        let Self {
+            _dir,
+            path,
+            guard,
+            _exclusive,
+        } = self;
         drop(guard);
         let bytes = std::fs::read(&path).expect("trace file");
         arc_proto::perfetto::Trace::decode(bytes.as_slice()).expect("decodable trace")
