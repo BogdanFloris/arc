@@ -8,7 +8,7 @@ Write and speak in plain English. Say only what the reader needs. Lead with the 
 
 ## Current phase
 
-Phase 3 is development. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. ARC becomes the harness used to write its own code. This includes provider roles, child-session jobs, workspaces, the tool registry and its containment rules, and an installed service. Do not build later-phase features. If work points toward forking, rewind, voice, or devices, add only the interface needed now.
+Phase 3.5 is the tree. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. Session forking, rewind, and tree navigation land now, developed through ARC itself — that week of use is Phase 3's carried exit criterion. History is never rewritten: a fork is a new branch, a rewind is a fork at an earlier point (invariant 1). Do not build later-phase features. If work points toward voice, devices, or a sandboxed worker, add only the interface needed now.
 
 ## Workspace
 
