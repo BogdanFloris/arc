@@ -116,6 +116,9 @@ message JobInfo {
   string parent_session = 12;
   // steer/continue_job messages waiting for their own turn
   uint32 queued_steers = 13;
+  // the last issued tool call, elided ("bash cargo test"); empty until
+  // the first call, when the strip falls back to the step count
+  string last_call = 14;
 }
 
 message JobList {
