@@ -26,6 +26,32 @@ pub enum Parsed {
 
 pub const DEFAULT_CONFIG: &str = "data/arc.toml";
 
+/// Installed config first, checkout fallback second: `~/.config/arc/arc.toml`
+/// when it exists, else `data/arc.toml` for in-repo development.
+pub fn default_config() -> PathBuf {
+    if let Some(installed) = installed_config(std::env::var_os("XDG_CONFIG_HOME"), home()) {
+        if installed.exists() {
+            return installed;
+        }
+    }
+    PathBuf::from(DEFAULT_CONFIG)
+}
+
+fn home() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+}
+
+fn installed_config(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = xdg
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("arc").join("arc.toml"))
+}
+
 pub const USAGE: &str = "\
 usage: arcd run [--config <path>]
        arcd rebuild [--config <path>]
@@ -40,7 +66,8 @@ commands:
                   report the resulting memory state, read-only
 
 options:
-  --config <path>       config file (default: data/arc.toml; a missing file means defaults)
+  --config <path>       config file (default: ~/.config/arc/arc.toml if present,
+                        else data/arc.toml; a missing file means defaults)
   --prompt <version>    prompt version to replay (memory-replay only)
   --against <version>   second version to run and diff against (memory-replay only)
   --session <id>        limit the replay to this session; repeatable (memory-replay only)
@@ -125,7 +152,7 @@ where
 
     Ok(Parsed::Run(Cli {
         command,
-        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG)),
+        config: config.unwrap_or_else(default_config),
     }))
 }
 
@@ -142,10 +169,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_config_prefers_xdg_and_falls_back_to_home() {
+        use super::installed_config;
+        assert_eq!(
+            installed_config(Some("/xdg".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/xdg/arc/arc.toml"))
+        );
+        assert_eq!(
+            installed_config(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.config/arc/arc.toml"))
+        );
+        assert_eq!(
+            installed_config(Some("".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.config/arc/arc.toml")),
+            "an empty XDG_CONFIG_HOME is unset per the spec"
+        );
+        assert_eq!(installed_config(None, None), None);
+    }
+
+    #[test]
     fn no_arguments_runs_the_daemon_with_the_default_config() {
         let cli = ok(&["arcd"]);
         assert_eq!(cli.command, Command::Run);
-        assert_eq!(cli.config, PathBuf::from("data/arc.toml"));
+        assert_eq!(cli.config, super::default_config());
     }
 
     #[test]
@@ -205,7 +251,7 @@ mod tests {
     fn rebuild_parses() {
         let cli = ok(&["arcd", "rebuild"]);
         assert_eq!(cli.command, Command::Rebuild);
-        assert_eq!(cli.config, PathBuf::from("data/arc.toml"));
+        assert_eq!(cli.config, super::default_config());
 
         assert_eq!(
             ok(&["arcd", "--config", "/etc/arc.toml", "rebuild"]).config,
