@@ -2,7 +2,7 @@
 
 `DESIGN.md` defines the provider architecture: four roles, session pinning, and counsel as a tool. This file records the current model for each role, its cost, and when to change it. The principles and role definitions are durable; the rest is a dated snapshot. Update it when it no longer matches reality.
 
-**Status:** Current as of 2026-08-22. The target is under $50/month, down from a $100/month Claude subscription, without reducing capability where it matters.
+**Status:** Current as of 2026-08-28. The target is under $50/month, down from a $100/month Claude subscription, without reducing capability where it matters.
 
 ---
 
@@ -36,8 +36,8 @@ These roles are stable. The next section records the current model for each one.
 
 | Role | Filled by | Access | Est. monthly |
 | --- | --- | --- | --- |
-| **concierge** | Gemini 3.7 Flash | Direct API key | ~$10 |
-| **executor** | DeepSeek V4 Flash, via OpenCode Go | Go subscription | $10 (plan) |
+| **concierge** | Gemini 3.6 Flash, thinking `minimal` (see below — 3.7 lacks `minimal`) | Direct API key | ~$10 |
+| **executor** | OpenCode Go — `deepseek-v4-flash` default; `glm-5.3-flash` in live use since 2026-08-28 | Go subscription | $10 (plan) |
 | ↳ escalation | DeepSeek V4 Pro first; GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
 | **counsel** | Opus via `claude -p`, read-only tools, for both `plan` and `review`. Degrades to Sonnet only under budget pressure | Claude Pro | $20 |
 | **archivist** | Qwen3-8B Q4_K_M on the RTX 5070 | llama.cpp sidecar | $0 |
@@ -62,13 +62,32 @@ Five runs of one chat turn, output tokens: **3.6 on `minimal` gave 28–33**, 3.
 
 Thinking is billed and never streamed, so `completion_tokens` under-reports output by about five times. The real figure is `total_tokens - prompt_tokens`, and every estimate in this file predates that correction.
 
+### Measured, 2026-08-26 to 2026-08-28 (task 7.3)
+
+Per-turn usage became durable on 2026-08-27 (row 6.22), so these come from the projection, not estimates. Two days, one of them an unusual arena day (a deliberate 31-minute executor turn); treat as a first calibration, not a steady state.
+
+| Role | Turns | Input | Output | Latency avg / max |
+| --- | --- | --- | --- | --- |
+| executor (glm-5.3-flash, Go) | 28 | 13.4M | 211k | 244s / 1837s |
+| concierge (3.6 Flash, minimal) | 45 | 228k | 7.0k | 3.1s / 7.5s |
+| archivist (Qwen3-8B, local) | 34 calls on 08-28 | 24.3k | 214 | — (spans only; not session turns) |
+
+What the numbers settle:
+
+- **The 96%-cache-reads assumption held.** Executor steps log ~99% `cached_tokens` on Go; the 13.4M input is overwhelmingly cache reads. Cached share is in spans and journal, not the projection — 7.3's durable accounting covers totals only.
+- **The concierge is noise in the budget.** 228k input over two heavy days extrapolates to ~3.5M/month — at Gemini Flash rates, low single-digit dollars. Latency is flat (7.5s worst), which is the property voice needs.
+- **The executor's monthly shape:** two heavy development days produced ~13.4M in / 211k out. The 19M-output/month planning figure above looks high by an order of magnitude for output; input volume, not output, is the metered mass — and it is almost all cached. Go's own dashboard is the dollar authority; this table is the token truth.
+- **The archivist is free in practice as well as in principle** — the section 8 gates cut its work to titling plus rare extraction.
+
+Re-measure after a full production week on the installed service (7.2); the arena day inflates the executor's average.
+
 ### Why the executor uses DeepSeek
 
 Go meters dollars, so the cost leader completes the most work. The expected workload is roughly 19M output tokens a month:
 
 | Candidate | Character | Est. monthly against the workload |
 | --- | --- | --- |
-| **DeepSeek V4 Flash** | The cheaper of the two DeepSeek tiers and the current default. Its rates are not priced here yet. | **under Pro** — rewrite this row from traces |
+| **DeepSeek V4 Flash** | The cheaper of the two DeepSeek tiers and the configured default. | see the measured section — Go meters the subscription, so tokens are the honest unit |
 | DeepSeek V4 Pro | Cost leader among the frontier-class models by a wide margin. 80.6% SWE-bench Verified. MIT. First escalation. | ~$17–25 — fits inside the cap with room |
 | GLM-5.3 | Trained for long-horizon agentic tool use. 1M context. ~92 tok/s. | ~$35–45 — fits, tighter |
 | Kimi K3 | Highest intelligence index on the plan. Also a documented heavy token consumer, and 38 tok/s. | ~$70+ — exceeds the monthly cap |
