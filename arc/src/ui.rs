@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use arc_proto::v1::{JobInfo, SessionRole, job_info};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -80,21 +82,17 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let max_back = lines.len().saturating_sub(height);
     app.scroll_back = app.scroll_back.min(max_back);
 
-    if let Some(boundary) = app.visual_boundary() {
+    if let Some(boundary) = app.visual_boundary().or_else(|| app.search_block()) {
         bring_into_view(app, &bounds, boundary, lines.len(), height, max_back);
     }
 
     let end = lines.len() - app.scroll_back;
     let start = end.saturating_sub(height);
-    let selected = app.visual_range().and_then(|(lo, hi)| {
-        let from = bounds.get(lo)?.0;
-        let to = bounds.get(hi)?.1;
-        Some(from..to)
-    });
+    let selected = highlight_ranges(app, &bounds);
     // pad the top so a short transcript still sits on the bottom
     let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
     visible.extend((start..end).map(|i| {
-        if selected.as_ref().is_some_and(|r| r.contains(&i)) {
+        if selected.iter().any(|range| range.contains(&i)) {
             lines[i]
                 .clone()
                 .patch_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -125,6 +123,22 @@ fn bring_into_view(
     } else if block_start >= end {
         app.scroll_back = total.saturating_sub(block_start + 1).min(max_back);
     }
+}
+
+// line ranges rendered reversed: the visual selection, plus the current search match
+fn highlight_ranges(app: &App, bounds: &[(usize, usize)]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    if let Some((lo, hi)) = app.visual_range() {
+        if let (Some(&(from, _)), Some(&(_, to))) = (bounds.get(lo), bounds.get(hi)) {
+            ranges.push(from..to);
+        }
+    }
+    if let Some(block) = app.search_block() {
+        if let Some(&(from, to)) = bounds.get(block) {
+            ranges.push(from..to);
+        }
+    }
+    ranges
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, height: usize, scroll_back: usize) {
@@ -408,7 +422,7 @@ fn input_height(app: &App, frame: Rect) -> u16 {
         (":", &app.cmd)
     } else if steering {
         ("s> ", &app.input)
-    } else if filtering {
+    } else if filtering || app.searching {
         ("/", &app.input)
     } else {
         ("> ", &app.input)
@@ -431,7 +445,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
     } else if steering {
         ("s> ", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
-    } else if filtering {
+    } else if filtering || app.searching {
         ("/", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
         let style =
@@ -473,6 +487,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     if app.mode == Mode::Cmd
         || steering
         || filtering
+        || app.searching
         || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none() && !app.help)
     {
         let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
@@ -731,6 +746,7 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               scroll transcript",
             "ctrl-u ctrl-d     page up / down",
             "G gg              scroll to bottom / top",
+            "/ n N             search (n older, N newer)",
             "s ctrl-p          open the session picker",
             "y                 yank the last reply (V for a range)",
             "Y                 yank the whole conversation",
@@ -952,8 +968,116 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 #[cfg(test)]
 mod tests {
     use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    use super::{job_label, label, last_active, picker_label, strip_label, wrap_input};
+    use super::{draw, job_label, label, last_active, picker_label, strip_label, wrap_input};
+    use crate::app::{App, Block, Mode, Search};
+
+    /// Renders `app` into a 100×30 buffer and returns it, so tests can
+    /// read glyphs and styles off the terminal exactly as drawn.
+    fn rendered(app: &mut App) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn reversed(text: &str, buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let mut rows = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            let mut run = String::new();
+            for x in 0..buffer.area.width {
+                let cell = buffer.cell((x, y)).expect("cell");
+                if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
+                    run.push_str(cell.symbol());
+                } else if !run.is_empty() {
+                    row.push_str(run.trim());
+                    row.push(' ');
+                    run.clear();
+                }
+            }
+            if !run.is_empty() {
+                row.push_str(run.trim());
+            }
+            if !row.is_empty() {
+                rows.push(row.trim().to_owned());
+            }
+        }
+        rows.into_iter().filter(|row| row.contains(text)).collect()
+    }
+
+    fn search(app: &mut App, query: &str) {
+        app.on_key(key(KeyCode::Char('/')));
+        typed(app, query);
+        app.on_key(key(KeyCode::Enter));
+    }
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(crossterm::event::KeyCode::Char(c)));
+        }
+    }
+
+    fn conversation() -> App {
+        let mut app = App::new();
+        app.on_key(key(crossterm::event::KeyCode::Esc));
+        for text in [
+            "old message",
+            "needle here",
+            "newer message",
+            "needle again",
+        ] {
+            app.transcript.push(Block::You(text.to_owned()));
+        }
+        app
+    }
+
+    #[test]
+    fn a_confirmed_search_scrolls_to_and_highlights_exactly_one_block() {
+        let mut app = conversation();
+        for i in 0..60 {
+            app.transcript.push(Block::You(format!("filler {i}")));
+        }
+        app.scroll_back = 0; // parked at the bottom, the match sits far above
+        search(&mut app, "needle here");
+        assert_eq!(app.search_block(), Some(1));
+
+        let buffer = rendered(&mut app);
+        assert!(app.scroll_back > 0, "the view followed the match");
+        assert_eq!(
+            reversed("needle", &buffer),
+            vec!["needle here"],
+            "exactly the match renders reversed"
+        );
+    }
+
+    #[test]
+    fn a_visual_selection_and_a_search_never_highlight_together() {
+        let mut app = conversation();
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.mode, Mode::Visual, "V selects the last block");
+
+        let buffer = rendered(&mut app);
+        assert_eq!(reversed("needle again", &buffer).len(), 1);
+        assert!(reversed("needle here", &buffer).is_empty());
+
+        app.mode = Mode::Normal;
+        app.search = Some(Search {
+            matches: vec![1],
+            current: 0,
+        });
+
+        let buffer = rendered(&mut app);
+        assert_eq!(reversed("needle here", &buffer).len(), 1);
+        assert!(reversed("needle again", &buffer).is_empty());
+    }
 
     fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
         SessionInfo {

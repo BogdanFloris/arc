@@ -126,6 +126,14 @@ pub struct Jobs {
     pub confirmation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    /// Matching block indices, newest first, so index 0 is match 1.
+    pub matches: Vec<usize>,
+    /// Where the view sits in `matches`.
+    pub current: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     You(String),
@@ -194,6 +202,9 @@ pub struct App {
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
     pub help: bool,
+    pub search: Option<Search>,
+    /// True while the input line is owned by the search prompt.
+    pub searching: bool,
     pub status: Status,
     pub last_error: Option<String>,
     pub yank_note: Option<String>,
@@ -209,6 +220,7 @@ pub struct App {
     steer_stash: Option<String>,
     previous_session: Option<String>,
     picker_filter_stash: Option<String>,
+    search_stash: Option<String>,
     /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
     /// The transcript index visual mode never moves: where `V` was pressed.
@@ -240,6 +252,8 @@ impl App {
             review: None,
             jobs: None,
             help: false,
+            search: None,
+            searching: false,
             status: Status::Idle,
             last_error: None,
             yank_note: None,
@@ -254,6 +268,7 @@ impl App {
             steer_stash: None,
             previous_session: None,
             picker_filter_stash: None,
+            search_stash: None,
             steer_turn_pending: false,
             visual_anchor: 0,
             visual_boundary: 0,
@@ -319,6 +334,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.on_picker_key(key.code);
+        }
+        if self.searching {
+            return self.on_search_key(key.code);
         }
         match self.mode {
             Mode::Insert => self.on_insert(key.code),
@@ -405,6 +423,7 @@ impl App {
             return None;
         }
         match code {
+            KeyCode::Esc if self.search.is_some() => self.search = None,
             KeyCode::Enter => return self.submit(),
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {
@@ -438,6 +457,9 @@ impl App {
             KeyCode::Char('j') => self.scroll_back = self.scroll_back.saturating_sub(1),
             KeyCode::Char('k') => self.scroll_back = self.scroll_back.saturating_add(1),
             KeyCode::Char('G') => self.scroll_back = 0,
+            KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('n') => self.search_next(true),
+            KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('s') => self.open_picker(),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
@@ -538,6 +560,83 @@ impl App {
             self.yank_note = Some("nothing to yank".to_owned());
             None
         }
+    }
+
+    fn start_search(&mut self) {
+        self.search_stash = Some(std::mem::take(&mut self.input));
+        self.cursor = 0;
+        self.searching = true;
+    }
+
+    fn on_search_key(&mut self, code: KeyCode) -> Option<Command> {
+        match code {
+            KeyCode::Esc => self.cancel_search(),
+            KeyCode::Enter => return self.confirm_search(),
+            _ => self.edit_input(code),
+        }
+        None
+    }
+
+    fn cancel_search(&mut self) {
+        self.searching = false;
+        self.input = self.search_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+    }
+
+    fn confirm_search(&mut self) -> Option<Command> {
+        self.searching = false;
+        let query = std::mem::take(&mut self.input);
+        self.input = self.search_stash.take().unwrap_or_default();
+        self.cursor = self.input.len();
+        let matches = self.search_matches(&query);
+        if matches.is_empty() {
+            self.search = None;
+            self.yank_note = Some("no match".to_owned());
+            return None;
+        }
+        self.yank_note = Some(format!("match 1/{}", matches.len()));
+        self.search = Some(Search {
+            matches,
+            current: 0,
+        });
+        None
+    }
+
+    // the yank text is the searchable surface: chrome never matches
+    fn search_matches(&self, query: &str) -> Vec<usize> {
+        let needle = query.to_lowercase();
+        self.transcript
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, block)| {
+                block_yank_text(block).is_some_and(|text| text.to_lowercase().contains(&needle))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn search_next(&mut self, older: bool) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.current = if older {
+            (search.current + 1).min(search.matches.len() - 1)
+        } else {
+            search.current.saturating_sub(1)
+        };
+        self.yank_note = Some(format!(
+            "match {}/{}",
+            search.current + 1,
+            search.matches.len()
+        ));
+    }
+
+    /// The block the confirmed search sits on, if it still exists.
+    pub fn search_block(&self) -> Option<usize> {
+        let search = self.search.as_ref()?;
+        let block = *search.matches.get(search.current)?;
+        (block < self.transcript.len()).then_some(block)
     }
 
     fn on_cmd(&mut self, code: KeyCode) -> Option<Command> {
@@ -966,6 +1065,7 @@ impl App {
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
         self.scroll_back = 0;
+        self.search = None;
         self.last_error = None;
         self.refetch_in_flight = false;
         let session_id = session_id?;
@@ -1036,6 +1136,7 @@ impl App {
                     self.transcript = rebuilt;
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
+                    self.search = None;
                     if self.mode == Mode::Visual && !appended_only {
                         self.mode = Mode::Normal;
                     }
@@ -4357,5 +4458,220 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
         assert_ne!(app.mode, Mode::Visual);
+    }
+
+    fn search(app: &mut App, query: &str) {
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.on_key(key(KeyCode::Char('/'))), None);
+        typed(app, query);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+    }
+
+    fn normal_app() -> App {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app
+    }
+
+    #[test]
+    fn slash_opens_the_search_prompt_and_esc_restores_the_draft() {
+        let mut app = conversation();
+        normal(&mut app, "i");
+        typed(&mut app, "a draft");
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.searching, "the prompt owns the input line");
+        assert_eq!(app.input, "", "the draft is stashed");
+        assert_eq!(app.cursor, 0, "the query starts empty");
+        assert!(app.search.is_none(), "only a confirm starts a search");
+
+        typed(&mut app, "needle");
+        assert_eq!(app.input, "needle", "typing edits the query");
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.searching);
+        assert_eq!(app.input, "a draft", "the draft is restored");
+        assert_eq!(app.cursor, "a draft".len());
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn a_confirmed_search_starts_on_the_newest_match() {
+        let mut app = conversation();
+        search(&mut app, "question");
+
+        assert!(!app.searching);
+        let found = app.search.as_ref().expect("confirmed");
+        assert_eq!(found.matches, vec![4, 0], "newest first");
+        assert_eq!(found.current, 0);
+        assert_eq!(app.search_block(), Some(4));
+        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
+    }
+
+    #[test]
+    fn n_and_n_walk_older_and_newer_and_stop_at_the_ends() {
+        let mut app = normal_app();
+        for i in 0..3 {
+            app.transcript.push(Block::You(format!("needle {i}")));
+        }
+        search(&mut app, "needle");
+        assert_eq!(app.search_block(), Some(2), "1 is the newest");
+
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_block(), Some(1));
+        assert_eq!(app.yank_note.as_deref(), Some("match 2/3"));
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_block(), Some(0), "the oldest block");
+        assert_eq!(app.yank_note.as_deref(), Some("match 3/3"));
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_block(), Some(0), "the oldest stops the walk");
+
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search_block(), Some(1));
+        assert_eq!(app.yank_note.as_deref(), Some("match 2/3"));
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search_block(), Some(2));
+        assert_eq!(app.yank_note.as_deref(), Some("match 1/3"));
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search_block(), Some(2), "the newest stops the walk");
+    }
+
+    #[test]
+    fn n_and_n_do_nothing_without_a_confirmed_search() {
+        let mut app = conversation();
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Char('N')));
+        assert!(app.search.is_none());
+        assert_eq!(app.yank_note, None);
+    }
+
+    #[test]
+    fn chrome_never_matches() {
+        let mut app = normal_app();
+        app.transcript = vec![
+            Block::Thought {
+                text: "secret trace words".to_owned(),
+                seconds: 3,
+                done: true,
+                open: true,
+            },
+            Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: "secret.sh".to_owned(),
+                outcome: Some("ok"),
+            },
+            Block::Cost {
+                input_tokens: 1,
+                output_tokens: 2,
+                seconds: 1.0,
+            },
+            Block::Note("secret note".to_owned()),
+            Block::Fault {
+                code: "boom".to_owned(),
+                msg: "secret failure".to_owned(),
+            },
+            Block::Handback {
+                subject: "Job 1234 finished.".to_owned(),
+                body: "secret handback".to_owned(),
+                open: true,
+            },
+            Block::You("plain words".to_owned()),
+        ];
+        search(&mut app, "secret");
+
+        assert!(app.search.is_none());
+        assert_eq!(app.yank_note.as_deref(), Some("no match"));
+    }
+
+    #[test]
+    fn a_no_match_search_leaves_the_view_alone() {
+        let mut app = conversation();
+        app.scroll_back = 3;
+        let transcript = app.transcript.clone();
+
+        search(&mut app, "absent everywhere");
+
+        assert!(app.search.is_none());
+        assert_eq!(app.scroll_back, 3, "the view stays put");
+        assert_eq!(app.transcript, transcript);
+        assert_eq!(app.yank_note.as_deref(), Some("no match"));
+    }
+
+    #[test]
+    fn esc_in_normal_mode_clears_the_search() {
+        let mut app = conversation();
+        search(&mut app, "question");
+        assert!(app.search.is_some());
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.search.is_none());
+        assert_eq!(app.search_block(), None);
+    }
+
+    #[test]
+    fn a_new_search_replaces_the_old_one() {
+        let mut app = conversation();
+        search(&mut app, "question");
+        search(&mut app, "answer");
+
+        let found = app.search.as_ref().expect("replaced");
+        assert_eq!(found.matches, vec![5, 1]);
+        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
+    }
+
+    #[test]
+    fn a_history_rebuild_drops_the_search() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        let entries = vec![prose_entry(Role::User as i32, "find the needle", false)];
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: entries.clone(),
+        });
+        search(&mut app, "needle");
+        assert!(app.search.is_some());
+
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries,
+        });
+        assert!(app.search.is_none(), "even an append-only rebuild drops it");
+    }
+
+    #[test]
+    fn opening_another_session_drops_the_search() {
+        let mut app = conversation();
+        search(&mut app, "question");
+
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn search_keys_keep_their_meaning_in_insert_mode() {
+        let mut app = App::new();
+        typed(&mut app, "/nN");
+
+        assert_eq!(app.input, "/nN", "they type into the message");
+        assert!(!app.searching);
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn slash_in_the_picker_still_starts_the_filter() {
+        let mut app = conversation();
+        search(&mut app, "question");
+        app.on_key(key(KeyCode::Char('s')));
+
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(
+            app.picker.as_ref().expect("picker is open").filtering,
+            "the picker filter, not the search prompt"
+        );
+        assert!(!app.searching);
+        assert!(app.search.is_some(), "the confirmed search survives");
     }
 }
