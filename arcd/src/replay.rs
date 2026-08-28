@@ -8,6 +8,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::dirs::DataDirs;
+use crate::identity;
 use crate::llama::Sidecar;
 use crate::roles::Roles;
 
@@ -23,6 +24,7 @@ pub async fn run(
         versions.push(resolve(against)?);
     }
     let timeout = Duration::from_secs(config.consolidation.timeout_seconds);
+    let identity = identity::load(dirs.identity()).context("loading the identity file")?;
 
     // replaying extraction is archivist work, so it runs on the archivist's model
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
@@ -45,6 +47,7 @@ pub async fn run(
         dirs.log(),
         &versions,
         sessions,
+        identity.as_deref(),
     )
     .await;
     if let Some(sidecar) = sidecar {

@@ -39,6 +39,7 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     } else {
         info!("no identity file, running without one");
     }
+    let identity_for_consolidation = identity.clone();
     let secrets = Secrets::new(dirs.secrets());
     let roles = match Roles::resolve(&config, sidecar.endpoint(), &secrets, identity) {
         Ok(roles) => roles,
@@ -47,7 +48,7 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
             return Err(error);
         }
     };
-    let served = match Daemon::start(config, dirs, roles) {
+    let served = match Daemon::start(config, dirs, roles, identity_for_consolidation) {
         Ok(daemon) => daemon.serve().await,
         Err(error) => Err(error),
     };
@@ -70,11 +71,18 @@ pub struct Daemon {
     roles: Roles,
 
     notifier: broadcast::Sender<Notification>,
+
+    identity: Option<String>,
 }
 
 impl Daemon {
     #[tracing::instrument(name = "daemon.start", skip_all, fields(data_dir = %dirs.root().display()))]
-    pub fn start(config: Config, dirs: DataDirs, roles: Roles) -> Result<Self> {
+    pub fn start(
+        config: Config,
+        dirs: DataDirs,
+        roles: Roles,
+        identity: Option<String>,
+    ) -> Result<Self> {
         dirs.create()
             .with_context(|| format!("preparing {}", dirs.root().display()))?;
 
@@ -156,6 +164,7 @@ impl Daemon {
             reads,
             roles,
             notifier,
+            identity,
         })
     }
 
@@ -186,6 +195,7 @@ impl Daemon {
             self.config.consolidation,
             self.roles.archivist(),
             Arc::clone(&self.engine),
+            self.identity.clone(),
         );
 
         let job_runners = BTreeMap::from([
@@ -234,6 +244,7 @@ fn consolidation_task(
     config: ConsolidationConfig,
     archivist: &Runner,
     engine: Arc<Engine>,
+    identity: Option<String>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
         info!("consolidation disabled");
@@ -245,6 +256,7 @@ fn consolidation_task(
         &archivist.model,
         archivist.thinking,
         Duration::from_secs(config.timeout_seconds),
+        identity,
     );
     info!(
         idle_seconds = config.idle_seconds,
@@ -531,7 +543,7 @@ mod tests {
         .expect("age the version");
         drop(conn);
 
-        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles())
+        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles(), None)
             .expect("start over a stale index");
 
         let sessions = daemon.engine.sessions().expect("sessions");
@@ -543,13 +555,15 @@ mod tests {
     async fn the_consolidation_tick_only_runs_when_enabled() {
         let temp = TempDir::new().expect("temp dir");
         let dirs = DataDirs::new(&temp.path().join("data"));
-        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles()).expect("start");
+        let daemon =
+            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
 
         assert!(
             consolidation_task(
                 Config::default().consolidation,
                 daemon.roles.archivist(),
                 Arc::clone(&daemon.engine),
+                None,
             )
             .is_none(),
             "disabled by default: no task, so a tick can do nothing"
@@ -564,6 +578,7 @@ mod tests {
             enabled,
             daemon.roles.archivist(),
             Arc::clone(&daemon.engine),
+            None,
         )
         .expect("enabled spawns the tick");
         task.abort();
@@ -633,7 +648,8 @@ mod tests {
         seed_idle_session(&mut log, "s-a", 1_000_000);
         seed_idle_session(&mut log, "s-b", 2_000_000);
         drop(log);
-        let daemon = Daemon::start(Config::default(), dirs, unreachable_roles()).expect("start");
+        let daemon =
+            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
 
         let extractor = AlwaysFailing(std::sync::Mutex::new(Vec::new()));
         let mut strikes = Strikes::default();
@@ -687,7 +703,7 @@ mod tests {
         );
         let dirs = DataDirs::new(&temp.path().join("data"));
         let log_dir = dirs.log().to_path_buf();
-        let daemon = Daemon::start(config, dirs, unreachable_roles()).expect("start");
+        let daemon = Daemon::start(config, dirs, unreachable_roles(), None).expect("start");
 
         let session_id = daemon
             .engine

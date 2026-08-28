@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,19 @@ const TRANSCRIPT_BUDGET: usize = 24_000;
 
 const TOOL_SNIPPET: usize = 200;
 
+const RECALLED_MARKER: &str = "\u{ab} [recalled — not extraction input]";
+
+/// Tool results the extractor must not re-learn from: the model already
+/// fetched this content from memory or the archive during the session.
+const RECALL_TOOLS: &[&str] = &[
+    "memory_read",
+    "memory_search",
+    "memory_write",
+    "memory_supersede",
+    "sessions_search",
+    "session_read",
+];
+
 pub const TITLE_PROMPT: &str = "Write a short title for this conversation. \
 At most six words, plain words, no quotes, no trailing punctuation. \
 Reply with the title only.";
@@ -72,6 +86,7 @@ pub struct ModelExtractor {
     timeout: Duration,
     prompt: String,
     seed: Option<u64>,
+    identity: Option<String>,
 }
 
 impl ModelExtractor {
@@ -80,6 +95,7 @@ impl ModelExtractor {
         model: &str,
         thinking: Thinking,
         timeout: Duration,
+        identity: Option<String>,
     ) -> Self {
         Self {
             provider,
@@ -88,6 +104,7 @@ impl ModelExtractor {
             timeout,
             prompt: PROMPT_V1.to_owned(),
             seed: None,
+            identity,
         }
     }
 
@@ -97,6 +114,7 @@ impl ModelExtractor {
         timeout: Duration,
         prompt: &str,
         seed: u64,
+        identity: Option<String>,
     ) -> Self {
         Self {
             provider,
@@ -105,6 +123,7 @@ impl ModelExtractor {
             timeout,
             prompt: prompt.to_owned(),
             seed: Some(seed),
+            identity,
         }
     }
 }
@@ -178,7 +197,7 @@ impl Extractor for ModelExtractor {
             system: Some(self.prompt.clone()),
             messages: vec![Message::Text {
                 role: Role::User,
-                content: render_input(session),
+                content: render_input(session, self.identity.as_deref()),
                 reasoning: None,
             }],
             tools: Vec::new(),
@@ -278,8 +297,16 @@ fn sanitize_title(text: &str) -> Option<String> {
     Some(cap_chars(trimmed, TITLE_OUTPUT_CAP))
 }
 
-fn render_input(session: &SessionSnapshot) -> String {
-    let lines: Vec<String> = session.rows.iter().map(render_row).collect();
+fn render_input(session: &SessionSnapshot, identity: Option<&str>) -> String {
+    let mut calls: HashMap<&str, &str> = HashMap::new();
+    let mut lines = Vec::with_capacity(session.rows.len());
+    for row in &session.rows {
+        if let MessageRow::ToolCall { call_id, name, .. } = row {
+            calls.insert(call_id.as_str(), name.as_str());
+        }
+        lines.push(render_row(row, &calls));
+    }
+    let known = identity.unwrap_or("(none)");
     let index = if session.memory_index.is_empty() {
         "(none yet)".to_owned()
     } else {
@@ -291,12 +318,13 @@ fn render_input(session: &SessionSnapshot) -> String {
             .join("\n")
     };
     format!(
-        "[Session transcript]\n{}\n\n[Existing memory records]\n{index}",
+        "[Session transcript]\n{}\n\n[Already known — never extract]\n{known}\n\n\
+         [Existing memory records]\n{index}",
         windowed(&lines)
     )
 }
 
-fn render_row(row: &MessageRow) -> String {
+fn render_row(row: &MessageRow, calls: &HashMap<&str, &str>) -> String {
     match row {
         MessageRow::Message { role, content, .. } => {
             format!("{}: {content}", role_name(*role))
@@ -306,7 +334,18 @@ fn render_row(row: &MessageRow) -> String {
             arguments_json,
             ..
         } => format!("\u{bb} {name}({})", snippet(arguments_json)),
-        MessageRow::ToolResult { content, .. } => format!("\u{ab} {}", snippet(content)),
+        MessageRow::ToolResult {
+            call_id, content, ..
+        } => {
+            let recalled = calls
+                .get(call_id.as_str())
+                .is_some_and(|name| RECALL_TOOLS.contains(name));
+            if recalled {
+                RECALLED_MARKER.to_owned()
+            } else {
+                format!("\u{ab} {}", snippet(content))
+            }
+        }
     }
 }
 
@@ -541,6 +580,7 @@ mod tests {
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(5),
+            None,
         );
         extractor.extract(&snapshot(index)).await
     }
@@ -570,6 +610,7 @@ mod tests {
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(300),
+            None,
         );
         let outcome = run_pass(
             &engine,
@@ -622,6 +663,8 @@ mod tests {
             "[Session transcript]\n\
              user: remember: keep replies short\n\
              assistant: noted\n\n\
+             [Already known — never extract]\n\
+             (none)\n\n\
              [Existing memory records]\n\
              (none yet)"
         );
@@ -717,6 +760,7 @@ mod tests {
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(300),
+            None,
         );
         let outcome = run_pass(
             &engine,
@@ -774,6 +818,7 @@ mod tests {
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(300),
+            None,
         );
         let outcome = run_pass(
             &engine,
@@ -954,6 +999,7 @@ mod tests {
             "test-model",
             Thinking::Minimal,
             Duration::from_millis(10),
+            None,
         );
         let err = extractor
             .extract(&snapshot(Vec::new()))
@@ -979,7 +1025,7 @@ mod tests {
             MessageRow::ToolCall {
                 call_id: "c1".to_owned(),
                 call_index: 0,
-                name: "memory_search".to_owned(),
+                name: "bash".to_owned(),
                 arguments_json: r#"{"query":"palette"}"#.to_owned(),
                 turn_id: "t".to_owned(),
                 provider_roundtrip: Vec::new(),
@@ -992,13 +1038,13 @@ mod tests {
                 turn_id: "t".to_owned(),
             },
         ];
-        let input = render_input(&snapshot);
+        let input = render_input(&snapshot, None);
         assert!(
             input.contains("user: line one\nline two"),
             "prose stays verbatim: {input}"
         );
         assert!(
-            input.contains("\u{bb} memory_search({\"query\":\"palette\"})"),
+            input.contains("\u{bb} bash({\"query\":\"palette\"})"),
             "{input}"
         );
         let result_line = input
@@ -1011,6 +1057,70 @@ mod tests {
             "{result_line}"
         );
         assert!(!result_line.contains("row\nx"), "newlines flattened");
+    }
+
+    #[tokio::test]
+    async fn a_recalled_memory_result_is_elided_but_a_bash_result_is_not() {
+        let mut snapshot = snapshot(Vec::new());
+        snapshot.rows = vec![
+            MessageRow::ToolCall {
+                call_id: "c1".to_owned(),
+                call_index: 0,
+                name: "memory_search".to_owned(),
+                arguments_json: r#"{"query":"palette"}"#.to_owned(),
+                turn_id: "t".to_owned(),
+                provider_roundtrip: Vec::new(),
+            },
+            MessageRow::ToolResult {
+                call_id: "c1".to_owned(),
+                outcome: 1,
+                content: "mr-1: User prefers dark mode".to_owned(),
+                truncated: false,
+                turn_id: "t".to_owned(),
+            },
+            MessageRow::ToolCall {
+                call_id: "c2".to_owned(),
+                call_index: 1,
+                name: "bash".to_owned(),
+                arguments_json: r#"{"cmd":"ls"}"#.to_owned(),
+                turn_id: "t".to_owned(),
+                provider_roundtrip: Vec::new(),
+            },
+            MessageRow::ToolResult {
+                call_id: "c2".to_owned(),
+                outcome: 1,
+                content: "Cargo.toml\nsrc".to_owned(),
+                truncated: false,
+                turn_id: "t".to_owned(),
+            },
+        ];
+        let input = render_input(&snapshot, None);
+        assert!(
+            input.contains("\u{bb} memory_search({\"query\":\"palette\"})"),
+            "the call line stays: {input}"
+        );
+        assert!(
+            input.contains("\u{ab} [recalled \u{2014} not extraction input]"),
+            "{input}"
+        );
+        assert!(
+            !input.contains("User prefers dark mode"),
+            "recalled content must not reach the extractor: {input}"
+        );
+        assert!(
+            input.contains("\u{ab} Cargo.toml src"),
+            "an unrelated tool's result still renders: {input}"
+        );
+    }
+
+    #[test]
+    fn identity_renders_in_the_already_known_section_or_none_absent() {
+        let snapshot = snapshot(Vec::new());
+        assert!(
+            render_input(&snapshot, Some("The user is named Bogdan."))
+                .contains("[Already known — never extract]\nThe user is named Bogdan."),
+        );
+        assert!(render_input(&snapshot, None).contains("[Already known — never extract]\n(none)"),);
     }
 
     #[test]

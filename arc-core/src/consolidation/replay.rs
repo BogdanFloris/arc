@@ -80,6 +80,7 @@ pub async fn run(
     log_dir: &Path,
     versions: &[(&str, &str)],
     session_filter: &[String],
+    identity: Option<&str>,
 ) -> Result<Vec<ReplayReport>, ReplayError> {
     let mut events = Vec::new();
     for item in LogReader::new(discover_segments(log_dir)?) {
@@ -96,6 +97,7 @@ pub async fn run(
                 version,
                 prompt,
                 session_filter,
+                identity,
             )
             .await?,
         );
@@ -120,6 +122,7 @@ async fn run_version(
     version: &str,
     prompt: &str,
     session_filter: &[String],
+    identity: Option<&str>,
 ) -> Result<ReplayReport, ReplayError> {
     let mut projection = Projection::in_memory()?;
     let mut session_order = Vec::new();
@@ -173,6 +176,7 @@ async fn run_version(
             timeout,
             prompt,
             session_seed(&session_id),
+            identity.map(str::to_owned),
         );
         let extracted =
             extractor
@@ -416,6 +420,7 @@ mod tests {
             dir.path(),
             &[("va", "PROMPT A"), ("vb", "PROMPT B")],
             &[],
+            Some("The user is named Bogdan."),
         )
         .await
         .expect("replay");
@@ -465,6 +470,14 @@ mod tests {
         );
         for index in 0..4 {
             assert!(
+                content(index)
+                    .contains("[Already known \u{2014} never extract]\nThe user is named Bogdan."),
+                "every session sees the identity: {}",
+                content(index)
+            );
+        }
+        for index in 0..4 {
+            assert!(
                 !content(index).contains("Stale live record"),
                 "the live pass's output must be excluded: {}",
                 content(index)
@@ -509,13 +522,22 @@ mod tests {
             dir.path(),
             &[("va", "PROMPT A")],
             &["s-2".to_owned()],
+            None,
         )
         .await
         .expect("replay");
 
         assert_eq!(reports[0].sessions.len(), 1);
         assert_eq!(reports[0].sessions[0].session_id, "s-2");
-        assert_eq!(provider.requests().len(), 1, "one session, one extraction");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "one session, one extraction");
+        let [Message::Text { content, .. }] = requests[0].messages.as_slice() else {
+            panic!("expected one user message");
+        };
+        assert!(
+            content.contains("[Already known \u{2014} never extract]\n(none)"),
+            "no identity given: {content}"
+        );
     }
 
     #[tokio::test]
@@ -539,6 +561,7 @@ mod tests {
             dir.path(),
             &[("va", "PROMPT A")],
             &[],
+            None,
         )
         .await
         .expect("replay");
