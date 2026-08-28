@@ -175,6 +175,9 @@ message StreamEnd {
   uint32 input_tokens = 2;
   uint32 output_tokens = 3;
   bool partial = 4;
+  // the turn used every tool step its role allows and was forced to stop;
+  // the reply narrates in-progress work, not a finished answer
+  bool step_capped = 5;
 }
 
 message Error {
