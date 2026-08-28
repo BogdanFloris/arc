@@ -363,6 +363,10 @@ impl App {
             KeyCode::Char('t') if self.status != Status::Streaming => {
                 return self.back_session();
             }
+            KeyCode::Char('n') if self.searching => self.search_live_step(true),
+            KeyCode::Char('p') if self.searching => self.search_live_step(false),
+            KeyCode::Char('n') if self.picker.is_some() => self.move_picker_selection(false),
+            KeyCode::Char('p') if self.picker.is_some() => self.move_picker_selection(true),
             KeyCode::Char('p') => self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
@@ -596,6 +600,16 @@ impl App {
         let query = std::mem::take(&mut self.input);
         self.input = self.search_stash.take().unwrap_or_default();
         self.cursor = self.input.len();
+        if let Some(search) = &self.search {
+            if search.query == query {
+                self.yank_note = Some(format!(
+                    "match {}/{}",
+                    search.current + 1,
+                    search.matches.len()
+                ));
+                return None;
+            }
+        }
         let matches = self.search_matches(&query);
         if matches.is_empty() {
             self.search = None;
@@ -612,6 +626,32 @@ impl App {
     }
 
     // the yank text is the searchable surface: chrome never matches
+    /// Steps matches of the still-open prompt's query: the first press
+    /// lands on the newest match, later ones walk; an edited query recomputes.
+    fn search_live_step(&mut self, older: bool) {
+        let query = self.input.clone();
+        if query.is_empty() {
+            return;
+        }
+        let stale = self.search.as_ref().is_none_or(|s| s.query != query);
+        if stale {
+            let matches = self.search_matches(&query);
+            if matches.is_empty() {
+                self.search = None;
+                self.yank_note = Some("no match".to_owned());
+                return;
+            }
+            self.yank_note = Some(format!("match 1/{}", matches.len()));
+            self.search = Some(Search {
+                query,
+                matches,
+                current: 0,
+            });
+            return;
+        }
+        self.search_next(older);
+    }
+
     fn search_matches(&self, query: &str) -> Vec<usize> {
         let needle = query.to_lowercase();
         self.transcript
@@ -4729,6 +4769,62 @@ mod tests {
         assert_eq!(app.scroll_back, 3, "the view stays put");
         assert_eq!(app.transcript, transcript);
         assert_eq!(app.yank_note.as_deref(), Some("no match"));
+    }
+
+    #[test]
+    fn ctrl_n_steps_matches_live_while_the_prompt_is_open() {
+        let mut app = conversation();
+        normal(&mut app, "/");
+        typed(&mut app, "question");
+
+        app.on_key(ctrl('n'));
+        assert!(app.searching, "the prompt stays open");
+        assert_eq!(app.search_block(), Some(4), "first press lands newest");
+        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
+
+        app.on_key(ctrl('n'));
+        assert_eq!(app.search_block(), Some(0));
+        assert_eq!(app.yank_note.as_deref(), Some("match 2/2"));
+        app.on_key(ctrl('p'));
+        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
+
+        let command = app.on_key(key(KeyCode::Enter));
+        assert_eq!(command, None);
+        assert!(!app.searching);
+        assert_eq!(
+            app.yank_note.as_deref(),
+            Some("match 1/2"),
+            "enter keeps the stepped position"
+        );
+    }
+
+    #[test]
+    fn an_edited_query_recomputes_on_the_next_live_step() {
+        let mut app = conversation();
+        normal(&mut app, "/");
+        typed(&mut app, "question");
+        app.on_key(ctrl('n'));
+        app.on_key(ctrl('n'));
+        assert_eq!(app.yank_note.as_deref(), Some("match 2/2"));
+
+        typed(&mut app, "zzz");
+        app.on_key(ctrl('n'));
+        assert_eq!(app.yank_note.as_deref(), Some("no match"));
+        assert_eq!(app.search_block(), None);
+    }
+
+    #[test]
+    fn ctrl_n_and_p_navigate_the_picker_instead_of_leaving_it() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session("a"), session("b")]));
+        app.on_key(ctrl('p'));
+        let before = app.picker.as_ref().expect("open").selected;
+        app.on_key(ctrl('n'));
+        assert!(app.picker.is_some(), "ctrl-n stays in the picker");
+        assert_eq!(app.picker.as_ref().expect("open").selected, before + 1);
+        app.on_key(ctrl('p'));
+        assert!(app.picker.is_some(), "ctrl-p navigates, not reopens");
+        assert_eq!(app.picker.as_ref().expect("open").selected, before);
     }
 
     #[test]

@@ -760,6 +760,7 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-u ctrl-d     page up / down",
             "G gg              scroll to bottom / top",
             "/ n N             search (n older, N newer)",
+            "ctrl-n ctrl-p     step matches while the / prompt is open",
             "s ctrl-p          open the session picker",
             "y                 yank the last reply (V for a range)",
             "Y                 yank the whole conversation",
