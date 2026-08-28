@@ -250,16 +250,22 @@ Next session: a deliberate test drive — Claude driving the TUI in tmux, puttin
 
 Three dispatch cycles through the TUI, watching the daemon from the journal and the projection. What worked: grounding (3/3 to `arc`), supervisor queueing under every poke burst, the handback as a dim system block, clean narration turns, the live strip with token counts, `:jobs` with 6.17's aging, `Enter` into a child and `Ctrl-t` back, elided tool lines making a child transcript readable. What failed went into rows 6.19 (widened: pokes fire at dispatch, multiply cost, and displace real `continue_job` use) and the new 6.21–6.24. One executor overstatement worth remembering when writing the identity.md guidance: a handback claimed a rule was "triplicated across format.rs, writer.rs, and dir.rs" when writer.rs never had it — the child's own transcript said three call layers, the summary garbled it into three files. Verify handbacks against the diff, not the prose.
 
+## State at the end of 2026-08-28
+
+One day, sections 7 through 9 opened and closed — roughly fifty commits. The morning was memory: the flood diagnosed from the log's own evidence, the field surveyed, and the pipeline rebuilt behind gates (role filter, known context, prompt v2 then v3, forced-choice dedup, required namespaces), then proven by canary and turned back on. The afternoon opened the direct door: `:code`, the mode label, the picker told the truth about sources, and the arena ran the same task through pi and ARC on the same model — parity, with the diffs converging on the same design. The evening installed it: rebuild proof run against the six-day log hours before that log was retired at Bogdan's call, state moved to XDG paths, keys out of every grantable root, `arc` a command, the unit enabled. The daemon now runs a fresh log whose first entries are the concierge introducing itself and the review queue catching its first organically wordy memory — which is the queue working.
+
+Standing watches, not tasks: whether the continue-vs-dispatch and cancelled-stays-stopped words keep holding; whether inline memory writes keep the scope they are stated at (words round two landed 2026-08-28 night; the next judgment miss triggers the 3.7-low concierge trial, not more words); 8.7's week of dedup and review numbers; 9.9's edit-tool friction. The phase gate that remains is the exit criterion itself: a week of real development through ARC, which by definition began tonight.
+
 ## Exit criteria
 
 Verify these live, not only in the test suite:
 
-- [ ] A week of real development on ARC done through ARC, not through another harness.
-- [ ] `arcd rebuild` reproduces live state from the log.
-- [ ] A job runs to completion while the conversation stays responsive, and reports back.
-- [ ] A call to a tool the session does not hold reaches the model as an error it acts on, and the declared sources survive a restart.
-- [ ] The TUI can refresh a running job's status and shows its final handback.
-- [ ] Measured token use and latency are visible by role in traces.
+- [ ] A week of real development on ARC done through ARC, not through another harness. *The clock started 2026-08-28 with the installed service and the fresh log; 6.27 and the 4.7 closure were developed through ARC already.*
+- [x] `arcd rebuild` reproduces live state from the log. *Proven 2026-08-28 against the real six-day log: four tables byte-identical, run twice.*
+- [x] A job runs to completion while the conversation stays responsive, and reports back. *Live daily since 2026-08-26; chains, steers, and cancels included.*
+- [x] A call to a tool the session does not hold reaches the model as an error it acts on, and the declared sources survive a restart. *Live: an analyze job's read-only refusal drove the concierge to redispatch implement (9.2's incident); sources and grants replayed across many restarts.*
+- [x] The TUI can refresh a running job's status and shows its final handback. *Live since 6.1/6.4; the strip now names the running command.*
+- [x] Measured token use and latency are visible by role in traces. *7.3: spans carry role and tokens; providers.md holds the measured table.*
 
 ## Not in this phase
 
