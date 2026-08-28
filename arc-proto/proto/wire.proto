@@ -18,9 +18,12 @@ message SessionInfo {
   google.protobuf.Timestamp last_at = 5;
   SessionRole role = 6;
   string project = 7;
-  // the session that dispatched it; empty for a root conversation, which
-  // is what the picker's conversation/job split keys on
+  // the session that dispatched it; empty for a root conversation
   string dispatched_by = 8;
+  // who created the session: USER is a conversation (TUI or :code), MODEL
+  // a dispatched job — the picker's split, correct for all history where
+  // dispatched_by is only recorded from 6.34 on
+  Source source = 9;
 }
 
 message ListSessions {}
