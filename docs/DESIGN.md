@@ -324,6 +324,8 @@ Storage is the easy half. Deciding what to remember is the hard half. v1 keeps i
 1. **Explicit.** "Remember this" → the model calls `memory_write` immediately.
 2. **End-of-session extraction.** When a session goes idle, a cheap model pass extracts durable facts, merges them into existing records, and resolves contradictions by superseding. Runs async on the daemon.
 
+**Gates around the extractor** (decided 2026-08-28; the evidence is in TASKS section 8). Extraction is role-gated: the pass mines concierge sessions only — job sessions are titled and marked consolidated, never asked for user facts, because a work transcript holds none and a model asked anyway writes a task log. The extractor's input states what is already known: the identity file renders into it as context that must never be re-extracted, and recalled memory — memory and archive tool results in the transcript — is elided, so injected content is never learned again. And dedup is code, not prompt: between parse and append, an exact-normalized match against ACTIVE records dies as a no-op, and near matches go to one forced-choice model call — reasoning first, then duplicate-of/supersedes/neither over integer indices into the shown neighbors — validated and applied by code. Asking the model to check the index is not trusted; that was measured to fail.
+
 Every decision emits Perfetto spans, so tuning happens against traces, not guesses. The failure modes to watch are hoarding noise and remembering nothing useful. Rules get complexity only once real usage shows which one bites.
 
 **Tuning loop.** Sessions live in an append-only log, so consolidation is re-runnable. That is the primary tuning mechanism:
