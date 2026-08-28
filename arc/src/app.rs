@@ -220,6 +220,9 @@ pub struct App {
     session_meta: HashMap<String, (SessionRole, String, Source)>,
     /// The role/project a `:code` command asked for, waiting for its `Accepted`.
     pending_code: Option<(SessionRole, String)>,
+    /// The first message typed behind a pending door, sent once the
+    /// created session's id arrives.
+    pending_first: Option<String>,
 }
 
 impl App {
@@ -256,6 +259,7 @@ impl App {
             visual_boundary: 0,
             session_meta: HashMap::new(),
             pending_code: None,
+            pending_first: None,
         }
     }
 
@@ -567,16 +571,16 @@ impl App {
     /// `:code <project>` (row 9.1): the direct door — a bound executor
     /// session, no dispatch. An empty project name is a usage error, not a
     /// request the daemon would refuse anyway.
+    /// Frontend-only until the first message: nothing durable exists for an
+    /// abandoned `:code`, exactly like an untyped-in concierge conversation.
     fn open_code(&mut self, project: &str) -> Option<Command> {
         if project.is_empty() {
             self.last_error = Some("E492".to_owned());
             return None;
         }
+        let command = self.start_session(None);
         self.pending_code = Some((SessionRole::Executor, project.to_owned()));
-        Some(Command::CreateSession {
-            role: SessionRole::Executor,
-            project: project.to_owned(),
-        })
+        command
     }
 
     fn open_review(&mut self) -> Command {
@@ -862,6 +866,11 @@ impl App {
         let order: Vec<&SessionInfo> = self
             .by_recency()
             .into_iter()
+            .filter(|session| {
+                !session.title.is_empty()
+                    || !session.preview.is_empty()
+                    || session.last_at.is_some()
+            })
             .filter(|session| show_all || !is_job_session(session))
             .collect();
         let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
@@ -926,6 +935,11 @@ impl App {
     /// user-opened executor session, `job/{project}` for one MODEL dispatched. Concierge and
     /// unspecified sessions render nothing: the default door needs no label.
     pub fn open_door_label(&self) -> Option<String> {
+        if self.session_id.is_none() {
+            if let Some((SessionRole::Executor, project)) = &self.pending_code {
+                return Some(format!("code/{project}"));
+            }
+        }
         let (role, project, source) = self
             .session_id
             .as_deref()
@@ -943,6 +957,8 @@ impl App {
     }
 
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
+        self.pending_code = None;
+        self.pending_first = None;
         if self.session_id != session_id {
             // only a named session is worth bouncing back to
             self.previous_session = self.session_id.clone();
@@ -969,6 +985,13 @@ impl App {
         if self.status == Status::Streaming {
             self.queued.push_back(content);
             return None;
+        }
+        if self.session_id.is_none() {
+            if let Some((role, project)) = self.pending_code.clone() {
+                self.status = Status::Streaming;
+                self.pending_first = Some(content);
+                return Some(Command::CreateSession { role, project });
+            }
         }
         Some(self.send(content))
     }
@@ -1116,6 +1139,7 @@ impl App {
             }
             NetEvent::Failed { code, msg } => {
                 self.steer_turn_pending = false;
+                self.pending_first = None;
                 self.finalize_thinking();
                 self.pop_empty_reply();
                 self.turn_started = None;
@@ -1183,7 +1207,9 @@ impl App {
                     self.session_meta
                         .insert(session_id.clone(), (role, project, Source::User));
                 }
-                self.start_session(Some(session_id))
+                self.session_id = Some(session_id);
+                let first = self.pending_first.take()?;
+                Some(self.send(first))
             }
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
@@ -1501,7 +1527,7 @@ mod tests {
             id: id.to_owned(),
             title: String::new(),
             started_at: None,
-            preview: String::new(),
+            preview: "hi".to_owned(),
             last_at: None,
             role: 0,
             project: String::new(),
@@ -1530,7 +1556,7 @@ mod tests {
             project: project.to_owned(),
             dispatched_by: "s-parent".to_owned(),
             source: Source::Model as i32,
-            ..session_with(id, title, "")
+            ..session_with(id, title, "hi")
         }
     }
 
@@ -1542,7 +1568,7 @@ mod tests {
             project: project.to_owned(),
             dispatched_by: String::new(),
             source: Source::User as i32,
-            ..session_with(id, title, "")
+            ..session_with(id, title, "hi")
         }
     }
 
@@ -3188,39 +3214,62 @@ mod tests {
     }
 
     #[test]
-    fn colon_code_sends_a_create_session_request() {
+    fn colon_code_is_frontend_only_until_the_first_message() {
         let mut app = App::new();
         normal(&mut app, ":code arc");
         let command = app.on_key(key(KeyCode::Enter));
 
+        assert_eq!(command, None, "nothing durable for an unsent :code");
+        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+        assert_eq!(app.last_error, None, ":code is a command, not E492");
+
+        app.on_key(key(KeyCode::Char('i')));
+        typed(&mut app, "hello");
+        let command = app.on_key(key(KeyCode::Enter));
         assert_eq!(
             command,
             Some(Command::CreateSession {
                 role: SessionRole::Executor,
                 project: "arc".to_owned(),
             }),
-            "the direct door: no dispatch, straight to a bound session"
+            "the first message is what opens the session"
         );
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.last_error, None, ":code is a command, not E492");
     }
 
     #[test]
-    fn the_code_flow_labels_its_new_session_without_a_list_refetch() {
+    fn the_code_flow_labels_the_pending_door_and_the_created_session() {
         let mut app = App::new();
         normal(&mut app, ":code scratch");
         app.on_key(key(KeyCode::Enter));
 
-        assert_eq!(app.open_door_label(), None, "no open session yet");
-        app.on_net(NetEvent::SessionCreated {
-            session_id: "s-new".to_owned(),
-        });
-
         assert_eq!(
             app.open_door_label().as_deref(),
             Some("code/scratch"),
-            "labelled from the create request, before any Sessions push lands"
+            "the pending door is labelled before anything exists"
         );
+
+        app.on_key(key(KeyCode::Char('i')));
+        typed(&mut app, "hello");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::SessionCreated {
+            session_id: "s-new".to_owned(),
+        });
+        assert_eq!(
+            app.open_door_label().as_deref(),
+            Some("code/scratch"),
+            "labelled from the create flow, before any Sessions push lands"
+        );
+    }
+
+    #[test]
+    fn abandoning_a_pending_door_creates_nothing_and_drops_the_label() {
+        let mut app = App::new();
+        normal(&mut app, ":code arc");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+
+        app.on_key(ctrl('n'));
+        assert_eq!(app.open_door_label(), None, "navigation abandons the door");
     }
 
     #[test]
@@ -3257,8 +3306,13 @@ mod tests {
     }
 
     #[test]
-    fn a_created_session_opens_like_a_picker_selection() {
+    fn a_created_session_receives_the_stashed_first_message() {
         let mut app = App::new();
+        normal(&mut app, ":code scratch");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('i')));
+        typed(&mut app, "run the tests");
+        app.on_key(key(KeyCode::Enter));
 
         let command = app.on_net(NetEvent::SessionCreated {
             session_id: "s-code".to_owned(),
@@ -3267,11 +3321,25 @@ mod tests {
         assert_eq!(app.session_id.as_deref(), Some("s-code"));
         assert_eq!(
             command,
-            Some(Command::History {
-                session_id: "s-code".to_owned()
+            Some(Command::Send {
+                session_id: Some("s-code".to_owned()),
+                content: "run the tests".to_owned(),
             }),
-            "opening fetches history, same as the picker"
+            "the message that opened the door is the session's first turn"
         );
+    }
+
+    #[test]
+    fn a_message_less_session_is_hidden_from_the_picker() {
+        let mut app = App::new();
+        let mut empty = session("s-empty");
+        empty.title = String::new();
+        empty.preview = String::new();
+        app.on_net(NetEvent::Sessions(vec![empty, session("s-real")]));
+        app.on_key(ctrl('p'));
+
+        let ids: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s-real"], "an artifact with no messages never lists");
     }
 
     #[test]
