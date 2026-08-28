@@ -1090,8 +1090,18 @@ mod tests {
         assert_eq!(
             child_user_messages(dir.path(), &parent_id),
             [
-                (Role::User, format!("Job {child_id} finished.\non it")),
-                (Role::User, format!("Job {child_id} finished.\nlinted too")),
+                (
+                    Role::User,
+                    format!(
+                        "Job {child_id} finished.\non it\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                    )
+                ),
+                (
+                    Role::User,
+                    format!(
+                        "Job {child_id} finished.\nlinted too\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                    )
+                ),
             ],
             "both the original finish and the resume's finish handed back to the same parent"
         );

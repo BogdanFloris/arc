@@ -341,7 +341,12 @@ mod tests {
 
         assert_eq!(
             child_user_messages(dir.path(), &parent_id),
-            [(Role::User, format!("Job {child_id} finished.\nall fixed"))],
+            [(
+                Role::User,
+                format!(
+                    "Job {child_id} finished.\nall fixed\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                )
+            )],
             "the handback names the child and carries its final reply"
         );
     }
@@ -461,7 +466,12 @@ mod tests {
 
         assert_eq!(
             child_user_messages(dir.path(), &parent_id),
-            [(Role::User, format!("Job {child_id} finished.\n{NO_REPLY}"))],
+            [(
+                Role::User,
+                format!(
+                    "Job {child_id} finished.\n{NO_REPLY}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                )
+            )],
             "an empty assistant reply reads the same as no reply at all"
         );
     }
@@ -505,7 +515,12 @@ mod tests {
         assert_eq!(
             child_user_messages(dir.path(), &parent_id),
             [
-                (Role::User, format!("Job {child_id} finished.\nall fixed")),
+                (
+                    Role::User,
+                    format!(
+                        "Job {child_id} finished.\nall fixed\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                    )
+                ),
                 (Role::Assistant, "the job did X".to_owned()),
             ],
             "the handback lands, then the concierge's own turn reacts to it"

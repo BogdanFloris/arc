@@ -467,7 +467,11 @@ impl Engine {
 
         let summary = truncate_summary(summary);
         let content = match reason {
-            None => format!("Job {child_session} finished.\n{summary}"),
+            None => format!(
+                "Job {child_session} finished.\n{summary}\n\
+                 For follow-ups about anything this job read or did, continue_job \
+                 {child_session} keeps its context; a new dispatch starts from nothing."
+            ),
             Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}"),
         };
         self.record(
@@ -4674,7 +4678,11 @@ mod tests {
             Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
             other => panic!("expected a message entry, got {other:?}"),
         };
-        assert!(content.ends_with(" [truncated]"), "{content}");
+        assert!(content.contains(" [truncated]\n"), "{content}");
+        assert!(
+            content.ends_with("a new dispatch starts from nothing."),
+            "the continue_job affordance stays the closing line: {content}"
+        );
         assert!(content.len() < long_summary.len());
     }
 

@@ -1853,7 +1853,10 @@ mod tests {
         assert_eq!(handback.role, Role::User as i32);
         assert_eq!(
             handback.content,
-            format!("Job {} finished.\non it", child.session_id),
+            format!(
+                "Job {0} finished.\non it\nFor follow-ups about anything this job read or did, continue_job {0} keeps its context; a new dispatch starts from nothing.",
+                child.session_id
+            ),
             "the handback names the child and carries its final reply"
         );
 

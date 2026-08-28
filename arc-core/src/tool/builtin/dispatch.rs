@@ -85,7 +85,10 @@ impl Tool for Dispatch {
             name: "dispatch".to_owned(),
             description: "Start a job: a child session bound to a configured project, with \
                           its own role and budget. This call only starts the job and names \
-                          the child session — it does not wait for the job to finish."
+                          the child session — it does not wait for the job to finish. \
+                          Before dispatching, check whether a finished job already holds \
+                          the needed context; continue_job continues it with that context \
+                          intact."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
