@@ -27,10 +27,10 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/arc
+WorkingDirectory=%h
 # Relative paths in the config (data/, the model file) resolve against
 # WorkingDirectory, so this is the same arcd you get from a shell.
-ExecStart=%h/arc/target/release/arcd --config %h/arc/data/arc.toml run
+ExecStart=%h/.local/bin/arcd run
 Environment=RUST_LOG=info,arc_core=debug
 
 # The daemon exiting is a bug, not a state to sit in: bring it back, slowly
