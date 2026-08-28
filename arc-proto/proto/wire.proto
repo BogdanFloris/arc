@@ -91,7 +91,13 @@ message Notification {
     SessionAppended session_appended = 1;
     // a job started, progressed, or reached a terminal state
     JobInfo job_changed = 2;
+    // the review queue changed; `pending` is its new size
+    ReviewChanged review_changed = 3;
   }
+}
+
+message ReviewChanged {
+  uint32 pending = 1;
 }
 
 message SessionAppended {
