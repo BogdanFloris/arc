@@ -633,7 +633,7 @@ impl App {
         let last = jobs.items.len().saturating_sub(1);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => self.jobs = None,
-            KeyCode::Up => jobs.selected = jobs.selected.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => jobs.selected = jobs.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => jobs.selected = (jobs.selected + 1).min(last),
             KeyCode::Char('r') => return Some(Command::ListJobs),
             KeyCode::Enter => {
@@ -646,14 +646,14 @@ impl App {
                     self.start_steer(session_id);
                 }
             }
-            KeyCode::Char('k') => return self.cancel_selected_job(),
+            KeyCode::Char('x') => return self.cancel_selected_job(),
             KeyCode::Char('d') => return self.drop_selected_steers(),
             _ => {}
         }
         None
     }
 
-    /// `k` on a running row (row 6.39): stops the job through the
+    /// `x` on a running row (row 6.39): stops the job through the
     /// supervisor and leaves a footer note either way, mirroring `s`'s
     /// plumbing — the confirmation is set optimistically here, before the
     /// command even reaches the wire.
@@ -737,7 +737,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_picker_selection(true),
             KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
             KeyCode::Char('/') => self.start_picker_filter(),
-            KeyCode::Char('a') => self.toggle_picker_show_all(),
+            KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
                 self.picker = None;
@@ -1419,6 +1419,7 @@ mod tests {
             last_at: None,
             role: 0,
             project: String::new(),
+            dispatched_by: String::new(),
         }
     }
 
@@ -1431,6 +1432,7 @@ mod tests {
             last_at: None,
             role: 0,
             project: String::new(),
+            dispatched_by: String::new(),
         }
     }
 
@@ -2221,6 +2223,7 @@ mod tests {
                 last_at: last.map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
                 role: 0,
                 project: String::new(),
+                dispatched_by: String::new(),
             }
         }
 
@@ -2654,6 +2657,45 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.picker_rows().len(), 1, "a toggles back off");
+    }
+
+    #[test]
+    fn space_toggles_show_all_same_as_a() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session("conv"),
+            job_session("job", "", SessionRole::Executor, "arc"),
+        ]));
+        normal(&mut app, "s");
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.picker_rows().len(), 2, "space reveals the job too");
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.picker_rows().len(), 1, "space toggles back off");
+    }
+
+    #[test]
+    fn space_while_filtering_types_into_the_filter_instead_of_toggling() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("keep", "two words", ""),
+            job_session("job", "two words job", SessionRole::Executor, "arc"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "two");
+        assert_eq!(app.picker_rows().len(), 1, "the job stays hidden");
+
+        app.on_key(key(KeyCode::Char(' ')));
+        typed(&mut app, "words");
+
+        assert_eq!(app.input, "two words", "space landed in the filter text");
+        assert_eq!(
+            app.picker_rows().len(),
+            1,
+            "show-all never toggled, the job is still hidden"
+        );
     }
 
     #[test]
@@ -3156,12 +3198,12 @@ mod tests {
     }
 
     #[test]
-    fn k_on_a_running_row_sends_cancel_job_and_confirms_in_the_footer() {
+    fn x_on_a_running_row_sends_cancel_job_and_confirms_in_the_footer() {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-a", State::Running)]);
 
-        let command = app.on_key(key(KeyCode::Char('k')));
+        let command = app.on_key(key(KeyCode::Char('x')));
 
         assert_eq!(
             command,
@@ -3177,18 +3219,33 @@ mod tests {
     }
 
     #[test]
-    fn k_on_a_terminal_row_is_a_no_op_with_a_footer_note() {
+    fn x_on_a_terminal_row_is_a_no_op_with_a_footer_note() {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-a", State::Finished)]);
 
-        let command = app.on_key(key(KeyCode::Char('k')));
+        let command = app.on_key(key(KeyCode::Char('x')));
 
         assert_eq!(command, None, "nothing to cancel on a finished job");
         assert_eq!(
             app.jobs.as_ref().expect("open").confirmation.as_deref(),
             Some("not running")
         );
+    }
+
+    #[test]
+    fn k_moves_the_job_selection_up_and_cancels_nothing() {
+        use arc_proto::v1::job_info::State;
+
+        let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+
+        let command = app.on_key(key(KeyCode::Char('k')));
+
+        assert_eq!(command, None, "k navigates, it does not cancel");
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
     }
 
     #[test]

@@ -766,7 +766,7 @@ const HELP: &[(&str, &[&str])] = &[
         &[
             "j k               move selection",
             "/                 filter by title/preview",
-            "a                 toggle showing dispatched jobs",
+            "space a           toggle showing dispatched jobs",
             "enter             open the selected session",
             "q esc             close (esc also clears an active filter)",
         ],
@@ -784,12 +784,11 @@ const HELP: &[(&str, &[&str])] = &[
     (
         "jobs keys",
         &[
-            "j down            move selection down",
-            "up                move selection up",
+            "j k               move selection",
             "r                 refresh the list",
             "enter             open the selected job's session",
             "s                 steer the selected job",
-            "k                 cancel the selected job (if running)",
+            "x                 cancel the selected job (if running)",
             "d                 drop its queued steers (if any)",
             "q esc             close",
         ],
@@ -952,6 +951,7 @@ mod tests {
             last_at: None,
             role: 0,
             project: String::new(),
+            dispatched_by: String::new(),
         }
     }
 
@@ -968,6 +968,7 @@ mod tests {
             }),
             role: 0,
             project: String::new(),
+            dispatched_by: String::new(),
         }
     }
 
