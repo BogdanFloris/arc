@@ -700,6 +700,7 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         role: summary.role,
         project: summary.project.clone().unwrap_or_default(),
         dispatched_by: summary.dispatched_by.clone(),
+        source: summary.source,
     }
 }
 
@@ -1231,6 +1232,7 @@ mod tests {
             role: SessionRole::Executor as i32,
             project: Some("arc".to_string()),
             dispatched_by: "s-parent".to_string(),
+            source: Source::Model as i32,
         };
 
         let info = session_info(&summary);
@@ -1238,6 +1240,7 @@ mod tests {
         assert_eq!(info.role, SessionRole::Executor as i32);
         assert_eq!(info.project, "arc");
         assert_eq!(info.dispatched_by, "s-parent");
+        assert_eq!(info.source, Source::Model as i32);
     }
 
     #[tokio::test]
@@ -2579,6 +2582,11 @@ mod tests {
         assert_eq!(
             code_summary.dispatched_by, "",
             "a :code session is a root conversation, not a dispatched child"
+        );
+        assert_eq!(
+            code_summary.source,
+            Source::User as i32,
+            "a :code session is user-opened, not model-dispatched"
         );
 
         harness.stop().await;

@@ -18,7 +18,8 @@ use crate::log;
 // 9: messages gained the source column
 // 10: messages gained input_tokens, output_tokens, elapsed_ms
 // 11: sessions gained provider, model columns
-pub(crate) const SCHEMA_VERSION: u32 = 11;
+// 12: sessions gained the source column
+pub(crate) const SCHEMA_VERSION: u32 = 12;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     consolidated_through INTEGER,
     role           INTEGER NOT NULL DEFAULT 0,
     provider       TEXT,
-    model          TEXT
+    model          TEXT,
+    source         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -146,6 +148,9 @@ pub struct SessionSummary {
     /// The session that dispatched it; empty for a root conversation, which
     /// is what the picker's conversation/job split keys on (row 6.34/9.1).
     pub dispatched_by: String,
+    /// Who created the session (row 9.5): the picker's actual conversation/job
+    /// split, correct for all history unlike `dispatched_by` alone.
+    pub source: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,7 +746,7 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                           ORDER BY m.seq LIMIT 1), ''),
                 (SELECT MAX(m.ts) FROM messages m
                  WHERE m.session_id = s.id AND m.kind = ?2),
-                s.role, s.project, coalesce(s.parent_session, '')
+                s.role, s.project, coalesce(s.parent_session, ''), s.source
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -754,6 +759,7 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
             role: row.get(5)?,
             project: row.get(6)?,
             dispatched_by: row.get(7)?,
+            source: row.get(8)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -909,8 +915,8 @@ fn insert_session(
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO sessions
-             (id, parent_session, fork_point, project, title, started_at, role, provider, model)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, parent_session, fork_point, project, title, started_at, role, provider, model, source)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             &created.session_id,
             (!created.dispatched_by.is_empty()).then_some(&created.dispatched_by),
@@ -920,6 +926,7 @@ fn insert_session(
             created.role,
             (!created.provider.is_empty()).then_some(&created.provider),
             (!created.model.is_empty()).then_some(&created.model),
+            event.source,
         ),
     )?;
     for grant in &created.grants {
@@ -2058,6 +2065,7 @@ mod tests {
                 role: SessionRole::Unspecified as i32,
                 project: None,
                 dispatched_by: String::new(),
+                source: Source::User as i32,
             }
         );
         assert_eq!(sessions[0].started_at, None);
@@ -2084,6 +2092,19 @@ mod tests {
 
         assert_eq!(root_summary.dispatched_by, "", "a root conversation");
         assert_eq!(child_summary.dispatched_by, "s-root");
+    }
+
+    #[test]
+    fn a_sessions_summary_carries_its_creation_source() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut job = session_created_as(0, "s-job", "job", Some(100));
+        job.source = Source::Model as i32;
+        projection.apply(&job).expect("apply");
+
+        let sessions = projection.sessions().expect("sessions");
+        let job_summary = sessions.iter().find(|s| s.id == "s-job").expect("job");
+
+        assert_eq!(job_summary.source, Source::Model as i32);
     }
 
     #[test]

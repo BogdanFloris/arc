@@ -308,6 +308,7 @@ fn server_frame_arms_round_trip() {
                 role: SessionRole::Executor as i32,
                 project: "arc".to_string(),
                 dispatched_by: "s-00".to_string(),
+                source: Source::User as i32,
             }],
         }),
         server_frame::Msg::SessionHistory(SessionHistory {

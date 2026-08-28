@@ -533,6 +533,7 @@ mod tests {
             role: 0,
             project: String::new(),
             dispatched_by: String::new(),
+            source: 0,
         };
         let list = server_frame::Msg::SessionList(SessionList {
             sessions: vec![session.clone()],

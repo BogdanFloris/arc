@@ -291,10 +291,17 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         draw_strip(frame, area, app, job);
         return;
     }
-    let mode = match app.mode {
-        Mode::Insert => "-- insert ",
-        Mode::Visual => "-- visual ",
+    let mode_word = match app.mode {
+        Mode::Insert => "insert",
+        Mode::Visual => "visual",
         Mode::Normal | Mode::Cmd => "",
+    };
+    let door = app.open_door_label();
+    let mode = match (mode_word.is_empty(), door) {
+        (true, None) => String::new(),
+        (true, Some(door)) => format!("-- {door} "),
+        (false, None) => format!("-- {mode_word} "),
+        (false, Some(door)) => format!("-- {mode_word} {door} "),
     };
     let mut words: Vec<Span> = Vec::new();
     match app.status {
@@ -319,7 +326,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         words.push(Span::styled(" --", theme::DIM));
     }
 
-    let used: usize = mode.len() + words.iter().map(Span::width).sum::<usize>();
+    let used: usize = mode.chars().count() + words.iter().map(Span::width).sum::<usize>();
     let dashes = "-".repeat((area.width as usize).saturating_sub(used));
     let mut spans = vec![
         Span::styled(mode, theme::DIM),
@@ -910,7 +917,12 @@ fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
     };
     let first = text.lines().next().unwrap_or_default().trim();
     if first.is_empty() {
-        return session.id.chars().take(8).collect();
+        let fallback = if session.project.is_empty() {
+            "(empty)".to_owned()
+        } else {
+            format!("(empty) · {}", session.project)
+        };
+        return elide(&fallback, room);
     }
     elide(first, room)
 }
@@ -953,6 +965,7 @@ mod tests {
             role: 0,
             project: String::new(),
             dispatched_by: String::new(),
+            source: 0,
         }
     }
 
@@ -970,6 +983,7 @@ mod tests {
             role: 0,
             project: String::new(),
             dispatched_by: String::new(),
+            source: 0,
         }
     }
 
@@ -1019,6 +1033,19 @@ mod tests {
     fn a_picker_row_falls_back_to_the_preview_without_a_title() {
         let session = session("s-01", "", "what color for the accent?");
         assert_eq!(label(&session, 40), "what color for the accent?");
+    }
+
+    #[test]
+    fn a_session_with_no_title_or_preview_falls_back_to_a_dim_empty_marker() {
+        let session = session("s-01", "", "");
+        assert_eq!(label(&session, 40), "(empty)");
+    }
+
+    #[test]
+    fn an_empty_session_with_a_project_names_it_alongside_the_marker() {
+        let mut session = session("s-01", "", "");
+        session.project = "scratch".to_owned();
+        assert_eq!(label(&session, 40), "(empty) · scratch");
     }
 
     #[test]

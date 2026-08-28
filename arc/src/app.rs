@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use arc_proto::v1::{
@@ -215,6 +215,11 @@ pub struct App {
     visual_anchor: usize,
     /// The transcript index `j`/`k`/`gg`/`G` move; the selection spans it to the anchor.
     visual_boundary: usize,
+    /// Every session fact seen so far — from a sessions list, a jobs push, or a `:code`
+    /// create — so the rule line can name the open door without waiting on a refetch.
+    session_meta: HashMap<String, (SessionRole, String, Source)>,
+    /// The role/project a `:code` command asked for, waiting for its `Accepted`.
+    pending_code: Option<(SessionRole, String)>,
 }
 
 impl App {
@@ -249,6 +254,8 @@ impl App {
             steer_turn_pending: false,
             visual_anchor: 0,
             visual_boundary: 0,
+            session_meta: HashMap::new(),
+            pending_code: None,
         }
     }
 
@@ -565,6 +572,7 @@ impl App {
             self.last_error = Some("E492".to_owned());
             return None;
         }
+        self.pending_code = Some((SessionRole::Executor, project.to_owned()));
         Some(Command::CreateSession {
             role: SessionRole::Executor,
             project: project.to_owned(),
@@ -907,6 +915,28 @@ impl App {
         order
     }
 
+    fn record_session_meta(&mut self, session_id: &str, role: i32, project: &str, source: i32) {
+        let role = SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified);
+        let source = Source::try_from(source).unwrap_or(Source::Unspecified);
+        self.session_meta
+            .insert(session_id.to_owned(), (role, project.to_owned(), source));
+    }
+
+    /// Names the exceptional door the open session came through — `code/{project}` for a
+    /// user-opened executor session, `job/{project}` for one MODEL dispatched. Concierge and
+    /// unspecified sessions render nothing: the default door needs no label.
+    pub fn open_door_label(&self) -> Option<String> {
+        let (role, project, source) = self
+            .session_id
+            .as_deref()
+            .and_then(|id| self.session_meta.get(id))?;
+        match (*source, *role) {
+            (Source::Model, _) => Some(format!("job/{project}")),
+            (Source::User, SessionRole::Executor) => Some(format!("code/{project}")),
+            _ => None,
+        }
+    }
+
     fn back_session(&mut self) -> Option<Command> {
         let previous = self.previous_session.take()?;
         self.start_session(Some(previous))
@@ -960,6 +990,14 @@ impl App {
         }
         match event {
             NetEvent::Sessions(sessions) => {
+                for session in &sessions {
+                    self.record_session_meta(
+                        &session.id,
+                        session.role,
+                        &session.project,
+                        session.source,
+                    );
+                }
                 self.sessions = sessions;
                 None
             }
@@ -1095,6 +1133,14 @@ impl App {
                 None
             }
             NetEvent::JobItems(items) => {
+                for job in &items {
+                    self.record_session_meta(
+                        &job.session_id,
+                        job.role,
+                        &job.project,
+                        Source::Model as i32,
+                    );
+                }
                 if let Some(jobs) = self.jobs.as_mut() {
                     jobs.items = items;
                     jobs.selected = 0;
@@ -1111,6 +1157,12 @@ impl App {
                 None
             }
             NetEvent::JobChanged(job) => {
+                self.record_session_meta(
+                    &job.session_id,
+                    job.role,
+                    &job.project,
+                    Source::Model as i32,
+                );
                 self.ambient
                     .retain(|existing| existing.session_id != job.session_id);
                 self.ambient.push(job.clone());
@@ -1126,7 +1178,13 @@ impl App {
                 }
                 None
             }
-            NetEvent::SessionCreated { session_id } => self.start_session(Some(session_id)),
+            NetEvent::SessionCreated { session_id } => {
+                if let Some((role, project)) = self.pending_code.take() {
+                    self.session_meta
+                        .insert(session_id.clone(), (role, project, Source::User));
+                }
+                self.start_session(Some(session_id))
+            }
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
                 self.last_error = Some("disconnected".to_owned());
@@ -1235,11 +1293,12 @@ fn is_running(job: &JobInfo) -> bool {
 }
 
 /// A dispatched child, kept behind the picker's show-all toggle; a root
-/// conversation — including a `:code` session, executor role but no
-/// dispatcher — always lists (row 9.1's reclassification: keyed on
-/// `dispatched_by`, not role).
+/// conversation — including a `:code` session — always lists. Keyed on the
+/// recorded creation source (row 9.5), correct for all history unlike
+/// `dispatched_by` alone; UNSPECIFIED only exists in a stale index and
+/// fails toward hiding it as noise.
 pub fn is_job_session(session: &SessionInfo) -> bool {
-    !session.dispatched_by.is_empty()
+    session.source != Source::User as i32
 }
 
 fn short_id(id: &str) -> &str {
@@ -1447,6 +1506,7 @@ mod tests {
             role: 0,
             project: String::new(),
             dispatched_by: String::new(),
+            source: Source::User as i32,
         }
     }
 
@@ -1460,6 +1520,7 @@ mod tests {
             role: 0,
             project: String::new(),
             dispatched_by: String::new(),
+            source: Source::User as i32,
         }
     }
 
@@ -1468,17 +1529,19 @@ mod tests {
             role: role as i32,
             project: project.to_owned(),
             dispatched_by: "s-parent".to_owned(),
+            source: Source::Model as i32,
             ..session_with(id, title, "")
         }
     }
 
-    /// A `:code` session (row 9.1): bound to a project like a job, but no
-    /// dispatcher — the picker must list it as a conversation, not a job.
+    /// A `:code` session (row 9.1): bound to a project like a job, but
+    /// user-opened — the picker must list it as a conversation, not a job.
     fn code_session(id: &str, title: &str, project: &str) -> SessionInfo {
         SessionInfo {
             role: SessionRole::Executor as i32,
             project: project.to_owned(),
             dispatched_by: String::new(),
+            source: Source::User as i32,
             ..session_with(id, title, "")
         }
     }
@@ -2263,6 +2326,7 @@ mod tests {
                 role: 0,
                 project: String::new(),
                 dispatched_by: String::new(),
+                source: Source::User as i32,
             }
         }
 
@@ -2699,7 +2763,7 @@ mod tests {
     }
 
     #[test]
-    fn a_code_sessions_empty_dispatched_by_lists_it_as_a_conversation() {
+    fn a_user_sourced_code_session_lists_it_as_a_conversation() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![
             code_session("code", "", "arc"),
@@ -2713,7 +2777,7 @@ mod tests {
                 .map(|s| s.id.as_str())
                 .collect::<Vec<_>>(),
             ["code"],
-            "an executor session with no dispatcher is a root conversation, not a job"
+            "a user-opened executor session is a root conversation, not a job"
         );
 
         app.on_key(key(KeyCode::Char('a')));
@@ -2721,6 +2785,44 @@ mod tests {
             app.picker_rows().len(),
             2,
             "a reveals the dispatched job alongside it"
+        );
+    }
+
+    #[test]
+    fn a_model_sourced_session_with_no_dispatched_by_still_hides_as_a_job() {
+        // pre-6.34: dispatched_by was never recorded, but source always was
+        let mut pre_634_job = job_session("job", "", SessionRole::Executor, "arc");
+        pre_634_job.dispatched_by = String::new();
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session("conv"), pre_634_job]));
+        normal(&mut app, "s");
+
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["conv"],
+            "the recorded source hides it even with no dispatched_by"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_source_session_hides_as_a_job() {
+        // a stale index predating the source column; a rebuild fixes it
+        let mut unspecified = session("stale");
+        unspecified.source = 0;
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session("conv"), unspecified]));
+        normal(&mut app, "s");
+
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["conv"],
+            "unspecified source fails toward hiding noise, not showing it"
         );
     }
 
@@ -3101,6 +3203,47 @@ mod tests {
         );
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":code is a command, not E492");
+    }
+
+    #[test]
+    fn the_code_flow_labels_its_new_session_without_a_list_refetch() {
+        let mut app = App::new();
+        normal(&mut app, ":code scratch");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.open_door_label(), None, "no open session yet");
+        app.on_net(NetEvent::SessionCreated {
+            session_id: "s-new".to_owned(),
+        });
+
+        assert_eq!(
+            app.open_door_label().as_deref(),
+            Some("code/scratch"),
+            "labelled from the create request, before any Sessions push lands"
+        );
+    }
+
+    #[test]
+    fn opening_a_session_from_a_sessions_list_shows_its_door_label() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            code_session("s-code", "", "scratch"),
+            job_session("s-job", "", SessionRole::Executor, "arc"),
+            session("s-concierge"),
+        ]));
+
+        app.start_session(Some("s-code".to_owned()));
+        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
+
+        app.start_session(Some("s-job".to_owned()));
+        assert_eq!(app.open_door_label().as_deref(), Some("job/arc"));
+
+        app.start_session(Some("s-concierge".to_owned()));
+        assert_eq!(
+            app.open_door_label(),
+            None,
+            "a concierge conversation is the default door, unlabelled"
+        );
     }
 
     #[test]
