@@ -273,10 +273,12 @@ async fn send(
                 input_tokens,
                 output_tokens,
                 partial,
+                step_capped,
             } => NetEvent::End {
                 partial,
                 input_tokens,
                 output_tokens,
+                step_capped,
             },
             TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
         };

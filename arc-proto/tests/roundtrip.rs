@@ -353,6 +353,7 @@ fn server_frame_arms_round_trip() {
             input_tokens: 128,
             output_tokens: 64,
             partial: true,
+            step_capped: true,
         }),
         server_frame::Msg::Error(Error {
             code: "provider_unavailable".to_string(),

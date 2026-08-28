@@ -69,6 +69,7 @@ pub enum NetEvent {
         partial: bool,
         input_tokens: u32,
         output_tokens: u32,
+        step_capped: bool,
     },
     Failed {
         code: String,
@@ -128,6 +129,8 @@ pub struct Jobs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Search {
+    /// The confirmed query, kept to re-run the search across an append-only rebuild.
+    pub query: String,
     /// Matching block indices, newest first, so index 0 is match 1.
     pub matches: Vec<usize>,
     /// Where the view sits in `matches`.
@@ -172,6 +175,8 @@ pub enum Block {
         output_tokens: u32,
         seconds: f32,
     },
+    /// The turn was forced to stop by the step cap, not a finished answer.
+    StepCapped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +216,8 @@ pub struct App {
     pub queued: VecDeque<String>,
     thinking_since: Option<Instant>,
     turn_started: Option<Instant>,
+    /// Chars applied from text and reasoning deltas since `turn_started`.
+    streamed_chars: usize,
     pub scroll_back: usize,
     pub quit: bool,
     /// Every `job_changed` push, oldest to newest touched; the strip reads only the running ones.
@@ -260,6 +267,7 @@ impl App {
             queued: VecDeque::new(),
             thinking_since: None,
             turn_started: None,
+            streamed_chars: 0,
             scroll_back: 0,
             quit: false,
             ambient: Vec::new(),
@@ -596,6 +604,7 @@ impl App {
         }
         self.yank_note = Some(format!("match 1/{}", matches.len()));
         self.search = Some(Search {
+            query,
             matches,
             current: 0,
         });
@@ -1017,6 +1026,16 @@ impl App {
         u64::from(job.idle_seconds) + self.strip_since.elapsed().as_secs()
     }
 
+    /// Seconds since the in-flight turn started, while one is streaming.
+    pub fn turn_elapsed_seconds(&self) -> Option<u64> {
+        self.turn_started.map(|since| since.elapsed().as_secs())
+    }
+
+    /// A rough token count for what's streamed so far this turn.
+    pub fn streamed_tokens_estimate(&self) -> u64 {
+        (self.streamed_chars / 4) as u64
+    }
+
     pub fn by_recency(&self) -> Vec<&SessionInfo> {
         let mut order: Vec<&SessionInfo> = self.sessions.iter().collect();
         order.sort_by(|a, b| activity(b).cmp(&activity(a)).then_with(|| a.id.cmp(&b.id)));
@@ -1100,6 +1119,7 @@ impl App {
         self.status = Status::Streaming;
         self.last_error = None;
         self.turn_started = Some(Instant::now());
+        self.streamed_chars = 0;
         Command::Send {
             session_id: self.session_id.clone(),
             content,
@@ -1133,10 +1153,33 @@ impl App {
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
                         && rebuilt.starts_with(&self.transcript);
+                    let kept_search =
+                        appended_only
+                            .then_some(self.search.as_ref())
+                            .flatten()
+                            .map(|search| {
+                                (
+                                    search.query.clone(),
+                                    search.matches.get(search.current).copied(),
+                                )
+                            });
                     self.transcript = rebuilt;
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
-                    self.search = None;
+                    self.search = kept_search.and_then(|(query, selected_block)| {
+                        let matches = self.search_matches(&query);
+                        if matches.is_empty() {
+                            return None;
+                        }
+                        let current = selected_block
+                            .and_then(|block| matches.iter().position(|&m| m == block))
+                            .unwrap_or(0);
+                        Some(Search {
+                            query,
+                            matches,
+                            current,
+                        })
+                    });
                     if self.mode == Mode::Visual && !appended_only {
                         self.mode = Mode::Normal;
                     }
@@ -1157,6 +1200,7 @@ impl App {
             }
             NetEvent::Delta(text) => {
                 self.finalize_thinking();
+                self.streamed_chars += text.chars().count();
                 if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
                     reply.push_str(&text);
                 } else {
@@ -1168,6 +1212,7 @@ impl App {
                 None
             }
             NetEvent::Reasoning(text) => {
+                self.streamed_chars += text.chars().count();
                 if let Some(Block::Thought {
                     text: thinking,
                     seconds,
@@ -1217,6 +1262,7 @@ impl App {
                 partial,
                 input_tokens,
                 output_tokens,
+                step_capped,
             } => {
                 if self.steer_turn_pending {
                     self.steer_turn_pending = false;
@@ -1235,6 +1281,9 @@ impl App {
                             seconds: elapsed.as_secs_f32(),
                         });
                     }
+                }
+                if step_capped {
+                    self.transcript.push(Block::StepCapped);
                 }
                 self.turn_over(Status::Idle)
             }
@@ -1484,6 +1533,7 @@ fn block_yank_text(block: &Block) -> Option<String> {
         | Block::Tool { .. }
         | Block::Cost { .. }
         | Block::Note(_)
+        | Block::StepCapped
         | Block::Fault { .. } => None,
     }
 }
@@ -1682,6 +1732,7 @@ mod tests {
             partial,
             input_tokens: 0,
             output_tokens: 0,
+            step_capped: false,
         }
     }
 
@@ -2156,6 +2207,7 @@ mod tests {
             partial: false,
             input_tokens: 2345,
             output_tokens: 140,
+            step_capped: false,
         });
 
         assert!(matches!(
@@ -2184,6 +2236,85 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, Block::Cost { .. })),
             "a steer ack carries zeroed usage"
+        );
+    }
+
+    #[test]
+    fn a_step_capped_end_appends_a_dim_notice_after_the_reply() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Delta("in progress".to_owned()));
+
+        app.on_net(NetEvent::End {
+            partial: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            step_capped: true,
+        });
+
+        assert_eq!(app.transcript.last(), Some(&Block::StepCapped));
+    }
+
+    #[test]
+    fn a_normal_end_appends_no_step_capped_notice() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Delta("done".to_owned()));
+
+        app.on_net(end(false));
+
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|block| matches!(block, Block::StepCapped))
+        );
+    }
+
+    #[test]
+    fn turn_counters_are_idle_until_a_turn_starts_then_track_streamed_deltas() {
+        let mut app = App::new();
+        assert_eq!(app.turn_elapsed_seconds(), None);
+        assert_eq!(app.streamed_tokens_estimate(), 0);
+
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.turn_elapsed_seconds(), Some(0));
+
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("thinking".to_owned())); // 8 chars
+        app.on_net(NetEvent::Delta("hello world".to_owned())); // 11 chars
+        assert_eq!(app.streamed_tokens_estimate(), (8 + 11) / 4);
+    }
+
+    #[test]
+    fn the_streamed_counter_resets_between_turns() {
+        let mut app = App::new();
+        typed(&mut app, "hi");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Delta("some streamed reply text".to_owned()));
+        assert!(app.streamed_tokens_estimate() > 0);
+
+        app.on_net(end(false));
+        typed(&mut app, "again");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.streamed_tokens_estimate(),
+            0,
+            "a fresh turn starts the counter over"
         );
     }
 
@@ -4568,6 +4699,7 @@ mod tests {
                 seconds: 1.0,
             },
             Block::Note("secret note".to_owned()),
+            Block::StepCapped,
             Block::Fault {
                 code: "boom".to_owned(),
                 msg: "secret failure".to_owned(),
@@ -4622,7 +4754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_history_rebuild_drops_the_search() {
+    fn an_append_only_history_rebuild_keeps_the_search() {
         let mut app = App::new();
         app.session_id = Some("s-1".to_owned());
         let entries = vec![prose_entry(Role::User as i32, "find the needle", false)];
@@ -4632,12 +4764,47 @@ mod tests {
         });
         search(&mut app, "needle");
         assert!(app.search.is_some());
+        let block = app.search_block();
 
+        let mut appended = entries;
+        appended.push(prose_entry(
+            Role::Assistant as i32,
+            "no needle in here",
+            false,
+        ));
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: appended,
+        });
+        assert!(
+            app.search.is_some(),
+            "the old transcript is a prefix of the new one"
+        );
+        assert_eq!(app.search_block(), block, "the same block stays selected");
+    }
+
+    #[test]
+    fn a_changed_prefix_history_rebuild_drops_the_search() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        let entries = vec![prose_entry(Role::User as i32, "find the needle", false)];
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries,
         });
-        assert!(app.search.is_none(), "even an append-only rebuild drops it");
+        search(&mut app, "needle");
+        assert!(app.search.is_some());
+
+        let rewritten = vec![prose_entry(
+            Role::User as i32,
+            "edited: find the needle",
+            false,
+        )];
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: rewritten,
+        });
+        assert!(app.search.is_none(), "a changed prefix drops it");
     }
 
     #[test]

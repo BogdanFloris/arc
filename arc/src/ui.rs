@@ -258,6 +258,12 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                 );
                 out.push(Line::styled(text, theme::DIM));
             }
+            Block::StepCapped => {
+                out.push(Line::styled(
+                    "stopped at the step cap — say continue to keep going",
+                    theme::DIM,
+                ));
+            }
         }
         bounds.push((block_start, out.len()));
     }
@@ -319,7 +325,14 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     };
     let mut words: Vec<Span> = Vec::new();
     match app.status {
-        Status::Streaming => words.push(Span::styled(" streaming", theme::DIM)),
+        Status::Streaming => {
+            let seconds = app.turn_elapsed_seconds().unwrap_or(0);
+            let tokens = format_tokens(app.streamed_tokens_estimate());
+            words.push(Span::styled(
+                format!(" streaming {seconds}s · ~{tokens} tok"),
+                theme::DIM,
+            ));
+        }
         Status::Disconnected => words.push(Span::styled(" disconnected", theme::DIM)),
         Status::Idle => {
             if let Some(code) = &app.last_error {
@@ -973,7 +986,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::{draw, job_label, label, last_active, picker_label, strip_label, wrap_input};
-    use crate::app::{App, Block, Mode, Search};
+    use crate::app::{App, Block, Mode, Search, Status};
 
     /// Renders `app` into a 100×30 buffer and returns it, so tests can
     /// read glyphs and styles off the terminal exactly as drawn.
@@ -1007,6 +1020,19 @@ mod tests {
             }
         }
         rows.into_iter().filter(|row| row.contains(text)).collect()
+    }
+
+    /// Every glyph in the buffer, styling ignored: for substring checks
+    /// against chrome like the rule line, not the transcript itself.
+    fn plain_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer.cell((x, y)).expect("cell").symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     fn search(app: &mut App, query: &str) {
@@ -1059,6 +1085,26 @@ mod tests {
     }
 
     #[test]
+    fn the_rule_line_shows_elapsed_seconds_and_streamed_size_while_streaming() {
+        let mut app = conversation();
+        app.status = Status::Streaming;
+
+        let buffer = rendered(&mut app);
+        assert!(
+            plain_text(&buffer).contains("streaming 0s"),
+            "the counter renders on the rule line"
+        );
+    }
+
+    #[test]
+    fn the_rule_line_hides_the_counter_when_idle() {
+        let mut app = conversation();
+
+        let buffer = rendered(&mut app);
+        assert!(!plain_text(&buffer).contains("streaming"));
+    }
+
+    #[test]
     fn a_visual_selection_and_a_search_never_highlight_together() {
         let mut app = conversation();
         app.on_key(key(KeyCode::Char('V')));
@@ -1070,6 +1116,7 @@ mod tests {
 
         app.mode = Mode::Normal;
         app.search = Some(Search {
+            query: "needle here".to_owned(),
             matches: vec![1],
             current: 0,
         });

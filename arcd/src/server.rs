@@ -398,6 +398,7 @@ async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> boo
         input_tokens: 0,
         output_tokens: 0,
         partial: false,
+        step_capped: false,
     });
     send_frame(ws, request_id, end).await
 }
@@ -629,6 +630,7 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         partial: reply.partial,
+        step_capped: reply.step_capped,
     })
 }
 
@@ -1180,6 +1182,7 @@ mod tests {
         assert_eq!(end.input_tokens, usage().input_tokens);
         assert_eq!(end.output_tokens, usage().output_tokens);
         assert!(!end.partial);
+        assert!(!end.step_capped, "the turn finished on its own");
 
         harness.stop().await;
     }
@@ -1525,6 +1528,58 @@ mod tests {
             ]
         );
         assert_eq!(end.session_id, session_id);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_step_capped_turn_marks_the_stream_end() {
+        // the concierge's step cap: mirrors arc-core's MAX_TOOL_STEPS
+        let mut script: VecDeque<Vec<Result<CompletionDelta, ProviderError>>> = (0..8)
+            .map(|step| {
+                vec![
+                    Ok(CompletionDelta::ToolCall(ToolCall {
+                        id: format!("c{step}"),
+                        index: 0,
+                        name: "alpha".to_owned(),
+                        arguments: "{}".to_owned(),
+                        provider_roundtrip: Vec::new(),
+                    })),
+                    Ok(CompletionDelta::Done {
+                        usage: usage(),
+                        stop: Stop::ToolCalls,
+                    }),
+                ]
+            })
+            .collect();
+        script.push_back(vec![
+            Ok(CompletionDelta::Text("enough".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Canned {
+            name: "alpha",
+            content: "A",
+            ok: true,
+            source: ToolSource::Builtin,
+        }));
+        let mut harness = Harness::with_tools(Script::Canned(script), registry).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hi")).await;
+
+        let end = loop {
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.request_id, 1, "request_id is echoed");
+            if let server_frame::Msg::StreamEnd(end) = frame.msg.expect("a message") {
+                break end;
+            }
+        };
+
+        assert!(end.step_capped, "the forced final step used up the cap");
 
         harness.stop().await;
     }

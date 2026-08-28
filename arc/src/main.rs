@@ -26,7 +26,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
-use crate::app::{App, Command, Mode};
+use crate::app::{App, Command, Mode, Status};
 
 const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
 
@@ -81,7 +81,7 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
     set_cursor_style(cursor);
 
     // a ticking clock display is a legitimate timer; it only runs while a
-    // running job is on the strip, so it never masquerades as data polling
+    // running job is on the strip or a turn streams, never data polling
     let mut clock = tokio::time::interval(Duration::from_secs(1));
 
     while !app.quit {
@@ -98,7 +98,7 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
                 Some(event) => app.on_net(event),
                 None => anyhow::bail!("the connection task died"),
             },
-            _ = clock.tick(), if app.has_running_job() => None,
+            _ = clock.tick(), if app.has_running_job() || app.status == Status::Streaming => None,
         };
 
         match command {

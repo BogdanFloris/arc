@@ -95,6 +95,7 @@ pub struct Reply {
     pub seq: u64,
     pub usage: Option<Usage>,
     pub partial: bool,
+    pub step_capped: bool,
     pub jobs: Vec<DispatchedJob>,
     pub continues: Vec<ContinuedJob>,
 }
@@ -889,6 +890,7 @@ impl Engine {
                         seq,
                         usage: total_usage,
                         partial: false,
+                        step_capped: last_step,
                         jobs,
                         continues,
                     });
@@ -914,6 +916,7 @@ impl Engine {
                         seq,
                         usage: None,
                         partial: true,
+                        step_capped: last_step,
                         jobs,
                         continues,
                     });
@@ -1726,6 +1729,7 @@ mod tests {
 
         assert_eq!(reply.usage, Some(usage()));
         assert!(!reply.partial);
+        assert!(!reply.step_capped, "the model finished on its own");
         assert_eq!(reply.seq, 2);
 
         let events = replay_log(dir.path());
@@ -2751,6 +2755,10 @@ mod tests {
         let events = replay_log(dir.path());
         assert_eq!(appended(events.last().expect("events")).content, "enough");
         assert!(!reply.partial);
+        assert!(
+            reply.step_capped,
+            "every step was spent wanting to keep going"
+        );
     }
 
     #[tokio::test]
@@ -2784,6 +2792,10 @@ mod tests {
             "no forced tool-less completion before the executor cap"
         );
         assert!(!reply.partial);
+        assert!(
+            !reply.step_capped,
+            "the executor's own cap is 256, not this"
+        );
     }
 
     #[tokio::test]
