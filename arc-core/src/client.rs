@@ -570,6 +570,7 @@ mod tests {
             idle_seconds: 1,
             parent_session: "s-parent".to_owned(),
             queued_steers: 2,
+            last_call: "bash cargo test".to_owned(),
         };
         let list = server_frame::Msg::JobList(arc_proto::v1::JobList {
             jobs: vec![job.clone()],

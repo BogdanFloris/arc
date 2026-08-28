@@ -2953,6 +2953,7 @@ mod tests {
             idle_seconds: 0,
             parent_session: String::new(),
             queued_steers: 0,
+            last_call: String::new(),
         }
     }
 

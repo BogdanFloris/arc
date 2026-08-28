@@ -338,13 +338,18 @@ fn draw_strip(frame: &mut Frame, area: Rect, app: &App, job: &JobInfo) {
 fn strip_label(app: &App, job: &JobInfo) -> String {
     let count = app.running_job_count();
     let noun = if count == 1 { "job" } else { "jobs" };
+    let activity = if job.last_call.is_empty() {
+        format!("step {}", job.tool_steps)
+    } else {
+        job.last_call.clone()
+    };
     format!(
-        " {count} {noun} · {} {} · {} tok · {}s · step {} - {}s ago",
+        " {count} {noun} · {} {} · {} tok · {}s · {} - {}s ago",
         job_subject(job),
         job_state_word(job.state),
         format_tokens(job.spent_tokens),
         app.strip_elapsed_seconds(job),
-        job.tool_steps,
+        activity,
         app.strip_idle_seconds(job),
     )
 }
@@ -1043,6 +1048,23 @@ mod tests {
     }
 
     #[test]
+    fn a_strip_with_a_last_call_shows_it_instead_of_the_step_count() {
+        use crate::app::{App, NetEvent};
+
+        let mut app = App::new();
+        let mut job = job(SessionRole::Executor, "arc", "");
+        job.tool_steps = 12;
+        job.idle_seconds = 6;
+        job.last_call = "bash cargo test".to_owned();
+        app.on_net(NetEvent::JobChanged(job.clone()));
+
+        assert_eq!(
+            strip_label(&app, &job),
+            " 1 job · executor/arc running · 12 tok · 5s · bash cargo test - 6s ago"
+        );
+    }
+
+    #[test]
     fn a_strip_step_of_zero_reads_as_thinking() {
         use crate::app::{App, NetEvent};
 
@@ -1073,6 +1095,7 @@ mod tests {
             idle_seconds: 0,
             parent_session: String::new(),
             queued_steers: 0,
+            last_call: String::new(),
         }
     }
 

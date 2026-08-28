@@ -67,6 +67,8 @@ struct JobStatus {
     parent_session: String,
     /// `steer`/`continue_job` messages waiting for their own turn (row 6.33).
     queued_steers: u32,
+    /// The last issued tool call, elided; empty until the first call.
+    last_call: String,
 }
 
 impl JobStatus {
@@ -96,6 +98,7 @@ impl JobStatus {
                 .unwrap_or(u32::MAX),
             parent_session: self.parent_session.clone(),
             queued_steers: self.queued_steers,
+            last_call: self.last_call.clone(),
         }
     }
 }
@@ -142,6 +145,7 @@ impl JobStatuses {
             last_engine_event: Instant::now(),
             parent_session: job.parent_session.clone(),
             queued_steers: 0,
+            last_call: String::new(),
         };
         let info = entry.to_job_info(&job.session_id);
         self.entries
@@ -160,10 +164,16 @@ impl JobStatuses {
 
     /// Counts an issued tool call and touches the idle clock, returning the
     /// fresh info so the turn loop can broadcast the strip's new state.
-    pub(super) fn record_tool_step(&self, session_id: &str) -> Option<JobInfo> {
+    pub(super) fn record_tool_step(
+        &self,
+        session_id: &str,
+        name: &str,
+        arguments_json: &str,
+    ) -> Option<JobInfo> {
         let mut entries = self.entries.lock().expect("statuses");
         let entry = entries.get_mut(session_id)?;
         entry.tool_steps += 1;
+        entry.last_call = compose_last_call(name, arguments_json);
         entry.last_engine_event = Instant::now();
         Some(entry.to_job_info(session_id))
     }
@@ -249,6 +259,44 @@ impl JobStatuses {
             .into_iter()
             .map(|(session_id, status)| status.to_job_info(session_id))
             .collect()
+    }
+}
+
+// the first meaningful string value, mirroring the client's tool lines;
+// flattened and capped because it rides every job_changed push
+fn compose_last_call(name: &str, arguments_json: &str) -> String {
+    let summary = serde_json::from_str::<serde_json::Value>(arguments_json)
+        .ok()
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => map.into_iter().find_map(|(_, value)| match value {
+                serde_json::Value::String(s) if !s.trim().is_empty() => Some(s),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or_default();
+    format!("{name} {}", summary.trim())
+        .trim_end()
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(120)
+        .collect()
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::compose_last_call;
+
+    #[test]
+    fn the_first_string_argument_rides_along_flattened_and_capped() {
+        assert_eq!(
+            compose_last_call("bash", r#"{"command":"cargo\ntest"}"#),
+            "bash cargo test"
+        );
+        assert_eq!(compose_last_call("get_time", "{}"), "get_time");
+        assert_eq!(compose_last_call("edit", "not json"), "edit");
+        let long = format!(r#"{{"command":"{}"}}"#, "x".repeat(300));
+        assert_eq!(compose_last_call("bash", &long).chars().count(), 120);
     }
 }
 

@@ -266,9 +266,16 @@ fn handle_job_event(
     session_id: &str,
 ) {
     match event {
-        EngineEvent::ToolCallStarted { .. } => {
+        EngineEvent::ToolCallStarted {
+            name,
+            arguments_json,
+            ..
+        } => {
             *pending_tool_calls += 1;
-            if let Some(info) = ctx.statuses.record_tool_step(session_id) {
+            if let Some(info) = ctx
+                .statuses
+                .record_tool_step(session_id, name, arguments_json)
+            {
                 notify_job_changed(ctx.notifier, ctx.engine, info);
             }
         }
