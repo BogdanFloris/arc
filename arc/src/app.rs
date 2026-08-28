@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
     HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, SessionRole, Source, ToolOutcome,
     history_entry, job_info,
@@ -8,8 +9,6 @@ use arc_proto::v1::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const PAGE: usize = 10;
-
-const REVIEW_WINDOW_MICROS: i64 = 7 * 24 * 3_600 * 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -79,6 +78,7 @@ pub enum NetEvent {
         reason: String,
     },
     ReviewItems(Vec<ReviewEntry>),
+    ReviewChanged(u32),
     JobItems(Vec<JobInfo>),
     SessionAppended {
         session_id: String,
@@ -242,6 +242,9 @@ pub struct App {
     /// The first message typed behind a pending door, sent once the
     /// created session's id arrives.
     pending_first: Option<String>,
+    /// The review queue's size: the server's word, not a local count.
+    /// Opening the pane never clears it; only a verdict shrinks it.
+    pub review_pending: u32,
 }
 
 impl App {
@@ -283,6 +286,7 @@ impl App {
             session_meta: HashMap::new(),
             pending_code: None,
             pending_first: None,
+            review_pending: 0,
         }
     }
 
@@ -1344,6 +1348,10 @@ impl App {
                     review.loaded = true;
                     review.pending_delete = false;
                 }
+                None
+            }
+            NetEvent::ReviewChanged(pending) => {
+                self.review_pending = pending;
                 None
             }
             NetEvent::JobItems(items) => {
@@ -3323,6 +3331,33 @@ mod tests {
         assert_eq!(app.review, None);
         app.on_net(NetEvent::ReviewItems(vec![entry("mr-2", "two")]));
         assert_eq!(app.review, None);
+    }
+
+    #[test]
+    fn a_review_changed_push_sets_the_pending_count() {
+        let mut app = App::new();
+        assert_eq!(app.review_pending, 0);
+
+        app.on_net(NetEvent::ReviewChanged(2));
+        assert_eq!(app.review_pending, 2);
+
+        app.on_net(NetEvent::ReviewChanged(0));
+        assert_eq!(app.review_pending, 0);
+    }
+
+    #[test]
+    fn opening_the_review_pane_does_not_touch_the_pending_count() {
+        let mut app = App::new();
+        app.on_net(NetEvent::ReviewChanged(3));
+
+        normal(&mut app, ":review");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::ReviewItems(vec![entry("mr-1", "one")]));
+
+        assert_eq!(
+            app.review_pending, 3,
+            "the queue's size, not an unread badge that opening clears"
+        );
     }
 
     #[test]

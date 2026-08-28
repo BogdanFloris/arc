@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    Budget, MemoryEvent, MessageAppended, Notification, Role, SessionAppended, SessionCreated,
-    SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
-    WorkspaceGrant,
+    Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role, SessionAppended,
+    SessionCreated, SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome,
+    ToolResultRecorded, WorkspaceGrant,
 };
 use arc_proto::v1::{event, memory_event, notification, session_event};
 use futures::StreamExt as _;
@@ -198,11 +198,13 @@ impl Engine {
     /// The verdict on a proposed memory record: accept the review queue's
     /// suggestion, or delete the record outright.
     pub fn review_accept(&self, record_id: &str) -> Result<(), Error> {
-        Ok(self.with_store_mut(|store| store.review_accept(record_id))?)
+        self.with_store_mut(|store| store.review_accept(record_id))?;
+        self.notify_review_changed()
     }
 
     pub fn review_delete(&self, record_id: &str) -> Result<(), Error> {
-        Ok(self.with_store_mut(|store| store.review_delete(record_id))?)
+        self.with_store_mut(|store| store.review_delete(record_id))?;
+        self.notify_review_changed()
     }
 
     fn turn_guard(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1239,11 +1241,34 @@ impl Engine {
         });
     }
 
+    /// The review queue's current size, over the same lookback the `:review`
+    /// pane defaults to, so a live count matches what opening it shows.
+    pub fn review_pending(&self) -> Result<u32, Error> {
+        let since = chrono::Utc::now().timestamp_micros() - projection::REVIEW_WINDOW_MICROS;
+        let items = self.with_store(|store| store.projection().review_items(since))?;
+        Ok(u32::try_from(items.len()).unwrap_or(u32::MAX))
+    }
+
+    fn notify_review_changed(&self) -> Result<(), Error> {
+        let Some(notifier) = &self.notifier else {
+            return Ok(());
+        };
+        let pending = self.review_pending()?;
+        let _ = notifier.send(Notification {
+            event: Some(notification::Event::ReviewChanged(ReviewChanged {
+                pending,
+            })),
+        });
+        Ok(())
+    }
+
     fn record_memory(&self, source: Source, payload: memory_event::Event) -> Result<u64, Error> {
         let payload = event::Payload::Memory(MemoryEvent {
             event: Some(payload),
         });
-        Ok(self.with_store_mut(|store| store.append(source, Some(now_ts()), payload))?)
+        let seq = self.with_store_mut(|store| store.append(source, Some(now_ts()), payload))?;
+        self.notify_review_changed()?;
+        Ok(seq)
     }
 
     fn append_reply(
@@ -3317,6 +3342,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inline_memory_write_pushes_a_review_changed_with_the_grown_count() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "memory_write",
+                    r#"{"kind":"preference","title":"Terse replies",
+                        "summary":"prefers short answers","body":"Prefers short answers."}"#,
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("saved"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
+        let engine = engine.with_notifier(notifier);
+
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "remember this", tx)
+            .await
+            .expect("send");
+
+        let mut pending_seen = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if let Some(arc_proto::v1::notification::Event::ReviewChanged(changed)) =
+                notification.event
+            {
+                pending_seen.push(changed.pending);
+            }
+        }
+        assert_eq!(
+            pending_seen,
+            [1],
+            "the new record is the only one pending review"
+        );
+    }
+
+    #[tokio::test]
     async fn a_supersede_turn_records_one_record_superseded() {
         struct Superseder;
 
@@ -3534,6 +3602,33 @@ mod tests {
             .map(|item| item.record.id)
             .collect();
         assert_eq!(queued, ["mr-fact"], "the deleted record is gone entirely");
+    }
+
+    #[tokio::test]
+    async fn a_review_verdict_pushes_a_review_changed_with_the_shrunk_count() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log_at(
+            &dir,
+            seeded_records(),
+            chrono::Utc::now().timestamp_micros(),
+        );
+        let (engine, _run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
+        let engine = engine.with_notifier(notifier);
+
+        engine.review_accept("mr-fact").expect("accept");
+
+        let notification = notifications.try_recv().expect("a notification was pushed");
+        match notification.event {
+            Some(arc_proto::v1::notification::Event::ReviewChanged(changed)) => {
+                assert_eq!(
+                    changed.pending, 1,
+                    "one of the two seeded records left the queue"
+                );
+            }
+            other => panic!("expected ReviewChanged, got {other:?}"),
+        }
     }
 
     #[tokio::test]

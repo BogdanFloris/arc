@@ -57,15 +57,19 @@ async fn connect(url: &str, events: &mpsc::UnboundedSender<NetEvent>) -> Option<
             return None;
         }
     };
-    match client.subscribe().await {
-        Ok(()) => Some(client),
-        Err(error) => {
-            let _ = events.send(NetEvent::Disconnected {
-                reason: error.to_string(),
-            });
-            None
-        }
+    if let Err(error) = client.subscribe().await {
+        let _ = events.send(NetEvent::Disconnected {
+            reason: error.to_string(),
+        });
+        return None;
     }
+    // best-effort: the indicator seeds on the next push if this fails
+    let since = chrono::Utc::now().timestamp_micros() - arc_core::projection::REVIEW_WINDOW_MICROS;
+    if let Ok(items) = client.review_items(since).await {
+        let pending = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let _ = events.send(NetEvent::ReviewChanged(pending));
+    }
+    Some(client)
 }
 
 fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>) {
@@ -77,6 +81,9 @@ fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>
         }
         Some(notification::Event::JobChanged(job)) => {
             let _ = events.send(NetEvent::JobChanged(job));
+        }
+        Some(notification::Event::ReviewChanged(changed)) => {
+            let _ = events.send(NetEvent::ReviewChanged(changed.pending));
         }
         None => {}
     }
@@ -292,7 +299,8 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{
-        ClientFrame, JobInfo, JobList, ServerFrame, SessionList, client_frame, server_frame,
+        ClientFrame, JobInfo, JobList, MemoryReviewItems, ServerFrame, SessionList, client_frame,
+        server_frame,
     };
     use futures::{SinkExt as _, StreamExt as _};
     use prost::Message as _;
@@ -362,6 +370,17 @@ mod tests {
                 expect_frame(&mut ws).await.msg,
                 Some(client_frame::Msg::Subscribe(_))
             ));
+            let review = expect_frame(&mut ws).await;
+            assert!(matches!(
+                review.msg,
+                Some(client_frame::Msg::MemoryReviewList(_))
+            ));
+            reply(
+                &mut ws,
+                review.request_id,
+                server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
+            )
+            .await;
             let list = expect_frame(&mut ws).await;
             assert!(matches!(list.msg, Some(client_frame::Msg::ListSessions(_))));
             reply(
@@ -384,6 +403,17 @@ mod tests {
                 ),
                 "the reconnect re-subscribes before the command runs"
             );
+            let review = expect_frame(&mut ws).await;
+            assert!(matches!(
+                review.msg,
+                Some(client_frame::Msg::MemoryReviewList(_))
+            ));
+            reply(
+                &mut ws,
+                review.request_id,
+                server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
+            )
+            .await;
             let jobs = expect_frame(&mut ws).await;
             assert!(matches!(jobs.msg, Some(client_frame::Msg::ListJobs(_))));
             reply(
@@ -401,6 +431,11 @@ mod tests {
         tokio::spawn(run(url, command_rx, event_tx));
 
         commands.send(Command::List).expect("net task alive");
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::ReviewChanged(0),
+            "connecting seeds the review indicator before the command runs"
+        );
         assert_eq!(next_event(&mut events).await, NetEvent::Sessions(vec![]));
         assert!(
             matches!(next_event(&mut events).await, NetEvent::Disconnected { .. }),
@@ -408,6 +443,11 @@ mod tests {
         );
 
         commands.send(Command::ListJobs).expect("net task alive");
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::ReviewChanged(0),
+            "the reconnect seeds the indicator again"
+        );
         assert_eq!(
             next_event(&mut events).await,
             NetEvent::JobItems(vec![job]),
@@ -418,5 +458,22 @@ mod tests {
             .await
             .expect("server finishes within PATIENCE")
             .expect("server task");
+    }
+
+    #[test]
+    fn a_pushed_review_changed_notification_dispatches_to_a_net_event() {
+        let (events, mut rx) = mpsc::unbounded_channel();
+        dispatch(
+            Notification {
+                event: Some(notification::Event::ReviewChanged(
+                    arc_proto::v1::ReviewChanged { pending: 4 },
+                )),
+            },
+            &events,
+        );
+        assert_eq!(
+            rx.try_recv().expect("dispatched"),
+            NetEvent::ReviewChanged(4)
+        );
     }
 }

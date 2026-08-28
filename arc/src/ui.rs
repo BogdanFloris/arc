@@ -316,12 +316,20 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Visual => "visual",
         Mode::Normal | Mode::Cmd => "",
     };
-    let door = app.open_door_label();
-    let mode = match (mode_word.is_empty(), door) {
-        (true, None) => String::new(),
-        (true, Some(door)) => format!("-- {door} "),
-        (false, None) => format!("-- {mode_word} "),
-        (false, Some(door)) => format!("-- {mode_word} {door} "),
+    let mut left: Vec<String> = Vec::new();
+    if !mode_word.is_empty() {
+        left.push(mode_word.to_owned());
+    }
+    if let Some(door) = app.open_door_label() {
+        left.push(door);
+    }
+    if app.review_pending > 0 {
+        left.push(format!("review {}", app.review_pending));
+    }
+    let mode = if left.is_empty() {
+        String::new()
+    } else {
+        format!("-- {} ", left.join(" "))
     };
     let mut words: Vec<Span> = Vec::new();
     match app.status {
@@ -1103,6 +1111,23 @@ mod tests {
 
         let buffer = rendered(&mut app);
         assert!(!plain_text(&buffer).contains("streaming"));
+    }
+
+    #[test]
+    fn the_rule_line_shows_the_review_queue_when_it_holds_records() {
+        let mut app = conversation();
+        app.review_pending = 2;
+
+        let buffer = rendered(&mut app);
+        assert!(plain_text(&buffer).contains("review 2"));
+    }
+
+    #[test]
+    fn the_rule_line_hides_the_review_segment_at_zero() {
+        let mut app = conversation();
+
+        let buffer = rendered(&mut app);
+        assert!(!plain_text(&buffer).contains("review"));
     }
 
     #[test]

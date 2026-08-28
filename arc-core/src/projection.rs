@@ -804,6 +804,10 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The `:review` pane's default lookback; the queue's live count uses the
+/// same window so it matches what opening the pane shows.
+pub const REVIEW_WINDOW_MICROS: i64 = 7 * 24 * 3_600 * 1_000_000;
+
 pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
     let mut stmt = conn.prepare(
         "SELECT id, kind, namespace, title, summary, body, links, provenance,

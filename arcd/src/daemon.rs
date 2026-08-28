@@ -12,7 +12,7 @@ use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
-use arc_proto::v1::{Notification, SessionRole};
+use arc_proto::v1::{Notification, ReviewChanged, SessionRole, notification};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -196,6 +196,7 @@ impl Daemon {
             self.roles.archivist(),
             Arc::clone(&self.engine),
             self.identity.clone(),
+            self.notifier.clone(),
         );
 
         let job_runners = BTreeMap::from([
@@ -245,6 +246,7 @@ fn consolidation_task(
     archivist: &Runner,
     engine: Arc<Engine>,
     identity: Option<String>,
+    notifier: broadcast::Sender<Notification>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
         info!("consolidation disabled");
@@ -275,7 +277,7 @@ fn consolidation_task(
                 warn!("no usable clock reading; skipping this consolidation tick");
                 continue;
             };
-            tick_once(&engine, &extractor, cutoff, &mut strikes).await;
+            tick_once(&engine, &extractor, cutoff, &mut strikes, &notifier).await;
         }
     }))
 }
@@ -285,12 +287,22 @@ async fn tick_once<E: Extractor>(
     extractor: &E,
     cutoff: i64,
     strikes: &mut Strikes,
+    notifier: &broadcast::Sender<Notification>,
 ) {
     let pass =
         consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION_V2, strikes.skip());
     match pass.await {
-        Ok(consolidation::Outcome::Consolidated { session_id, .. }) => {
+        Ok(consolidation::Outcome::Consolidated {
+            session_id,
+            records,
+            ..
+        }) => {
             strikes.succeeded(&session_id);
+            // consolidation writes memory events straight through the store,
+            // bypassing the engine's own notify-on-append
+            if records > 0 {
+                notify_review_changed(engine, notifier);
+            }
         }
         Ok(_) => {}
         Err(consolidation::Error::Extractor { session_id, source }) => {
@@ -304,6 +316,19 @@ async fn tick_once<E: Extractor>(
             }
         }
         Err(error) => warn!(%error, "consolidation pass failed; yielding until the next tick"),
+    }
+}
+
+fn notify_review_changed(engine: &Engine, notifier: &broadcast::Sender<Notification>) {
+    match engine.review_pending() {
+        Ok(pending) => {
+            let _ = notifier.send(Notification {
+                event: Some(notification::Event::ReviewChanged(ReviewChanged {
+                    pending,
+                })),
+            });
+        }
+        Err(error) => warn!(%error, "reading the review queue after consolidation failed"),
     }
 }
 
@@ -564,6 +589,7 @@ mod tests {
                 daemon.roles.archivist(),
                 Arc::clone(&daemon.engine),
                 None,
+                daemon.notifier.clone(),
             )
             .is_none(),
             "disabled by default: no task, so a tick can do nothing"
@@ -579,6 +605,7 @@ mod tests {
             daemon.roles.archivist(),
             Arc::clone(&daemon.engine),
             None,
+            daemon.notifier.clone(),
         )
         .expect("enabled spawns the tick");
         task.abort();
@@ -654,7 +681,14 @@ mod tests {
         let extractor = AlwaysFailing(std::sync::Mutex::new(Vec::new()));
         let mut strikes = Strikes::default();
         for _ in 0..4 {
-            tick_once(&daemon.engine, &extractor, i64::MAX, &mut strikes).await;
+            tick_once(
+                &daemon.engine,
+                &extractor,
+                i64::MAX,
+                &mut strikes,
+                &daemon.notifier,
+            )
+            .await;
         }
 
         let seen = extractor.0.lock().expect("seen").clone();
@@ -665,6 +699,98 @@ mod tests {
         );
         assert!(strikes.skip().contains("s-a"));
         assert!(!strikes.skip().contains("s-b"), "s-b has strikes to spare");
+    }
+
+    struct Scripted(Vec<arc_proto::v1::memory_event::Event>);
+
+    impl arc_core::consolidation::Extractor for Scripted {
+        async fn extract(
+            &self,
+            _session: &arc_core::consolidation::SessionSnapshot,
+        ) -> Result<Vec<arc_proto::v1::memory_event::Event>, arc_core::consolidation::ExtractError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn created_record(id: &str) -> arc_proto::v1::memory_event::Event {
+        use arc_proto::v1::{MemoryRecord, MemoryRecordCreated, memory_record};
+        arc_proto::v1::memory_event::Event::RecordCreated(MemoryRecordCreated {
+            record: Some(MemoryRecord {
+                id: id.to_owned(),
+                kind: memory_record::Kind::Fact as i32,
+                namespace: "global".to_owned(),
+                title: "extracted".to_owned(),
+                summary: "an extracted fact".to_owned(),
+                body: "the body".to_owned(),
+                links: Vec::new(),
+                provenance: None,
+                status: memory_record::Status::Active as i32,
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_consolidation_pass_that_lands_a_record_broadcasts_review_changed() {
+        let temp = TempDir::new().expect("temp dir");
+        let dirs = DataDirs::new(&temp.path().join("data"));
+        dirs.create().expect("create dirs");
+        let mut log = Log::open(dirs.log()).expect("open log");
+        seed_idle_session(&mut log, "s-a", 1_000_000);
+        drop(log);
+        let daemon =
+            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
+        let mut notifications = daemon.notifier.subscribe();
+
+        let extractor = Scripted(vec![created_record("m-1")]);
+        let mut strikes = Strikes::default();
+        tick_once(
+            &daemon.engine,
+            &extractor,
+            i64::MAX,
+            &mut strikes,
+            &daemon.notifier,
+        )
+        .await;
+
+        let notification = notifications
+            .try_recv()
+            .expect("a review_changed notification was pushed");
+        match notification.event {
+            Some(notification::Event::ReviewChanged(changed)) => {
+                assert_eq!(changed.pending, 1, "the landed record is pending review");
+            }
+            other => panic!("expected ReviewChanged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_consolidation_pass_that_extracts_nothing_pushes_no_notification() {
+        let temp = TempDir::new().expect("temp dir");
+        let dirs = DataDirs::new(&temp.path().join("data"));
+        dirs.create().expect("create dirs");
+        let mut log = Log::open(dirs.log()).expect("open log");
+        seed_idle_session(&mut log, "s-a", 1_000_000);
+        drop(log);
+        let daemon =
+            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
+        let mut notifications = daemon.notifier.subscribe();
+
+        let extractor = Scripted(Vec::new());
+        let mut strikes = Strikes::default();
+        tick_once(
+            &daemon.engine,
+            &extractor,
+            i64::MAX,
+            &mut strikes,
+            &daemon.notifier,
+        )
+        .await;
+
+        assert!(
+            notifications.try_recv().is_err(),
+            "nothing landed, so nothing to notify"
+        );
     }
 
     #[test]
