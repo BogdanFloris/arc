@@ -37,6 +37,10 @@ pub enum Command {
     DropSteers {
         session_id: String,
     },
+    CreateSession {
+        role: SessionRole,
+        project: String,
+    },
     Yank(String),
 }
 
@@ -79,6 +83,9 @@ pub enum NetEvent {
         session_id: String,
     },
     JobChanged(JobInfo),
+    SessionCreated {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,17 +540,35 @@ impl App {
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                match self.cmd.as_str() {
+                let cmd = std::mem::take(&mut self.cmd);
+                match cmd.as_str() {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
                     "jobs" => return Some(self.open_jobs()),
                     "help" => self.help = true,
-                    _ => self.last_error = Some("E492".to_owned()),
+                    cmd => match cmd.strip_prefix("code ") {
+                        Some(project) => return self.open_code(project.trim()),
+                        None => self.last_error = Some("E492".to_owned()),
+                    },
                 }
             }
             _ => {}
         }
         None
+    }
+
+    /// `:code <project>` (row 9.1): the direct door — a bound executor
+    /// session, no dispatch. An empty project name is a usage error, not a
+    /// request the daemon would refuse anyway.
+    fn open_code(&mut self, project: &str) -> Option<Command> {
+        if project.is_empty() {
+            self.last_error = Some("E492".to_owned());
+            return None;
+        }
+        Some(Command::CreateSession {
+            role: SessionRole::Executor,
+            project: project.to_owned(),
+        })
     }
 
     fn open_review(&mut self) -> Command {
@@ -1101,6 +1126,7 @@ impl App {
                 }
                 None
             }
+            NetEvent::SessionCreated { session_id } => self.start_session(Some(session_id)),
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
                 self.last_error = Some("disconnected".to_owned());
@@ -1208,11 +1234,12 @@ fn is_running(job: &JobInfo) -> bool {
     job.state == job_info::State::Running as i32
 }
 
+/// A dispatched child, kept behind the picker's show-all toggle; a root
+/// conversation — including a `:code` session, executor role but no
+/// dispatcher — always lists (row 9.1's reclassification: keyed on
+/// `dispatched_by`, not role).
 pub fn is_job_session(session: &SessionInfo) -> bool {
-    matches!(
-        SessionRole::try_from(session.role),
-        Ok(SessionRole::Executor | SessionRole::Archivist)
-    )
+    !session.dispatched_by.is_empty()
 }
 
 fn short_id(id: &str) -> &str {
@@ -1440,6 +1467,18 @@ mod tests {
         SessionInfo {
             role: role as i32,
             project: project.to_owned(),
+            dispatched_by: "s-parent".to_owned(),
+            ..session_with(id, title, "")
+        }
+    }
+
+    /// A `:code` session (row 9.1): bound to a project like a job, but no
+    /// dispatcher — the picker must list it as a conversation, not a job.
+    fn code_session(id: &str, title: &str, project: &str) -> SessionInfo {
+        SessionInfo {
+            role: SessionRole::Executor as i32,
+            project: project.to_owned(),
+            dispatched_by: String::new(),
             ..session_with(id, title, "")
         }
     }
@@ -2660,6 +2699,32 @@ mod tests {
     }
 
     #[test]
+    fn a_code_sessions_empty_dispatched_by_lists_it_as_a_conversation() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            code_session("code", "", "arc"),
+            job_session("job", "", SessionRole::Executor, "arc"),
+        ]));
+        normal(&mut app, "s");
+
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["code"],
+            "an executor session with no dispatcher is a root conversation, not a job"
+        );
+
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(
+            app.picker_rows().len(),
+            2,
+            "a reveals the dispatched job alongside it"
+        );
+    }
+
+    #[test]
     fn space_toggles_show_all_same_as_a() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![
@@ -3018,6 +3083,52 @@ mod tests {
         assert!(!jobs.loaded, "nothing has been answered yet");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":jobs is a command, not E492");
+    }
+
+    #[test]
+    fn colon_code_sends_a_create_session_request() {
+        let mut app = App::new();
+        normal(&mut app, ":code arc");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::CreateSession {
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+            }),
+            "the direct door: no dispatch, straight to a bound session"
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.last_error, None, ":code is a command, not E492");
+    }
+
+    #[test]
+    fn colon_code_with_no_project_is_e492() {
+        let mut app = App::new();
+        normal(&mut app, ":code");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, None);
+        assert_eq!(app.last_error.as_deref(), Some("E492"));
+    }
+
+    #[test]
+    fn a_created_session_opens_like_a_picker_selection() {
+        let mut app = App::new();
+
+        let command = app.on_net(NetEvent::SessionCreated {
+            session_id: "s-code".to_owned(),
+        });
+
+        assert_eq!(app.session_id.as_deref(), Some("s-code"));
+        assert_eq!(
+            command,
+            Some(Command::History {
+                session_id: "s-code".to_owned()
+            }),
+            "opening fetches history, same as the picker"
+        );
     }
 
     #[test]

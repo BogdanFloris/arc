@@ -758,6 +758,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":q :q! :qa :quit  quit",
             ":review           open the review pane",
             ":jobs             open the jobs pane",
+            ":code <project>   open a bound executor session, no dispatch",
             ":help             this popup",
         ],
     ),

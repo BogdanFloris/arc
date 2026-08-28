@@ -16,10 +16,21 @@ fn job_preamble(root: &Path) -> String {
     )
 }
 
-/// The preamble, plus the project's `AGENTS.md` verbatim if it has one.
-/// Built once at spawn so it stays byte-stable for the job's lifetime.
-pub(super) fn job_system_prompt(root: &Path) -> String {
-    let preamble = job_preamble(root);
+/// Same shape as `job_preamble`, for a session the user opened directly
+/// (`:code`, row 9.1) rather than a job dispatched to run alone: no report
+/// line, since the user is present and the turn is one message in an
+/// ongoing conversation, not a hand-back.
+fn direct_preamble(root: &Path) -> String {
+    format!(
+        "You are a coding agent inside ARC's harness, working interactively with \
+         the user in {}. Four workspace tools are available: read, write, edit, \
+         bash. Be concise. Show file paths clearly.",
+        root.display()
+    )
+}
+
+/// `preamble`, plus the project's `AGENTS.md` verbatim if it has one.
+fn with_agents_md(root: &Path, preamble: String) -> String {
     match identity::load(&root.join("AGENTS.md")) {
         Ok(Some(agents)) => format!("{preamble}\n\n{agents}"),
         Ok(None) => preamble,
@@ -28,6 +39,19 @@ pub(super) fn job_system_prompt(root: &Path) -> String {
             preamble
         }
     }
+}
+
+/// The job preamble, plus AGENTS.md. Built once at spawn so it stays
+/// byte-stable for the job's lifetime.
+pub(super) fn job_system_prompt(root: &Path) -> String {
+    with_agents_md(root, job_preamble(root))
+}
+
+/// The direct preamble, plus AGENTS.md. Re-derived per turn like `sources`
+/// (row 9.1) — byte-stable while AGENTS.md is unchanged, since caching
+/// depends on the prefix staying stable turn to turn.
+pub(crate) fn direct_system_prompt(root: &Path) -> String {
+    with_agents_md(root, direct_preamble(root))
 }
 
 #[cfg(test)]
@@ -120,6 +144,35 @@ mod tests {
             .clone()
             .expect("a job runner gets a system prompt even with no AGENTS.md");
         assert_eq!(system, job_preamble(&root));
+    }
+
+    #[test]
+    fn direct_system_prompt_says_interactive_and_carries_agents_md() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("AGENTS.md"), "Use jj, not git.\n").expect("write AGENTS.md");
+
+        let system = direct_system_prompt(&root);
+
+        assert!(
+            system.contains("working interactively with the user"),
+            "{system}"
+        );
+        assert!(!system.contains("job's report"), "{system}");
+        assert!(system.contains("Use jj, not git."), "{system}");
+    }
+
+    #[test]
+    fn direct_and_job_preambles_differ_only_in_who_is_present() {
+        let root = std::path::Path::new("/tmp/proj");
+
+        let job = job_preamble(root);
+        let direct = direct_preamble(root);
+
+        assert_ne!(job, direct);
+        assert!(job.contains("non-interactively"));
+        assert!(direct.contains("interactively with the user"));
     }
 
     #[tokio::test]

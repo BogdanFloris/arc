@@ -108,6 +108,9 @@ async fn handle(
         Command::DropSteers { session_id } => {
             verdict(client.drop_steers(&session_id).await, events)
         }
+        Command::CreateSession { role, project } => {
+            create_session(&mut client, role, &project, events).await
+        }
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
         Command::Yank(_) => Ok(()),
     };
@@ -198,6 +201,25 @@ async fn list_jobs(
     match client.jobs().await {
         Ok(jobs) => {
             let _ = events.send(NetEvent::JobItems(jobs));
+            Ok(())
+        }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn create_session(
+    client: &mut Client,
+    role: arc_proto::v1::SessionRole,
+    project: &str,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.create_session(role, project).await {
+        Ok(session_id) => {
+            let _ = events.send(NetEvent::SessionCreated { session_id });
             Ok(())
         }
         Err(Error::Server { code, msg }) => {

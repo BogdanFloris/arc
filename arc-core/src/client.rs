@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 
 use arc_proto::v1::{
-    CancelJob, ClientFrame, DropSteers, FetchHistory, JobInfo, ListJobs, ListSessions,
-    MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification,
-    SendMessage, ServerFrame, SessionHistory, SessionInfo, Subscribe, client_frame, server_frame,
+    CancelJob, ClientFrame, CreateSession, DropSteers, FetchHistory, JobInfo, ListJobs,
+    ListSessions, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList,
+    Notification, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe,
+    client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -219,6 +220,30 @@ impl Client {
             }))
             .await?;
         self.verdict_ack(id).await
+    }
+
+    /// The `:code` door (row 9.1): opens a bound session directly, no
+    /// dispatch. The daemon accepts only `SessionRole::Executor` for now.
+    #[tracing::instrument(name = "client.create_session", skip_all, fields(project))]
+    pub async fn create_session(
+        &mut self,
+        role: SessionRole,
+        project: &str,
+    ) -> Result<String, Error> {
+        let id = self
+            .send(client_frame::Msg::CreateSession(CreateSession {
+                role: role as i32,
+                project: project.to_owned(),
+            }))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::MessageAccepted(accepted) => Ok(accepted.session_id),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("MessageAccepted", &other)),
+        }
     }
 
     async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
@@ -587,6 +612,41 @@ mod tests {
             frames[0].msg,
             Some(client_frame::Msg::ListJobs(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn create_session_round_trips_the_new_sessions_id() {
+        let (url, handle) = server(vec![vec![echo(accepted("s-code"))]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let session_id = client
+            .create_session(SessionRole::Executor, "arc")
+            .await
+            .expect("create_session");
+
+        assert_eq!(session_id, "s-code");
+        let frames = received(handle).await;
+        match &frames[0].msg {
+            Some(client_frame::Msg::CreateSession(create)) => {
+                assert_eq!(create.role, SessionRole::Executor as i32);
+                assert_eq!(create.project, "arc");
+            }
+            other => panic!("expected CreateSession, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_surfaces_the_daemons_refusal() {
+        let (url, handle) = server(vec![vec![echo(error("unsupported_role", "no"))]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let err = client
+            .create_session(SessionRole::Concierge, "arc")
+            .await
+            .expect_err("a non-executor role is refused");
+
+        assert!(matches!(err, Error::Server { code, .. } if code == "unsupported_role"));
+        received(handle).await;
     }
 
     #[tokio::test]

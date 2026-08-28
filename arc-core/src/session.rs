@@ -261,19 +261,44 @@ impl Engine {
             budget,
             Intent::Implement,
             None,
+            Source::Model,
+        )
+    }
+
+    /// The `:code` door (row 9.1): a bound session the user opened directly,
+    /// not a model's `dispatch`. Recorded `Source::User`, read-write grants
+    /// (implement-style, no downgrade), no budget, no `dispatched_by` — it
+    /// is a conversation, not a job.
+    pub fn create_direct_session(
+        &self,
+        runner: &Runner,
+        project: &str,
+        role: SessionRole,
+    ) -> Result<String, Error> {
+        self.create_bound_session_with_intent(
+            runner,
+            project,
+            role,
+            None,
+            Intent::Implement,
+            None,
+            Source::User,
         )
     }
 
     /// Same as `create_bound_session`, but `Intent::Analyze` records the
     /// project root grant read-only instead of read-write. `dispatched_by`
     /// is the parent recorded on a job's own creation (DESIGN.md/6.34); a
-    /// session the runner starts for itself passes `None`.
+    /// session the runner starts for itself passes `None`. `source` is
+    /// `Model` for a dispatch and `User` for the `:code` door — who asked
+    /// for the session, not who runs it.
     #[tracing::instrument(
         level = "info",
         name = "session.create_bound_session",
         skip_all,
         fields(project, session_id = tracing::field::Empty)
     )]
+    #[allow(clippy::too_many_arguments)]
     fn create_bound_session_with_intent(
         &self,
         runner: &Runner,
@@ -282,6 +307,7 @@ impl Engine {
         budget: Option<Budget>,
         intent: Intent,
         dispatched_by: Option<&str>,
+        source: Source,
     ) -> Result<String, Error> {
         let spec = self
             .projects
@@ -309,9 +335,8 @@ impl Engine {
             .get(&role)
             .cloned()
             .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
-        // a job session exists because a model asked for it
         self.record(
-            Source::Model,
+            source,
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.clone(),
                 title: String::new(),
@@ -355,6 +380,7 @@ impl Engine {
             budget,
             intent,
             Some(parent_session),
+            Source::Model,
         ) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
@@ -527,6 +553,12 @@ impl Engine {
     pub fn session_role(&self, session_id: &str) -> Result<Option<SessionRole>, Error> {
         let raw = self.with_store(|store| store.projection().session_role(session_id))?;
         Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
+    }
+
+    /// The project a session was bound to at creation, straight from the
+    /// log. `None` for an unbound session or one predating project stamping.
+    pub fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
+        Ok(self.with_store(|store| store.projection().session_project(session_id))?)
     }
 
     /// A session's summed input+output tokens across every message it
@@ -1530,7 +1562,8 @@ mod tests {
         Canned, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying,
         channel, counter_samples, done_reply, drain, engine, engine_with_tools,
         engine_with_tools_at, issued, reopened_engine, replay_events, replay_log, resulted, runner,
-        seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools, turn, usage,
+        runner_with_role, seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools, turn,
+        usage,
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
@@ -3868,6 +3901,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_direct_session_records_source_user_and_no_dispatch_metadata() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin, ToolSource::Workspace],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_identities(BTreeMap::from([(
+                SessionRole::Executor,
+                ("opencode".to_owned(), "deepseek-v4-pro".to_owned()),
+            )]));
+
+        let session_id = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect(":code opens a direct session");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 1, "no dispatch, so nothing else was appended");
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated, got {:?}", events[0]);
+        };
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(created.role, SessionRole::Executor as i32);
+        assert_eq!(
+            created.provider, "opencode",
+            "the executor role's own identity, not the caller's"
+        );
+        assert_eq!(created.model, "deepseek-v4-pro");
+        assert!(created.budget.is_none(), "the user is present; no budget");
+        assert_eq!(
+            created.dispatched_by, "",
+            "a :code session is a root conversation, not a dispatched job"
+        );
+        assert_eq!(
+            created.grants,
+            [arc_proto::v1::WorkspaceGrant {
+                root: root
+                    .canonicalize()
+                    .expect("canon")
+                    .to_string_lossy()
+                    .into_owned(),
+                read_write: true,
+            }],
+            "implement-style: read-write, no downgrade"
+        );
+
+        let raw_events = replay_events(dir.path());
+        assert_eq!(
+            raw_events[0].source,
+            Source::User as i32,
+            "the user asked for this, not a model"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_direct_session_names_an_unknown_project() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+
+        let err = engine
+            .create_direct_session(&run, "ghost", SessionRole::Executor)
+            .expect_err("an unconfigured project must be refused");
+
+        assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
+        assert!(err.to_string().contains("ghost"));
+        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+    }
+
+    #[tokio::test]
+    async fn a_turn_served_into_a_direct_session_resolves_its_grants() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("inside.txt"), "hi").expect("write");
+
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "read",
+                    &serde_json::json!({"path": root.join("inside.txt")}).to_string(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let executor_run = runner_with_role(&provider, SessionRole::Executor);
+
+        let session_id = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect("create a direct session");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&executor_run, Some(&session_id), "read it", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(result.content, "hi");
+    }
+
+    #[tokio::test]
     async fn a_bound_sessions_grants_flow_from_the_log_through_the_gate() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
@@ -4741,6 +4896,7 @@ mod tests {
                 None,
                 Intent::Analyze,
                 Some(&parent_id),
+                Source::Model,
             )
             .expect("create an analyze child");
 

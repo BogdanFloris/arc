@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_core::projection::{Reader, ReviewItem, SessionSummary};
+use arc_core::provider::role_label;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, Delta, Error as WireError, JobList, MemoryReviewItem, MemoryReviewItems,
-    MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame, SessionHistory,
-    SessionInfo, SessionList, SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, client_frame,
-    server_frame,
+    ClientFrame, CreateSession, Delta, Error as WireError, JobList, MemoryReviewItem,
+    MemoryReviewItems, MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame,
+    SessionHistory, SessionInfo, SessionList, SessionRole, StreamEnd, ToolCallEnded,
+    ToolCallStarted, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -257,6 +258,9 @@ async fn request(
         Some(client_frame::Msg::DropSteers(drop)) => {
             drop_steers(ws, supervisor, frame.request_id, &drop.session_id).await
         }
+        Some(client_frame::Msg::CreateSession(create)) => {
+            create_session(ws, engine, runner, frame.request_id, create).await
+        }
         // no reply frame: the subscription's frames are the notifications,
         // pushed from the connection loop's select, not from here
         Some(client_frame::Msg::Subscribe(_)) => {
@@ -298,7 +302,7 @@ async fn send_message(
 
     // forward has to run alongside the engine or the event channel fills
     let (result, connected) = tokio::join!(
-        engine.send_message(served_by, session_id, &send.content, events),
+        engine.send_message(&served_by, session_id, &send.content, events),
         forward(ws, request_id, send.session_id.clone(), rx),
     );
 
@@ -331,21 +335,52 @@ async fn send_message(
 /// queue, no handback). A fresh session, a concierge session, or a role the
 /// map has no runner for all fall through to the concierge runner, exactly
 /// as before — an unmapped role then surfaces as an honest `role_mismatch`.
-fn turn_runner<'a>(
+/// An executor session bound to a project gets that project's direct system
+/// prompt (row 9.1, closing 6.41's promptless gap): re-derived every turn
+/// from config, like `sources` is, not the once-at-spawn prompt a
+/// supervisor-run job builds for itself.
+fn turn_runner(
     engine: &Engine,
-    supervisor: &'a Supervisor,
-    concierge: &'a Runner,
+    supervisor: &Supervisor,
+    concierge: &Runner,
     session_id: &str,
-) -> &'a Runner {
+) -> Runner {
     if session_id.is_empty() {
-        return concierge;
+        return concierge.clone();
     }
     match engine.session_role(session_id) {
         Ok(Some(role @ (SessionRole::Executor | SessionRole::Archivist))) => {
-            supervisor.job_runner(role).unwrap_or(concierge)
+            let mut served_by = supervisor
+                .job_runner(role)
+                .cloned()
+                .unwrap_or_else(|| concierge.clone());
+            if role == SessionRole::Executor {
+                if let Some(prompt) = direct_system_prompt_for(engine, supervisor, session_id) {
+                    served_by.system = Some(prompt);
+                }
+            }
+            served_by
         }
-        _ => concierge,
+        _ => concierge.clone(),
     }
+}
+
+/// The `job_system_prompt`-shaped prompt for a direct turn into an executor
+/// session (`:code`, or a follow-up sent straight to a finished job's own
+/// session): built from the session's recorded project, not what dispatched
+/// it. `None` when the session names no project or the project is gone from
+/// config — the same fail-closed the tool sources already apply.
+fn direct_system_prompt_for(
+    engine: &Engine,
+    supervisor: &Supervisor,
+    session_id: &str,
+) -> Option<String> {
+    let project = engine.session_project(session_id).ok().flatten()?;
+    if project.is_empty() {
+        return None;
+    }
+    let root = supervisor.project_root(&project)?;
+    Some(crate::jobs::prompt::direct_system_prompt(root))
 }
 
 /// A steered message never reaches the engine on this connection: its turn
@@ -463,6 +498,36 @@ async fn drop_steers(
         })
     } else {
         error_frame("unknown_job", format!("no live job named {session_id}"))
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+/// The `:code` door (row 9.1): opens a bound session directly, no dispatch.
+/// Only `SessionRole::Executor` is accepted for now.
+async fn create_session(
+    ws: &mut Socket,
+    engine: &Engine,
+    runner: &Runner,
+    request_id: u64,
+    create: CreateSession,
+) -> ControlFlow<()> {
+    let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
+    let msg = if role == SessionRole::Executor {
+        match engine.create_direct_session(runner, &create.project, role) {
+            Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
+            Err(error) => {
+                warn!(%error, code = error_code(&error), "create_session failed");
+                error_frame(error_code(&error), &error)
+            }
+        }
+    } else {
+        error_frame(
+            "unsupported_role",
+            format!(
+                ":code opens an executor session only, not {}",
+                role_label(role)
+            ),
+        )
     };
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -620,6 +685,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::Subscribe(_)) => "subscribe",
         Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
         Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
+        Some(client_frame::Msg::CreateSession(_)) => "create_session",
         None => "unknown",
     }
 }
@@ -633,6 +699,7 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         last_at: summary.last_at.map(timestamp),
         role: summary.role,
         project: summary.project.clone().unwrap_or_default(),
+        dispatched_by: summary.dispatched_by.clone(),
     }
 }
 
@@ -871,6 +938,18 @@ mod tests {
                     )
                 })
                 .collect();
+            // mirrors daemon.rs: the same read-write root a project's spec
+            // grants is what a job's (or a direct turn's) system prompt reads
+            // AGENTS.md from
+            let project_roots: BTreeMap<String, std::path::PathBuf> = projects
+                .iter()
+                .filter_map(|(name, spec)| {
+                    spec.grants
+                        .iter()
+                        .find(|grant| grant.mode == arc_core::tool::workspace::Mode::ReadWrite)
+                        .map(|grant| (name.clone(), grant.root.clone()))
+                })
+                .collect();
             let engine = Arc::new(
                 Engine::new(Store::new(log, projection), registry)
                     .with_projects(projects)
@@ -886,7 +965,9 @@ mod tests {
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
-                Supervisor::new(Arc::clone(&engine), job_runners).with_notifier(notifier.clone()),
+                Supervisor::new(Arc::clone(&engine), job_runners)
+                    .with_projects(project_roots)
+                    .with_notifier(notifier.clone()),
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1064,6 +1145,26 @@ mod tests {
         }
     }
 
+    async fn create_session(
+        ws: &mut Client,
+        request_id: u64,
+        role: SessionRole,
+        project: &str,
+    ) -> server_frame::Msg {
+        send(
+            ws,
+            request_id,
+            client_frame::Msg::CreateSession(CreateSession {
+                role: role as i32,
+                project: project.to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(ws).await;
+        assert_eq!(frame.request_id, request_id);
+        frame.msg.expect("a server frame with no message")
+    }
+
     #[tokio::test]
     async fn a_message_round_trips_accepted_deltas_and_stream_end() {
         let mut harness = Harness::start(Script::Echo).await;
@@ -1129,12 +1230,14 @@ mod tests {
             last_at: None,
             role: SessionRole::Executor as i32,
             project: Some("arc".to_string()),
+            dispatched_by: "s-parent".to_string(),
         };
 
         let info = session_info(&summary);
 
         assert_eq!(info.role, SessionRole::Executor as i32);
         assert_eq!(info.project, "arc");
+        assert_eq!(info.dispatched_by, "s-parent");
     }
 
     #[tokio::test]
@@ -2392,6 +2495,124 @@ mod tests {
             ],
             "the follow-up landed in the child's own log, as a real conversation"
         );
+
+        harness.stop().await;
+    }
+
+    /// Row 9.1: the `:code` door round-trips a fresh executor session, and
+    /// the first turn sent into it carries the direct preamble and
+    /// AGENTS.md — while a job dispatched into the same project still gets
+    /// the unchanged job preamble. Pins both variants side by side.
+    #[tokio::test]
+    async fn create_session_opens_a_code_session_with_the_direct_prompt_and_a_job_keeps_its_own() {
+        let (registry, project_dir, projects) = dispatch_registry_and_projects();
+        std::fs::write(
+            project_dir.path().join("AGENTS.md"),
+            "Keep commits small.\n",
+        )
+        .expect("write AGENTS.md");
+
+        let executor_provider =
+            ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("hi there")]);
+        let mut harness = Harness::with_executor_provider(
+            dispatching_concierge("fix the failing test"),
+            registry,
+            Arc::clone(&executor_provider) as Arc<dyn Provider>,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "start a job")).await;
+        run_turn_to_end(&mut ws, 1).await;
+        harness.drain_jobs().await;
+
+        let msg = create_session(&mut ws, 2, SessionRole::Executor, "arc").await;
+        let code_session_id = match msg {
+            server_frame::Msg::MessageAccepted(accepted) => accepted.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        assert!(!code_session_id.is_empty());
+        assert_ne!(
+            code_session_id,
+            dispatched_child_id(&harness),
+            "a :code session is its own session, not the dispatched job"
+        );
+
+        send(&mut ws, 3, say(&code_session_id, "hello")).await;
+        let (session_id, text, closing) = turn(&mut ws, 3).await;
+        assert_eq!(session_id, code_session_id);
+        assert_eq!(text, "hi there");
+        assert!(!ended(closing).partial);
+
+        let requests = executor_provider.requests();
+        assert_eq!(requests.len(), 2, "the job's turn, then the :code turn");
+        let job_system = requests[0]
+            .system
+            .clone()
+            .expect("the job gets a system prompt");
+        assert!(
+            job_system.contains("non-interactively") && job_system.contains("job's report"),
+            "{job_system}"
+        );
+        assert!(job_system.contains("Keep commits small."), "{job_system}");
+
+        let direct_system = requests[1]
+            .system
+            .clone()
+            .expect("the :code turn gets a system prompt");
+        assert!(
+            direct_system.contains("interactively with the user"),
+            "{direct_system}"
+        );
+        assert!(!direct_system.contains("job's report"), "{direct_system}");
+        assert!(
+            direct_system.contains("Keep commits small."),
+            "{direct_system}"
+        );
+
+        let sessions = list(&mut ws, 4).await;
+        let code_summary = sessions
+            .iter()
+            .find(|s| s.id == code_session_id)
+            .expect("the :code session is listed");
+        assert_eq!(
+            code_summary.dispatched_by, "",
+            "a :code session is a root conversation, not a dispatched child"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_refuses_a_non_executor_role() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let mut harness = Harness::with_executor_provider(
+            Script::Echo,
+            registry,
+            ScriptedProvider::scripted(vec![]) as Arc<dyn Provider>,
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        let msg = create_session(&mut ws, 1, SessionRole::Concierge, "arc").await;
+
+        assert_eq!(failed(msg).code, "unsupported_role");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_names_an_unknown_project() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        let msg = create_session(&mut ws, 1, SessionRole::Executor, "ghost").await;
+
+        let error = failed(msg);
+        assert_eq!(error.code, "unknown_project");
+        assert!(error.msg.contains("ghost"), "{}", error.msg);
 
         harness.stop().await;
     }

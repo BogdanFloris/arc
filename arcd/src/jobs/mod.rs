@@ -1,12 +1,12 @@
 mod handback;
-mod prompt;
+pub(crate) mod prompt;
 mod status;
 #[cfg(test)]
 mod tests_common;
 mod turn;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -181,6 +181,13 @@ impl Supervisor {
     /// on a job's own session with its own role instead of the concierge's.
     pub fn job_runner(&self, role: SessionRole) -> Option<&Runner> {
         self.runners.get(&role)
+    }
+
+    /// A configured project's root, for building an executor turn's system
+    /// prompt outside a job spawn (the `:code` door and any direct send into
+    /// an executor session, row 9.1). `None` if the project is unconfigured.
+    pub(crate) fn project_root(&self, project: &str) -> Option<&Path> {
+        self.projects.get(project).map(PathBuf::as_path)
     }
 
     /// Routes a `continue_job` request (DESIGN.md §6.16): queued into the

@@ -143,6 +143,9 @@ pub struct SessionSummary {
     pub last_at: Option<i64>,
     pub role: i32,
     pub project: Option<String>,
+    /// The session that dispatched it; empty for a root conversation, which
+    /// is what the picker's conversation/job split keys on (row 6.34/9.1).
+    pub dispatched_by: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -738,7 +741,7 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                           ORDER BY m.seq LIMIT 1), ''),
                 (SELECT MAX(m.ts) FROM messages m
                  WHERE m.session_id = s.id AND m.kind = ?2),
-                s.role, s.project
+                s.role, s.project, coalesce(s.parent_session, '')
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -750,6 +753,7 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
             last_at: row.get(4)?,
             role: row.get(5)?,
             project: row.get(6)?,
+            dispatched_by: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -2053,9 +2057,33 @@ mod tests {
                 last_at: None,
                 role: SessionRole::Unspecified as i32,
                 project: None,
+                dispatched_by: String::new(),
             }
         );
         assert_eq!(sessions[0].started_at, None);
+    }
+
+    #[test]
+    fn a_dispatched_sessions_summary_names_its_parent() {
+        let mut projection = Projection::in_memory().expect("open");
+        let root = session_created_as(0, "s-root", "root", Some(100));
+        let mut child = session_created_as(1, "s-child", "child", Some(200));
+        let event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        }) = child.payload.as_mut().expect("payload")
+        else {
+            unreachable!("session_created_as always builds a SessionCreated")
+        };
+        created.dispatched_by = "s-root".to_string();
+        projection.apply(&root).expect("apply root");
+        projection.apply(&child).expect("apply child");
+
+        let sessions = projection.sessions().expect("sessions");
+        let root_summary = sessions.iter().find(|s| s.id == "s-root").expect("root");
+        let child_summary = sessions.iter().find(|s| s.id == "s-child").expect("child");
+
+        assert_eq!(root_summary.dispatched_by, "", "a root conversation");
+        assert_eq!(child_summary.dispatched_by, "s-root");
     }
 
     #[test]
