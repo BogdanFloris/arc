@@ -208,8 +208,9 @@ fn record_properties(namespaces: &[String]) -> serde_json::Value {
         "namespace": {
             "type": "string",
             "enum": namespaces,
-            "description": "Where the fact files: the project it is about, \
-                or global for facts about the user or the world."
+            "description": "Where the fact files: the project it was stated \
+                about — preferences for how ARC behaves within a project belong \
+                to that project — and global only for facts that hold everywhere."
         },
         "links": {
             "type": "array",
@@ -253,8 +254,12 @@ impl Tool for MemoryWrite {
                           be stale in a week it does not belong. If the index already holds \
                           the fact, use memory_supersede or nothing. Phrase records as \
                           self-contained, present-tense declarative facts with names, not \
-                          pronouns (\"User prefers X\"), never as instructions, and keep \
-                          specifics specific — dates absolute, proper nouns unrounded."
+                          pronouns (\"User prefers X\"), never as instructions. Save the \
+                          fact at the scope it was stated: a preference voiced about one \
+                          project is about that project, not a wider habit — widen only \
+                          when the user says it holds everywhere. Dates absolute, proper \
+                          nouns unrounded, one clause of summary that does not repeat the \
+                          body."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
