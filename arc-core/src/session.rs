@@ -24,7 +24,7 @@ use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource
 
 const MAX_TOOL_STEPS: usize = 8;
 // a coding turn explores and edits; 8 forced a nudge ratchet
-const MAX_EXECUTOR_TOOL_STEPS: usize = 64;
+const MAX_EXECUTOR_TOOL_STEPS: usize = 256;
 
 fn max_tool_steps(role: SessionRole) -> usize {
     match role {
