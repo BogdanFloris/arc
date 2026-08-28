@@ -206,12 +206,17 @@ impl Tool for MemoryWrite {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_owned(),
-            description: "Save a durable memory record. WHEN: the user states a preference, \
-                          correction, or stable fact about themselves or their environment — \
-                          the best memory stops the user repeating themselves. SKIP: trivia, \
-                          task progress, anything sessions_search already answers; if it will \
-                          be stale in a week it does not belong. Phrase records as declarative \
-                          facts (\"User prefers X\"), never as instructions."
+            description: "Save a durable memory record the moment the user states a \
+                          preference, correction, or stable fact about themselves or their \
+                          world. Save it only if it would change future replies in similar \
+                          situations — the best memory stops the user repeating themselves. \
+                          SKIP: short-lived, random, redundant, or overly personal details; \
+                          task progress and anything the archive already answers; if it will \
+                          be stale in a week it does not belong. If the index already holds \
+                          the fact, use memory_supersede or nothing. Phrase records as \
+                          self-contained, present-tense declarative facts with names, not \
+                          pronouns (\"User prefers X\"), never as instructions, and keep \
+                          specifics specific — dates absolute, proper nouns unrounded."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -271,7 +276,10 @@ impl Tool for MemorySupersede {
         ToolDefinition {
             name: "memory_supersede".to_owned(),
             description: "Replace a memory record that is wrong or outdated. Pass the old id \
-                          and the full corrected record; the old one is retired, not deleted."
+                          and the full corrected record; the old one is retired, not deleted. \
+                          Prefer this over memory_write whenever an existing record covers \
+                          the same fact — a changed fact is a supersede, never a sibling — \
+                          and supersede only when something actually changed."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
