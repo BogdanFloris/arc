@@ -359,11 +359,15 @@ impl Engine {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
-                    "Dispatched {} into {project} as session {child_id}. The job is \
+                    "Dispatched {} into {project} as session {child_id} ({}). The job is \
                      running; its summary will arrive here as a handback when it \
                      finishes. Do not call continue_job to ask for status or results — \
                      each message costs the job a full turn. End this reply and wait.",
-                    provider::role_label(role)
+                    provider::role_label(role),
+                    match intent {
+                        Intent::Analyze => "analyze: read-only, it reports but cannot edit",
+                        Intent::Implement => "implement: read-write",
+                    }
                 ),
                 Some(DispatchedJob {
                     session_id: child_id,
@@ -467,11 +471,24 @@ impl Engine {
 
         let summary = truncate_summary(summary);
         let content = match reason {
-            None => format!(
-                "Job {child_session} finished.\n{summary}\n\
-                 For follow-ups about anything this job read or did, continue_job \
-                 {child_session} keeps its context; a new dispatch starts from nothing."
-            ),
+            None => {
+                let grants =
+                    self.with_store(|store| store.projection().session_grants(child_session))?;
+                let read_only = !grants.is_empty() && grants.iter().all(|(_, rw)| !*rw);
+                let tail = if read_only {
+                    format!(
+                        "For follow-ups about anything this job read, continue_job \
+                         {child_session} keeps its context but stays read-only — a change \
+                         needs a fresh implement dispatch; a new dispatch starts from nothing."
+                    )
+                } else {
+                    format!(
+                        "For follow-ups about anything this job read or did, continue_job \
+                         {child_session} keeps its context; a new dispatch starts from nothing."
+                    )
+                };
+                format!("Job {child_session} finished.\n{summary}\n{tail}")
+            }
             Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}"),
         };
         self.record(
@@ -4093,6 +4110,11 @@ mod tests {
         assert!(result.content.contains(&child_id), "{}", result.content);
         assert!(result.content.contains("executor"), "{}", result.content);
         assert!(result.content.contains("arc"), "{}", result.content);
+        assert!(
+            result.content.contains("(implement: read-write)"),
+            "{}",
+            result.content
+        );
 
         // the role-mismatch pin keys on the recorded role, not the runner
         // that created the session, so a same-identity executor runner
@@ -4171,6 +4193,15 @@ mod tests {
                 read_write: false,
             }],
             "analyze records the project root read-only, not the configured read-write"
+        );
+
+        let result = resulted(&events[4]);
+        assert!(
+            result
+                .content
+                .contains("(analyze: read-only, it reports but cannot edit)"),
+            "{}",
+            result.content
         );
 
         let grants = workspace::Grants::from_recorded(vec![(
@@ -4684,6 +4715,124 @@ mod tests {
             "the continue_job affordance stays the closing line: {content}"
         );
         assert!(content.len() < long_summary.len());
+    }
+
+    #[tokio::test]
+    async fn record_handback_for_an_analyze_child_warns_that_continuing_stays_read_only() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let parent_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .expect("create the parent");
+        let child_id = engine
+            .create_bound_session_with_intent(
+                &run,
+                "arc",
+                SessionRole::Executor,
+                None,
+                Intent::Analyze,
+                Some(&parent_id),
+            )
+            .expect("create an analyze child");
+
+        engine
+            .record_handback(&parent_id, &child_id, None, "found the bug")
+            .await
+            .expect("record_handback");
+
+        let entries = engine.transcript(&parent_id).expect("transcript");
+        let content = match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
+            other => panic!("expected a message entry, got {other:?}"),
+        };
+        assert_eq!(
+            content,
+            format!(
+                "Job {child_id} finished.\nfound the bug\nFor follow-ups about anything this \
+                 job read, continue_job {child_id} keeps its context but stays read-only — a \
+                 change needs a fresh implement dispatch; a new dispatch starts from nothing."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn record_handback_for_an_implement_child_keeps_the_plain_tail() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let parent_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .expect("create the parent");
+        let child_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("create an implement child");
+
+        engine
+            .record_handback(&parent_id, &child_id, None, "fixed it")
+            .await
+            .expect("record_handback");
+
+        let entries = engine.transcript(&parent_id).expect("transcript");
+        let content = match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
+            other => panic!("expected a message entry, got {other:?}"),
+        };
+        assert_eq!(
+            content,
+            format!(
+                "Job {child_id} finished.\nfixed it\nFor follow-ups about anything this job \
+                 read or did, continue_job {child_id} keeps its context; a new dispatch starts \
+                 from nothing."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn record_handback_for_a_grantless_child_keeps_the_plain_tail() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        // "child-2" was never created durably: its session_grants is empty,
+        // the same shape a non-workspace job leaves behind
+        engine
+            .record_handback(&reply.session_id, "child-2", None, "no workspace here")
+            .await
+            .expect("record_handback");
+
+        let entries = engine.transcript(&reply.session_id).expect("transcript");
+        let content = match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
+            other => panic!("expected a message entry, got {other:?}"),
+        };
+        assert_eq!(
+            content,
+            "Job child-2 finished.\nno workspace here\nFor follow-ups about anything this job \
+             read or did, continue_job child-2 keeps its context; a new dispatch starts from \
+             nothing."
+        );
     }
 
     async fn wait_for_event_count(dir: &std::path::Path, want: usize) {
