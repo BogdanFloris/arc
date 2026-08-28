@@ -64,6 +64,7 @@ mod tests {
             kind,
             title: title.to_owned(),
             summary: summary.to_owned(),
+            body: String::new(),
         }
     }
 

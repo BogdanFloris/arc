@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,8 +7,8 @@ use futures::StreamExt as _;
 use serde::Deserialize;
 
 use super::{ExtractError, Extractor, SessionSnapshot};
-use crate::memory::index_line;
-use crate::projection::MessageRow;
+use crate::memory::{index_line, kind_name};
+use crate::projection::{MemoryIndexEntry, MessageRow};
 use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking};
 use crate::tool::builtin::memory::{mint_record, parse_kind};
 
@@ -95,6 +95,17 @@ pub const KNOWN_VERSIONS: &[(&str, &str)] = &[
     (PROMPT_VERSION_V1, PROMPT_V1),
     (PROMPT_VERSION_V2, PROMPT_V2),
 ];
+
+pub const DEDUP_PROMPT_V1: &str = r#"You judge one candidate memory record against numbered existing records.
+Think briefly, then answer with strict JSON, nothing else:
+{"reasoning": "...", "duplicate_of": [], "supersedes": []}
+duplicate_of: numbers of existing records stating the same fact — same
+meaning counts even if the wording differs. supersedes: numbers of
+existing records the candidate updates or contradicts — the same fact
+with a changed value supersedes; it is not a duplicate. Records that
+differ in numbers, dates, or qualifiers are never duplicates. Both lists
+empty means the candidate is genuinely new.
+"#;
 
 const TRANSCRIPT_BUDGET: usize = 24_000;
 
@@ -220,18 +231,154 @@ impl ModelExtractor {
         }
         Ok(text)
     }
+
+    /// Mechanical dedup between parsing and event conversion: stage 1 drops
+    /// exact matches in code, stage 2 finds neighbors in code, stage 3 asks
+    /// the model to judge only the ops with neighbors.
+    async fn dedup(
+        &self,
+        operations: Vec<RawOperation>,
+        index: &[MemoryIndexEntry],
+        seed: u64,
+    ) -> (Vec<RawOperation>, DedupStats) {
+        let mut stats = DedupStats::default();
+        let mut stage1 = Vec::with_capacity(operations.len());
+        let mut seen_writes: Vec<(String, String)> = Vec::new();
+        for op in operations {
+            match op.op.as_str() {
+                "write" => {
+                    let norm_title = normalize(&op.title);
+                    let norm_summary = normalize(&op.summary);
+                    let index_dup = index.iter().any(|entry| {
+                        normalize(&entry.title) == norm_title
+                            && normalize(&entry.summary) == norm_summary
+                    });
+                    let batch_dup = seen_writes
+                        .iter()
+                        .any(|(title, summary)| *title == norm_title && *summary == norm_summary);
+                    if index_dup || batch_dup {
+                        stats.dropped += 1;
+                        continue;
+                    }
+                    seen_writes.push((norm_title, norm_summary));
+                    stage1.push(op);
+                }
+                "supersede" => {
+                    let target = op
+                        .id
+                        .as_ref()
+                        .and_then(|id| index.iter().find(|entry| entry.id == *id));
+                    let touch = target.is_some_and(|target| {
+                        normalize(&op.title) == normalize(&target.title)
+                            && normalize(&op.summary) == normalize(&target.summary)
+                            && normalize(&op.body) == normalize(&target.body)
+                    });
+                    if touch {
+                        stats.dropped += 1;
+                        continue;
+                    }
+                    stage1.push(op);
+                }
+                _ => stage1.push(op),
+            }
+        }
+
+        let mut result = Vec::with_capacity(stage1.len());
+        for op in stage1 {
+            if op.op != "write" {
+                result.push(op);
+                continue;
+            }
+            let candidates = dedup_candidates(&op.title, &op.summary, index);
+            if candidates.is_empty() {
+                result.push(op);
+                continue;
+            }
+            stats.calls += 1;
+            match self.forced_choice(&op, &candidates, seed).await {
+                Some(DedupChoice::Duplicate) => stats.dropped += 1,
+                Some(DedupChoice::Supersede(target_id)) => {
+                    stats.converted += 1;
+                    result.push(RawOperation {
+                        op: "supersede".to_owned(),
+                        id: Some(target_id),
+                        kind: op.kind,
+                        title: op.title,
+                        summary: op.summary,
+                        body: op.body,
+                        links: op.links,
+                    });
+                }
+                None => result.push(op),
+            }
+        }
+        (result, stats)
+    }
+
+    /// A dedup call that fails to parse, errors, or times out keeps the
+    /// write: the human review queue catches a duplicate, but a dropped
+    /// fact is unrecoverable.
+    async fn forced_choice(
+        &self,
+        op: &RawOperation,
+        candidates: &[&MemoryIndexEntry],
+        seed: u64,
+    ) -> Option<DedupChoice> {
+        let request = CompletionRequest {
+            model: self.model.clone(),
+            role: SessionRole::Archivist,
+            thinking: self.thinking,
+            system: Some(DEDUP_PROMPT_V1.to_owned()),
+            messages: vec![Message::Text {
+                role: Role::User,
+                content: render_dedup_input(op, candidates),
+                reasoning: None,
+            }],
+            tools: Vec::new(),
+            seed: Some(seed),
+        };
+        let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "dedup call failed; keeping the write");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("dedup call timed out; keeping the write");
+                return None;
+            }
+        };
+        let reply: DedupReply = match serde_json::from_str(strip_residue(&text)) {
+            Ok(reply) => reply,
+            Err(error) => {
+                tracing::warn!(%error, "unparseable dedup reply; keeping the write");
+                return None;
+            }
+        };
+        tracing::debug!(reasoning = %reply.reasoning, "dedup reasoning");
+        apply_dedup_reply(&reply, candidates)
+    }
 }
 
 impl Extractor for ModelExtractor {
     #[tracing::instrument(
         name = "consolidation.extract",
         skip_all,
-        fields(task = "consolidation", session_id = %session.session_id)
+        fields(
+            task = "consolidation",
+            session_id = %session.session_id,
+            counter.dedup_dropped = tracing::field::Empty,
+            counter.dedup_converted = tracing::field::Empty,
+            dedup_calls = tracing::field::Empty,
+        )
     )]
     async fn extract(
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<memory_event::Event>, ExtractError> {
+        let seed = self
+            .seed
+            .unwrap_or_else(|| session_seed(&session.session_id));
         let request = CompletionRequest {
             model: self.model.clone(),
             role: SessionRole::Archivist,
@@ -243,10 +390,7 @@ impl Extractor for ModelExtractor {
                 reasoning: None,
             }],
             tools: Vec::new(),
-            seed: Some(
-                self.seed
-                    .unwrap_or_else(|| session_seed(&session.session_id)),
-            ),
+            seed: Some(seed),
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
@@ -258,6 +402,17 @@ impl Extractor for ModelExtractor {
             })??;
         let operations = parse_operations(&text)?;
         tracing::debug!(operations = operations.len(), "extraction parsed");
+        let (operations, stats) = self.dedup(operations, &session.memory_index, seed).await;
+        let span = tracing::Span::current();
+        if stats.dropped > 0 {
+            span.record("counter.dedup_dropped", stats.dropped);
+        }
+        if stats.converted > 0 {
+            span.record("counter.dedup_converted", stats.converted);
+        }
+        if stats.calls > 0 {
+            span.record("dedup_calls", stats.calls);
+        }
         operations
             .into_iter()
             .map(|op| to_event(op, session))
@@ -479,6 +634,146 @@ fn strip_residue(text: &str) -> &str {
     rest.trim()
 }
 
+fn normalize(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "of", "to", "in", "on", "for", "and", "or", "with", "about",
+    "user", "arc",
+];
+
+fn tokenize(normalized: &str) -> HashSet<&str> {
+    normalized
+        .split_whitespace()
+        .filter(|word| !STOPWORDS.contains(word))
+        .collect()
+}
+
+/// Entries sharing at least two content words with the op, top 3 by score,
+/// ties broken by index order.
+fn dedup_candidates<'a>(
+    title: &str,
+    summary: &str,
+    index: &'a [MemoryIndexEntry],
+) -> Vec<&'a MemoryIndexEntry> {
+    let op_norm = normalize(&format!("{title} {summary}"));
+    let op_words = tokenize(&op_norm);
+    let mut scored: Vec<(usize, usize, &MemoryIndexEntry)> = index
+        .iter()
+        .enumerate()
+        .filter_map(|(position, entry)| {
+            let entry_norm = normalize(&format!("{} {}", entry.title, entry.summary));
+            let score = tokenize(&entry_norm).intersection(&op_words).count();
+            (score >= 2).then_some((score, position, entry))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, _, entry)| entry)
+        .collect()
+}
+
+#[derive(Default)]
+struct DedupStats {
+    dropped: usize,
+    converted: usize,
+    calls: usize,
+}
+
+enum DedupChoice {
+    Duplicate,
+    Supersede(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DedupReply {
+    reasoning: String,
+    #[serde(default)]
+    duplicate_of: Vec<i64>,
+    #[serde(default)]
+    supersedes: Vec<i64>,
+}
+
+fn apply_dedup_reply(reply: &DedupReply, candidates: &[&MemoryIndexEntry]) -> Option<DedupChoice> {
+    let len = candidates.len();
+    let in_range = |number: i64| {
+        usize::try_from(number)
+            .ok()
+            .filter(|n| *n >= 1 && *n <= len)
+    };
+
+    for &number in &reply.duplicate_of {
+        if in_range(number).is_none() {
+            tracing::warn!(
+                number,
+                "dedup duplicate_of names a nonexistent candidate; ignored"
+            );
+        }
+    }
+    if reply
+        .duplicate_of
+        .iter()
+        .any(|&number| in_range(number).is_some())
+    {
+        return Some(DedupChoice::Duplicate);
+    }
+
+    for &number in &reply.supersedes {
+        if in_range(number).is_none() {
+            tracing::warn!(
+                number,
+                "dedup supersedes names a nonexistent candidate; ignored"
+            );
+        }
+    }
+    let mut hits: Vec<usize> = reply
+        .supersedes
+        .iter()
+        .filter_map(|&number| in_range(number))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_unstable();
+    if hits.len() > 1 {
+        tracing::warn!(
+            count = hits.len(),
+            "dedup supersedes named more than one candidate; using the lowest"
+        );
+    }
+    Some(DedupChoice::Supersede(candidates[hits[0] - 1].id.clone()))
+}
+
+fn render_dedup_input(op: &RawOperation, candidates: &[&MemoryIndexEntry]) -> String {
+    use std::fmt::Write as _;
+
+    let candidate = format!(
+        "[Candidate]\nkind: {}\ntitle: {}\nsummary: {}\nbody: {}",
+        op.kind, op.title, op.summary, op.body
+    );
+    let mut listed = String::from("[Existing records]");
+    for (position, entry) in candidates.iter().enumerate() {
+        let _ = write!(
+            listed,
+            "\n{}. kind: {}\n   namespace: {}\n   title: {}\n   summary: {}\n   body: {}",
+            position + 1,
+            kind_name(entry.kind),
+            entry.namespace,
+            entry.title,
+            entry.summary,
+            entry.body,
+        );
+    }
+    format!("{candidate}\n\n{listed}")
+}
+
 fn to_event(
     op: RawOperation,
     session: &SessionSnapshot,
@@ -555,8 +850,8 @@ mod tests {
 
     use super::{
         ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_VERSION_V1, PROMPT_VERSION_V2, TITLE_PROMPT,
-        TOOL_SNIPPET, TRANSCRIPT_BUDGET, render_input, sanitize_title, snippet, title_prompt,
-        windowed,
+        TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates, normalize, render_input, sanitize_title,
+        snippet, title_prompt, tokenize, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -584,13 +879,41 @@ mod tests {
         ]
     }
 
+    fn dedup_reply(json: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
+        vec![
+            Ok(CompletionDelta::Reasoning(
+                "comparing against neighbors".to_owned(),
+            )),
+            Ok(CompletionDelta::Text(json.to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]
+    }
+
     fn entry(id: &str, title: &str, summary: &str) -> MemoryIndexEntry {
+        entry_with_body(id, title, summary, "")
+    }
+
+    fn entry_with_body(id: &str, title: &str, summary: &str, body: &str) -> MemoryIndexEntry {
+        entry_full(id, "global", title, summary, body)
+    }
+
+    fn entry_full(
+        id: &str,
+        namespace: &str,
+        title: &str,
+        summary: &str,
+        body: &str,
+    ) -> MemoryIndexEntry {
         MemoryIndexEntry {
             id: id.to_owned(),
-            namespace: "global".to_owned(),
+            namespace: namespace.to_owned(),
             kind: memory_record::Kind::Fact as i32,
             title: title.to_owned(),
             summary: summary.to_owned(),
+            body: body.to_owned(),
         }
     }
 
@@ -617,7 +940,18 @@ mod tests {
         script: Vec<Result<CompletionDelta, ProviderError>>,
         index: Vec<MemoryIndexEntry>,
     ) -> Result<Vec<memory_event::Event>, crate::consolidation::ExtractError> {
-        let provider = ScriptedProvider::scripted(vec![script]);
+        extract_scripted(vec![script], index).await
+    }
+
+    /// One script per model call the pass is expected to make, in order:
+    /// the extraction call, then a dedup call per write op with neighbors.
+    /// `ScriptedProvider` panics on script exhaustion, which proves a test
+    /// that supplies only the extraction reply made no dedup call.
+    async fn extract_scripted(
+        scripts: Vec<Vec<Result<CompletionDelta, ProviderError>>>,
+        index: Vec<MemoryIndexEntry>,
+    ) -> Result<Vec<memory_event::Event>, crate::consolidation::ExtractError> {
+        let provider = ScriptedProvider::scripted(scripts);
         let extractor = ModelExtractor::new(
             provider,
             "test-model",
@@ -631,6 +965,22 @@ mod tests {
     const WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"preference",
         "title":"Terse replies","summary":"User prefers short answers",
         "body":"User prefers short answers in chat.","links":[]}]}"#;
+
+    /// Shares "coffee", "drinks", "every" with `overlap_neighbor`, three
+    /// content words above the >= 2 candidate threshold.
+    const OVERLAP_WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"fact",
+        "title":"Coffee habit","summary":"drinks coffee every day",
+        "body":"The user drinks coffee every day.","links":[]}]}"#;
+
+    fn overlap_neighbor(id: &str, namespace: &str) -> MemoryIndexEntry {
+        entry_full(
+            id,
+            namespace,
+            "Coffee break",
+            "drinks coffee every morning",
+            "The user drinks coffee every morning.",
+        )
+    }
 
     #[tokio::test]
     async fn a_scripted_extraction_lands_records_marker_and_next_index() {
@@ -1281,5 +1631,205 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
         assert_eq!(PROMPT_V2, pinned);
+    }
+
+    #[test]
+    fn normalize_lowercases_collapses_whitespace_and_trims() {
+        assert_eq!(
+            normalize("  Terse   Replies\n\tare Good "),
+            "terse replies are good"
+        );
+    }
+
+    #[test]
+    fn tokenize_drops_stopwords() {
+        let words = tokenize("the user prefers a terse reply about arc");
+        assert_eq!(words, HashSet::from_iter(["prefers", "terse", "reply"]));
+    }
+
+    #[test]
+    fn dedup_candidates_takes_the_top_three_by_score_ties_broken_by_index_order() {
+        let index = vec![
+            entry("mr-1", "Coffee break", "drinks coffee this morning"),
+            entry("mr-2", "Work log", "daily entries before lunch"),
+            entry("mr-3", "Habit tracker", "tracks work hours"),
+            entry("mr-4", "Coffee log", "daily brew notes"),
+            entry("mr-5", "Morning routine", "starts before sunrise"),
+            entry("mr-6", "Bicycle", "rides daily"),
+        ];
+        let candidates = dedup_candidates(
+            "Morning coffee habit",
+            "drinks coffee daily before work",
+            &index,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mr-1", "mr-2", "mr-3"],
+            "the two highest-scoring plus the lowest-index tie at score 2; \
+             mr-6 scores 1 and never qualifies"
+        );
+    }
+
+    #[test]
+    fn dedup_candidates_is_empty_below_the_shared_word_threshold() {
+        let index = vec![entry("mr-1", "Bicycle", "rides a bicycle to work")];
+        assert!(
+            dedup_candidates("Coffee habit", "drinks coffee every day", &index).is_empty(),
+            "one shared word (\"work\" isn't even shared) must not clear the >= 2 bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_duplicate_write_is_dropped_with_no_dedup_call() {
+        let events = extract_from(
+            extraction_reply(WRITE_OP),
+            vec![entry(
+                "mr-1",
+                "  terse REPLIES ",
+                "user   prefers short answers",
+            )],
+        )
+        .await
+        .expect("extract");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    const BATCH_DUP_OP: &str = r#"{"operations":[
+        {"op":"write","kind":"preference","title":"Terse replies",
+         "summary":"User prefers short answers","body":"First body.","links":[]},
+        {"op":"write","kind":"preference","title":"  terse   REPLIES ",
+         "summary":"user   prefers short answers","body":"Second body.","links":[]}]}"#;
+
+    #[tokio::test]
+    async fn a_within_batch_duplicate_keeps_the_first_op() {
+        let events = extract_from(extraction_reply(BATCH_DUP_OP), Vec::new())
+            .await
+            .expect("extract");
+        assert_eq!(events.len(), 1);
+        let memory_event::Event::RecordCreated(created) = &events[0] else {
+            panic!("expected RecordCreated, got {:?}", events[0]);
+        };
+        assert_eq!(created.record.as_ref().expect("record").body, "First body.");
+    }
+
+    const TOUCH_SUPERSEDE_OP: &str = r#"{"operations":[{"op":"supersede","id":"mr-old","kind":"fact",
+        "title":"Old address","summary":"lives at X","body":"The user lives at X.","links":[]}]}"#;
+
+    #[tokio::test]
+    async fn a_supersede_identical_to_its_target_is_dropped() {
+        let events = extract_from(
+            extraction_reply(TOUCH_SUPERSEDE_OP),
+            vec![entry_with_body(
+                "mr-old",
+                "Old address",
+                "lives at X",
+                "The user lives at X.",
+            )],
+        )
+        .await
+        .expect("extract");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_write_with_no_neighbors_makes_no_dedup_call() {
+        let events = extract_from(
+            extraction_reply(OVERLAP_WRITE_OP),
+            vec![entry("mr-1", "Bicycle", "rides a bicycle to work")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn a_forced_choice_duplicate_of_drops_the_write() {
+        let events = extract_scripted(
+            vec![
+                extraction_reply(OVERLAP_WRITE_OP),
+                dedup_reply(r#"{"reasoning":"same fact","duplicate_of":[1],"supersedes":[]}"#),
+            ],
+            vec![overlap_neighbor("mr-1", "global")],
+        )
+        .await
+        .expect("extract");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_forced_choice_supersedes_converts_the_write_through_to_event() {
+        let events = extract_scripted(
+            vec![
+                extraction_reply(OVERLAP_WRITE_OP),
+                dedup_reply(r#"{"reasoning":"value changed","duplicate_of":[],"supersedes":[1]}"#),
+            ],
+            vec![overlap_neighbor("mr-1", "coffee-notes")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        let memory_event::Event::RecordSuperseded(superseded) = &events[0] else {
+            panic!("expected RecordSuperseded, got {:?}", events[0]);
+        };
+        assert_eq!(superseded.superseded_id, "mr-1");
+        let record = superseded.record.as_ref().expect("record");
+        assert_ne!(record.id, "mr-1");
+        assert_eq!(record.namespace, "coffee-notes", "namespace inherited");
+        assert_eq!(record.title, "Coffee habit");
+    }
+
+    #[tokio::test]
+    async fn a_forced_choice_with_both_lists_empty_keeps_the_write() {
+        let events = extract_scripted(
+            vec![
+                extraction_reply(OVERLAP_WRITE_OP),
+                dedup_reply(r#"{"reasoning":"unrelated","duplicate_of":[],"supersedes":[]}"#),
+            ],
+            vec![overlap_neighbor("mr-1", "global")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_dedup_reply_keeps_the_write_and_extraction_still_succeeds() {
+        let events = extract_scripted(
+            vec![
+                extraction_reply(OVERLAP_WRITE_OP),
+                vec![
+                    Ok(CompletionDelta::Text("not json at all".to_owned())),
+                    Ok(CompletionDelta::Done {
+                        usage: usage(),
+                        stop: Stop::EndTurn,
+                    }),
+                ],
+            ],
+            vec![overlap_neighbor("mr-1", "global")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_duplicate_index_is_ignored_and_the_write_kept() {
+        let events = extract_scripted(
+            vec![
+                extraction_reply(OVERLAP_WRITE_OP),
+                dedup_reply(r#"{"reasoning":"miscounted","duplicate_of":[9],"supersedes":[]}"#),
+            ],
+            vec![overlap_neighbor("mr-1", "global")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
     }
 }

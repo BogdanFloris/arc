@@ -181,6 +181,7 @@ pub struct MemoryIndexEntry {
     pub kind: i32,
     pub title: String,
     pub summary: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,7 +613,7 @@ impl Projection {
 
     pub(crate) fn memory_index(&self) -> Result<Vec<MemoryIndexEntry>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, namespace, kind, title, summary FROM memory_records
+            "SELECT id, namespace, kind, title, summary, body FROM memory_records
              WHERE status = ?1 ORDER BY namespace, kind, title, id",
         )?;
         let rows = stmt.query_map([memory_record::Status::Active as i32], |row| {
@@ -622,6 +623,7 @@ impl Projection {
                 kind: row.get(2)?,
                 title: row.get(3)?,
                 summary: row.get(4)?,
+                body: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -2651,6 +2653,7 @@ mod tests {
                 kind: memory_record::Kind::Fact as i32,
                 title: "gruvbox".to_string(),
                 summary: "the palette".to_string(),
+                body: "gruvbox, at length".to_string(),
             }]
         );
     }
