@@ -124,8 +124,12 @@ pub fn turn(message: &Message) -> (Role, &str) {
 }
 
 pub fn runner(provider: &Arc<ScriptedProvider>) -> Runner {
+    runner_with_role(provider, SessionRole::Concierge)
+}
+
+pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> Runner {
     Runner {
-        role: SessionRole::Concierge,
+        role,
         provider: Arc::clone(provider) as Arc<dyn Provider>,
         model: "test-model".to_owned(),
         thinking: Thinking::Default,
@@ -135,6 +139,19 @@ pub fn runner(provider: &Arc<ScriptedProvider>) -> Runner {
 
 pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> (Engine, Runner) {
     engine_with_tools(provider, dir, Registry::new(512))
+}
+
+pub fn engine_with_role(
+    provider: &Arc<ScriptedProvider>,
+    dir: &TempDir,
+    role: SessionRole,
+) -> (Engine, Runner) {
+    let log = Log::open(dir.path()).expect("open log");
+    let projection = Projection::in_memory().expect("open projection");
+    (
+        Engine::new(Store::new(log, projection), Registry::new(512)),
+        runner_with_role(provider, role),
+    )
 }
 
 pub fn engine_with_tools(

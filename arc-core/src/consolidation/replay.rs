@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_proto::v1::{Event, MemoryEvent, Source, event, memory_event, session_event};
+use arc_proto::v1::{Event, MemoryEvent, SessionRole, Source, event, memory_event, session_event};
 
 use super::extract::ModelExtractor;
 use super::{ExtractError, Extractor as _, SessionSnapshot};
@@ -150,11 +150,22 @@ async fn run_version(
         let (Some(latest_seq), false) = (latest_seq, rows.is_empty()) else {
             continue;
         };
+        let role = projection
+            .session_role(&session_id)?
+            .unwrap_or(SessionRole::Unspecified as i32);
+        if !super::extracts_user_facts(role) {
+            sessions.push(SessionReplay {
+                session_id,
+                operations: Vec::new(),
+            });
+            continue;
+        }
         let snapshot = SessionSnapshot {
             session_id: session_id.clone(),
             rows,
             latest_seq,
             memory_index: projection.memory_index()?,
+            role,
         };
         let extractor = ModelExtractor::pinned(
             Arc::clone(provider),
@@ -296,13 +307,17 @@ mod tests {
     }
 
     fn created(session_id: &str) -> event::Payload {
+        created_with_role(session_id, SessionRole::Unspecified)
+    }
+
+    fn created_with_role(session_id: &str, role: SessionRole) -> event::Payload {
         event::Payload::Session(SessionEvent {
             event: Some(session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.to_owned(),
                 title: String::new(),
                 provider: "scripted".to_owned(),
                 model: "test-model".to_owned(),
-                role: SessionRole::Unspecified as i32,
+                role: role as i32,
                 project: String::new(),
                 budget: None,
                 grants: Vec::new(),
@@ -501,6 +516,53 @@ mod tests {
         assert_eq!(reports[0].sessions.len(), 1);
         assert_eq!(reports[0].sessions[0].session_id, "s-2");
         assert_eq!(provider.requests().len(), 1, "one session, one extraction");
+    }
+
+    #[tokio::test]
+    async fn a_gated_executor_session_contributes_zero_operations() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log_payloads(
+            &dir,
+            vec![
+                created("s-1"),
+                message("s-1", "My name is Bogdan"),
+                created_with_role("s-2", SessionRole::Executor),
+                message("s-2", "run the build"),
+            ],
+        );
+        let provider = ScriptedProvider::scripted(vec![extraction_reply(WRITE_NAME_A)]);
+
+        let reports = run(
+            &(Arc::clone(&provider) as Arc<dyn Provider>),
+            "test-model",
+            Duration::from_secs(5),
+            dir.path(),
+            &[("va", "PROMPT A")],
+            &[],
+        )
+        .await
+        .expect("replay");
+
+        let report = &reports[0];
+        assert_eq!(
+            report
+                .sessions
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>(),
+            ["s-1", "s-2"],
+            "the executor session is reported, not omitted"
+        );
+        assert_eq!(report.sessions[0].operations.len(), 1);
+        assert!(
+            report.sessions[1].operations.is_empty(),
+            "the executor session contributes zero operations"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "the extractor is never asked for the executor session"
+        );
     }
 
     fn state(records: Vec<ReplayRecord>) -> ReplayReport {

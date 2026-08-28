@@ -4,7 +4,7 @@ pub mod replay;
 use std::collections::HashSet;
 use std::future::Future;
 
-use arc_proto::v1::{Role, memory_event};
+use arc_proto::v1::{Role, SessionRole, memory_event};
 
 use crate::projection::MessageRow;
 use crate::session::Engine;
@@ -142,13 +142,22 @@ async fn pass<E: Extractor>(
     title_if_due(engine, extractor, &snapshot).await?;
 
     // the store is not locked during extraction: it can take minutes
-    let events = extractor
-        .extract(&snapshot)
-        .await
-        .map_err(|source| Error::Extractor {
-            session_id: snapshot.session_id.clone(),
-            source,
-        })?;
+    let events = if extracts_user_facts(snapshot.role) {
+        extractor
+            .extract(&snapshot)
+            .await
+            .map_err(|source| Error::Extractor {
+                session_id: snapshot.session_id.clone(),
+                source,
+            })?
+    } else {
+        tracing::info!(
+            session_id = %snapshot.session_id,
+            role = role_name(snapshot.role),
+            "session role holds no user facts; skipping extraction"
+        );
+        Vec::new()
+    };
     let records = events.len();
     let records_created = events
         .iter()
@@ -225,20 +234,36 @@ fn is_role(row: &MessageRow, role: Role) -> bool {
     matches!(row, MessageRow::Message { role: r, .. } if *r == role as i32)
 }
 
+/// A work transcript holds no user facts; only concierge and pre-role
+/// (legacy) sessions were TUI conversations worth extracting.
+fn extracts_user_facts(role: i32) -> bool {
+    matches!(
+        SessionRole::try_from(role),
+        Ok(SessionRole::Unspecified | SessionRole::Concierge)
+    )
+}
+
+fn role_name(role: i32) -> &'static str {
+    SessionRole::try_from(role).map_or("unknown", crate::provider::role_label)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Source, event, memory_event,
-        memory_record, session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, SessionRole, Source, event,
+        memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
     use super::{ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, run_pass};
     use crate::projection::Projection;
     use crate::testkit::{
-        ScriptedProvider, TraceCapture, channel, counter_samples, done_reply, engine, replay_events,
+        ScriptedProvider, TraceCapture, channel, counter_samples, done_reply, engine,
+        engine_with_role, replay_events,
     };
 
     const ALL_IDLE: i64 = i64::MAX;
@@ -292,6 +317,27 @@ mod tests {
 
         async fn title(&self, _session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
             panic!("an already-titled session must not be retitled");
+        }
+    }
+
+    /// Counts calls to `extract` and titles unconditionally, so a test can
+    /// assert the gate skipped (or didn't skip) the extractor.
+    struct CountingExtractor {
+        calls: Arc<AtomicUsize>,
+        records: Vec<memory_event::Event>,
+    }
+
+    impl Extractor for CountingExtractor {
+        async fn extract(
+            &self,
+            _session: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.records.clone())
+        }
+
+        async fn title(&self, _session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            Ok(Some("Job transcript".to_owned()))
         }
     }
 
@@ -713,5 +759,104 @@ mod tests {
                 .expect("pass"),
             Outcome::NothingDue
         );
+    }
+
+    #[tokio::test]
+    async fn an_idle_executor_session_is_titled_but_never_extracted() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Executor);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: Vec::new(),
+        };
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+
+        assert_eq!(
+            outcome,
+            Outcome::Consolidated {
+                session_id: reply.session_id.clone(),
+                through_seq: 2,
+                records: 0,
+                records_created: 0,
+                records_superseded: 0,
+            }
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an executor session must never reach the extractor"
+        );
+
+        let titled = titled_events(dir.path());
+        assert_eq!(
+            titled.len(),
+            1,
+            "an eligible executor session still gets a title"
+        );
+        assert_eq!(titled[0].session_id, reply.session_id);
+    }
+
+    #[tokio::test]
+    async fn a_concierge_session_still_extracts() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: vec![created_record("mr-x")],
+        };
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+
+        assert!(
+            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
+            "got: {outcome:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_role_less_legacy_session_still_extracts() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Unspecified);
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: vec![created_record("mr-x")],
+        };
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+
+        assert!(
+            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
+            "got: {outcome:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

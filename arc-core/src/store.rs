@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_proto::v1::{
     Event, MemoryEvent, MemoryRecordDeleted, MemoryRecordReviewed, SessionConsolidated,
-    SessionEvent, SessionTitled, Source, event, memory_event, session_event,
+    SessionEvent, SessionRole, SessionTitled, Source, event, memory_event, session_event,
 };
 use prost_types::Timestamp;
 use tracing::info;
@@ -35,6 +35,7 @@ pub struct SessionSnapshot {
     pub rows: Vec<MessageRow>,
     pub latest_seq: u64,
     pub memory_index: Vec<MemoryIndexEntry>,
+    pub role: i32,
 }
 
 impl Store {
@@ -97,11 +98,16 @@ impl Store {
         };
         let rows = self.projection.messages(&first.session_id)?;
         let memory_index = self.projection.memory_index()?;
+        let role = self
+            .projection
+            .session_role(&first.session_id)?
+            .unwrap_or(SessionRole::Unspecified as i32);
         Ok(Some(SessionSnapshot {
             session_id: first.session_id,
             rows,
             latest_seq: first.latest_seq,
             memory_index,
+            role,
         }))
     }
 

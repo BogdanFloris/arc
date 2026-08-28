@@ -527,6 +527,7 @@ mod tests {
             }],
             latest_seq: 1,
             memory_index,
+            role: arc_proto::v1::SessionRole::Concierge as i32,
         }
     }
 
