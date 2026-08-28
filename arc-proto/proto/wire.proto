@@ -18,6 +18,9 @@ message SessionInfo {
   google.protobuf.Timestamp last_at = 5;
   SessionRole role = 6;
   string project = 7;
+  // the session that dispatched it; empty for a root conversation, which
+  // is what the picker's conversation/job split keys on
+  string dispatched_by = 8;
 }
 
 message ListSessions {}
@@ -52,7 +55,16 @@ message ClientFrame {
     Subscribe subscribe = 18;
     CancelJob cancel_job = 19;
     DropSteers drop_steers = 20;
+    CreateSession create_session = 21;
   }
+}
+
+// Creates a bound session directly — the TUI's :code door. No dispatch,
+// no budget; the project's grants are recorded at creation and the reply
+// is a MessageAccepted naming the new session.
+message CreateSession {
+  SessionRole role = 1;
+  string project = 2;
 }
 
 // Stops a live job outright: drops its running turn, drains any queued
