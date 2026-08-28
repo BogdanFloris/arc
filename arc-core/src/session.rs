@@ -1123,10 +1123,17 @@ impl Engine {
 
     // stable first, volatile after: everything here is prefix the provider caches,
     // so anything that changes per turn has to go in the messages instead
-    fn system_prompt(runner: &Runner, memory_index: Option<&str>) -> Option<String> {
+    fn system_prompt(
+        runner: &Runner,
+        start_date: Option<&str>,
+        memory_index: Option<&str>,
+    ) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &runner.system {
             parts.push(identity);
+        }
+        if let Some(date) = start_date {
+            parts.push(date);
         }
         if let Some(index) = memory_index {
             parts.push(index);
@@ -1213,13 +1220,21 @@ impl Engine {
         runner: &Runner,
         session_id: &str,
     ) -> Result<(Vec<Message>, Option<String>), Error> {
-        let (rows, memory_index) = self.with_store(|store| {
+        let (rows, memory_index, started_at) = self.with_store(|store| {
             Ok::<_, Error>((
                 store.projection().messages(session_id)?,
                 store.projection().memory_index()?,
+                store.projection().session_started_at(session_id)?,
             ))
         })?;
-        let system = Self::system_prompt(runner, render_memory_index(&memory_index).as_deref());
+        let start_date = (runner.role == SessionRole::Concierge)
+            .then(|| started_at.and_then(start_date_line))
+            .flatten();
+        let system = Self::system_prompt(
+            runner,
+            start_date.as_deref(),
+            render_memory_index(&memory_index).as_deref(),
+        );
         Ok((rebuild_transcript(&rows), system))
     }
 
@@ -1245,6 +1260,14 @@ impl Engine {
             seed: None,
         }
     }
+}
+
+// frozen at session start so the prefix stays byte-stable across turns
+fn start_date_line(micros: i64) -> Option<String> {
+    let date = chrono::DateTime::from_timestamp_micros(micros)?
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d");
+    Some(format!("This conversation started on {date}."))
 }
 
 const MAX_HANDBACK_SUMMARY_BYTES: usize = 2048;
@@ -1765,7 +1788,10 @@ mod tests {
         assert_eq!(events.len(), 5, "exactly one SessionCreated");
 
         let requests = provider.requests();
-        assert_eq!(requests[1].system.as_deref(), Some("be terse"));
+        assert_eq!(
+            requests[1].system,
+            Some(format!("be terse\n\n{}", today_line()))
+        );
         let turns: Vec<(Role, &str)> = requests[1].messages.iter().map(turn).collect();
         assert_eq!(
             turns,
@@ -2809,8 +2835,8 @@ mod tests {
             .expect("send");
 
         assert_eq!(
-            provider.requests()[0].system.as_deref(),
-            Some("be terse"),
+            provider.requests()[0].system,
+            Some(format!("be terse\n\n{}", today_line())),
             "the marker is the sidecar's dialect and belongs to its provider"
         );
         assert_eq!(provider.requests()[0].thinking, Thinking::Minimal);
@@ -2885,6 +2911,10 @@ mod tests {
                 "the palette everywhere",
             ),
         ]
+    }
+
+    fn today_line() -> String {
+        super::start_date_line(chrono::Local::now().timestamp_micros()).expect("valid now")
     }
 
     fn seeded_block() -> String {
@@ -2969,7 +2999,11 @@ mod tests {
 
         assert_eq!(
             provider.requests()[0].system,
-            Some(format!("be terse\n\n{}", seeded_block()))
+            Some(format!(
+                "be terse\n\n{}\n\n{}",
+                today_line(),
+                seeded_block()
+            ))
         );
     }
 
@@ -2992,7 +3026,11 @@ mod tests {
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
-        let expected = Some(format!("be terse\n\n{}", seeded_block()));
+        let expected = Some(format!(
+            "be terse\n\n{}\n\n{}",
+            today_line(),
+            seeded_block()
+        ));
         assert_eq!(requests[0].system, expected);
         assert_eq!(requests[1].system, expected, "per turn, not per completion");
     }
@@ -3009,7 +3047,10 @@ mod tests {
             .await
             .expect("send");
 
-        assert_eq!(provider.requests()[0].system.as_deref(), Some("be terse"));
+        assert_eq!(
+            provider.requests()[0].system,
+            Some(format!("be terse\n\n{}", today_line()))
+        );
     }
 
     #[tokio::test]
@@ -3035,7 +3076,10 @@ mod tests {
             .await
             .expect("send");
 
-        assert_eq!(provider.requests()[0].system, Some(seeded_block()));
+        assert_eq!(
+            provider.requests()[0].system,
+            Some(format!("{}\n\n{}", today_line(), seeded_block()))
+        );
     }
 
     const SEARCH_HIT: &str = r#"{"records":[{"id":"mr-pal","namespace":"global","kind":"fact","title":"Gruvbox","summary":"the palette"}]}"#;
@@ -3332,7 +3376,11 @@ mod tests {
 
         assert_eq!(
             provider.requests()[0].system,
-            Some(format!("be terse\n\n{}", seeded_block()))
+            Some(format!(
+                "be terse\n\n{}\n\n{}",
+                today_line(),
+                seeded_block()
+            ))
         );
     }
 

@@ -436,6 +436,18 @@ impl Projection {
         Ok(role)
     }
 
+    pub(crate) fn session_started_at(&self, session_id: &str) -> Result<Option<i64>, Error> {
+        let started: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT started_at FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(started.flatten())
+    }
+
     pub(crate) fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
         let project: Option<Option<String>> = self
             .conn

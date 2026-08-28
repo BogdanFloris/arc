@@ -1591,7 +1591,8 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         for request in harness.provider.requests() {
             assert_eq!(request.messages.len(), 1, "no history bled across sessions");
-            assert_eq!(request.system.as_deref(), Some("be terse"));
+            let system = request.system.as_deref().expect("a system prompt");
+            assert!(system.starts_with("be terse"), "{system}");
         }
 
         harness.stop().await;
