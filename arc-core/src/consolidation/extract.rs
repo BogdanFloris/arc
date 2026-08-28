@@ -52,7 +52,49 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
 
-pub const KNOWN_VERSIONS: &[(&str, &str)] = &[(PROMPT_VERSION_V1, PROMPT_V1)];
+pub const PROMPT_VERSION_V2: &str = "v2";
+
+pub const PROMPT_V2: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
+Most conversations contain nothing durable. Return {"operations": []}
+unless a fact clearly earns a place in the small always-loaded index; an
+empty list is the expected outcome, and a needless record is a failure,
+not thoroughness.
+
+Save a fact only if it would change ARC's replies in similar future
+situations. Look, in order: corrections and mistakes the user pointed
+out; stated preferences; stable facts about the user or their world.
+Contrast: "User prefers short chapters" is worth saving; "User edited
+chapter 3 today" is not — the archive already holds this conversation
+verbatim and searchably.
+
+Never capture: task progress or completed work; the conversation itself
+("user asked about X"); anything the already-known section or the
+existing records already cover; environment-dependent or transient
+failures; negative claims about tools.
+
+A record is a self-contained, present-tense declarative fact: names, not
+pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
+console"). "User prefers concise replies" is right; "Always reply
+concisely" is wrong — an imperative gets re-read as a directive later.
+
+If an existing record covers the same fact and something changed, emit a
+supersede of that record. If nothing changed, emit nothing for it.
+
+Answer with strict JSON, nothing else after your thinking:
+{"operations": []}
+where each operation is one of
+{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
+{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
+"kind" is one of person, project, preference, fact, decision. "summary" is
+one declarative line; it appears in every future session. "links" is
+optional related record ids. A supersede's "id" names the existing record
+it replaces. An empty operations list means nothing was worth saving.
+"#;
+
+pub const KNOWN_VERSIONS: &[(&str, &str)] = &[
+    (PROMPT_VERSION_V1, PROMPT_V1),
+    (PROMPT_VERSION_V2, PROMPT_V2),
+];
 
 const TRANSCRIPT_BUDGET: usize = 24_000;
 
@@ -102,7 +144,7 @@ impl ModelExtractor {
             model: model.to_owned(),
             thinking,
             timeout,
-            prompt: PROMPT_V1.to_owned(),
+            prompt: PROMPT_V2.to_owned(),
             seed: None,
             identity,
         }
@@ -512,8 +554,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ModelExtractor, PROMPT_V1, PROMPT_VERSION_V1, TITLE_PROMPT, TOOL_SNIPPET,
-        TRANSCRIPT_BUDGET, render_input, sanitize_title, snippet, title_prompt, windowed,
+        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_VERSION_V1, PROMPT_VERSION_V2, TITLE_PROMPT,
+        TOOL_SNIPPET, TRANSCRIPT_BUDGET, render_input, sanitize_title, snippet, title_prompt,
+        windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -616,7 +659,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V1,
+            PROMPT_VERSION_V2,
             &HashSet::new(),
         )
         .await
@@ -652,7 +695,7 @@ mod tests {
         );
 
         let request = &provider.requests()[2];
-        assert_eq!(request.system.as_deref(), Some(PROMPT_V1));
+        assert_eq!(request.system.as_deref(), Some(PROMPT_V2));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
             panic!("expected one user message, got {:?}", request.messages);
@@ -705,7 +748,7 @@ mod tests {
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
         };
-        assert_eq!(marker.prompt_version, "v1");
+        assert_eq!(marker.prompt_version, "v2");
         assert_eq!(marker.through_seq, 2);
 
         let (tx, _rx) = channel();
@@ -766,7 +809,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V1,
+            PROMPT_VERSION_V2,
             &HashSet::new(),
         )
         .await
@@ -824,7 +867,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V1,
+            PROMPT_VERSION_V2,
             &HashSet::new(),
         )
         .await
@@ -1196,5 +1239,47 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
         assert_eq!(PROMPT_V1, pinned);
+    }
+
+    #[test]
+    fn prompt_v2_is_pinned() {
+        assert_eq!(PROMPT_VERSION_V2, "v2");
+        let pinned = r#"You are ARC's memory consolidation pass, reading one finished conversation.
+Most conversations contain nothing durable. Return {"operations": []}
+unless a fact clearly earns a place in the small always-loaded index; an
+empty list is the expected outcome, and a needless record is a failure,
+not thoroughness.
+
+Save a fact only if it would change ARC's replies in similar future
+situations. Look, in order: corrections and mistakes the user pointed
+out; stated preferences; stable facts about the user or their world.
+Contrast: "User prefers short chapters" is worth saving; "User edited
+chapter 3 today" is not — the archive already holds this conversation
+verbatim and searchably.
+
+Never capture: task progress or completed work; the conversation itself
+("user asked about X"); anything the already-known section or the
+existing records already cover; environment-dependent or transient
+failures; negative claims about tools.
+
+A record is a self-contained, present-tense declarative fact: names, not
+pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
+console"). "User prefers concise replies" is right; "Always reply
+concisely" is wrong — an imperative gets re-read as a directive later.
+
+If an existing record covers the same fact and something changed, emit a
+supersede of that record. If nothing changed, emit nothing for it.
+
+Answer with strict JSON, nothing else after your thinking:
+{"operations": []}
+where each operation is one of
+{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
+{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
+"kind" is one of person, project, preference, fact, decision. "summary" is
+one declarative line; it appears in every future session. "links" is
+optional related record ids. A supersede's "id" names the existing record
+it replaces. An empty operations list means nothing was worth saving.
+"#;
+        assert_eq!(PROMPT_V2, pinned);
     }
 }
