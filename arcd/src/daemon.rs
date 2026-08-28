@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use arc_core::archive::Archive;
-use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION_V2};
+use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION_V3};
 use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
@@ -191,11 +191,14 @@ impl Daemon {
             "arcd ready"
         );
 
+        let mut namespaces = vec!["global".to_owned()];
+        namespaces.extend(self.config.projects.keys().cloned());
         let consolidation = consolidation_task(
             self.config.consolidation,
             self.roles.archivist(),
             Arc::clone(&self.engine),
             self.identity.clone(),
+            namespaces,
             self.notifier.clone(),
         );
 
@@ -246,6 +249,7 @@ fn consolidation_task(
     archivist: &Runner,
     engine: Arc<Engine>,
     identity: Option<String>,
+    namespaces: Vec<String>,
     notifier: broadcast::Sender<Notification>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -259,11 +263,12 @@ fn consolidation_task(
         archivist.thinking,
         Duration::from_secs(config.timeout_seconds),
         identity,
+        namespaces,
     );
     info!(
         idle_seconds = config.idle_seconds,
         timeout_seconds = config.timeout_seconds,
-        prompt_version = PROMPT_VERSION_V2,
+        prompt_version = PROMPT_VERSION_V3,
         "consolidation enabled"
     );
     Some(tokio::spawn(async move {
@@ -290,7 +295,7 @@ async fn tick_once<E: Extractor>(
     notifier: &broadcast::Sender<Notification>,
 ) {
     let pass =
-        consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION_V2, strikes.skip());
+        consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION_V3, strikes.skip());
     match pass.await {
         Ok(consolidation::Outcome::Consolidated {
             session_id,
@@ -589,6 +594,7 @@ mod tests {
                 daemon.roles.archivist(),
                 Arc::clone(&daemon.engine),
                 None,
+                vec!["global".to_owned()],
                 daemon.notifier.clone(),
             )
             .is_none(),
@@ -605,6 +611,7 @@ mod tests {
             daemon.roles.archivist(),
             Arc::clone(&daemon.engine),
             None,
+            vec!["global".to_owned()],
             daemon.notifier.clone(),
         )
         .expect("enabled spawns the tick");

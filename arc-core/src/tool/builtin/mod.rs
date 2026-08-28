@@ -24,14 +24,19 @@ pub fn tools(
     projects: Vec<(String, String)>,
     scratch: Option<String>,
 ) -> Vec<Box<dyn Tool>> {
+    let mut namespaces = vec!["global".to_owned()];
+    namespaces.extend(projects.iter().map(|(name, _)| name.clone()));
     vec![
         Box::new(ContinueJob),
         Box::new(Dispatch::new(projects, scratch)),
         Box::new(GetTime),
         Box::new(MemoryRead::new(Arc::clone(&archive))),
         Box::new(MemorySearch::new(Arc::clone(&archive))),
-        Box::new(MemorySupersede::new(Arc::clone(&archive))),
-        Box::new(MemoryWrite),
+        Box::new(MemorySupersede::new(
+            Arc::clone(&archive),
+            namespaces.clone(),
+        )),
+        Box::new(MemoryWrite::new(namespaces)),
         Box::new(SessionRead::new(Arc::clone(&archive))),
         Box::new(SessionsSearch::new(archive)),
     ]

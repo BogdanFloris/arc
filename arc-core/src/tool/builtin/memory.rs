@@ -151,15 +151,27 @@ impl Tool for MemorySearch {
     }
 }
 
-pub struct MemoryWrite;
+pub struct MemoryWrite {
+    namespaces: Vec<String>,
+}
+
+impl MemoryWrite {
+    pub fn new(namespaces: Vec<String>) -> Self {
+        Self { namespaces }
+    }
+}
 
 pub struct MemorySupersede {
     archive: Arc<Archive>,
+    namespaces: Vec<String>,
 }
 
 impl MemorySupersede {
-    pub fn new(archive: Arc<Archive>) -> Self {
-        Self { archive }
+    pub fn new(archive: Arc<Archive>, namespaces: Vec<String>) -> Self {
+        Self {
+            archive,
+            namespaces,
+        }
     }
 }
 
@@ -181,7 +193,7 @@ struct SupersedeArgs {
     record: RecordArgs,
 }
 
-fn record_properties() -> serde_json::Value {
+fn record_properties(namespaces: &[String]) -> serde_json::Value {
     serde_json::json!({
         "kind": {
             "type": "string",
@@ -193,13 +205,38 @@ fn record_properties() -> serde_json::Value {
             "description": "One declarative line; shown in every session."
         },
         "body": {"type": "string", "description": "The full fact, markdown."},
-        "namespace": {"type": "string", "description": "Project id; omit for global."},
+        "namespace": {
+            "type": "string",
+            "enum": namespaces,
+            "description": "Where the fact files: the project it is about, \
+                or global for facts about the user or the world."
+        },
         "links": {
             "type": "array",
             "items": {"type": "string"},
             "description": "Related record ids."
         }
     })
+}
+
+// 1.3 measured optional fields being silently dropped; required-with-escape
+fn resolve_namespace(
+    namespace: Option<&str>,
+    namespaces: &[String],
+) -> Result<Option<String>, ToolReply> {
+    let Some(namespace) = namespace.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Err(ToolReply::error(format!(
+            "ERROR: namespace is required — one of {}.",
+            namespaces.join(", ")
+        )));
+    };
+    if !namespaces.iter().any(|n| n == namespace) {
+        return Err(ToolReply::error(format!(
+            "ERROR: unknown namespace {namespace:?} — one of {}.",
+            namespaces.join(", ")
+        )));
+    }
+    Ok(Some(namespace.to_owned()))
 }
 
 impl Tool for MemoryWrite {
@@ -220,8 +257,8 @@ impl Tool for MemoryWrite {
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": record_properties(),
-                "required": ["kind", "title", "summary", "body"]
+                "properties": record_properties(&self.namespaces),
+                "required": ["kind", "title", "summary", "body", "namespace"]
             }),
         }
     }
@@ -245,7 +282,7 @@ impl Tool for MemoryWrite {
                     ));
                 }
             };
-            let record = match build_record(args, &ctx) {
+            let record = match build_record(args, &self.namespaces, &ctx) {
                 Ok(record) => record,
                 Err(reply) => return reply,
             };
@@ -270,7 +307,7 @@ impl Tool for MemorySupersede {
             "id".to_owned(),
             serde_json::json!({"type": "string", "description": "Id of the record to replace."}),
         );
-        if let serde_json::Value::Object(fields) = record_properties() {
+        if let serde_json::Value::Object(fields) = record_properties(&self.namespaces) {
             properties.extend(fields);
         }
         ToolDefinition {
@@ -284,7 +321,7 @@ impl Tool for MemorySupersede {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": properties,
-                "required": ["id", "kind", "title", "summary", "body"]
+                "required": ["id", "kind", "title", "summary", "body", "namespace"]
             }),
         }
     }
@@ -315,7 +352,7 @@ impl Tool for MemorySupersede {
                     return ToolReply::error(format!("ERROR: memory read failed ({error})."));
                 }
             }
-            let record = match build_record(args.record, &ctx) {
+            let record = match build_record(args.record, &self.namespaces, &ctx) {
                 Ok(record) => record,
                 Err(reply) => return reply,
             };
@@ -338,7 +375,13 @@ impl Tool for MemorySupersede {
 
 // an early-return-on-error reads best here; ToolReply is not on a hot path
 #[allow(clippy::result_large_err)]
-fn build_record(args: RecordArgs, ctx: &TurnContext) -> Result<MemoryRecord, ToolReply> {
+fn build_record(
+    args: RecordArgs,
+    namespaces: &[String],
+    ctx: &TurnContext,
+) -> Result<MemoryRecord, ToolReply> {
+    let namespace = resolve_namespace(args.namespace.as_deref(), namespaces)?;
+    let args = RecordArgs { namespace, ..args };
     let Some(kind) = parse_kind(&args.kind) else {
         return Err(ToolReply::error(format!(
             "ERROR: unknown kind {:?}. Use person, project, preference, fact, \
@@ -429,7 +472,58 @@ mod tests {
     };
     use crate::tool::{Registry, Tool as _, TurnContext};
 
-    const WRITE_ARGS: &str = r#"{"kind":"preference","title":"Terse replies",
+    #[tokio::test]
+    async fn a_write_without_a_namespace_is_refused_naming_the_legal_values() {
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
+            .execute(
+                r#"{"kind":"fact","title":"t","summary":"s","body":"b"}"#.to_owned(),
+                TurnContext::default(),
+            )
+            .await;
+        assert!(!reply.ok);
+        assert!(
+            reply.content.contains("namespace is required"),
+            "{}",
+            reply.content
+        );
+        assert!(reply.content.contains("global, arc"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_write_with_an_unknown_namespace_is_refused_naming_the_legal_values() {
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
+            .execute(
+                r#"{"kind":"fact","namespace":"vibes","title":"t","summary":"s","body":"b"}"#
+                    .to_owned(),
+                TurnContext::default(),
+            )
+            .await;
+        assert!(!reply.ok);
+        assert!(
+            reply.content.contains("unknown namespace \"vibes\""),
+            "{}",
+            reply.content
+        );
+        assert!(reply.content.contains("global, arc"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_write_with_a_project_namespace_files_the_record_there() {
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
+            .execute(
+                r#"{"kind":"fact","namespace":"arc","title":"t","summary":"s","body":"b"}"#
+                    .to_owned(),
+                TurnContext::default(),
+            )
+            .await;
+        assert!(reply.ok, "{}", reply.content);
+        let [memory_event::Event::RecordCreated(created)] = reply.memory_events.as_slice() else {
+            panic!("expected one create");
+        };
+        assert_eq!(created.record.as_ref().expect("record").namespace, "arc");
+    }
+
+    const WRITE_ARGS: &str = r#"{"kind":"preference","namespace":"global","title":"Terse replies",
         "summary":"User prefers short answers","body":"User prefers short answers in chat."}"#;
 
     fn registry(tools: Vec<Box<dyn crate::tool::Tool>>) -> Registry {
@@ -487,8 +581,14 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let (engine, run) =
-            engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
+        let (engine, run) = engine_with_tools_at(
+            &provider,
+            &dir,
+            registry(vec![Box::new(MemoryWrite::new(vec![
+                "global".to_owned(),
+                "arc".to_owned(),
+            ]))]),
+        );
         let (tx, _rx) = channel();
 
         let reply = engine
@@ -532,8 +632,14 @@ mod tests {
             done_reply("saved it"),
             done_reply("hello again"),
         ]);
-        let (engine, run) =
-            engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
+        let (engine, run) = engine_with_tools_at(
+            &provider,
+            &dir,
+            registry(vec![Box::new(MemoryWrite::new(vec![
+                "global".to_owned(),
+                "arc".to_owned(),
+            ]))]),
+        );
         let (tx, _rx) = channel();
         let reply = engine
             .send_message(&run, None, "remember this", tx)
@@ -569,8 +675,14 @@ mod tests {
             ],
             done_reply("saved it"),
         ]);
-        let (engine, run) =
-            engine_with_tools_at(&provider, &dir, registry(vec![Box::new(MemoryWrite)]));
+        let (engine, run) = engine_with_tools_at(
+            &provider,
+            &dir,
+            registry(vec![Box::new(MemoryWrite::new(vec![
+                "global".to_owned(),
+                "arc".to_owned(),
+            ]))]),
+        );
         let (tx, _rx) = channel();
         let reply = engine
             .send_message(&run, None, "remember this", tx)
@@ -603,7 +715,7 @@ mod tests {
                     "c1",
                     0,
                     "memory_supersede",
-                    r#"{"id":"mr-old","kind":"fact","title":"New address",
+                    r#"{"id":"mr-old","kind":"fact","namespace":"global","title":"New address",
                         "summary":"lives at Y","body":"User moved to Y."}"#,
                 )),
                 Ok(tool_stop()),
@@ -611,7 +723,10 @@ mod tests {
             done_reply("updated"),
             done_reply("hello again"),
         ]);
-        let registry = registry(vec![Box::new(MemorySupersede::new(archive_at(&dir)))]);
+        let registry = registry(vec![Box::new(MemorySupersede::new(
+            archive_at(&dir),
+            vec!["global".to_owned(), "arc".to_owned()],
+        ))]);
         let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
         let (tx, _rx) = channel();
         let reply = engine
@@ -652,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_reply_is_events_not_writes() {
-        let reply = MemoryWrite
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
             .execute(
                 WRITE_ARGS.to_owned(),
                 TurnContext {
@@ -681,9 +796,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_with_an_unknown_kind_or_blank_field_is_an_error() {
-        let reply = MemoryWrite
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
             .execute(
-                r#"{"kind":"vibe","title":"t","summary":"s","body":"b"}"#.to_owned(),
+                r#"{"kind":"vibe","namespace":"global","title":"t","summary":"s","body":"b"}"#
+                    .to_owned(),
                 TurnContext::default(),
             )
             .await;
@@ -691,9 +807,10 @@ mod tests {
         assert!(reply.memory_events.is_empty());
         assert!(reply.content.contains("preference"), "{}", reply.content);
 
-        let reply = MemoryWrite
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
             .execute(
-                r#"{"kind":"fact","title":"t","summary":"  ","body":"b"}"#.to_owned(),
+                r#"{"kind":"fact","namespace":"global","title":"t","summary":"  ","body":"b"}"#
+                    .to_owned(),
                 TurnContext::default(),
             )
             .await;
@@ -705,11 +822,14 @@ mod tests {
     async fn superseding_an_unknown_id_is_an_error_naming_it() {
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
-        let tool = MemorySupersede::new(archive_at(&dir));
+        let tool = MemorySupersede::new(
+            archive_at(&dir),
+            vec!["global".to_owned(), "arc".to_owned()],
+        );
 
         let reply = tool
             .execute(
-                r#"{"id":"mr-ghost","kind":"fact","title":"t","summary":"s","body":"b"}"#
+                r#"{"id":"mr-ghost","kind":"fact","namespace":"global","title":"t","summary":"s","body":"b"}"#
                     .to_owned(),
                 TurnContext::default(),
             )
@@ -775,7 +895,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
 
-        let reply = MemoryWrite
+        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
             .execute(r#"{"kind""#.to_owned(), TurnContext::default())
             .await;
         assert!(!reply.ok);

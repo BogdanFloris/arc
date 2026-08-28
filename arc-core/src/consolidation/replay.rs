@@ -81,6 +81,7 @@ pub async fn run(
     versions: &[(&str, &str)],
     session_filter: &[String],
     identity: Option<&str>,
+    namespaces: &[String],
 ) -> Result<Vec<ReplayReport>, ReplayError> {
     let mut events = Vec::new();
     for item in LogReader::new(discover_segments(log_dir)?) {
@@ -98,6 +99,7 @@ pub async fn run(
                 prompt,
                 session_filter,
                 identity,
+                namespaces,
             )
             .await?,
         );
@@ -123,6 +125,7 @@ async fn run_version(
     prompt: &str,
     session_filter: &[String],
     identity: Option<&str>,
+    namespaces: &[String],
 ) -> Result<ReplayReport, ReplayError> {
     let mut projection = Projection::in_memory()?;
     let mut session_order = Vec::new();
@@ -177,6 +180,7 @@ async fn run_version(
             prompt,
             session_seed(&session_id),
             identity.map(str::to_owned),
+            namespaces.to_vec(),
         );
         let extracted =
             extractor
@@ -421,6 +425,7 @@ mod tests {
             &[("va", "PROMPT A"), ("vb", "PROMPT B")],
             &[],
             Some("The user is named Bogdan."),
+            &["global".to_owned(), "arc".to_owned()],
         )
         .await
         .expect("replay");
@@ -523,6 +528,7 @@ mod tests {
             &[("va", "PROMPT A")],
             &["s-2".to_owned()],
             None,
+            &["global".to_owned(), "arc".to_owned()],
         )
         .await
         .expect("replay");
@@ -562,6 +568,7 @@ mod tests {
             &[("va", "PROMPT A")],
             &[],
             None,
+            &["global".to_owned(), "arc".to_owned()],
         )
         .await
         .expect("replay");

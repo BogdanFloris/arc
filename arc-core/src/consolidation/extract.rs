@@ -91,9 +91,52 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
 
+pub const PROMPT_VERSION_V3: &str = "v3";
+
+pub const PROMPT_V3: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
+Most conversations contain nothing durable. Return {"operations": []}
+unless a fact clearly earns a place in the small always-loaded index; an
+empty list is the expected outcome, and a needless record is a failure,
+not thoroughness.
+
+Save a fact only if it would change ARC's replies in similar future
+situations. Look, in order: corrections and mistakes the user pointed
+out; stated preferences; stable facts about the user or their world.
+Contrast: "User prefers short chapters" is worth saving; "User edited
+chapter 3 today" is not — the archive already holds this conversation
+verbatim and searchably.
+
+Never capture: task progress or completed work; the conversation itself
+("user asked about X"); anything the already-known section or the
+existing records already cover; environment-dependent or transient
+failures; negative claims about tools.
+
+A record is a self-contained, present-tense declarative fact: names, not
+pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
+console"). "User prefers concise replies" is right; "Always reply
+concisely" is wrong — an imperative gets re-read as a directive later.
+
+If an existing record covers the same fact and something changed, emit a
+supersede of that record. If nothing changed, emit nothing for it.
+
+Answer with strict JSON, nothing else after your thinking:
+{"operations": []}
+where each operation is one of
+{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
+{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
+"kind" is one of person, project, preference, fact, decision. "namespace"
+files the fact: choose from the namespaces listed in the input — a
+project's name when the fact is about that project, "global" otherwise;
+a supersede keeps its record's namespace. "summary" is
+one declarative line; it appears in every future session. "links" is
+optional related record ids. A supersede's "id" names the existing record
+it replaces. An empty operations list means nothing was worth saving.
+"#;
+
 pub const KNOWN_VERSIONS: &[(&str, &str)] = &[
     (PROMPT_VERSION_V1, PROMPT_V1),
     (PROMPT_VERSION_V2, PROMPT_V2),
+    (PROMPT_VERSION_V3, PROMPT_V3),
 ];
 
 pub const DEDUP_PROMPT_V1: &str = r#"You judge one candidate memory record against numbered existing records.
@@ -140,6 +183,7 @@ pub struct ModelExtractor {
     prompt: String,
     seed: Option<u64>,
     identity: Option<String>,
+    namespaces: Vec<String>,
 }
 
 impl ModelExtractor {
@@ -149,15 +193,17 @@ impl ModelExtractor {
         thinking: Thinking,
         timeout: Duration,
         identity: Option<String>,
+        namespaces: Vec<String>,
     ) -> Self {
         Self {
             provider,
             model: model.to_owned(),
             thinking,
             timeout,
-            prompt: PROMPT_V2.to_owned(),
+            prompt: PROMPT_V3.to_owned(),
             seed: None,
             identity,
+            namespaces,
         }
     }
 
@@ -168,6 +214,7 @@ impl ModelExtractor {
         prompt: &str,
         seed: u64,
         identity: Option<String>,
+        namespaces: Vec<String>,
     ) -> Self {
         Self {
             provider,
@@ -177,6 +224,7 @@ impl ModelExtractor {
             prompt: prompt.to_owned(),
             seed: Some(seed),
             identity,
+            namespaces,
         }
     }
 }
@@ -302,6 +350,7 @@ impl ModelExtractor {
                     result.push(RawOperation {
                         op: "supersede".to_owned(),
                         id: Some(target_id),
+                        namespace: None,
                         kind: op.kind,
                         title: op.title,
                         summary: op.summary,
@@ -386,7 +435,7 @@ impl Extractor for ModelExtractor {
             system: Some(self.prompt.clone()),
             messages: vec![Message::Text {
                 role: Role::User,
-                content: render_input(session, self.identity.as_deref()),
+                content: render_input(session, self.identity.as_deref(), &self.namespaces),
                 reasoning: None,
             }],
             tools: Vec::new(),
@@ -415,7 +464,7 @@ impl Extractor for ModelExtractor {
         }
         operations
             .into_iter()
-            .map(|op| to_event(op, session))
+            .map(|op| to_event(op, session, &self.namespaces))
             .collect()
     }
 
@@ -494,7 +543,11 @@ fn sanitize_title(text: &str) -> Option<String> {
     Some(cap_chars(trimmed, TITLE_OUTPUT_CAP))
 }
 
-fn render_input(session: &SessionSnapshot, identity: Option<&str>) -> String {
+fn render_input(
+    session: &SessionSnapshot,
+    identity: Option<&str>,
+    namespaces: &[String],
+) -> String {
     let mut calls: HashMap<&str, &str> = HashMap::new();
     let mut lines = Vec::with_capacity(session.rows.len());
     for row in &session.rows {
@@ -516,8 +569,9 @@ fn render_input(session: &SessionSnapshot, identity: Option<&str>) -> String {
     };
     format!(
         "[Session transcript]\n{}\n\n[Already known — never extract]\n{known}\n\n\
-         [Existing memory records]\n{index}",
-        windowed(&lines)
+         [Namespaces]\n{}\n\n[Existing memory records]\n{index}",
+        windowed(&lines),
+        namespaces.join(", ")
     )
 }
 
@@ -596,6 +650,8 @@ struct RawOperation {
     op: String,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
     kind: String,
     title: String,
     summary: String,
@@ -777,6 +833,7 @@ fn render_dedup_input(op: &RawOperation, candidates: &[&MemoryIndexEntry]) -> St
 fn to_event(
     op: RawOperation,
     session: &SessionSnapshot,
+    namespaces: &[String],
 ) -> Result<memory_event::Event, ExtractError> {
     let Some(kind) = parse_kind(&op.kind) else {
         return Err(ExtractError(format!("unknown kind {:?}", op.kind)));
@@ -790,6 +847,16 @@ fn to_event(
             return Err(ExtractError(format!("empty {field}")));
         }
     }
+    let namespace = op.namespace.as_deref().map(str::trim).and_then(|ns| {
+        if namespaces.iter().any(|legal| legal == ns) {
+            Some(ns.to_owned())
+        } else {
+            if !ns.is_empty() {
+                tracing::warn!(namespace = ns, "unknown namespace; filing global");
+            }
+            None
+        }
+    });
     let RawOperation {
         op,
         id,
@@ -816,7 +883,7 @@ fn to_event(
                 return Err(ExtractError(format!("a write must not carry an id ({id})")));
             }
             Ok(memory_event::Event::RecordCreated(MemoryRecordCreated {
-                record: Some(mint(None)),
+                record: Some(mint(namespace)),
             }))
         }
         "supersede" => {
@@ -849,9 +916,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_VERSION_V1, PROMPT_VERSION_V2, TITLE_PROMPT,
-        TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates, normalize, render_input, sanitize_title,
-        snippet, title_prompt, tokenize, windowed,
+        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_VERSION_V1, PROMPT_VERSION_V2,
+        PROMPT_VERSION_V3, TITLE_PROMPT, TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates,
+        normalize, render_input, sanitize_title, snippet, title_prompt, tokenize, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -958,6 +1025,7 @@ mod tests {
             Thinking::Minimal,
             Duration::from_secs(5),
             None,
+            vec!["global".to_owned(), "arc".to_owned()],
         );
         extractor.extract(&snapshot(index)).await
     }
@@ -1004,12 +1072,13 @@ mod tests {
             Thinking::Minimal,
             Duration::from_secs(300),
             None,
+            vec!["global".to_owned(), "arc".to_owned()],
         );
         let outcome = run_pass(
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V2,
+            PROMPT_VERSION_V3,
             &HashSet::new(),
         )
         .await
@@ -1045,7 +1114,7 @@ mod tests {
         );
 
         let request = &provider.requests()[2];
-        assert_eq!(request.system.as_deref(), Some(PROMPT_V2));
+        assert_eq!(request.system.as_deref(), Some(PROMPT_V3));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
             panic!("expected one user message, got {:?}", request.messages);
@@ -1058,6 +1127,8 @@ mod tests {
              assistant: noted\n\n\
              [Already known — never extract]\n\
              (none)\n\n\
+             [Namespaces]\n\
+             global, arc\n\n\
              [Existing memory records]\n\
              (none yet)"
         );
@@ -1098,7 +1169,7 @@ mod tests {
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
         };
-        assert_eq!(marker.prompt_version, "v2");
+        assert_eq!(marker.prompt_version, "v3");
         assert_eq!(marker.through_seq, 2);
 
         let (tx, _rx) = channel();
@@ -1154,12 +1225,13 @@ mod tests {
             Thinking::Minimal,
             Duration::from_secs(300),
             None,
+            vec!["global".to_owned(), "arc".to_owned()],
         );
         let outcome = run_pass(
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V2,
+            PROMPT_VERSION_V3,
             &HashSet::new(),
         )
         .await
@@ -1212,12 +1284,13 @@ mod tests {
             Thinking::Minimal,
             Duration::from_secs(300),
             None,
+            vec!["global".to_owned(), "arc".to_owned()],
         );
         let outcome = run_pass(
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V2,
+            PROMPT_VERSION_V3,
             &HashSet::new(),
         )
         .await
@@ -1393,6 +1466,7 @@ mod tests {
             Thinking::Minimal,
             Duration::from_millis(10),
             None,
+            vec!["global".to_owned(), "arc".to_owned()],
         );
         let err = extractor
             .extract(&snapshot(Vec::new()))
@@ -1431,7 +1505,7 @@ mod tests {
                 turn_id: "t".to_owned(),
             },
         ];
-        let input = render_input(&snapshot, None);
+        let input = render_input(&snapshot, None, &["global".to_owned()]);
         assert!(
             input.contains("user: line one\nline two"),
             "prose stays verbatim: {input}"
@@ -1487,7 +1561,7 @@ mod tests {
                 turn_id: "t".to_owned(),
             },
         ];
-        let input = render_input(&snapshot, None);
+        let input = render_input(&snapshot, None, &["global".to_owned()]);
         assert!(
             input.contains("\u{bb} memory_search({\"query\":\"palette\"})"),
             "the call line stays: {input}"
@@ -1510,10 +1584,17 @@ mod tests {
     fn identity_renders_in_the_already_known_section_or_none_absent() {
         let snapshot = snapshot(Vec::new());
         assert!(
-            render_input(&snapshot, Some("The user is named Bogdan."))
-                .contains("[Already known — never extract]\nThe user is named Bogdan."),
+            render_input(
+                &snapshot,
+                Some("The user is named Bogdan."),
+                &["global".to_owned()]
+            )
+            .contains("[Already known — never extract]\nThe user is named Bogdan."),
         );
-        assert!(render_input(&snapshot, None).contains("[Already known — never extract]\n(none)"),);
+        assert!(
+            render_input(&snapshot, None, &["global".to_owned()])
+                .contains("[Already known — never extract]\n(none)"),
+        );
     }
 
     #[test]
@@ -1631,6 +1712,86 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
         assert_eq!(PROMPT_V2, pinned);
+    }
+
+    #[test]
+    fn prompt_v3_is_pinned() {
+        assert_eq!(PROMPT_VERSION_V3, "v3");
+        let pinned = r#"You are ARC's memory consolidation pass, reading one finished conversation.
+Most conversations contain nothing durable. Return {"operations": []}
+unless a fact clearly earns a place in the small always-loaded index; an
+empty list is the expected outcome, and a needless record is a failure,
+not thoroughness.
+
+Save a fact only if it would change ARC's replies in similar future
+situations. Look, in order: corrections and mistakes the user pointed
+out; stated preferences; stable facts about the user or their world.
+Contrast: "User prefers short chapters" is worth saving; "User edited
+chapter 3 today" is not — the archive already holds this conversation
+verbatim and searchably.
+
+Never capture: task progress or completed work; the conversation itself
+("user asked about X"); anything the already-known section or the
+existing records already cover; environment-dependent or transient
+failures; negative claims about tools.
+
+A record is a self-contained, present-tense declarative fact: names, not
+pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
+console"). "User prefers concise replies" is right; "Always reply
+concisely" is wrong — an imperative gets re-read as a directive later.
+
+If an existing record covers the same fact and something changed, emit a
+supersede of that record. If nothing changed, emit nothing for it.
+
+Answer with strict JSON, nothing else after your thinking:
+{"operations": []}
+where each operation is one of
+{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
+{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
+"kind" is one of person, project, preference, fact, decision. "namespace"
+files the fact: choose from the namespaces listed in the input — a
+project's name when the fact is about that project, "global" otherwise;
+a supersede keeps its record's namespace. "summary" is
+one declarative line; it appears in every future session. "links" is
+optional related record ids. A supersede's "id" names the existing record
+it replaces. An empty operations list means nothing was worth saving.
+"#;
+        assert_eq!(PROMPT_V3, pinned);
+    }
+
+    #[tokio::test]
+    async fn a_v3_write_files_its_namespace_and_an_unknown_one_goes_global() {
+        let filed = extract_from(
+            extraction_reply(
+                r#"{"operations":[{"op":"write","kind":"fact","namespace":"arc",
+                    "title":"t","summary":"s","body":"b","links":[]}]}"#,
+            ),
+            Vec::new(),
+        )
+        .await
+        .expect("filed");
+        let [memory_event::Event::RecordCreated(created)] = filed.as_slice() else {
+            panic!("expected one create");
+        };
+        assert_eq!(created.record.as_ref().expect("record").namespace, "arc");
+
+        let unknown = extract_from(
+            extraction_reply(
+                r#"{"operations":[{"op":"write","kind":"fact","namespace":"vibes",
+                    "title":"t","summary":"s","body":"b","links":[]}]}"#,
+            ),
+            Vec::new(),
+        )
+        .await
+        .expect("kept");
+        let [memory_event::Event::RecordCreated(created)] = unknown.as_slice() else {
+            panic!("expected one create");
+        };
+        assert_eq!(
+            created.record.as_ref().expect("record").namespace,
+            "global",
+            "misfiled beats lost: unknown namespaces fall to global"
+        );
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub async fn run(
         false => None,
     };
 
+    let mut namespaces = vec!["global".to_owned()];
+    namespaces.extend(config.projects.keys().cloned());
     let outcome = replay::run(
         &archivist.provider,
         &archivist.model,
@@ -48,6 +50,7 @@ pub async fn run(
         &versions,
         sessions,
         identity.as_deref(),
+        &namespaces,
     )
     .await;
     if let Some(sidecar) = sidecar {

@@ -3314,7 +3314,7 @@ mod tests {
                     "c1",
                     0,
                     "memory_write",
-                    r#"{"kind":"preference","title":"Terse replies",
+                    r#"{"kind":"preference","namespace":"global","title":"Terse replies",
                         "summary":"prefers short answers","body":"Prefers short answers."}"#,
                 )),
                 Ok(tool_stop()),
@@ -3323,7 +3323,9 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite));
+        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite::new(
+            vec!["global".to_owned(), "arc".to_owned()],
+        )));
         let (engine, run) = engine_with_tools(&provider, &dir, registry);
 
         let capture = TraceCapture::start();
@@ -3349,7 +3351,7 @@ mod tests {
                     "c1",
                     0,
                     "memory_write",
-                    r#"{"kind":"preference","title":"Terse replies",
+                    r#"{"kind":"preference","namespace":"global","title":"Terse replies",
                         "summary":"prefers short answers","body":"Prefers short answers."}"#,
                 )),
                 Ok(tool_stop()),
@@ -3358,7 +3360,9 @@ mod tests {
         ]);
         let dir = TempDir::new().expect("temp dir");
         let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite));
+        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite::new(
+            vec!["global".to_owned(), "arc".to_owned()],
+        )));
         let (engine, run) = engine_with_tools(&provider, &dir, registry);
         let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
         let engine = engine.with_notifier(notifier);
