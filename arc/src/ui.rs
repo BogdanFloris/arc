@@ -854,7 +854,7 @@ const HELP: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn draw_help(frame: &mut Frame, app: &App, full: Rect) {
+fn draw_help(frame: &mut Frame, app: &mut App, full: Rect) {
     let total = u16::try_from(help_line_count()).unwrap_or(u16::MAX);
     let area = popup(frame, full, 60, total, "help");
     let width = area.width.saturating_sub(2).max(8) as usize;
@@ -874,7 +874,10 @@ fn draw_help(frame: &mut Frame, app: &App, full: Rect) {
     }
 
     let visible = area.height as usize;
-    let top = app.help_scroll.min(lines.len().saturating_sub(visible));
+    // write the clamp back, like the transcript does with scroll_back —
+    // otherwise every extra j is debt that k has to repay
+    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(visible));
+    let top = app.help_scroll;
     let more_below = lines.len() > top + visible;
     let mut lines: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
     if more_below {
