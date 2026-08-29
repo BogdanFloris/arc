@@ -287,11 +287,13 @@ async fn send(
                 output_tokens,
                 partial,
                 step_capped,
+                grounding_json,
             } => NetEvent::End {
                 partial,
                 input_tokens,
                 output_tokens,
                 step_capped,
+                grounding_json,
             },
             TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
         };

@@ -399,6 +399,7 @@ async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> boo
         output_tokens: 0,
         partial: false,
         step_capped: false,
+        grounding_json: String::new(),
     });
     send_frame(ws, request_id, end).await
 }
@@ -631,6 +632,7 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
         output_tokens: usage.output_tokens,
         partial: reply.partial,
         step_capped: reply.step_capped,
+        grounding_json: reply.grounding_json.clone(),
     })
 }
 

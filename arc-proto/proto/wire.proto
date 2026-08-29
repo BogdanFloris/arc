@@ -186,6 +186,9 @@ message StreamEnd {
   // the turn used every tool step its role allows and was forced to stop;
   // the reply narrates in-progress work, not a finished answer
   bool step_capped = 5;
+  // grounding metadata for the reply just streamed, so a live turn can
+  // render citations without a refetch; empty when ungrounded
+  string grounding_json = 6;
 }
 
 message Error {

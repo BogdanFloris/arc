@@ -246,6 +246,16 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                 };
                 out.push(Line::styled(elide(&text, width), theme::DIM));
             }
+            Block::Sources(sources) => {
+                for (title, uri) in sources {
+                    let line = if title == uri {
+                        format!("- {uri}")
+                    } else {
+                        format!("- {title} ({uri})")
+                    };
+                    out.push(Line::styled(elide(&line, width), theme::DIM));
+                }
+            }
             Block::Cost {
                 input_tokens,
                 output_tokens,

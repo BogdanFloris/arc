@@ -99,6 +99,7 @@ pub struct Reply {
     pub usage: Option<Usage>,
     pub partial: bool,
     pub step_capped: bool,
+    pub grounding_json: String,
     pub jobs: Vec<DispatchedJob>,
     pub continues: Vec<ContinuedJob>,
 }
@@ -935,6 +936,7 @@ impl Engine {
                         usage: total_usage,
                         partial: false,
                         step_capped: last_step,
+                        grounding_json: grounding.clone().unwrap_or_default(),
                         jobs,
                         continues,
                     });
@@ -962,6 +964,7 @@ impl Engine {
                         usage: None,
                         partial: true,
                         step_capped: last_step,
+                        grounding_json: grounding.clone().unwrap_or_default(),
                         jobs,
                         continues,
                     });

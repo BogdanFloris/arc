@@ -49,6 +49,7 @@ pub enum TurnEvent {
         output_tokens: u32,
         partial: bool,
         step_capped: bool,
+        grounding_json: String,
     },
     Failed {
         code: String,
@@ -371,6 +372,7 @@ impl Turn<'_> {
                     output_tokens: end.output_tokens,
                     partial: end.partial,
                     step_capped: end.step_capped,
+                    grounding_json: end.grounding_json,
                 }
             }
             server_frame::Msg::Error(error) => {
@@ -466,6 +468,7 @@ mod tests {
             output_tokens: 5,
             partial,
             step_capped: false,
+            grounding_json: String::new(),
         })
     }
 
@@ -721,7 +724,8 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 5,
                 partial: false,
-                step_capped: false
+                step_capped: false,
+                grounding_json: String::new(),
             })
         );
         assert_eq!(turn.next().await.expect("closed"), None, "the turn is over");
@@ -791,7 +795,8 @@ mod tests {
                     input_tokens: 3,
                     output_tokens: 5,
                     partial: false,
-                    step_capped: false
+                    step_capped: false,
+                    grounding_json: String::new(),
                 },
             ]
         );

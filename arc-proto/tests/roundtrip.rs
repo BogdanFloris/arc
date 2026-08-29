@@ -356,6 +356,7 @@ fn server_frame_arms_round_trip() {
             output_tokens: 64,
             partial: true,
             step_capped: true,
+            grounding_json: r#"{"webSearchQueries":["arc"]}"#.to_string(),
         }),
         server_frame::Msg::Error(Error {
             code: "provider_unavailable".to_string(),

@@ -69,6 +69,7 @@ pub enum NetEvent {
         input_tokens: u32,
         output_tokens: u32,
         step_capped: bool,
+        grounding_json: String,
     },
     Failed {
         code: String,
@@ -181,6 +182,8 @@ pub enum Block {
     },
     /// The turn was forced to stop by the step cap, not a finished answer.
     StepCapped,
+    /// What a grounded reply cited: (title, uri) pairs, dim under the answer.
+    Sources(Vec<(String, String)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1302,6 +1305,7 @@ impl App {
                 input_tokens,
                 output_tokens,
                 step_capped,
+                grounding_json,
             } => {
                 if self.steer_turn_pending {
                     self.steer_turn_pending = false;
@@ -1323,6 +1327,10 @@ impl App {
                 }
                 if step_capped {
                     self.transcript.push(Block::StepCapped);
+                }
+                let sources = grounding_sources(&grounding_json);
+                if !sources.is_empty() {
+                    self.transcript.push(Block::Sources(sources));
                 }
                 self.turn_over(Status::Idle)
             }
@@ -1599,6 +1607,7 @@ fn block_yank_text(block: &Block) -> Option<String> {
         | Block::Cost { .. }
         | Block::Note(_)
         | Block::StepCapped
+        | Block::Sources(_)
         | Block::Fault { .. } => None,
     }
 }
@@ -1608,6 +1617,31 @@ fn block_yank_text(block: &Block) -> Option<String> {
 // the map is a BTreeMap, so "first value" is alphabetical-key order —
 // `project` would beat `question`; known payload keys are tried first
 const SUMMARY_KEYS: &[&str] = &["question", "command", "query", "brief", "path", "id"];
+
+/// (title, uri) pairs out of Gemini's grounding metadata: any
+/// `groundingChunks[].web` with a uri counts; a missing title shows the uri.
+fn grounding_sources(grounding_json: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(grounding_json) else {
+        return Vec::new();
+    };
+    let Some(chunks) = value.get("groundingChunks").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    chunks
+        .iter()
+        .filter_map(|chunk| {
+            let web = chunk.get("web")?;
+            let uri = web.get("uri")?.as_str()?.to_owned();
+            let title = web
+                .get("title")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or(&uri)
+                .to_owned();
+            Some((title, uri))
+        })
+        .collect()
+}
 
 fn tool_summary(arguments_json: &str) -> String {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arguments_json) else {
@@ -1677,9 +1711,13 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                 let input_tokens = message.input_tokens;
                 let output_tokens = message.output_tokens;
                 let elapsed_ms = message.elapsed_ms;
+                let sources = grounding_sources(&message.grounding_json);
                 if let Some(block) = prose_block(message) {
                     let is_arc = matches!(block, Block::Arc { .. });
                     blocks.push(block);
+                    if is_arc && !sources.is_empty() {
+                        blocks.push(Block::Sources(sources));
+                    }
                     if is_arc && (input_tokens != 0 || output_tokens != 0) {
                         blocks.push(Block::Cost {
                             input_tokens,
@@ -1812,6 +1850,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             step_capped: false,
+            grounding_json: String::new(),
         }
     }
 
@@ -2263,6 +2302,90 @@ mod tests {
         );
     }
 
+    const GROUNDING: &str = r#"{"webSearchQueries":["arc daemon"],"groundingChunks":[
+        {"web":{"uri":"https://example.org/a","title":"Example A"}},
+        {"web":{"uri":"https://example.org/b"}},
+        {"retrieval":{"uri":"ignored"}}]}"#;
+
+    #[test]
+    fn grounding_sources_pull_titled_and_untitled_web_chunks_and_skip_the_rest() {
+        assert_eq!(
+            grounding_sources(GROUNDING),
+            [
+                ("Example A".to_owned(), "https://example.org/a".to_owned()),
+                (
+                    "https://example.org/b".to_owned(),
+                    "https://example.org/b".to_owned()
+                ),
+            ],
+            "a missing title falls back to the uri; non-web chunks are skipped"
+        );
+        assert_eq!(grounding_sources(""), Vec::<(String, String)>::new());
+        assert_eq!(
+            grounding_sources("not json"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn a_grounded_end_appends_a_sources_block_and_an_ungrounded_one_does_not() {
+        let mut app = App::new();
+        typed(&mut app, "what's new?");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        app.on_net(NetEvent::Delta("the answer".to_owned()));
+        app.on_net(NetEvent::End {
+            partial: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            step_capped: false,
+            grounding_json: GROUNDING.to_owned(),
+        });
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(Block::Sources(sources)) if sources.len() == 2
+            ),
+            "citations sit under the answer, got {:?}",
+            app.transcript.last()
+        );
+
+        typed(&mut app, "and plainly?");
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::Delta("no web involved".to_owned()));
+        app.on_net(end(false));
+        assert!(
+            !matches!(app.transcript.last(), Some(Block::Sources(_))),
+            "an ungrounded turn adds nothing"
+        );
+    }
+
+    #[test]
+    fn a_grounded_history_message_renders_its_sources_after_the_reply() {
+        let entries = vec![HistoryEntry {
+            entry: Some(history_entry::Entry::Message(HistoryMessage {
+                role: Role::Assistant as i32,
+                content: "sourced answer".to_owned(),
+                partial: false,
+                source: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
+                grounding_json: GROUNDING.to_owned(),
+            })),
+        }];
+        let blocks = history_blocks(entries);
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [Block::Arc { .. }, Block::Sources(sources)] if sources.len() == 2
+            ),
+            "got {blocks:?}"
+        );
+    }
+
     #[test]
     fn the_summary_prefers_the_payload_key_over_alphabetical_order() {
         assert_eq!(
@@ -2301,6 +2424,7 @@ mod tests {
             input_tokens: 2345,
             output_tokens: 140,
             step_capped: false,
+            grounding_json: String::new(),
         });
 
         assert!(matches!(
@@ -2347,6 +2471,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             step_capped: true,
+            grounding_json: String::new(),
         });
 
         assert_eq!(app.transcript.last(), Some(&Block::StepCapped));
