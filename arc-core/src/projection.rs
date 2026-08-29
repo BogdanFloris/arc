@@ -19,7 +19,8 @@ use crate::log;
 // 10: messages gained input_tokens, output_tokens, elapsed_ms
 // 11: sessions gained provider, model columns
 // 12: sessions gained the source column
-pub(crate) const SCHEMA_VERSION: u32 = 12;
+// 13: memory_records gained created_at, superseded_at
+pub(crate) const SCHEMA_VERSION: u32 = 13;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -84,7 +85,9 @@ CREATE TABLE IF NOT EXISTS memory_records (
     created_seq    INTEGER NOT NULL,
     last_event_seq INTEGER NOT NULL,
     changed_at     INTEGER,
-    reviewed_at    INTEGER
+    reviewed_at    INTEGER,
+    created_at     INTEGER,
+    superseded_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS projection_meta (
@@ -653,6 +656,10 @@ impl Projection {
         review_items(&self.conn, since_micros)
     }
 
+    pub fn memory_active_at(&self, at_micros: i64) -> Result<Vec<MemoryRecord>, Error> {
+        memory_active_at(&self.conn, at_micros)
+    }
+
     pub(crate) fn memory_record(&self, id: &str) -> Result<Option<MemoryRecordState>, Error> {
         let row = self
             .conn
@@ -733,6 +740,10 @@ impl Reader {
         review_items(&self.conn(), since_micros)
     }
 
+    pub fn memory_active_at(&self, at_micros: i64) -> Result<Vec<MemoryRecord>, Error> {
+        memory_active_at(&self.conn(), at_micros)
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -806,7 +817,8 @@ const REBUILD_TABLES: &[TableSpec] = &[
         table: "memory_records",
         key_columns: 1,
         select: "SELECT id, kind, namespace, title, summary, body, links, provenance, \
-                 status, superseded_by, created_seq, last_event_seq, changed_at, reviewed_at \
+                 status, superseded_by, created_seq, last_event_seq, changed_at, reviewed_at, \
+                 created_at, superseded_at \
                  FROM memory_records ORDER BY id",
     },
     TableSpec {
@@ -1018,6 +1030,40 @@ pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<R
             changed_at: row.get(10)?,
         })
     })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The records held at `at_micros`, each in its last-known form: a record
+/// is active on [`created_at`, `superseded_at`). Content is not reconstructed —
+/// the log holds that — and a purged record is absent from history too,
+/// which is the point of a purge. Rows missing a timestamp (a create or
+/// supersede event without one) are excluded rather than guessed.
+fn memory_active_at(conn: &Connection, at_micros: i64) -> Result<Vec<MemoryRecord>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, namespace, title, summary, body, links, provenance, status
+         FROM memory_records
+         WHERE created_at IS NOT NULL AND created_at <= ?1
+           AND (status = ?2 OR (superseded_at IS NOT NULL AND superseded_at > ?1))
+         ORDER BY namespace, kind, title, id",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![at_micros, memory_record::Status::Active as i32],
+        |row| {
+            Ok(MemoryRecord {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                namespace: row.get(2)?,
+                title: row.get(3)?,
+                summary: row.get(4)?,
+                body: row.get(5)?,
+                links: links_from_json(&row.get::<_, String>(6)?)
+                    .map_err(|e| bad_json_column(6, &e))?,
+                provenance: provenance_from_json(row.get::<_, Option<String>>(7)?.as_deref())
+                    .map_err(|e| bad_json_column(7, &e))?,
+                status: row.get(8)?,
+            })
+        },
+    )?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -1262,8 +1308,8 @@ fn create_memory_record(
     tx.execute(
         "INSERT INTO memory_records
              (id, kind, namespace, title, summary, body, links, provenance,
-              status, superseded_by, created_seq, last_event_seq, changed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11)",
+              status, superseded_by, created_seq, last_event_seq, changed_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11, ?11)",
         rusqlite::params![
             &record.id,
             record.kind,
@@ -1331,7 +1377,8 @@ fn supersede_memory_record(
     if record.id != superseded.superseded_id {
         let changed = tx.execute(
             "UPDATE memory_records
-             SET status = ?2, superseded_by = ?3, last_event_seq = ?4, changed_at = ?5
+             SET status = ?2, superseded_by = ?3, last_event_seq = ?4, changed_at = ?5,
+                 superseded_at = ?5
              WHERE id = ?1 AND last_event_seq < ?4",
             rusqlite::params![
                 &superseded.superseded_id,
@@ -1364,18 +1411,20 @@ fn upsert_memory_record(
     event: &Event,
     record: &MemoryRecord,
 ) -> Result<(), Error> {
+    // an in-place replacement keeps created_at — same record, revised, like
+    // an update — and clears superseded_at so it reads active again
     let changed = tx.execute(
         "INSERT INTO memory_records
              (id, kind, namespace, title, summary, body, links, provenance,
-              status, superseded_by, created_seq, last_event_seq, changed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11)
+              status, superseded_by, created_seq, last_event_seq, changed_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, ?11, ?11)
          ON CONFLICT (id) DO UPDATE SET
              kind = excluded.kind, namespace = excluded.namespace,
              title = excluded.title, summary = excluded.summary,
              body = excluded.body, links = excluded.links,
              provenance = excluded.provenance, status = excluded.status,
              superseded_by = NULL, last_event_seq = excluded.last_event_seq,
-             changed_at = excluded.changed_at
+             changed_at = excluded.changed_at, superseded_at = NULL
          WHERE memory_records.last_event_seq < excluded.last_event_seq",
         rusqlite::params![
             &record.id,
@@ -4059,6 +4108,118 @@ mod tests {
             review_ids(&projection, 0),
             ["mr-b"],
             "the stamp moves changed_at past reviewed_at, re-opening mr-b"
+        );
+    }
+
+    fn active_ids_at(projection: &Projection, at: i64) -> Vec<String> {
+        projection
+            .memory_active_at(at)
+            .expect("memory_active_at")
+            .into_iter()
+            .map(|record| record.id)
+            .collect()
+    }
+
+    #[test]
+    fn active_at_walks_a_supersede_chain() {
+        let mut projection = Projection::in_memory().expect("open");
+        let a = record("mr-a", "address", "lives at X");
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+        let b = record("mr-b", "bicycle", "rides a bicycle");
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
+            .expect("apply");
+        let a2 = record("mr-a2", "address", "lives at Y");
+        projection
+            .apply(&memory_at(
+                2,
+                100,
+                memory_payload(mem_superseded(2, "mr-a", a2)),
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            active_ids_at(&projection, 49),
+            Vec::<String>::new(),
+            "nothing was held before the first record"
+        );
+        assert_eq!(
+            active_ids_at(&projection, 70),
+            ["mr-a", "mr-b"],
+            "the superseded mr-a was still the held fact at 70"
+        );
+        assert_eq!(
+            active_ids_at(&projection, 100),
+            ["mr-a2", "mr-b"],
+            "the interval is [created_at, superseded_at): at 100 the replacement holds"
+        );
+    }
+
+    #[test]
+    fn a_purged_record_is_absent_from_every_point_in_time() {
+        let mut projection = Projection::in_memory().expect("open");
+        let a = record("mr-a", "address", "lives at X");
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+        projection
+            .apply(&memory_at(1, 100, memory_payload(mem_deleted(1, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(
+            active_ids_at(&projection, 70),
+            Vec::<String>::new(),
+            "a purge erases the record from history, not just from now"
+        );
+    }
+
+    #[test]
+    fn an_in_place_supersede_keeps_its_activation_time() {
+        let mut projection = Projection::in_memory().expect("open");
+        let a = record("mr-a", "address", "lives at X");
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+        let revised = record("mr-a", "address", "lives at X, corrected");
+        projection
+            .apply(&memory_at(
+                1,
+                100,
+                memory_payload(mem_superseded(1, "mr-a", revised)),
+            ))
+            .expect("apply");
+
+        let held = projection.memory_active_at(70).expect("memory_active_at");
+        assert_eq!(
+            held.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["mr-a"],
+            "an in-place revision is the same record, held since 50"
+        );
+        assert_eq!(
+            held[0].summary, "lives at X, corrected",
+            "content is the last-known form, not a reconstruction"
+        );
+    }
+
+    #[test]
+    fn a_supersede_without_a_timestamp_excludes_the_row_rather_than_guessing() {
+        let mut projection = Projection::in_memory().expect("open");
+        let a = record("mr-a", "address", "lives at X");
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+        let a2 = record("mr-a2", "address", "lives at Y");
+        let mut untimestamped = memory(1, memory_payload(mem_superseded(1, "mr-a", a2)));
+        untimestamped.ts = None;
+        projection.apply(&untimestamped).expect("apply");
+
+        assert_eq!(
+            active_ids_at(&projection, 70),
+            Vec::<String>::new(),
+            "with no supersede timestamp, mr-a's interval end is unknown and it is \
+             excluded; the untimestamped mr-a2 is excluded by its missing created_at"
         );
     }
 
