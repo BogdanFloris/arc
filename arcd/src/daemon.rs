@@ -561,6 +561,8 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::SessionCreated(SessionCreated {
                     session_id: "s-01".to_owned(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: "never".to_owned(),
                     model: "test-model".to_owned(),
@@ -652,6 +654,8 @@ mod tests {
         let events = [
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.to_owned(),
+                parent_session: String::new(),
+                fork_point: 0,
                 title: String::new(),
                 provider: "never".to_owned(),
                 model: "test-model".to_owned(),

@@ -43,13 +43,28 @@ message SessionCreated {
   string title = 2;
   string provider = 3;
   string model = 4;
-  reserved 5, 6;  // forking's parent_session and fork_point
+  string parent_session = 5;
+  uint64 fork_point = 6;
   SessionRole role = 7;
   string project = 8;
   Budget budget = 9;
   repeated WorkspaceGrant grants = 10;
   // the dispatching parent, set only for a job session's own creation
   string dispatched_by = 11;
+}
+
+// A branch's standing, latest wins on replay: unmarked is scratch and never
+// feeds consolidation; REAL is a human saying it counts; ABANDONED is
+// reversible
+message BranchMarked {
+  string session_id = 1;
+  Disposition disposition = 2;
+
+  enum Disposition {
+    DISPOSITION_UNSPECIFIED = 0;
+    DISPOSITION_REAL = 1;
+    DISPOSITION_ABANDONED = 2;
+  }
 }
 
 message MessageAppended {
@@ -123,6 +138,7 @@ message SessionEvent {
     SessionConsolidated session_consolidated = 6;
     SessionTitled session_titled = 7;
     ServerCallRecorded server_call_recorded = 8;
+    BranchMarked branch_marked = 9;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
 }

@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use arc_proto::v1::{
-    Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall, HistoryToolResult,
-    MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
-    MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-    Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent, SessionTitled,
-    ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event, memory_record,
-    session_event,
+    BranchMarked, Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall,
+    HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
+    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
+    ProvenanceEntry, Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent,
+    SessionTitled, ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event,
+    memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -23,7 +23,8 @@ use crate::log;
 // 13: memory_records gained created_at, superseded_at
 // 14: memory_fts indexes memory records for ranked search
 // 15: messages gained grounding_json and the server-call kind
-pub(crate) const SCHEMA_VERSION: u32 = 15;
+// 16: sessions split dispatched_by out of parent_session and gained disposition
+pub(crate) const SCHEMA_VERSION: u32 = 16;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
     parent_session TEXT,
     fork_point     INTEGER,
+    dispatched_by  TEXT,
     project        TEXT,
     title          TEXT,
     started_at     INTEGER,
@@ -41,7 +43,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     role           INTEGER NOT NULL DEFAULT 0,
     provider       TEXT,
     model          TEXT,
-    source         INTEGER NOT NULL DEFAULT 0
+    source         INTEGER NOT NULL DEFAULT 0,
+    disposition    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -403,6 +406,9 @@ impl Projection {
                 session_event::Event::ServerCallRecorded(call) => {
                     insert_server_call(&tx, event, call)?;
                 }
+                session_event::Event::BranchMarked(marked) => {
+                    mark_branch(&tx, event, marked)?;
+                }
                 session_event::Event::SessionConsolidated(consolidated) => {
                     mark_consolidated(&tx, event, consolidated)?;
                 }
@@ -557,8 +563,8 @@ impl Projection {
     /// recorded parent and is absent here — it cannot be repaired.
     pub(crate) fn parented_job_sessions(&self) -> Result<Vec<(String, String, i32)>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_session, role FROM sessions
-             WHERE parent_session IS NOT NULL AND role IN (?1, ?2)",
+            "SELECT id, dispatched_by, role FROM sessions
+             WHERE dispatched_by IS NOT NULL AND role IN (?1, ?2)",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -823,8 +829,8 @@ const REBUILD_TABLES: &[TableSpec] = &[
     TableSpec {
         table: "sessions",
         key_columns: 1,
-        select: "SELECT id, parent_session, fork_point, project, title, started_at, \
-                 consolidated_through, role, provider, model, source \
+        select: "SELECT id, parent_session, fork_point, dispatched_by, project, title, \
+                 started_at, consolidated_through, role, provider, model, source, disposition \
                  FROM sessions ORDER BY id",
     },
     TableSpec {
@@ -963,7 +969,7 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                           ORDER BY m.seq LIMIT 1), ''),
                 (SELECT MAX(m.ts) FROM messages m
                  WHERE m.session_id = s.id AND m.kind = ?2),
-                s.role, s.project, coalesce(s.parent_session, ''), s.source
+                s.role, s.project, coalesce(s.dispatched_by, ''), s.source
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -1162,6 +1168,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::ToolCallIssued(_) => "tool_call_issued",
             session_event::Event::ToolResultRecorded(_) => "tool_result_recorded",
             session_event::Event::ServerCallRecorded(_) => "server_call_recorded",
+            session_event::Event::BranchMarked(_) => "branch_marked",
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
             session_event::Event::SessionTitled(_) => "session_titled",
         },
@@ -1191,10 +1198,13 @@ fn insert_session(
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO sessions
-             (id, parent_session, fork_point, project, title, started_at, role, provider, model, source)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, parent_session, fork_point, dispatched_by, project, title, started_at,
+              role, provider, model, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         (
             &created.session_id,
+            (!created.parent_session.is_empty()).then_some(&created.parent_session),
+            (created.fork_point > 0).then_some(seq_param(created.fork_point)?),
             (!created.dispatched_by.is_empty()).then_some(&created.dispatched_by),
             (!created.project.is_empty()).then_some(&created.project),
             &created.title,
@@ -1210,6 +1220,23 @@ fn insert_session(
             "INSERT INTO session_grants (session_id, root, read_write) VALUES (?1, ?2, ?3)",
             (&created.session_id, &grant.root, grant.read_write),
         )?;
+    }
+    Ok(())
+}
+
+// latest wins, like a title: replay applies in seq order, so a plain
+// overwrite is the rule — abandonment is reversible by construction
+fn mark_branch(tx: &Transaction<'_>, event: &Event, marked: &BranchMarked) -> Result<(), Error> {
+    let changed = tx.execute(
+        "UPDATE sessions SET disposition = ?2 WHERE id = ?1",
+        rusqlite::params![&marked.session_id, marked.disposition],
+    )?;
+    if changed == 0 {
+        tracing::warn!(
+            seq = event.seq,
+            id = %marked.session_id,
+            "branch mark for an unknown session; skipping"
+        );
     }
     Ok(())
 }
@@ -1728,7 +1755,7 @@ mod tests {
     use std::path::Path;
 
     use arc_proto::v1::{
-        Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
+        BranchMarked, Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
         Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent, SessionRole,
         SessionTitled, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
@@ -1763,6 +1790,8 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::SessionCreated(SessionCreated {
                     session_id: "s-01".to_string(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: "first light".to_string(),
                     provider: "gemini".to_string(),
                     model: "gemini-3-pro".to_string(),
@@ -2432,6 +2461,102 @@ mod tests {
         assert_eq!(hits, 1, "what the model read from the web is findable");
     }
 
+    fn session_lineage(
+        projection: &Projection,
+        id: &str,
+    ) -> (Option<String>, Option<i64>, Option<String>, Option<i32>) {
+        projection
+            .conn
+            .query_row(
+                "SELECT parent_session, fork_point, dispatched_by, disposition
+                 FROM sessions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("session row")
+    }
+
+    #[test]
+    fn a_forked_session_records_lineage_and_a_dispatched_one_records_supervision() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+
+        let mut fork = session_created_as(1, "s-fork", "", None);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = fork.payload.as_mut()
+        {
+            created.parent_session = "s-01".to_owned();
+            created.fork_point = 7;
+        }
+        projection.apply(&fork).expect("apply");
+
+        let mut job = session_created_as(2, "s-job", "", None);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = job.payload.as_mut()
+        {
+            created.dispatched_by = "s-01".to_owned();
+        }
+        projection.apply(&job).expect("apply");
+
+        assert_eq!(
+            session_lineage(&projection, "s-fork"),
+            (Some("s-01".to_owned()), Some(7), None, None),
+            "a fork is lineage: parent and fork point, no supervisor, scratch by default"
+        );
+        assert_eq!(
+            session_lineage(&projection, "s-job"),
+            (None, None, Some("s-01".to_owned()), None),
+            "a dispatch is supervision, never lineage"
+        );
+    }
+
+    fn branch_marked(seq: u64, id: &str, disposition: i32) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::User as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::BranchMarked(BranchMarked {
+                    session_id: id.to_owned(),
+                    disposition,
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn branch_marks_are_latest_wins_and_abandonment_is_reversible() {
+        use arc_proto::v1::branch_marked::Disposition;
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+
+        projection
+            .apply(&branch_marked(1, "s-01", Disposition::Real as i32))
+            .expect("apply");
+        assert_eq!(
+            session_lineage(&projection, "s-01").3,
+            Some(Disposition::Real as i32)
+        );
+
+        projection
+            .apply(&branch_marked(2, "s-01", Disposition::Abandoned as i32))
+            .expect("apply");
+        projection
+            .apply(&branch_marked(3, "s-01", Disposition::Real as i32))
+            .expect("apply");
+        assert_eq!(
+            session_lineage(&projection, "s-01").3,
+            Some(Disposition::Real as i32),
+            "a re-mark reopens an abandoned branch; latest wins"
+        );
+
+        projection
+            .apply(&branch_marked(4, "s-ghost", Disposition::Real as i32))
+            .expect("a mark for an unknown session warns and skips, never errors");
+    }
+
     #[test]
     fn fts_matches_prose_and_results_and_kind_filters_them_apart() {
         let mut projection = Projection::in_memory().expect("open");
@@ -2489,6 +2614,8 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::SessionCreated(SessionCreated {
                     session_id: id.to_string(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: title.to_string(),
                     provider: "gemini".to_string(),
                     model: "gemini-3-pro".to_string(),

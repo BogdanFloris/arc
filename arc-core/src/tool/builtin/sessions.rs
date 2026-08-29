@@ -215,6 +215,8 @@ mod tests {
     fn created(id: &str, title: &str) -> session_event::Event {
         session_event::Event::SessionCreated(SessionCreated {
             session_id: id.to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: title.to_owned(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),

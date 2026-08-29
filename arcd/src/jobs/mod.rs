@@ -623,6 +623,8 @@ mod tests {
     ) -> arc_proto::v1::session_event::Event {
         arc_proto::v1::session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: id.to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: String::new(),
             provider: "scripted".to_owned(),
             model: "test-model".to_owned(),

@@ -355,6 +355,8 @@ impl Engine {
             source,
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.clone(),
+                parent_session: String::new(),
+                fork_point: 0,
                 title: String::new(),
                 provider,
                 model,
@@ -747,6 +749,8 @@ impl Engine {
                 Source::User,
                 session_event::Event::SessionCreated(SessionCreated {
                     session_id: session_id.clone(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: runner.provider.name().to_owned(),
                     model: runner.model.clone(),
@@ -1501,6 +1505,7 @@ fn session_id_of(event: &session_event::Event) -> &str {
         session_event::Event::ToolCallIssued(e) => &e.session_id,
         session_event::Event::ToolResultRecorded(e) => &e.session_id,
         session_event::Event::ServerCallRecorded(e) => &e.session_id,
+        session_event::Event::BranchMarked(e) => &e.session_id,
         session_event::Event::SessionConsolidated(e) => &e.session_id,
         session_event::Event::SessionTitled(e) => &e.session_id,
     }
@@ -1755,6 +1760,8 @@ mod tests {
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: "s-01".to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: String::new(),
             provider: "scripted".to_owned(),
             model: "test-model".to_owned(),
@@ -1860,6 +1867,8 @@ mod tests {
     fn seeded_session_with_project(project: &str) -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: "s-01".to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: String::new(),
             provider: "scripted".to_owned(),
             model: "test-model".to_owned(),
@@ -2050,6 +2059,8 @@ mod tests {
             vec![
                 session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
                     session_id: "s-01".to_owned(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: "scripted".to_owned(),
                     model: "test-model".to_owned(),
@@ -2273,6 +2284,8 @@ mod tests {
                 Source::System,
                 session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
                     session_id: "s-old".to_owned(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: "scripted".to_owned(),
                     model: "test-model".to_owned(),
@@ -5120,6 +5133,8 @@ mod tests {
     fn unstamped_session(id: &str, role: SessionRole) -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: id.to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: String::new(),
             provider: String::new(),
             model: String::new(),
@@ -5139,6 +5154,8 @@ mod tests {
     ) -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: id.to_owned(),
+            parent_session: String::new(),
+            fork_point: 0,
             title: String::new(),
             provider: provider.to_owned(),
             model: model.to_owned(),
@@ -5687,6 +5704,8 @@ mod tests {
             vec![
                 session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
                     session_id: "s-01".to_owned(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: "scripted".to_owned(),
                     model: "test-model".to_owned(),

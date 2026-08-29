@@ -1368,6 +1368,8 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::SessionCreated(SessionCreated {
                     session_id: "s-exec".to_owned(),
+                    parent_session: String::new(),
+                    fork_point: 0,
                     title: String::new(),
                     provider: "mock".to_owned(),
                     model: "test-model".to_owned(),

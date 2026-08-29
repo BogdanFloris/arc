@@ -33,6 +33,8 @@ fn session_created_event() -> Event {
         payload: Some(event::Payload::Session(SessionEvent {
             event: Some(session_event::Event::SessionCreated(SessionCreated {
                 session_id: "s-01".to_string(),
+                parent_session: String::new(),
+                fork_point: 0,
                 title: "first light".to_string(),
                 provider: "gemini".to_string(),
                 model: "gemini-2.5-pro".to_string(),
