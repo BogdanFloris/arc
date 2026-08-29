@@ -89,9 +89,6 @@ async fn run(
     let mut cursor = Mode::Insert;
     set_cursor_style(cursor);
 
-    let mut agent_state = AgentState::Idle;
-    let mut cancelling = false;
-
     // a ticking clock display is a legitimate timer; it only runs while a
     // running job is on the strip or a turn streams, never data polling
     let mut clock = tokio::time::interval(Duration::from_secs(1));
@@ -99,13 +96,9 @@ async fn run(
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        let mut key_pressed = false;
         let command = tokio::select! {
             key = keys.next() => match key {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                    key_pressed = true;
-                    app.on_key(key)
-                }
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
                 Some(Ok(_)) => None,
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
@@ -120,7 +113,6 @@ async fn run(
         match command {
             Some(Command::Yank(text)) => yank(&text),
             Some(command @ Command::CancelTurn { .. }) => {
-                cancelling = true;
                 control_commands.send(command).expect("control task alive");
             }
             Some(command) => commands.send(command).expect("connection task alive"),
@@ -131,33 +123,19 @@ async fn run(
             set_cursor_style(cursor);
         }
 
-        agent_state = next_agent_state(agent_state, app.status, key_pressed, cancelling);
-        if app.status != Status::Streaming {
-            cancelling = false;
-        }
-        herdr.state(agent_state);
+        herdr.state(agent_state(app.status));
         herdr.metadata(session_title(&app), app.running_job_count());
     }
     Ok(())
 }
 
-/// What the herdr sidebar should say. Done means a turn finished while the
-/// user was away; the next keypress collapses it to idle. A cancelled turn
-/// never reads as done — the user ended it, nothing awaits review.
-fn next_agent_state(
-    previous: AgentState,
-    status: Status,
-    key_pressed: bool,
-    cancelling: bool,
-) -> AgentState {
+// arc never says done: herdr derives it from working→idle and clears it on
+// pane focus, which is also what makes its finished-turn notification fire
+fn agent_state(status: Status) -> AgentState {
     match status {
         Status::Streaming => AgentState::Working,
         Status::Disconnected => AgentState::Blocked,
-        Status::Idle => match previous {
-            AgentState::Working if !cancelling => AgentState::Done,
-            AgentState::Done if !key_pressed => AgentState::Done,
-            _ => AgentState::Idle,
-        },
+        Status::Idle => AgentState::Idle,
     }
 }
 
@@ -187,35 +165,4 @@ fn set_cursor_style(mode: Mode) {
     let mut out = std::io::stdout();
     let _ = crossterm::execute!(out, style);
     let _ = out.flush();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_finished_turn_reads_done_until_the_next_keypress() {
-        let state = next_agent_state(AgentState::Working, Status::Idle, false, false);
-        assert_eq!(state, AgentState::Done);
-        let state = next_agent_state(state, Status::Idle, false, false);
-        assert_eq!(state, AgentState::Done);
-        let state = next_agent_state(state, Status::Idle, true, false);
-        assert_eq!(state, AgentState::Idle);
-    }
-
-    #[test]
-    fn a_cancelled_turn_lands_idle_not_done() {
-        let state = next_agent_state(AgentState::Working, Status::Idle, false, true);
-        assert_eq!(state, AgentState::Idle);
-    }
-
-    #[test]
-    fn streaming_is_working_and_disconnect_is_blocked() {
-        let state = next_agent_state(AgentState::Idle, Status::Streaming, true, false);
-        assert_eq!(state, AgentState::Working);
-        let state = next_agent_state(state, Status::Disconnected, false, false);
-        assert_eq!(state, AgentState::Blocked);
-        let state = next_agent_state(state, Status::Idle, false, false);
-        assert_eq!(state, AgentState::Idle);
-    }
 }

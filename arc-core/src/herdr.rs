@@ -8,12 +8,14 @@ use tokio::sync::mpsc;
 const SOURCE: &str = "custom:arc";
 const AGENT: &str = "arc";
 
+// the full report vocabulary: `done` is not reportable — the server rejects
+// it, derives done from a working→idle transition on its own, and clears it
+// when the pane gains focus
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
     Idle,
     Working,
     Blocked,
-    Done,
 }
 
 impl AgentState {
@@ -22,7 +24,6 @@ impl AgentState {
             Self::Idle => "idle",
             Self::Working => "working",
             Self::Blocked => "blocked",
-            Self::Done => "done",
         }
     }
 }
@@ -248,7 +249,6 @@ mod tests {
             (AgentState::Idle, "idle"),
             (AgentState::Working, "working"),
             (AgentState::Blocked, "blocked"),
-            (AgentState::Done, "done"),
         ] {
             assert_eq!(state.wire(), wire);
         }
