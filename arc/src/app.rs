@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
@@ -1307,11 +1307,20 @@ impl App {
         self.picker_tree().into_iter().map(|(s, _)| s).collect()
     }
 
-    /// `picker_rows`, paired with fork depth: how many parent hops stay
-    /// inside this same filtered list. A parent filtered out or elsewhere
-    /// reads as depth 0, same as an actual root.
-    pub fn picker_tree(&self) -> Vec<(&SessionInfo, usize)> {
-        tree_order(&self.picker_candidates())
+    /// `picker_rows`, paired with the lineage annotation: the parent's id
+    /// prefix for a branch, `None` for a root. Position is pure recency —
+    /// the freshest work is the first row; lineage is information, not
+    /// hierarchy (decided 2026-08-29, after nesting made the dead parent
+    /// the click target).
+    pub fn picker_tree(&self) -> Vec<(&SessionInfo, Option<String>)> {
+        self.picker_candidates()
+            .into_iter()
+            .map(|session| {
+                let parent = (!session.parent_session.is_empty())
+                    .then(|| session.parent_session.chars().take(8).collect());
+                (session, parent)
+            })
+            .collect()
     }
 
     fn picker_candidates(&self) -> Vec<&SessionInfo> {
@@ -1870,53 +1879,6 @@ pub fn is_job_session(session: &SessionInfo) -> bool {
 
 fn is_abandoned(session: &SessionInfo) -> bool {
     session.disposition == arc_proto::v1::branch_marked::Disposition::Abandoned as i32
-}
-
-/// `candidates`, depth-first: each root in its given order, immediately
-/// followed by its own children (recursively) in theirs — a branch whose
-/// `parent_session` isn't among `candidates` counts as a root.
-fn tree_order<'a>(candidates: &[&'a SessionInfo]) -> Vec<(&'a SessionInfo, usize)> {
-    let ids: HashSet<&str> = candidates.iter().map(|s| s.id.as_str()).collect();
-    let mut children: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
-    let mut roots: Vec<&SessionInfo> = Vec::new();
-    for &session in candidates {
-        let parent = session.parent_session.as_str();
-        if !parent.is_empty() && ids.contains(parent) {
-            children.entry(parent).or_default().push(session);
-        } else {
-            roots.push(session);
-        }
-    }
-    let mut out = Vec::with_capacity(candidates.len());
-    for root in roots {
-        push_branch(root, 0, &children, &mut out);
-    }
-    // a parent cycle in a corrupt log would orphan its members from every
-    // root; an unreachable session is worse than an oddly-sorted one
-    if out.len() < candidates.len() {
-        let placed: HashSet<&str> = out.iter().map(|(s, _)| s.id.as_str()).collect();
-        out.extend(
-            candidates
-                .iter()
-                .filter(|s| !placed.contains(s.id.as_str()))
-                .map(|&s| (s, 0)),
-        );
-    }
-    out
-}
-
-fn push_branch<'a>(
-    session: &'a SessionInfo,
-    depth: usize,
-    children: &HashMap<&str, Vec<&'a SessionInfo>>,
-    out: &mut Vec<(&'a SessionInfo, usize)>,
-) {
-    out.push((session, depth));
-    if let Some(kids) = children.get(session.id.as_str()) {
-        for kid in kids {
-            push_branch(kid, depth + 1, children, out);
-        }
-    }
 }
 
 fn short_id(id: &str) -> &str {
@@ -2987,8 +2949,8 @@ mod tests {
             .collect();
         assert_eq!(
             listed,
-            ["s-root", "s-dead"],
-            "x brings the abandoned branch back under its parent"
+            ["s-dead", "s-root"],
+            "x brings the abandoned branch back, in plain recency order"
         );
     }
 
@@ -3591,28 +3553,27 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_nests_a_branch_directly_under_its_parent() {
+    fn the_picker_keeps_recency_order_and_annotates_lineage() {
         let mut app = App::new();
         let mut fork = session_with("child-of-1", "the fork", "hi");
-        fork.parent_session = "s-1".to_owned();
+        fork.parent_session = "s-1-uuid-long".to_owned();
         app.on_net(NetEvent::Sessions(vec![
             fork,
-            session_with("s-1", "root one", "hi"),
+            session_with("s-1-uuid-long", "root one", "hi"),
             session_with("s-2", "root two", "hi"),
         ]));
 
-        let ids: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
+        let rows = app.picker_tree();
+        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["s-1", "child-of-1", "s-2"],
-            "the branch renders directly after its parent, not by plain recency"
+            ["child-of-1", "s-1-uuid-long", "s-2"],
+            "position is pure recency: the fresh branch leads, its stale parent follows"
         );
         assert_eq!(
-            app.picker_tree()
-                .into_iter()
-                .map(|(_, depth)| depth)
-                .collect::<Vec<_>>(),
-            [0, 1, 0]
+            rows.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
+            [Some("s-1-uuid".to_owned()), None, None],
+            "lineage is an annotation — the parent's 8-char prefix — not a hierarchy"
         );
     }
 
@@ -3627,8 +3588,11 @@ mod tests {
         ]));
         normal(&mut app, "s");
         app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.picker_session(2).map(|s| s.id.as_str()), Some("s-fork"));
+        assert_eq!(
+            app.picker_session(1).map(|s| s.id.as_str()),
+            Some("s-fork"),
+            "the fresh branch is the first row under flat recency"
+        );
 
         let command = app.on_key(key(KeyCode::Char('m')));
 

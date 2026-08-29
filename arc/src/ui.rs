@@ -590,7 +590,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 };
                 vec![Span::styled(format!("{prefix}new session"), style)]
             }
-            Some((session, depth)) => {
+            Some((session, parent)) => {
                 let job = crate::app::is_job_session(session);
                 let style = if job {
                     theme::DIM
@@ -599,12 +599,15 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 } else {
                     theme::DIM
                 };
-                let indent = branch_indent(*depth);
                 let tag = disposition_tag(session)
                     .map(|c| format!("{c} "))
                     .unwrap_or_default();
-                let room = room.saturating_sub(indent.chars().count() + tag.chars().count());
-                let mut spans = vec![Span::styled(format!("{prefix}{indent}"), style)];
+                let lineage = parent
+                    .as_ref()
+                    .map(|p| format!("  \\ of {p}"))
+                    .unwrap_or_default();
+                let room = room.saturating_sub(tag.chars().count() + lineage.chars().count());
+                let mut spans = vec![Span::styled(prefix.to_owned(), style)];
                 if !tag.is_empty() {
                     spans.push(Span::styled(tag, theme::DIM));
                 }
@@ -612,6 +615,9 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                     format!("{:<room$}", picker_label(session, room, job)),
                     style,
                 ));
+                if !lineage.is_empty() {
+                    spans.push(Span::styled(lineage, theme::DIM));
+                }
                 spans.push(Span::styled(
                     format!("  {:>TIME_WIDTH$}", last_active(session, now)),
                     theme::DIM,
@@ -624,13 +630,8 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-// a branch renders under its parent, pure ASCII: two spaces, a backslash,
-// a space, per fork hop (row 2.3)
-fn branch_indent(depth: usize) -> String {
-    "  \\ ".repeat(depth)
-}
-
-// a root has no disposition to show; a branch's is unmarked/real/abandoned
+// lineage is an annotation, not a hierarchy: position stays pure recency.
+// A root has no disposition to show; a branch's is unmarked/real/abandoned
 fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
     use arc_proto::v1::branch_marked::Disposition;
     if session.parent_session.is_empty() {
@@ -1364,9 +1365,17 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
 
         let text = plain_text(&rendered(&mut app));
+        let branch_line = text
+            .lines()
+            .find(|line| line.contains("fixing the parser"))
+            .expect("the branch row renders");
         assert!(
-            text.contains("\\ + fixing the parser"),
-            "the branch renders indented under its parent with its real tag, got:\n{text}"
+            branch_line.contains("+ fixing the parser"),
+            "the branch carries its real tag, got: {branch_line:?}"
+        );
+        assert!(
+            branch_line.contains("\\ of s-root"),
+            "lineage renders as an annotation, got: {branch_line:?}"
         );
         let root_line = text
             .lines()
@@ -1374,7 +1383,7 @@ mod tests {
             .expect("the root row renders");
         assert!(
             !root_line.contains('\\'),
-            "a root is not indented, got: {root_line:?}"
+            "a root carries no lineage annotation, got: {root_line:?}"
         );
         assert!(
             !root_line.contains('+') && !root_line.contains('?'),
