@@ -834,6 +834,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_real_branch_extracts_its_own_rows_and_a_real_executor_branch_never_extracts() {
+        use arc_proto::v1::branch_marked::Disposition;
+        // concierge: a REAL branch is due and mines like any main line
+        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (tx, _rx) = channel();
+        let first = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+        let branch = engine
+            .fork_session(&first.session_id, first.seq)
+            .expect("fork");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&branch), "branch turn", tx)
+            .await
+            .expect("send on branch");
+        engine
+            .mark_branch(&branch, Disposition::Real)
+            .expect("mark real");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: vec![created_record("mr-branch")],
+        };
+        // both the root and the REAL branch are due; the scratch default
+        // would have kept the branch out (pinned by the projection tests)
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+        assert!(
+            matches!(outcome, Outcome::Consolidated { .. }),
+            "got: {outcome:?}"
+        );
+        let extractor_two = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: vec![created_record("mr-branch-2")],
+        };
+        let second = run_pass(&engine, &extractor_two, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+        assert!(
+            matches!(second, Outcome::Consolidated { .. }),
+            "got: {second:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "root and REAL branch both mined, each once"
+        );
+    }
+
+    #[tokio::test]
     async fn a_role_less_legacy_session_still_extracts() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");

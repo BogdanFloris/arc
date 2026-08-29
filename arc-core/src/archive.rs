@@ -829,6 +829,39 @@ mod tests {
     }
 
     #[test]
+    fn an_abandoned_branchs_words_stay_searchable_in_the_archive() {
+        use arc_proto::v1::{BranchMarked, branch_marked::Disposition};
+        let mut branch = SessionCreated {
+            session_id: "s-dead".to_owned(),
+            parent_session: "s-root".to_owned(),
+            fork_point: 1,
+            ..match created("s-dead", "wrong turn") {
+                session_event::Event::SessionCreated(c) => c,
+                _ => unreachable!(),
+            }
+        };
+        branch.title = "wrong turn".to_owned();
+        let events = vec![
+            created("s-root", "the trunk"),
+            said("s-root", Role::User, "the good path"),
+            session_event::Event::SessionCreated(branch),
+            said("s-dead", Role::User, "an unrepeatable quixotic detour"),
+            session_event::Event::BranchMarked(BranchMarked {
+                session_id: "s-dead".to_owned(),
+                disposition: Disposition::Abandoned as i32,
+            }),
+        ];
+        let (_dir, archive) = archive_over(events);
+
+        let reply = archive.search("quixotic", false, None).expect("search");
+        assert_eq!(
+            reply.sessions.first().map(|s| s.session_id.as_str()),
+            Some("s-dead"),
+            "abandoned never means erased: the archive still answers for it"
+        );
+    }
+
+    #[test]
     fn search_dedupes_to_one_slot_per_session_and_caps_at_five() {
         let mut events = vec![
             created("s-best", ""),

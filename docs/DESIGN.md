@@ -342,6 +342,8 @@ The projection stamps `changed_at` and `reviewed_at`, so the review list is "cha
 
 Fixing happens through conversation, not a TUI editor: the review pane prefills the chat input with a supersede instruction the user edits and sends, and the model writes through the ordinary tools. The review UI never mutates memory.
 
+**Branches.** The gate is a query, not machinery: a session with a fork parent is due only once marked *real*, so scratch and abandoned branches never write distilled memory — fail-closed, since unmarked is scratch. A real branch consolidates its own rows only; its inherited prefix was already the parent's to mine. The role gate composes as an AND on top: a real executor branch is titled, never asked for user facts.
+
 **Coverage and atomicity.** What the pass has covered is durable state, so it lives in the log: `SessionConsolidated { session_id, through_seq, prompt_version }`, a skip-safe kind appended when the pass finishes a session — including when it extracted nothing, because "looked and found nothing" is a decision. `through_seq` is the last event the pass read. A session is due when it has been idle past the window and has events after its latest marker, so "what is due" is a query and never daemon memory.
 
 The pass is atomic and shaped for a shared sidecar: read the session, release the engine, run the model with nobody blocked, then re-check under the lock that the session is still idle before appending records and marker together. New activity since the read discards the pass whole, and a fresh idle timeout re-runs it over the longer history. Model-written records use `Event.source = SYSTEM` — arcd initiated the write, not the user's turn.
