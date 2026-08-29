@@ -52,6 +52,57 @@ pub struct RolesConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archivist: Option<RoleConfig>,
+
+    /// The command template `consult_expert` spawns (§6.2). Absent = counsel
+    /// off: the tool is never registered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counsel: Option<CounselConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounselConfig {
+    pub command: CounselCommand,
+
+    pub model: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CounselCommand {
+    Claude,
+    Codex,
+}
+
+impl CounselConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.model.trim().is_empty(),
+            "role `counsel` needs a model"
+        );
+        if self.fallback_model.is_some() {
+            ensure!(
+                self.command == CounselCommand::Claude,
+                "role `counsel`: fallback_model is only valid with command = \"claude\"; \
+                 codex has no equivalent flag"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolve(&self) -> arc_core::tool::expert::CounselSpec {
+        arc_core::tool::expert::CounselSpec {
+            command: match self.command {
+                CounselCommand::Claude => arc_core::tool::expert::CounselCommand::Claude,
+                CounselCommand::Codex => arc_core::tool::expert::CounselCommand::Codex,
+            },
+            model: self.model.clone(),
+            fallback_model: self.fallback_model.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -290,6 +341,9 @@ impl Config {
         for (name, role) in self.roles.configured() {
             role.validate(name)?;
         }
+        if let Some(counsel) = &self.roles.counsel {
+            counsel.validate()?;
+        }
         for (name, project) in &self.projects {
             project.validate(name)?;
         }
@@ -309,7 +363,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ProjectConfig, RoleConfig, RoleProvider, RolesConfig, ToolSource};
+    use super::{
+        Config, CounselCommand, ProjectConfig, RoleConfig, RoleProvider, RolesConfig, ToolSource,
+    };
     use arc_core::provider::Thinking;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
@@ -385,6 +441,11 @@ mod tests {
                     key: None,
                     thinking: Thinking::Minimal,
                 }),
+                counsel: Some(super::CounselConfig {
+                    command: super::CounselCommand::Claude,
+                    model: "opus".to_owned(),
+                    fallback_model: Some("sonnet".to_owned()),
+                }),
             },
             projects: BTreeMap::from([(
                 "arc".to_owned(),
@@ -449,6 +510,75 @@ provider = "local"
         let archivist = config.roles.archivist.expect("archivist is configured");
         assert_eq!(archivist.provider, RoleProvider::Local);
         assert_eq!(archivist.model, None, "the sidecar names its own model");
+    }
+
+    #[test]
+    fn counsel_parses_to_a_command_and_a_model() {
+        let config = parse(
+            "[roles.counsel]\ncommand = \"claude\"\nmodel = \"opus\"\nfallback_model = \"sonnet\"\n",
+        );
+
+        let counsel = config.roles.counsel.expect("counsel is configured");
+        assert_eq!(counsel.command, CounselCommand::Claude);
+        assert_eq!(counsel.model, "opus");
+        assert_eq!(counsel.fallback_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn counsel_is_absent_by_default() {
+        let config = parse("");
+        assert!(config.roles.counsel.is_none());
+    }
+
+    #[test]
+    fn an_unknown_counsel_key_is_rejected() {
+        let err = toml::from_str::<Config>(
+            "[roles.counsel]\ncommand = \"claude\"\nmodel = \"opus\"\nmoedl = \"oops\"\n",
+        )
+        .expect_err("a typo must not be ignored");
+        assert!(err.to_string().contains("moedl"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_counsel_command_is_rejected() {
+        let err =
+            toml::from_str::<Config>("[roles.counsel]\ncommand = \"gpt\"\nmodel = \"opus\"\n")
+                .expect_err("an unconfigurable command must not load");
+        assert!(err.to_string().contains("gpt"), "{err}");
+    }
+
+    #[test]
+    fn a_counsel_fallback_model_with_codex_is_rejected() {
+        let err = rejected(
+            "[roles.counsel]\ncommand = \"codex\"\nmodel = \"gpt-5-codex\"\nfallback_model = \"sonnet\"\n",
+        );
+        assert!(
+            err.contains("counsel") && err.contains("fallback_model") && err.contains("codex"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_counsel_without_a_model_is_rejected() {
+        let err = toml::from_str::<Config>("[roles.counsel]\ncommand = \"claude\"\n")
+            .expect_err("model is required");
+        assert!(err.to_string().contains("model"), "{err}");
+    }
+
+    #[test]
+    fn a_counsel_fallback_model_with_claude_is_fine() {
+        let config = parse(
+            "[roles.counsel]\ncommand = \"claude\"\nmodel = \"opus\"\nfallback_model = \"sonnet\"\n",
+        );
+        assert_eq!(
+            config
+                .roles
+                .counsel
+                .expect("configured")
+                .fallback_model
+                .as_deref(),
+            Some("sonnet")
+        );
     }
 
     #[test]

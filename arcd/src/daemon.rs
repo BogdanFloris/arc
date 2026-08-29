@@ -11,6 +11,7 @@ use arc_core::session::{Engine, ProjectSpec, Runner};
 use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
+use arc_core::tool::expert::Expert;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
 use arc_proto::v1::{Notification, ReviewChanged, SessionRole, notification};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -130,6 +131,15 @@ impl Daemon {
         for tool in workspace::tools(Arc::new(Workspace::new())) {
             registry.register(tool);
         }
+        let expert_enabled = config.roles.counsel.is_some();
+        if let Some(counsel) = &config.roles.counsel {
+            let project_roots = config
+                .projects
+                .iter()
+                .map(|(name, project)| (name.clone(), project.root.clone()))
+                .collect();
+            registry.register(Box::new(Expert::new(counsel.resolve(), project_roots)));
+        }
 
         let reads = Arc::new(
             Reader::open(dirs.index())
@@ -155,7 +165,8 @@ impl Daemon {
         let engine = Engine::new(store, registry)
             .with_projects(projects)
             .with_role_identities(role_identities)
-            .with_notifier(notifier.clone());
+            .with_notifier(notifier.clone())
+            .with_expert_enabled(expert_enabled);
 
         Ok(Self {
             config,

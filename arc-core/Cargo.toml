@@ -16,7 +16,7 @@ reqwest = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true, optional = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -25,12 +25,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-testkit = ["dep:tempfile"]
+testkit = []
 
 [dev-dependencies]
 expect-test = { workspace = true }
 anyhow = { workspace = true }
-tempfile = { workspace = true }
 wiremock = { workspace = true }
 
 [lints]

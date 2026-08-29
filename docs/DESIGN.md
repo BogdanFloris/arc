@@ -375,13 +375,14 @@ trait Provider {
 
 ### 6.1 Roles
 
-**A role is a name in config that resolves to a provider and a model.** Three are needed in Phase 3:
+**A role is a name in config that resolves to a provider and a model.** Counsel is the one exception: it resolves to a command template instead, and never holds a session (§6.2). Three arrived in Phase 3; counsel joined in 3.5:
 
 | Role | Job | Why it is its own role |
 | --- | --- | --- |
 | **concierge** | The conversation. Talk, recall, dispatch jobs (§4.1). Loads the identity file and the record index; §5.1 defines its register. | Small token volume, high sensitivity to voice and judgment, latency-critical once §7's voice client lands. Needs vision. |
 | **executor** | Job execution. The overwhelming majority of tokens ARC will ever spend. | High volume, mechanical. Cost per *completed task* is the only figure that matters. |
 | **archivist** | Consolidation, extraction, classification, and titling. | High volume, low stakes, latency-insensitive. A local model does it for nothing. |
+| **counsel** | Plans, reviews, and unsticking: a stronger mind consulted read-only over the workspace, a few calls per job. | Selected for capability, not cost or volume. Resolves to a command, never a provider; the `consult_expert` tool (§6.2) consumes it, so it never holds a session. |
 
 This is how §12's routing question gets answered without a runtime difficulty classifier: the mapping is static config, and the role label rides every `CompletionRequest` onto its span (§8), so traces attribute spend by role from the first day.
 
@@ -391,9 +392,17 @@ This is how §12's routing question gets answered without a runtime difficulty c
 
 **A session is pinned to its role's provider for its lifetime.** This amends the earlier v1 position that sessions do not own a provider. The trait stays per-completion, but prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session — a mid-session model swap pays for the whole context again. Hot-swapping a live session is therefore no longer a feature to reach for; changing role means a new session or a fork. The engine refuses to continue a session whose recorded role is not its own. Sessions written before roles existed carry `SESSION_ROLE_UNSPECIFIED` and stay unpinned.
 
-### 6.2 Expert consultation is deferred
+### 6.2 Expert consultation — counsel
 
-`consult_expert` is a useful future tool, but it does not belong in the initial job path. Add it when the basic executor job repeatedly needs a separate planning or review model. It must then be a read-only command-backed tool, not a provider or a hard-coded job workflow.
+Decided 2026-08-29, after Phase 3's drives showed jobs worth a second mind. `consult_expert` is a read-only command-backed tool, not a provider and not a hard-coded workflow — the position this section held while deferred, kept on arrival.
+
+`[roles.counsel]` names a command (`claude`, default, or `codex`) and a model. The tool spawns the spike-verified argv (TASKS-phase3.md section 4) over a project root: the CLI runs its own read-only loop — Read, Glob, Grep — against the real workspace, which is what makes counsel better than pasting context into a prompt. Wrapping these CLIs in the `Provider` trait would be a lie the engine acts on: they stream nothing through our loop and take no tools from our registry.
+
+The concierge and the executor hold the tool, resolved from the role whenever counsel is configured; the archivist never does. It takes a required dispatch-style `project` argument — `"none"` means the bound caller's own root; the unbound concierge names a configured project. Output lands as ordinary tool call and result events; latency and reported usage go to spans; counsel's spend is subscription-side and invisible to job token budgets.
+
+Claude is the default command because its tool surface closes completely (`--strict-mcp-config --setting-sources ""`); codex's `web__run` survives its config isolation, so its read-only covers the filesystem but not the tool surface. Prefer claude when a diff may hold secrets.
+
+Two honest edges. The child inherits the user's environment — subscription auth lives in HOME — a deliberate exception to `bash`'s scrub, accepted because an allowlist that blocks login is a tool that does not run. And the CLI reads as the user, unconfined by our grants: the same residual risk §3.1 states for `bash`, closed by nothing short of privilege separation.
 
 ### 6.3 Transport and credentials
 

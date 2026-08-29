@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod expert;
 pub mod workspace;
 
 use std::collections::BTreeMap;
@@ -95,10 +96,17 @@ pub enum ToolSource {
     /// Resolved from the session provider's own grounding; no tools of ours.
     Web,
     Workspace,
+    /// `consult_expert`; resolved by role, not project config (§6.2).
+    Expert,
 }
 
 impl ToolSource {
-    pub const ALL: [ToolSource; 3] = [ToolSource::Builtin, ToolSource::Web, ToolSource::Workspace];
+    pub const ALL: [ToolSource; 4] = [
+        ToolSource::Builtin,
+        ToolSource::Web,
+        ToolSource::Workspace,
+        ToolSource::Expert,
+    ];
 }
 
 pub trait Tool: Send + Sync {
