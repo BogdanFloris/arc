@@ -1314,6 +1314,8 @@ impl Engine {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 elapsed_ms,
+                // filled once the provider loop hands grounding through (row 1.3)
+                grounding_json: String::new(),
             }),
         )
     }
@@ -1392,6 +1394,7 @@ fn session_id_of(event: &session_event::Event) -> &str {
         session_event::Event::MessageAppended(e) => &e.session_id,
         session_event::Event::ToolCallIssued(e) => &e.session_id,
         session_event::Event::ToolResultRecorded(e) => &e.session_id,
+        session_event::Event::ServerCallRecorded(e) => &e.session_id,
         session_event::Event::SessionConsolidated(e) => &e.session_id,
         session_event::Event::SessionTitled(e) => &e.session_id,
     }
@@ -1425,7 +1428,7 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
             MessageRow::ToolCall { call_id, .. } => {
                 issued.insert(call_id.as_str());
             }
-            MessageRow::Message { .. } => {}
+            MessageRow::Message { .. } | MessageRow::ServerCall { .. } => {}
         }
     }
 
@@ -1500,6 +1503,12 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
                 if !issued.contains(call_id.as_str()) {
                     tracing::warn!(%call_id, "skipping a tool result no call claimed");
                 }
+                i += 1;
+            }
+            // provider-side and already resolved: replaying it as ours would
+            // tell the model it issued a call it never did; the answer text
+            // it produced carries what the search contributed
+            MessageRow::ServerCall { .. } => {
                 i += 1;
             }
         }

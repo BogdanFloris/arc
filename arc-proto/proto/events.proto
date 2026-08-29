@@ -62,6 +62,22 @@ message MessageAppended {
   uint32 input_tokens = 6;
   uint32 output_tokens = 7;
   uint32 elapsed_ms = 8;
+  // the provider's grounding metadata, verbatim; empty means ungrounded.
+  // Citations render from here; keeping the blob is what keeps replay honest.
+  string grounding_json = 9;
+}
+
+// A provider-side tool invocation (e.g. Gemini's google_search), arrived
+// already resolved inside the model's turn: never orphaned, never counted
+// against tool steps, never re-executed or replayed to the provider.
+message ServerCallRecorded {
+  string session_id = 1;
+  string turn_id = 2;
+  string name = 3;
+  string arguments_json = 4;
+  // the provider's response part, verbatim
+  string response_json = 5;
+  bytes provider_roundtrip = 6;
 }
 
 message ToolCallIssued {
@@ -106,6 +122,7 @@ message SessionEvent {
     ToolResultRecorded tool_result_recorded = 4;
     SessionConsolidated session_consolidated = 6;
     SessionTitled session_titled = 7;
+    ServerCallRecorded server_call_recorded = 8;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
 }

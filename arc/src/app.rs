@@ -1703,6 +1703,13 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                     *outcome = Some(outcome_label(result.outcome));
                 }
             }
+            // provider-side, arrives resolved; styled like a finished tool line
+            Some(history_entry::Entry::ServerCall(call)) => blocks.push(Block::Tool {
+                call_id: String::new(),
+                name: call.name,
+                args: tool_summary(&call.arguments_json),
+                outcome: Some("web"),
+            }),
             None => {}
         }
     }

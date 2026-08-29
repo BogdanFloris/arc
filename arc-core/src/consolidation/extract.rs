@@ -642,6 +642,16 @@ fn render_row(row: &MessageRow, calls: &HashMap<&str, &str>) -> String {
                 format!("\u{ab} {}", snippet(content))
             }
         }
+        // web content is transient, never a user fact; the extractor sees
+        // that a search happened, not what came back
+        MessageRow::ServerCall {
+            name,
+            arguments_json,
+            ..
+        } => format!(
+            "\u{bb} {name}({}) [web \u{2014} not extraction input]",
+            snippet(arguments_json)
+        ),
     }
 }
 
@@ -1062,6 +1072,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 elapsed_ms: 0,
+                grounding_json: String::new(),
             }],
             latest_seq: 1,
             memory_index,
@@ -1411,6 +1422,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             elapsed_ms: 0,
+            grounding_json: String::new(),
         });
         let prompt = title_prompt(&snapshot).expect("both roles present");
         assert!(prompt.starts_with("User: hi\nAssistant: "));
@@ -1554,6 +1566,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 elapsed_ms: 0,
+                grounding_json: String::new(),
             },
             MessageRow::ToolCall {
                 call_id: "c1".to_owned(),
@@ -1823,6 +1836,25 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
         assert_eq!(PROMPT_V3, pinned);
+    }
+
+    #[test]
+    fn a_server_call_renders_its_query_and_never_its_response() {
+        let line = super::render_row(
+            &MessageRow::ServerCall {
+                name: "google_search".to_owned(),
+                arguments_json: r#"{"queries":["arc daemon"]}"#.to_owned(),
+                response_json: "transient web content".to_owned(),
+                turn_id: "t".to_owned(),
+            },
+            &std::collections::HashMap::new(),
+        );
+        assert!(line.contains("google_search"), "{line}");
+        assert!(line.contains("not extraction input"), "{line}");
+        assert!(
+            !line.contains("transient web content"),
+            "web content is never extraction input: {line}"
+        );
     }
 
     #[test]

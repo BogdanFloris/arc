@@ -206,6 +206,16 @@ message HistoryMessage {
   uint32 input_tokens = 5;
   uint32 output_tokens = 6;
   uint32 elapsed_ms = 7;
+  // provider grounding metadata, verbatim; the client renders citations from it
+  string grounding_json = 8;
+}
+
+// a provider-side invocation surfaced in history; display-only, the client
+// styles it like a tool line
+message HistoryServerCall {
+  string name = 1;
+  string arguments_json = 2;
+  string response_json = 3;
 }
 
 message HistoryToolCall {
@@ -225,6 +235,7 @@ message HistoryEntry {
     HistoryMessage message = 1;
     HistoryToolCall tool_call = 2;
     HistoryToolResult tool_result = 3;
+    HistoryServerCall server_call = 4;
   }
 }
 

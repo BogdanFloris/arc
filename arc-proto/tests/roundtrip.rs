@@ -73,6 +73,7 @@ fn message_appended_event() -> Event {
                 input_tokens: 12,
                 output_tokens: 34,
                 elapsed_ms: 5600,
+                grounding_json: String::new(),
             })),
         })),
     }
@@ -323,6 +324,7 @@ fn server_frame_arms_round_trip() {
                         input_tokens: 12,
                         output_tokens: 34,
                         elapsed_ms: 5600,
+                        grounding_json: String::new(),
                     })),
                 },
                 HistoryEntry {

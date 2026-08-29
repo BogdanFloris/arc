@@ -603,6 +603,7 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     elapsed_ms: 0,
+                    grounding_json: String::new(),
                 },
                 MessageRow::ToolCall {
                     call_id: "c1".to_owned(),
@@ -630,6 +631,7 @@ mod tests {
             input_tokens,
             output_tokens,
             elapsed_ms: _,
+            grounding_json: _,
         } = &rows[3]
         else {
             panic!("expected the final assistant message, got {:?}", rows[3]);

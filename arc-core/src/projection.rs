@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use arc_proto::v1::{
-    Event, HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryEvent,
-    MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
+    Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall, HistoryToolResult,
+    MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordReviewed,
     MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-    Role, SessionConsolidated, SessionCreated, SessionEvent, SessionTitled, ToolCallIssued,
-    ToolResultRecorded, event, history_entry, memory_event, memory_record, session_event,
+    Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent, SessionTitled,
+    ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event, memory_record,
+    session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -21,7 +22,8 @@ use crate::log;
 // 12: sessions gained the source column
 // 13: memory_records gained created_at, superseded_at
 // 14: memory_fts indexes memory records for ranked search
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+// 15: messages gained grounding_json and the server-call kind
+pub(crate) const SCHEMA_VERSION: u32 = 15;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS messages (
     source         INTEGER,
     input_tokens   INTEGER,
     output_tokens  INTEGER,
-    elapsed_ms     INTEGER
+    elapsed_ms     INTEGER,
+    grounding_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
@@ -115,6 +118,8 @@ pub(crate) const KIND_MESSAGE: i64 = 0;
 const KIND_TOOL_CALL: i64 = 1;
 
 const KIND_TOOL_RESULT: i64 = 2;
+
+const KIND_SERVER_CALL: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -173,6 +178,7 @@ pub enum MessageRow {
         input_tokens: u32,
         output_tokens: u32,
         elapsed_ms: u32,
+        grounding_json: String,
     },
     ToolCall {
         call_id: String,
@@ -187,6 +193,13 @@ pub enum MessageRow {
         outcome: i32,
         content: String,
         truncated: bool,
+        turn_id: String,
+    },
+    // a provider-side invocation, arrived resolved; display and archive only
+    ServerCall {
+        name: String,
+        arguments_json: String,
+        response_json: String,
         turn_id: String,
     },
 }
@@ -386,6 +399,9 @@ impl Projection {
                 }
                 session_event::Event::ToolResultRecorded(result) => {
                     insert_tool_result(&tx, event, result)?;
+                }
+                session_event::Event::ServerCallRecorded(call) => {
+                    insert_server_call(&tx, event, call)?;
                 }
                 session_event::Event::SessionConsolidated(consolidated) => {
                     mark_consolidated(&tx, event, consolidated)?;
@@ -816,7 +832,8 @@ const REBUILD_TABLES: &[TableSpec] = &[
         key_columns: 2,
         select: "SELECT session_id, seq, kind, turn_id, role, content, partial, call_id, \
                  call_index, name, arguments_json, outcome, truncated, ts, \
-                 provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms \
+                 provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms, \
+                 grounding_json \
                  FROM messages ORDER BY session_id, seq",
     },
     TableSpec {
@@ -969,7 +986,8 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
     let mut stmt = conn.prepare(
         "SELECT kind, role, content, partial, turn_id,
                 call_id, call_index, name, arguments_json, outcome, truncated,
-                provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms
+                provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms,
+                grounding_json
          FROM messages WHERE session_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
@@ -982,6 +1000,7 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
             input_tokens: nonneg_u32(row.get::<_, Option<i64>>(13)?),
             output_tokens: nonneg_u32(row.get::<_, Option<i64>>(14)?),
             elapsed_ms: nonneg_u32(row.get::<_, Option<i64>>(15)?),
+            grounding_json: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
         }),
         KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
             call_id: row.get(5)?,
@@ -997,6 +1016,12 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
             outcome: row.get(9)?,
             content: row.get(2)?,
             truncated: row.get(10)?,
+            turn_id: row.get(4)?,
+        }),
+        KIND_SERVER_CALL => Ok(MessageRow::ServerCall {
+            name: row.get(7)?,
+            arguments_json: row.get(8)?,
+            response_json: row.get(2)?,
             turn_id: row.get(4)?,
         }),
         other => Err(bad_column(0, &format!("unknown message kind {other}"))),
@@ -1083,6 +1108,7 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             input_tokens,
             output_tokens,
             elapsed_ms,
+            grounding_json,
             ..
         } => history_entry::Entry::Message(HistoryMessage {
             role,
@@ -1092,6 +1118,7 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             input_tokens,
             output_tokens,
             elapsed_ms,
+            grounding_json,
         }),
         MessageRow::ToolCall {
             call_id,
@@ -1113,6 +1140,16 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             outcome,
             truncated,
         }),
+        MessageRow::ServerCall {
+            name,
+            arguments_json,
+            response_json,
+            ..
+        } => history_entry::Entry::ServerCall(HistoryServerCall {
+            name,
+            arguments_json,
+            response_json,
+        }),
     };
     HistoryEntry { entry: Some(entry) }
 }
@@ -1124,6 +1161,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::MessageAppended(_) => "message_appended",
             session_event::Event::ToolCallIssued(_) => "tool_call_issued",
             session_event::Event::ToolResultRecorded(_) => "tool_result_recorded",
+            session_event::Event::ServerCallRecorded(_) => "server_call_recorded",
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
             session_event::Event::SessionTitled(_) => "session_titled",
         },
@@ -1223,8 +1261,8 @@ fn insert_message(
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO messages (session_id, seq, kind, turn_id, role, content, partial, ts, source,
-                                input_tokens, output_tokens, elapsed_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                input_tokens, output_tokens, elapsed_ms, grounding_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             &appended.session_id,
             seq_param(event.seq)?,
@@ -1238,9 +1276,40 @@ fn insert_message(
             appended.input_tokens,
             appended.output_tokens,
             appended.elapsed_ms,
+            empty_as_null(&appended.grounding_json),
         ],
     )?;
     index_content(tx, event.seq, &appended.content)
+}
+
+fn empty_as_null(text: &str) -> Option<&str> {
+    (!text.is_empty()).then_some(text)
+}
+
+fn insert_server_call(
+    tx: &Transaction<'_>,
+    event: &Event,
+    call: &ServerCallRecorded,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO messages
+             (session_id, seq, kind, turn_id, content, name, arguments_json, ts,
+              provider_roundtrip)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            &call.session_id,
+            seq_param(event.seq)?,
+            KIND_SERVER_CALL,
+            &call.turn_id,
+            &call.response_json,
+            &call.name,
+            &call.arguments_json,
+            epoch_micros(event.ts.as_ref()),
+            &call.provider_roundtrip,
+        ],
+    )?;
+    // web content the model read is archive-searchable, like a tool result
+    index_content(tx, event.seq, &call.response_json)
 }
 
 fn insert_tool_call(
@@ -1661,9 +1730,9 @@ mod tests {
     use arc_proto::v1::{
         Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled,
-        Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event,
-        memory_event, memory_record, session_event,
+        Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent, SessionRole,
+        SessionTitled, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
+        event, history_entry, memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::{Connection, OptionalExtension};
@@ -2127,6 +2196,7 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     elapsed_ms: 0,
+                    grounding_json: String::new(),
                 },
                 MessageRow::ToolCall {
                     call_id: "c-a".to_string(),
@@ -2179,6 +2249,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 elapsed_ms: 0,
+                grounding_json: String::new(),
             }
         );
         assert_eq!(
@@ -2226,6 +2297,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 elapsed_ms: 0,
+                grounding_json: String::new(),
             },
             "a zero-usage event leaves zeros"
         );
@@ -2240,9 +2312,124 @@ mod tests {
                 input_tokens: 2345,
                 output_tokens: 140,
                 elapsed_ms: 1500,
+                grounding_json: String::new(),
             },
             "the event's usage lands in the columns"
         );
+    }
+
+    fn server_call(seq: u64, name: &str, arguments: &str, response: &str) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ServerCallRecorded(
+                    ServerCallRecorded {
+                        session_id: "s-01".to_string(),
+                        turn_id: "t-01".to_string(),
+                        name: name.to_string(),
+                        arguments_json: arguments.to_string(),
+                        response_json: response.to_string(),
+                        provider_roundtrip: Vec::new(),
+                    },
+                )),
+            })),
+        }
+    }
+
+    #[test]
+    fn a_server_call_projects_whole_and_serves_as_a_history_server_call() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&server_call(
+                1,
+                "google_search",
+                r#"{"queries":["arc daemon"]}"#,
+                r#"{"chunks":[{"uri":"https://example.org","title":"ARC"}]}"#,
+            ))
+            .expect("apply");
+
+        let rows = projection.messages("s-01").expect("messages");
+        assert_eq!(
+            rows,
+            [MessageRow::ServerCall {
+                name: "google_search".to_string(),
+                arguments_json: r#"{"queries":["arc daemon"]}"#.to_string(),
+                response_json: r#"{"chunks":[{"uri":"https://example.org","title":"ARC"}]}"#
+                    .to_string(),
+                turn_id: "t-01".to_string(),
+            }],
+            "arrives resolved, projects as one row"
+        );
+        let entry = super::history_entry(rows.into_iter().next().expect("one row"));
+        assert!(
+            matches!(
+                entry.entry,
+                Some(history_entry::Entry::ServerCall(call))
+                    if call.name == "google_search" && call.response_json.contains("example.org")
+            ),
+            "history serves it as its own entry kind"
+        );
+    }
+
+    #[test]
+    fn a_grounded_message_round_trips_its_blob_and_an_ungrounded_one_stays_empty() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        let mut grounded = message_appended(1, "the answer, sourced");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(appended)),
+        })) = grounded.payload.as_mut()
+        {
+            appended.grounding_json = r#"{"webSearchQueries":["arc"]}"#.to_string();
+        }
+        projection.apply(&grounded).expect("apply");
+        projection
+            .apply(&message_appended(2, "plain reply"))
+            .expect("apply");
+
+        let rows = projection.messages("s-01").expect("messages");
+        let [
+            MessageRow::Message {
+                grounding_json: with,
+                ..
+            },
+            MessageRow::Message {
+                grounding_json: without,
+                ..
+            },
+        ] = rows.as_slice()
+        else {
+            panic!("expected two prose rows, got {rows:?}");
+        };
+        assert_eq!(with, r#"{"webSearchQueries":["arc"]}"#);
+        assert_eq!(without, "", "empty stays empty through the NULL column");
+    }
+
+    #[test]
+    fn a_server_calls_response_is_archive_searchable() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&server_call(
+                1,
+                "google_search",
+                r#"{"queries":["weather"]}"#,
+                r#"{"snippet":"heavy thundersnow expected"}"#,
+            ))
+            .expect("apply");
+
+        let hits: i64 = projection
+            .conn
+            .query_row(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'thundersnow'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts query");
+        assert_eq!(hits, 1, "what the model read from the web is findable");
     }
 
     #[test]
