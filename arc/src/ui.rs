@@ -856,6 +856,7 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               move selection",
             "/                 filter by title/preview",
             "space a           toggle showing dispatched jobs",
+            "x                 toggle showing abandoned branches",
             "m                 mark the selected branch real",
             "X                 mark the selected branch abandoned",
             "enter             open the selected session",

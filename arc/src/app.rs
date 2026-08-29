@@ -135,6 +135,8 @@ pub struct Picker {
     pub filtering: bool,
     /// True once `a` reveals dispatched job sessions alongside conversations.
     pub show_all: bool,
+    /// abandoned branches are hidden until asked for; x toggles
+    pub show_abandoned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1174,6 +1176,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
             KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
+            KeyCode::Char('x') => self.toggle_picker_show_abandoned(),
             KeyCode::Char('m') => {
                 return self.mark_selected_branch(selected, branch_marked::Disposition::Real);
             }
@@ -1222,6 +1225,13 @@ impl App {
             }
         }
         None
+    }
+
+    fn toggle_picker_show_abandoned(&mut self) {
+        if let Some(picker) = self.picker.as_mut() {
+            picker.show_abandoned = !picker.show_abandoned;
+            picker.selected = 0;
+        }
     }
 
     fn toggle_picker_show_all(&mut self) {
@@ -1275,6 +1285,7 @@ impl App {
                 selected: 0,
                 filtering: false,
                 show_all: false,
+                show_abandoned: false,
             });
             return Some(Command::List);
         }
@@ -1302,6 +1313,10 @@ impl App {
 
     fn picker_candidates(&self) -> Vec<&SessionInfo> {
         let show_all = self.picker.as_ref().is_some_and(|picker| picker.show_all);
+        let show_abandoned = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.show_abandoned);
         let order: Vec<&SessionInfo> = self
             .by_recency()
             .into_iter()
@@ -1311,6 +1326,7 @@ impl App {
                     || session.last_at.is_some()
             })
             .filter(|session| show_all || !is_job_session(session))
+            .filter(|session| show_abandoned || !is_abandoned(session))
             .collect();
         let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
         if !filtering || self.input.is_empty() {
@@ -1846,6 +1862,10 @@ fn is_running(job: &JobInfo) -> bool {
 /// fails toward hiding it as noise.
 pub fn is_job_session(session: &SessionInfo) -> bool {
     session.source != Source::User as i32
+}
+
+fn is_abandoned(session: &SessionInfo) -> bool {
+    session.disposition == arc_proto::v1::branch_marked::Disposition::Abandoned as i32
 }
 
 /// `candidates`, depth-first: each root in its given order, immediately
@@ -2916,6 +2936,44 @@ mod tests {
         app.on_key(key(KeyCode::Char('q')));
         assert!(!app.help);
         assert_eq!(app.help_scroll, 0, "closing forgets the scroll");
+    }
+
+    #[test]
+    fn abandoned_branches_hide_from_the_picker_until_x_toggles_them_in() {
+        use arc_proto::v1::branch_marked::Disposition;
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        let mut root = session_with("s-root", "the trunk", "hi");
+        root.last_at = Some(prost_types::Timestamp::default());
+        let mut dead = session_with("s-dead", "wrong turn", "hi");
+        dead.parent_session = "s-root".to_owned();
+        dead.disposition = Disposition::Abandoned as i32;
+        dead.last_at = Some(prost_types::Timestamp::default());
+        app.sessions = vec![root, dead];
+        app.on_key(key(KeyCode::Char('s')));
+
+        let listed: Vec<&str> = app
+            .picker_tree()
+            .iter()
+            .map(|(s, _)| s.id.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            ["s-root"],
+            "abandoned stays out of sight by default"
+        );
+
+        app.on_key(key(KeyCode::Char('x')));
+        let listed: Vec<&str> = app
+            .picker_tree()
+            .iter()
+            .map(|(s, _)| s.id.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            ["s-root", "s-dead"],
+            "x brings the abandoned branch back under its parent"
+        );
     }
 
     #[test]
