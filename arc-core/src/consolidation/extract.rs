@@ -133,10 +133,55 @@ optional related record ids. A supersede's "id" names the existing record
 it replaces. An empty operations list means nothing was worth saving.
 "#;
 
+pub const PROMPT_VERSION_V4: &str = "v4";
+
+pub const PROMPT_V4: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
+Most conversations contain nothing durable. Return {"operations": []}
+unless a fact clearly earns a place in the small always-loaded index; an
+empty list is the expected outcome, and a needless record is a failure,
+not thoroughness.
+
+Save a fact only if it would change ARC's replies in similar future
+situations. Look, in order: corrections and mistakes the user pointed
+out; stated preferences; stable facts about the user or their world.
+Contrast: "User prefers short chapters" is worth saving; "User edited
+chapter 3 today" is not — the archive already holds this conversation
+verbatim and searchably.
+
+Never capture: task progress or completed work; the conversation itself
+("user asked about X"); anything the already-known section or the
+existing records already cover; environment-dependent or transient
+failures; negative claims about tools.
+
+A record is a self-contained, present-tense declarative fact: names, not
+pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
+console"). "User prefers concise replies" is right; "Always reply
+concisely" is wrong — an imperative gets re-read as a directive later.
+
+If an existing record covers the same fact and something changed, emit a
+supersede of that record. If nothing changed, emit nothing for it.
+
+Answer with strict JSON, nothing else after your thinking:
+{"operations": []}
+where each operation is one of
+{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
+{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
+"kind" is one of person, project, preference, fact, decision. "namespace"
+files the fact: choose from the namespaces listed in the input — a
+project's name when the fact is about that project, "global" otherwise;
+a supersede keeps its record's namespace. "summary" is
+one declarative line; it appears in every future session. "links" names
+ids from the existing-records list that this fact leans on — link a
+record when this fact would need re-checking if that record changed;
+otherwise leave links empty. A supersede's "id" names the existing record
+it replaces. An empty operations list means nothing was worth saving.
+"#;
+
 pub const KNOWN_VERSIONS: &[(&str, &str)] = &[
     (PROMPT_VERSION_V1, PROMPT_V1),
     (PROMPT_VERSION_V2, PROMPT_V2),
     (PROMPT_VERSION_V3, PROMPT_V3),
+    (PROMPT_VERSION_V4, PROMPT_V4),
 ];
 
 pub const DEDUP_PROMPT_V1: &str = r#"You judge one candidate memory record against numbered existing records.
@@ -200,7 +245,7 @@ impl ModelExtractor {
             model: model.to_owned(),
             thinking,
             timeout,
-            prompt: PROMPT_V3.to_owned(),
+            prompt: PROMPT_V4.to_owned(),
             seed: None,
             identity,
             namespaces,
@@ -866,6 +911,26 @@ fn to_event(
         links,
         ..
     } = op;
+    let known: HashSet<&str> = session
+        .memory_index
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut unknown = Vec::new();
+    let links: Vec<String> = links
+        .into_iter()
+        .filter(|id| {
+            if !known.contains(id.as_str()) {
+                unknown.push(id.clone());
+                return false;
+            }
+            seen.insert(id.clone())
+        })
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(ids = ?unknown, "extraction linked unknown record ids; dropped");
+    }
     let mint = |namespace| {
         mint_record(
             kind,
@@ -916,9 +981,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_VERSION_V1, PROMPT_VERSION_V2,
-        PROMPT_VERSION_V3, TITLE_PROMPT, TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates,
-        normalize, render_input, sanitize_title, snippet, title_prompt, tokenize, windowed,
+        KNOWN_VERSIONS, ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4,
+        PROMPT_VERSION_V1, PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4, TITLE_PROMPT,
+        TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates, normalize, render_input, sanitize_title,
+        snippet, title_prompt, tokenize, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -1078,7 +1144,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V3,
+            PROMPT_VERSION_V4,
             &HashSet::new(),
         )
         .await
@@ -1114,7 +1180,7 @@ mod tests {
         );
 
         let request = &provider.requests()[2];
-        assert_eq!(request.system.as_deref(), Some(PROMPT_V3));
+        assert_eq!(request.system.as_deref(), Some(PROMPT_V4));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
             panic!("expected one user message, got {:?}", request.messages);
@@ -1169,7 +1235,7 @@ mod tests {
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
         };
-        assert_eq!(marker.prompt_version, "v3");
+        assert_eq!(marker.prompt_version, "v4");
         assert_eq!(marker.through_seq, 2);
 
         let (tx, _rx) = channel();
@@ -1231,7 +1297,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V3,
+            PROMPT_VERSION_V4,
             &HashSet::new(),
         )
         .await
@@ -1290,7 +1356,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V3,
+            PROMPT_VERSION_V4,
             &HashSet::new(),
         )
         .await
@@ -1759,6 +1825,29 @@ it replaces. An empty operations list means nothing was worth saving.
         assert_eq!(PROMPT_V3, pinned);
     }
 
+    #[test]
+    fn v4_is_known_and_differs_from_v3_only_in_the_links_sentence() {
+        assert!(
+            KNOWN_VERSIONS
+                .iter()
+                .any(|&(version, prompt)| version == PROMPT_VERSION_V4 && prompt == PROMPT_V4)
+        );
+        let shared_header =
+            "You are ARC's memory consolidation pass, reading one finished conversation.";
+        assert!(PROMPT_V3.contains(shared_header));
+        assert!(PROMPT_V4.contains(shared_header));
+
+        let new_sentence = "would need re-checking if that record changed";
+        assert!(
+            !PROMPT_V3.contains(new_sentence),
+            "v3 keeps its old, permissive links sentence"
+        );
+        assert!(
+            PROMPT_V4.contains(new_sentence),
+            "v4 replaces it with re-checking guidance"
+        );
+    }
+
     #[tokio::test]
     async fn a_v3_write_files_its_namespace_and_an_unknown_one_goes_global() {
         let filed = extract_from(
@@ -1905,6 +1994,30 @@ it replaces. An empty operations list means nothing was worth saving.
         .expect("extract");
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+    }
+
+    const LINKED_WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"preference",
+        "title":"Terse replies","summary":"User prefers short answers",
+        "body":"User prefers short answers in chat.","links":["mr-real","mr-hallucinated"]}]}"#;
+
+    #[tokio::test]
+    async fn a_hallucinated_linked_id_is_dropped_and_the_real_one_kept() {
+        let events = extract_from(
+            extraction_reply(LINKED_WRITE_OP),
+            vec![entry("mr-real", "Bicycle", "rides a bicycle to work")],
+        )
+        .await
+        .expect("extract");
+        assert_eq!(events.len(), 1);
+        let memory_event::Event::RecordCreated(created) = &events[0] else {
+            panic!("expected RecordCreated, got {:?}", events[0]);
+        };
+        let record = created.record.as_ref().expect("record");
+        assert_eq!(
+            record.links,
+            ["mr-real"],
+            "an id absent from the session's memory_index is dropped"
+        );
     }
 
     #[tokio::test]

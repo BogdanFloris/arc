@@ -1355,7 +1355,8 @@ fn supersede_memory_record(
             );
         }
     }
-    upsert_memory_record(tx, event, record)
+    upsert_memory_record(tx, event, record)?;
+    stamp_link_dependents(tx, &superseded.superseded_id, event)
 }
 
 fn upsert_memory_record(
@@ -1421,6 +1422,34 @@ fn delete_memory_record(
             "delete of an unknown memory record; nothing to remove"
         );
     }
+    stamp_link_dependents(tx, &deleted.id, event)
+}
+
+// last_event_seq guards content-changing writes (StaleMemoryEvent); a
+// dependent re-entering review is not a content change, so it stays put.
+fn stamp_link_dependents(
+    tx: &Transaction<'_>,
+    target_id: &str,
+    event: &Event,
+) -> Result<(), Error> {
+    let Some(at) = epoch_micros(event.ts.as_ref()) else {
+        tracing::warn!(
+            seq = event.seq,
+            id = %target_id,
+            "supersede/delete event carries no timestamp; dependents not re-queued"
+        );
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE memory_records
+         SET changed_at = ?2
+         WHERE status = ?3
+           AND id != ?1
+           AND (changed_at IS NULL OR changed_at < ?2)
+           AND EXISTS (SELECT 1 FROM json_each(memory_records.links)
+                       WHERE json_each.value = ?1)",
+        rusqlite::params![target_id, at, memory_record::Status::Active as i32],
+    )?;
     Ok(())
 }
 
@@ -3751,6 +3780,286 @@ mod tests {
         projection.apply(&unstamped).expect("apply");
 
         assert_eq!(review_ids(&projection, i64::MIN), Vec::<String>::new());
+    }
+
+    fn changed_at(projection: &Projection, id: &str) -> Option<i64> {
+        projection
+            .conn
+            .query_row(
+                "SELECT changed_at FROM memory_records WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("changed_at")
+    }
+
+    fn last_event_seq(projection: &Projection, id: &str) -> i64 {
+        projection
+            .conn
+            .query_row(
+                "SELECT last_event_seq FROM memory_records WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("last_event_seq")
+    }
+
+    #[test]
+    fn a_supersede_stamps_changed_at_on_active_link_dependents() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "old address", "lives at X");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut b = record("mr-b", "commute", "bikes past mr-a's place");
+        b.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
+            .expect("apply");
+
+        let mut c = record("mr-c", "unrelated", "unrelated fact");
+        c.links = vec![];
+        projection
+            .apply(&memory_at(2, 60, memory_payload(mem_created(2, c))))
+            .expect("apply");
+
+        assert_eq!(
+            review_ids(&projection, 250),
+            Vec::<String>::new(),
+            "mr-b's changed_at of 60 falls outside a window starting at 250"
+        );
+
+        let mut a2 = record("mr-a2", "new address", "lives at Y");
+        a2.links = vec![];
+        projection
+            .apply(&memory_at(
+                3,
+                300,
+                memory_payload(mem_superseded(3, "mr-a", a2)),
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            review_ids(&projection, 250),
+            ["mr-a", "mr-a2", "mr-b"],
+            "the supersede's own rows and mr-b, its link dependent, now land in the window"
+        );
+        assert_eq!(
+            changed_at(&projection, "mr-c"),
+            Some(60),
+            "mr-c has no link to mr-a and stays untouched"
+        );
+    }
+
+    #[test]
+    fn a_delete_stamps_changed_at_on_active_link_dependents() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "old note", "to delete");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut b = record("mr-b", "commute", "bikes past mr-a's place");
+        b.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
+            .expect("apply");
+
+        let mut c = record("mr-c", "unrelated", "unrelated fact");
+        c.links = vec![];
+        projection
+            .apply(&memory_at(2, 60, memory_payload(mem_created(2, c))))
+            .expect("apply");
+
+        assert_eq!(review_ids(&projection, 250), Vec::<String>::new());
+
+        projection
+            .apply(&memory_at(3, 300, memory_payload(mem_deleted(3, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(
+            review_ids(&projection, 250),
+            ["mr-b"],
+            "the deleted mr-a leaves no row; mr-b, its link dependent, re-enters"
+        );
+        assert_eq!(
+            changed_at(&projection, "mr-c"),
+            Some(60),
+            "mr-c has no link to mr-a and stays untouched"
+        );
+    }
+
+    #[test]
+    fn a_superseded_dependent_is_not_stamped() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "note", "target");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut d = record("mr-d", "old dependent", "links to mr-a");
+        d.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, d))))
+            .expect("apply");
+
+        let mut d2 = record("mr-d2", "new dependent", "supersedes mr-d");
+        d2.links = vec![];
+        projection
+            .apply(&memory_at(
+                2,
+                100,
+                memory_payload(mem_superseded(2, "mr-d", d2)),
+            ))
+            .expect("apply");
+
+        projection
+            .apply(&memory_at(3, 300, memory_payload(mem_deleted(3, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(
+            changed_at(&projection, "mr-d"),
+            Some(100),
+            "a SUPERSEDED row does not re-enter review just because it once linked to mr-a"
+        );
+    }
+
+    #[test]
+    fn an_in_place_supersede_does_not_stamp_the_replacement_itself() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut e = record("mr-e", "old self", "self-linking record");
+        e.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, e))))
+            .expect("apply");
+
+        let mut f = record("mr-f", "dependent", "leans on mr-e");
+        f.links = vec!["mr-e".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, f))))
+            .expect("apply");
+
+        let mut e2 = record("mr-e", "new self", "still self-linking");
+        e2.links = vec!["mr-e".to_string()];
+        projection
+            .apply(&memory_at(
+                2,
+                300,
+                memory_payload(mem_superseded(2, "mr-e", e2)),
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            changed_at(&projection, "mr-e"),
+            Some(300),
+            "the replacement's own changed_at comes from the upsert, not a self-stamp"
+        );
+        assert_eq!(
+            changed_at(&projection, "mr-f"),
+            Some(300),
+            "an unrelated dependent still gets stamped by the same in-place supersede"
+        );
+    }
+
+    #[test]
+    fn the_stamp_never_moves_changed_at_backwards() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "note", "target");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut b = record("mr-b", "dependent", "leans on mr-a");
+        b.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 200, memory_payload(mem_created(1, b))))
+            .expect("apply");
+
+        projection
+            .apply(&memory_at(2, 100, memory_payload(mem_deleted(2, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(
+            changed_at(&projection, "mr-b"),
+            Some(200),
+            "a stamp older than the current changed_at is a no-op"
+        );
+    }
+
+    #[test]
+    fn the_stamp_leaves_last_event_seq_untouched_so_later_updates_still_apply() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "note", "target");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut b = record("mr-b", "dependent", "leans on mr-a");
+        b.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
+            .expect("apply");
+
+        projection
+            .apply(&memory_at(2, 300, memory_payload(mem_deleted(2, "mr-a"))))
+            .expect("apply");
+        assert_eq!(
+            last_event_seq(&projection, "mr-b"),
+            1,
+            "the stamp does not touch last_event_seq"
+        );
+
+        let mut b2 = record("mr-b", "dependent", "leans on mr-a, updated");
+        b2.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(3, 400, memory_payload(mem_updated(3, b2))))
+            .expect("a later legitimate update still applies");
+
+        let state = projection
+            .memory_record("mr-b")
+            .expect("memory_record")
+            .expect("the record exists");
+        assert_eq!(state.record.summary, "leans on mr-a, updated");
+    }
+
+    #[test]
+    fn a_stamp_re_enters_a_reviewed_dependent_into_the_queue() {
+        let mut projection = Projection::in_memory().expect("open");
+        let mut a = record("mr-a", "note", "target");
+        a.links = vec![];
+        projection
+            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
+            .expect("apply");
+
+        let mut b = record("mr-b", "dependent", "leans on mr-a");
+        b.links = vec!["mr-a".to_string()];
+        projection
+            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
+            .expect("apply");
+
+        projection.apply(&reviewed(2, 55, "mr-a")).expect("apply");
+        projection.apply(&reviewed(3, 70, "mr-b")).expect("apply");
+        assert_eq!(
+            review_ids(&projection, 0),
+            Vec::<String>::new(),
+            "reviewed after their last change, mr-a and mr-b are both settled"
+        );
+
+        projection
+            .apply(&memory_at(4, 300, memory_payload(mem_deleted(4, "mr-a"))))
+            .expect("apply");
+
+        assert_eq!(
+            review_ids(&projection, 0),
+            ["mr-b"],
+            "the stamp moves changed_at past reviewed_at, re-opening mr-b"
+        );
     }
 
     #[test]
