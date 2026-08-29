@@ -197,13 +197,11 @@ async fn run(spec: &CounselSpec, question: &str, root: &Path, timeout: Duration)
 }
 
 fn claude_argv(spec: &CounselSpec, question: &str) -> Vec<String> {
-    let mut argv = vec![
-        "claude".to_owned(),
-        "-p".to_owned(),
-        question.to_owned(),
-        "--model".to_owned(),
-        spec.model.clone(),
-    ];
+    let mut argv = vec!["claude".to_owned(), "-p".to_owned(), question.to_owned()];
+    if !spec.model.trim().is_empty() {
+        argv.push("--model".to_owned());
+        argv.push(spec.model.clone());
+    }
     if let Some(fallback) = &spec.fallback_model {
         argv.push("--fallback-model".to_owned());
         argv.push(fallback.clone());
@@ -227,12 +225,12 @@ fn claude_argv(spec: &CounselSpec, question: &str) -> Vec<String> {
 }
 
 fn codex_argv(spec: &CounselSpec, question: &str, root: &Path, result_file: &Path) -> Vec<String> {
-    vec![
-        "codex".to_owned(),
-        "exec".to_owned(),
-        question.to_owned(),
-        "-m".to_owned(),
-        spec.model.clone(),
+    let mut argv = vec!["codex".to_owned(), "exec".to_owned()];
+    if !spec.model.trim().is_empty() {
+        argv.push("-m".to_owned());
+        argv.push(spec.model.clone());
+    }
+    argv.extend([
         "-s".to_owned(),
         "read-only".to_owned(),
         "--json".to_owned(),
@@ -241,7 +239,11 @@ fn codex_argv(spec: &CounselSpec, question: &str, root: &Path, result_file: &Pat
         root.to_string_lossy().into_owned(),
         "-o".to_owned(),
         result_file.to_string_lossy().into_owned(),
-    ]
+    ]);
+    // after `--` clap parses positionals only
+    argv.push("--".to_owned());
+    argv.push(question.to_owned());
+    argv
 }
 
 async fn run_claude(
@@ -327,7 +329,7 @@ fn claude_reply(status: ExitStatus, stdout: &Captured, stderr: &Captured) -> Too
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&stdout.text) else {
         return ToolReply::ok(format!(
             "[consult_expert: claude's output did not parse as JSON; returning it raw]\n{}",
-            mark(&stdout.text, stdout.dropped)
+            mark(stdout, Keep::Head)
         ));
     };
     let usage = envelope.get("usage");
@@ -351,7 +353,7 @@ fn claude_reply(status: ExitStatus, stdout: &Captured, stderr: &Captured) -> Too
     let content = envelope
         .get("result")
         .and_then(serde_json::Value::as_str)
-        .map_or_else(|| mark(&stdout.text, stdout.dropped), str::to_owned);
+        .map_or_else(|| mark(stdout, Keep::Head), str::to_owned);
     ToolReply::ok(content)
 }
 
@@ -362,16 +364,31 @@ fn exit_error(program: &str, status: ExitStatus, stderr: &Captured) -> ToolReply
     let tail = if stderr.text.is_empty() {
         String::new()
     } else {
-        format!("\n{}", mark(&stderr.text, stderr.dropped))
+        format!("\n{}", mark(stderr, Keep::Tail))
     };
     ToolReply::error(format!("ERROR: {program} exited {code}.{tail}"))
 }
 
-fn mark(text: &str, dropped: usize) -> String {
-    if dropped > 0 {
-        format!("[first {dropped} bytes dropped]\n{text}")
-    } else {
-        text.to_owned()
+// stdout keeps its head (claude's JSON envelope opens at byte zero), stderr its tail
+#[derive(Clone, Copy)]
+enum Keep {
+    Head,
+    Tail,
+}
+
+fn mark(captured: &Captured, keep: Keep) -> String {
+    if captured.dropped == 0 {
+        return captured.text.clone();
+    }
+    match keep {
+        Keep::Head => format!(
+            "[last {} bytes dropped]\n{}",
+            captured.dropped, captured.text
+        ),
+        Keep::Tail => format!(
+            "[first {} bytes dropped]\n{}",
+            captured.dropped, captured.text
+        ),
     }
 }
 
@@ -400,8 +417,8 @@ async fn spawn_capture(mut cmd: Command, timeout: Duration) -> RunOutcome {
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
     let stdout_pipe = child.stdout.take().expect("stdout is piped");
     let stderr_pipe = child.stderr.take().expect("stderr is piped");
-    let mut stdout_task = tokio::spawn(drain(stdout_pipe));
-    let mut stderr_task = tokio::spawn(drain(stderr_pipe));
+    let mut stdout_task = tokio::spawn(drain(stdout_pipe, Keep::Head));
+    let mut stderr_task = tokio::spawn(drain(stderr_pipe, Keep::Tail));
 
     let Ok(wait_result) = tokio::time::timeout(timeout, child.wait()).await else {
         kill_group(pgid);
@@ -457,7 +474,10 @@ fn starts_a_char(byte: u8) -> bool {
     byte & 0b1100_0000 != 0b1000_0000
 }
 
-async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> Captured {
+async fn drain(
+    mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    keep: Keep,
+) -> Captured {
     let mut buf: Vec<u8> = Vec::new();
     let mut dropped: usize = 0;
     let mut chunk = [0u8; 8192];
@@ -466,14 +486,23 @@ async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_CAPTURE_BYTES {
-            let overflow = buf.len() - MAX_CAPTURE_BYTES;
-            let cut = (overflow..buf.len())
-                .find(|&i| starts_a_char(buf[i]))
-                .unwrap_or(buf.len());
-            dropped += cut;
-            buf.drain(..cut);
+        match keep {
+            Keep::Head => {
+                let take = n.min(MAX_CAPTURE_BYTES.saturating_sub(buf.len()));
+                buf.extend_from_slice(&chunk[..take]);
+                dropped += n - take;
+            }
+            Keep::Tail => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > MAX_CAPTURE_BYTES {
+                    let overflow = buf.len() - MAX_CAPTURE_BYTES;
+                    let cut = (overflow..buf.len())
+                        .find(|&i| starts_a_char(buf[i]))
+                        .unwrap_or(buf.len());
+                    dropped += cut;
+                    buf.drain(..cut);
+                }
+            }
         }
     }
     let text = match std::str::from_utf8(&buf) {
@@ -494,7 +523,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CounselCommand, CounselSpec, Expert, claude_argv, codex_argv, run_claude, run_codex,
+        CounselCommand, CounselSpec, Expert, Keep, MAX_CAPTURE_BYTES, claude_argv, codex_argv,
+        drain, mark, run_claude, run_codex,
     };
     use crate::tool::workspace::{Grant, Grants, Mode};
     use crate::tool::{Tool as _, ToolSource, TurnContext};
@@ -504,6 +534,14 @@ mod tests {
             command,
             model: "opus".to_owned(),
             fallback_model: fallback.map(str::to_owned),
+        }
+    }
+
+    fn spec_without_model(command: CounselCommand) -> CounselSpec {
+        CounselSpec {
+            command,
+            model: String::new(),
+            fallback_model: None,
         }
     }
 
@@ -579,7 +617,6 @@ mod tests {
             [
                 "codex",
                 "exec",
-                "what is broken?",
                 "-m",
                 "opus",
                 "-s",
@@ -590,8 +627,42 @@ mod tests {
                 "/tmp/proj",
                 "-o",
                 "/tmp/scratch/result.json",
+                "--",
+                "what is broken?",
             ]
         );
+    }
+
+    #[test]
+    fn a_dash_leading_prompt_lands_after_the_end_of_flags_marker() {
+        let argv = codex_argv(
+            &spec(CounselCommand::Codex, None),
+            "-s danger-full-access",
+            std::path::Path::new("/tmp/proj"),
+            std::path::Path::new("/tmp/scratch/result.json"),
+        );
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--", "-s danger-full-access"],
+            "the prompt must be the last argument, behind `--`: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn codex_argv_without_a_model_leaves_the_model_to_the_cli_default() {
+        let argv = codex_argv(
+            &spec_without_model(CounselCommand::Codex),
+            "q",
+            std::path::Path::new("/tmp/proj"),
+            std::path::Path::new("/tmp/scratch/result.json"),
+        );
+        assert!(!argv.contains(&"-m".to_owned()), "{argv:?}");
+    }
+
+    #[test]
+    fn claude_argv_without_a_model_leaves_the_model_to_the_cli_default() {
+        let argv = claude_argv(&spec_without_model(CounselCommand::Claude), "q");
+        assert!(!argv.contains(&"--model".to_owned()), "{argv:?}");
     }
 
     // --- project resolution ---
@@ -894,9 +965,13 @@ mod tests {
             &stub_dir,
             "codex",
             "#!/bin/sh\n\
-             # the -o path is the last argument\n\
-             for a in \"$@\"; do out=\"$a\"; done\n\
-             echo 'looks fine from codex' > \"$out\"\n",
+             out=''; prev=''; last=''\n\
+             for a in \"$@\"; do\n\
+             [ \"$prev\" = '-o' ] && out=\"$a\"\n\
+             last=\"$a\"; prev=\"$a\"\n\
+             done\n\
+             # the prompt must arrive last, behind --\n\
+             [ \"$last\" = 'what is broken?' ] && echo 'looks fine from codex' > \"$out\"\n",
         );
         let _path_guard = PathGuard::set(&stub_dir);
         let root = TempDir::new().expect("root");
@@ -961,5 +1036,61 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.content.contains("timed out"), "{}", reply.content);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    // --- capture truncation ---
+
+    #[tokio::test]
+    async fn stdout_capture_keeps_the_head_and_marks_the_dropped_tail() {
+        // a JSON envelope whose opening must survive the cap
+        let mut bytes = b"{\"result\":\"".to_vec();
+        bytes.resize(MAX_CAPTURE_BYTES + 4096, b'x');
+
+        let captured = drain(std::io::Cursor::new(bytes), Keep::Head).await;
+
+        assert_eq!(captured.text.len(), MAX_CAPTURE_BYTES);
+        assert!(captured.text.starts_with("{\"result\":\""));
+        assert_eq!(captured.dropped, 4096);
+        assert_eq!(
+            mark(&captured, Keep::Head),
+            format!("[last 4096 bytes dropped]\n{}", captured.text)
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_keeps_the_tail_and_marks_the_dropped_head() {
+        let error = b"the actual error";
+        let mut bytes = vec![b'x'; MAX_CAPTURE_BYTES + 4096 - error.len()];
+        bytes.extend_from_slice(error);
+
+        let captured = drain(std::io::Cursor::new(bytes), Keep::Tail).await;
+
+        assert!(captured.text.ends_with("the actual error"));
+        assert_eq!(captured.dropped, 4096);
+        assert!(
+            mark(&captured, Keep::Tail).starts_with("[first 4096 bytes dropped]"),
+            "{}",
+            mark(&captured, Keep::Tail)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_char_split_at_the_head_cap_is_trimmed_not_mangled() {
+        let mut bytes = vec![b'a'; MAX_CAPTURE_BYTES - 1];
+        bytes.extend_from_slice("é".as_bytes());
+        bytes.extend_from_slice(b"tail");
+
+        let captured = drain(std::io::Cursor::new(bytes), Keep::Head).await;
+
+        assert_eq!(captured.text.len(), MAX_CAPTURE_BYTES - 1);
+        assert_eq!(captured.dropped, 5);
+    }
+
+    #[tokio::test]
+    async fn an_undersized_capture_is_passed_through_untouched() {
+        let captured = drain(std::io::Cursor::new(b"short".to_vec()), Keep::Head).await;
+
+        assert_eq!(captured.dropped, 0);
+        assert_eq!(mark(&captured, Keep::Head), "short");
     }
 }

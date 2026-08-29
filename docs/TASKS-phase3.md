@@ -88,7 +88,7 @@ Nothing in config can catch `minimal` against a model that lacks it — it is a 
 | 4.5 | Add `bash` with a scrubbed environment. It is now the search and listing path, which makes two things load-bearing: a deterministic output cap with a timeout, and a `PATH` in the scrubbed environment that carries the search tool, git, and the toolchain. Scrubbed is not empty — Nix and cargo also need `HOME`, `USER`, and the `XDG_*` vars, or builds fail in ways that read as bugs. `bash` runs as the user with nothing between it and the filesystem; the grants are a tool-level check, not containment. A sandbox is later work. **The pass-through is an allowlist — `PATH`, `HOME`, `USER`, `TMPDIR`, `LANG`, `XDG_*` — never a denylist, and this settles §3.1's open redaction question: a result cannot carry a credential the process never received. Runs `--noprofile --norc` in the read-write root, stdin closed (spike 1.2: CLIs block on an open one), 16 KiB per stream cut at a char boundary, 120s default timeout clamped to 1–600. The child gets its own process group and a timeout SIGKILLs the group, so a dead build cannot leak grandchildren. One failure found in review and fixed with a regression test: a background child holding the pipes past bash's exit hung the call — and the engine turn with it — forever; the drains now get a 500ms grace and then the group is killed, which delivers EOF and keeps the captured bytes. `ripgrep` joined the devshell in this commit, since routing search through `bash` makes it a dependency. Reply shape is deterministic: bare stdout on a clean quiet exit, `exit {code}`/stderr sections only when present, no durations.** | claude | done |
 | 4.7 | **Token budget re-measure** (carried, re-scoped). The Phase 2 note assumed a 16k local concierge; with a hosted one the ceiling changes and the question becomes which sources load into which session. Measure before 5.2 wires anything else always-on **Closed 2026-08-28 as no longer necessary — token budgets and context overhead are sufficiently understood or handled. Budgets stay suspended with the subscription cap as the working ceiling (DESIGN §4.1); where real numbers are wanted they come from 6.22's durable per-turn usage through 7.3's by-role accounting, not from a one-off probe.** | — | done |
 
-The two expert invocations from spike 1.2 are retained here for the deferred expert-tool task. Both were verified read-only against a workspace on 2026-08-23. Close stdin: both CLIs block on an open one. The prompt is a positional argument. claude has no `--cd`, so set the child's working directory; codex takes `-C`. codex runs commands through `zsh -lc`, a login shell that sources the user's profile, so set `shell_environment_policy.inherit` explicitly for invariant 8.
+The two expert invocations from spike 1.2 are retained here for the deferred expert-tool task. Both were verified read-only against a workspace on 2026-08-23. Close stdin: both CLIs block on an open one. The prompt is a positional argument — on codex it now goes last, behind `--`, so a prompt beginning with `-` cannot parse as flags and rewrite the sandbox. claude has no `--cd`, so set the child's working directory; codex takes `-C`. codex runs commands through `zsh -lc`, a login shell that sources the user's profile, so set `shell_environment_policy.inherit` explicitly for invariant 8.
 
 ```
 claude -p "<prompt>" --model opus --fallback-model sonnet
@@ -98,9 +98,12 @@ claude -p "<prompt>" --model opus --fallback-model sonnet
 ```
 
 ```
-codex exec "<prompt>" -s read-only --json --ephemeral
-  -C <project root> --output-schema <schema file> -o <result file> < /dev/null
+codex exec -m <model> -s read-only --json --ephemeral
+  -C <project root> --output-schema <schema file> -o <result file>
+  -- "<prompt>" < /dev/null
 ```
+
+Hardened 2026-08-29 against codex-cli 0.147.0: the prompt moved behind `--` to the end of the argv (before it, a dash-leading prompt was parsed as flags — `-s danger-full-access` included), and `-m` was confirmed to reach codex; `-m` is omitted when `[roles.counsel]` sets no model, leaving the CLI's own default.
 
 `--strict-mcp-config --setting-sources ""` is load-bearing. Without them the child inherits the user's MCP servers — a plain `claude -p` came back holding Gmail, Calendar, and Drive tools, none of which are read-only or inside the workspace. codex cannot be closed the same way: `--ignore-user-config` leaves `web__run` and its bundled app tools in place, so its read-only covers the filesystem and not the tool surface. Prefer claude when a diff may contain secrets. `--bare` would cut claude's prompt prefix but reads auth only from `ANTHROPIC_API_KEY`, so it cannot run on the subscription.
 
