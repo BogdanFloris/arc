@@ -24,6 +24,11 @@ message SessionInfo {
   // a dispatched job — the picker's split, correct for all history where
   // dispatched_by is only recorded from 6.34 on
   Source source = 9;
+  // the FORK parent (row 2.3): who a branch was rewound from; empty for a
+  // root conversation. Distinct from dispatched_by's supervision sense.
+  string parent_session = 10;
+  // a branch's standing; DISPOSITION_UNSPECIFIED for a root or an unmarked branch
+  arc.v1.BranchMarked.Disposition disposition = 11;
 }
 
 message ListSessions {}
@@ -60,6 +65,7 @@ message ClientFrame {
     DropSteers drop_steers = 20;
     CreateSession create_session = 21;
     ForkSession fork_session = 22;
+    MarkBranch mark_branch = 23;
   }
 }
 
@@ -77,6 +83,13 @@ message CreateSession {
 message ForkSession {
   string session_id = 1;
   uint64 fork_point = 2;
+}
+
+// Marks a fork's standing (row 2.4): REAL counts it toward consolidation,
+// ABANDONED excludes it; both are reversible, latest wins on replay.
+message MarkBranch {
+  string session_id = 1;
+  arc.v1.BranchMarked.Disposition disposition = 2;
 }
 
 // Stops a live job outright: drops its running turn, drains any queued
@@ -256,6 +269,10 @@ message SessionHistory {
   reserved 2;  // was `messages`, a prose-only copy of `entries`
   string session_id = 1;
   repeated HistoryEntry entries = 3;
+  // the fork parent and point (row 2.3), so the client can mark where
+  // inherited rows end; empty/0 for a parentless session
+  string parent_session = 4;
+  uint64 fork_point = 5;
 }
 
 message MemoryReviewItem {

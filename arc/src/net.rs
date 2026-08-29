@@ -128,6 +128,10 @@ async fn handle(
             session_id,
             fork_point,
         } => fork_session(&mut client, &session_id, fork_point, events).await,
+        Command::MarkBranch {
+            session_id,
+            disposition,
+        } => mark_branch(&mut client, &session_id, disposition, events).await,
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
         Command::Yank(_) => Ok(()),
     };
@@ -167,6 +171,8 @@ async fn history(
             let _ = events.send(NetEvent::History {
                 session_id: session_id.to_owned(),
                 entries: answer.entries,
+                parent_session: answer.parent_session,
+                fork_point: answer.fork_point,
             });
             Ok(())
         }
@@ -260,6 +266,24 @@ async fn fork_session(
             let _ = events.send(NetEvent::SessionForked { session_id });
             Ok(())
         }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A branch's standing (row 2.4): a bare verdict wire-side, but the picker
+/// wants the fresh disposition on screen, so a success also refreshes the list.
+async fn mark_branch(
+    client: &mut Client,
+    session_id: &str,
+    disposition: arc_proto::v1::branch_marked::Disposition,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.mark_branch(session_id, disposition).await {
+        Ok(()) => list(client, events).await,
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())

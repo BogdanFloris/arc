@@ -1,13 +1,13 @@
 use arc_proto::v1::{
     Budget, ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
-    HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
-    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MemoryReviewAccept,
-    MemoryReviewDelete, MemoryReviewItem, MemoryReviewItems, MemoryReviewList, MessageAccepted,
-    MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role, SendMessage, ServerFrame,
-    SessionConsolidated, SessionCreated, SessionEvent, SessionHistory, SessionInfo, SessionList,
-    SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallIssued, ToolCallStarted, ToolOutcome,
-    ToolResultRecorded, WorkspaceGrant, client_frame, event, history_entry, memory_event,
-    memory_record, server_frame, session_event,
+    HistoryToolResult, MarkBranch, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+    MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated,
+    MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewItems, MemoryReviewList,
+    MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role,
+    SendMessage, ServerFrame, SessionConsolidated, SessionCreated, SessionEvent, SessionHistory,
+    SessionInfo, SessionList, SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallIssued,
+    ToolCallStarted, ToolOutcome, ToolResultRecorded, WorkspaceGrant, branch_marked, client_frame,
+    event, history_entry, memory_event, memory_record, server_frame, session_event,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -274,6 +274,17 @@ fn client_frame_review_arms_round_trip() {
 }
 
 #[test]
+fn client_frame_mark_branch_round_trips() {
+    round_trip(&ClientFrame {
+        request_id: 7,
+        msg: Some(client_frame::Msg::MarkBranch(MarkBranch {
+            session_id: "s-fork".to_string(),
+            disposition: branch_marked::Disposition::Abandoned as i32,
+        })),
+    });
+}
+
+#[test]
 fn server_frame_review_items_round_trips() {
     round_trip(&ServerFrame {
         request_id: 7,
@@ -312,10 +323,14 @@ fn server_frame_arms_round_trip() {
                 project: "arc".to_string(),
                 dispatched_by: "s-00".to_string(),
                 source: Source::User as i32,
+                parent_session: "s-parent".to_string(),
+                disposition: branch_marked::Disposition::Real as i32,
             }],
         }),
         server_frame::Msg::SessionHistory(SessionHistory {
             session_id: "s-01".to_string(),
+            parent_session: "s-parent".to_string(),
+            fork_point: 5,
             entries: vec![
                 HistoryEntry {
                     entry: Some(history_entry::Entry::Message(HistoryMessage {

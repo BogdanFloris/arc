@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 
 use arc_proto::v1::{
     CancelJob, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession, JobInfo,
-    ListJobs, ListSessions, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
+    ListJobs, ListSessions, MarkBranch, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
     MemoryReviewList, Notification, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionRole, Subscribe, client_frame, server_frame,
+    SessionRole, Subscribe, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -270,6 +270,22 @@ impl Client {
             }),
             other => Err(unexpected("MessageAccepted", &other)),
         }
+    }
+
+    /// A branch's standing (row 2.4): reversible, latest wins.
+    #[tracing::instrument(name = "client.mark_branch", skip_all, fields(session_id))]
+    pub async fn mark_branch(
+        &mut self,
+        session_id: &str,
+        disposition: branch_marked::Disposition,
+    ) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::MarkBranch(MarkBranch {
+                session_id: session_id.to_owned(),
+                disposition: disposition as i32,
+            }))
+            .await?;
+        self.verdict_ack(id).await
     }
 
     async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
@@ -564,6 +580,8 @@ mod tests {
             project: String::new(),
             dispatched_by: String::new(),
             source: 0,
+            parent_session: String::new(),
+            disposition: 0,
         };
         let list = server_frame::Msg::SessionList(SessionList {
             sessions: vec![session.clone()],
@@ -714,6 +732,57 @@ mod tests {
 
         assert!(matches!(err, Error::Server { code, .. } if code == "unknown_session"));
         received(handle).await;
+    }
+
+    #[tokio::test]
+    async fn mark_branch_acks_and_a_refusal_is_a_server_error() {
+        let (url, handle) = server(vec![
+            vec![echo(accepted(""))],
+            vec![echo(error(
+                "not_a_branch",
+                "session s-root is a root conversation",
+            ))],
+        ])
+        .await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client
+            .mark_branch("s-fork", branch_marked::Disposition::Real)
+            .await
+            .expect("mark");
+        match client
+            .mark_branch("s-root", branch_marked::Disposition::Abandoned)
+            .await
+        {
+            Err(Error::Server { code, .. }) => assert_eq!(code, "not_a_branch"),
+            other => panic!("expected Error::Server, got {other:?}"),
+        }
+
+        let sent: Vec<_> = received(handle)
+            .await
+            .into_iter()
+            .map(|frame| frame.msg.expect("a message"))
+            .collect();
+        assert!(
+            matches!(
+                &sent[0],
+                client_frame::Msg::MarkBranch(m)
+                    if m.session_id == "s-fork"
+                        && m.disposition == branch_marked::Disposition::Real as i32
+            ),
+            "got: {:?}",
+            sent[0]
+        );
+        assert!(
+            matches!(
+                &sent[1],
+                client_frame::Msg::MarkBranch(m)
+                    if m.session_id == "s-root"
+                        && m.disposition == branch_marked::Disposition::Abandoned as i32
+            ),
+            "got: {:?}",
+            sent[1]
+        );
     }
 
     #[tokio::test]

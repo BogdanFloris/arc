@@ -9,10 +9,10 @@ use arc_core::provider::role_label;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MemoryReviewItem,
-    MemoryReviewItems, MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame,
-    SessionHistory, SessionInfo, SessionList, SessionRole, StreamEnd, ToolCallEnded,
-    ToolCallStarted, client_frame, server_frame,
+    ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MarkBranch,
+    MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ReasoningDelta,
+    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, SessionRole, StreamEnd,
+    ToolCallEnded, ToolCallStarted, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -263,6 +263,9 @@ async fn request(
         }
         Some(client_frame::Msg::ForkSession(fork)) => {
             fork_session(ws, engine, frame.request_id, fork).await
+        }
+        Some(client_frame::Msg::MarkBranch(mark)) => {
+            mark_branch(ws, engine, frame.request_id, mark).await
         }
         // no reply frame: the subscription's frames are the notifications,
         // pushed from the connection loop's select, not from here
@@ -555,6 +558,28 @@ async fn fork_session(
     flow(send_frame(ws, request_id, msg).await)
 }
 
+/// A branch's standing (row 2.4): a verdict like a review accept/delete,
+/// answered with the same empty-id ack.
+async fn mark_branch(
+    ws: &mut Socket,
+    engine: &Engine,
+    request_id: u64,
+    mark: MarkBranch,
+) -> ControlFlow<()> {
+    let disposition = branch_marked::Disposition::try_from(mark.disposition)
+        .unwrap_or(branch_marked::Disposition::Unspecified);
+    let msg = match engine.mark_branch(&mark.session_id, disposition) {
+        Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: String::new(),
+        }),
+        Err(error) => {
+            warn!(%error, code = error_code(&error), "mark_branch failed");
+            error_frame(error_code(&error), &error)
+        }
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
 async fn review_list(
     ws: &mut Socket,
     reads: &Reader,
@@ -663,12 +688,19 @@ async fn fetch_history(
     request_id: u64,
     session_id: &str,
 ) -> ControlFlow<()> {
-    let read = reads.transcript(session_id);
+    let read = reads
+        .transcript(session_id)
+        .and_then(|entries| Ok((entries, reads.fork_parent(session_id)?)));
     let msg = match read {
-        Ok(entries) => server_frame::Msg::SessionHistory(SessionHistory {
-            session_id: session_id.to_owned(),
-            entries,
-        }),
+        Ok((entries, parent)) => {
+            let (parent_session, fork_point) = parent.unwrap_or_default();
+            server_frame::Msg::SessionHistory(SessionHistory {
+                session_id: session_id.to_owned(),
+                entries,
+                parent_session,
+                fork_point,
+            })
+        }
         Err(error) => {
             warn!(%error, session_id, "reading history failed");
             error_frame("internal", &error)
@@ -694,6 +726,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::UnknownProject { .. } => "unknown_project",
         SessionError::UnknownSession { .. } => "unknown_session",
         SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
+        SessionError::NotABranch { .. } => "not_a_branch",
         SessionError::Store(_) | SessionError::Projection(_) | SessionError::Grants { .. } => {
             "internal"
         }
@@ -714,6 +747,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
         Some(client_frame::Msg::CreateSession(_)) => "create_session",
         Some(client_frame::Msg::ForkSession(_)) => "fork_session",
+        Some(client_frame::Msg::MarkBranch(_)) => "mark_branch",
         None => "unknown",
     }
 }
@@ -729,6 +763,8 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         project: summary.project.clone().unwrap_or_default(),
         dispatched_by: summary.dispatched_by.clone(),
         source: summary.source,
+        parent_session: summary.parent_session.clone(),
+        disposition: summary.disposition,
     }
 }
 
@@ -1262,6 +1298,8 @@ mod tests {
             project: Some("arc".to_string()),
             dispatched_by: "s-parent".to_string(),
             source: Source::Model as i32,
+            parent_session: "s-fork-parent".to_string(),
+            disposition: arc_proto::v1::branch_marked::Disposition::Real as i32,
         };
 
         let info = session_info(&summary);
@@ -1270,6 +1308,11 @@ mod tests {
         assert_eq!(info.project, "arc");
         assert_eq!(info.dispatched_by, "s-parent");
         assert_eq!(info.source, Source::Model as i32);
+        assert_eq!(info.parent_session, "s-fork-parent");
+        assert_eq!(
+            info.disposition,
+            arc_proto::v1::branch_marked::Disposition::Real as i32
+        );
     }
 
     #[tokio::test]
@@ -2770,6 +2813,141 @@ mod tests {
         let error = failed(frame.msg.expect("a message"));
         assert_eq!(error.code, "unknown_session");
         assert!(error.msg.contains("ghost"), "{}", error.msg);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_fetched_forked_sessions_history_names_its_fork_lineage() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _text, closing) = turn(&mut ws, 1).await;
+        ended(closing);
+
+        let answer = history(&mut ws, 2, &session_id).await;
+        assert_eq!(
+            answer.parent_session, "",
+            "a root conversation has no lineage"
+        );
+        let fork_point = answer.entries[0].seq;
+
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::ForkSession(ForkSession {
+                session_id: session_id.clone(),
+                fork_point,
+            }),
+        )
+        .await;
+        let fork_id = match next_frame(&mut ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+
+        let forked_history = history(&mut ws, 4, &fork_id).await;
+        assert_eq!(forked_history.parent_session, session_id);
+        assert_eq!(forked_history.fork_point, fork_point);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn mark_branch_round_trips_and_the_list_shows_the_disposition() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _text, closing) = turn(&mut ws, 1).await;
+        ended(closing);
+        let fork_point = history(&mut ws, 2, &session_id).await.entries[0].seq;
+
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::ForkSession(ForkSession {
+                session_id: session_id.clone(),
+                fork_point,
+            }),
+        )
+        .await;
+        let fork_id = match next_frame(&mut ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+
+        send(
+            &mut ws,
+            4,
+            client_frame::Msg::MarkBranch(MarkBranch {
+                session_id: fork_id.clone(),
+                disposition: branch_marked::Disposition::Real as i32,
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 4);
+        assert!(matches!(
+            frame.msg,
+            Some(server_frame::Msg::MessageAccepted(_))
+        ));
+
+        let sessions = list(&mut ws, 5).await;
+        let forked = sessions
+            .iter()
+            .find(|s| s.id == fork_id)
+            .expect("the fork is listed");
+        assert_eq!(forked.parent_session, session_id);
+        assert_eq!(forked.disposition, branch_marked::Disposition::Real as i32);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn mark_branch_on_a_root_session_is_an_instructive_error() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _text, closing) = turn(&mut ws, 1).await;
+        ended(closing);
+
+        send(
+            &mut ws,
+            2,
+            client_frame::Msg::MarkBranch(MarkBranch {
+                session_id: session_id.clone(),
+                disposition: branch_marked::Disposition::Real as i32,
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "not_a_branch");
+        assert!(error.msg.contains(&session_id), "{}", error.msg);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn mark_branch_on_an_unknown_session_is_an_honest_error() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::MarkBranch(MarkBranch {
+                session_id: "ghost".to_owned(),
+                disposition: branch_marked::Disposition::Abandoned as i32,
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "unknown_session");
 
         harness.stop().await;
     }

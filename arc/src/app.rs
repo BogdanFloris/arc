@@ -1,10 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
     HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, SessionRole, Source, ToolOutcome,
-    history_entry, job_info,
+    branch_marked, history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -44,6 +44,10 @@ pub enum Command {
         session_id: String,
         fork_point: u64,
     },
+    MarkBranch {
+        session_id: String,
+        disposition: branch_marked::Disposition,
+    },
     Yank(String),
 }
 
@@ -53,6 +57,10 @@ pub enum NetEvent {
     History {
         session_id: String,
         entries: Vec<HistoryEntry>,
+        /// The FORK parent and point (row 2.3), so a reopened branch can
+        /// mark where its inherited rows end. Empty/0 for a parentless session.
+        parent_session: String,
+        fork_point: u64,
     },
     Accepted {
         session_id: String,
@@ -259,6 +267,12 @@ pub struct App {
     /// visual mode, so a typed command still knows it — by the time Enter
     /// runs the command, `mode` has already left `Visual`.
     visual_at_cmd: Option<usize>,
+    /// True while point visual is the rewind flavor (`R`): `j`/`k`/`gg`/`G`
+    /// then walk only `Block::You`, and Enter forks-then-prefills instead of nothing.
+    visual_rewind: bool,
+    /// The rewound message's text, stashed between `R`'s Enter and the
+    /// `SessionForked` reply that opens the branch to prefill it into.
+    pending_rewind_text: Option<String>,
     /// Every session fact seen so far — from a sessions list, a jobs push, or a `:code`
     /// create — so the rule line can name the open door without waiting on a refetch.
     session_meta: HashMap<String, (SessionRole, String, Source)>,
@@ -312,6 +326,8 @@ impl App {
             visual_point: false,
             visual_boundary: 0,
             visual_at_cmd: None,
+            visual_rewind: false,
+            pending_rewind_text: None,
             session_meta: HashMap::new(),
             pending_code: None,
             pending_first: None,
@@ -518,11 +534,15 @@ impl App {
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('s') => self.open_picker(),
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('J') => return Some(self.open_jobs()),
+            KeyCode::Char('M') => return Some(self.open_review()),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
             KeyCode::Char('V') if self.status != Status::Streaming => self.enter_visual(false),
             KeyCode::Char('v') if self.status != Status::Streaming => self.enter_visual(true),
+            KeyCode::Char('R') if self.status != Status::Streaming => self.enter_rewind(),
             KeyCode::Char('Y') if self.status != Status::Streaming => return self.yank_all(),
             KeyCode::Char(':') => {
                 self.cmd.clear();
@@ -556,6 +576,25 @@ impl App {
         self.visual_anchor = last;
         self.visual_boundary = last;
         self.visual_point = point;
+        self.visual_rewind = false;
+        self.mode = Mode::Visual;
+    }
+
+    /// `R` (row 2.3): point visual pre-positioned on the last message sent,
+    /// walking only `Block::You` — the flavor Enter reforks-and-refills from.
+    fn enter_rewind(&mut self) {
+        let Some(last_you) = self
+            .transcript
+            .iter()
+            .rposition(|b| matches!(b, Block::You(_)))
+        else {
+            return;
+        };
+        self.pending = None;
+        self.visual_anchor = last_you;
+        self.visual_boundary = last_you;
+        self.visual_point = true;
+        self.visual_rewind = true;
         self.mode = Mode::Visual;
     }
 
@@ -565,40 +604,94 @@ impl App {
         }
     }
 
+    /// Whether `block` is a stop for `j`/`k`/`gg`/`G` in point visual: any
+    /// message normally, only a sent one (`Block::You`) in the rewind flavor.
+    fn is_visual_stop(&self, block: &Block) -> bool {
+        if self.visual_rewind {
+            matches!(block, Block::You(_))
+        } else {
+            matches!(block, Block::You(_) | Block::Arc { .. })
+        }
+    }
+
+    /// Walks `visual_boundary` one stop toward `up` or down, skipping
+    /// non-stops; no stop that way leaves the boundary where it was.
+    fn step_point(&mut self, up: bool) {
+        let len = self.transcript.len();
+        let mut at = self.visual_boundary;
+        loop {
+            let next = if up {
+                at.checked_sub(1)
+            } else {
+                at.checked_add(1)
+            };
+            let Some(next) = next else {
+                return;
+            };
+            if next >= len {
+                return;
+            }
+            at = next;
+            if self.is_visual_stop(&self.transcript[at]) {
+                self.visual_boundary = at;
+                self.follow_point();
+                return;
+            }
+        }
+    }
+
+    /// `gg`/`G` in point visual: the first or last stop in the transcript.
+    fn jump_point(&mut self, to_end: bool) {
+        let found = if to_end {
+            self.transcript.iter().rposition(|b| self.is_visual_stop(b))
+        } else {
+            self.transcript.iter().position(|b| self.is_visual_stop(b))
+        };
+        if let Some(at) = found {
+            self.visual_boundary = at;
+            self.follow_point();
+        }
+    }
+
     fn on_visual(&mut self, code: KeyCode) -> Option<Command> {
         if let Some(pending) = self.pending.take() {
             if pending == 'g' && code == KeyCode::Char('g') {
-                self.visual_boundary = 0;
-                self.follow_point();
+                if self.visual_point {
+                    self.jump_point(false);
+                } else {
+                    self.visual_boundary = 0;
+                }
             }
             return None;
         }
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('j') => {
-                let cap = if self.visual_point {
-                    self.transcript.len().saturating_sub(1)
+                if self.visual_point {
+                    self.step_point(false);
                 } else {
                     // a range never extends below its anchor
-                    self.visual_anchor
-                };
-                self.visual_boundary = (self.visual_boundary + 1).min(cap);
-                self.follow_point();
+                    self.visual_boundary = (self.visual_boundary + 1).min(self.visual_anchor);
+                }
             }
             KeyCode::Char('k') => {
-                self.visual_boundary = self.visual_boundary.saturating_sub(1);
-                self.follow_point();
+                if self.visual_point {
+                    self.step_point(true);
+                } else {
+                    self.visual_boundary = self.visual_boundary.saturating_sub(1);
+                }
             }
             KeyCode::Char('G') => {
-                self.visual_boundary = if self.visual_point {
-                    self.transcript.len().saturating_sub(1)
+                if self.visual_point {
+                    self.jump_point(true);
                 } else {
-                    self.visual_anchor
-                };
-                self.follow_point();
+                    self.visual_boundary = self.visual_anchor;
+                }
             }
             KeyCode::Char('g') => self.pending = Some('g'),
             KeyCode::Char('y') => return self.yank_visual(),
+            KeyCode::Char('f') => return self.fork_selected_visual(),
+            KeyCode::Enter if self.visual_rewind => return self.rewind_fork(),
             // `visual_boundary()` reads `mode`, which Enter flips to Normal
             // before the typed command runs — stash the selection now
             KeyCode::Char(':') => {
@@ -840,6 +933,43 @@ impl App {
         }
     }
 
+    /// `f` in visual mode (row 2.3): `:fork` in one key, either flavor —
+    /// stash the pointed block exactly as `:` does before Enter runs it.
+    fn fork_selected_visual(&mut self) -> Option<Command> {
+        self.visual_at_cmd = self.visual_boundary();
+        self.mode = Mode::Normal;
+        self.fork_selected()
+    }
+
+    /// Rewind's Enter (row 2.3): forks before the You block `R` is pointed
+    /// at — excluding it, so the retyped message replaces it on the branch —
+    /// and stashes its text for `SessionForked` to prefill.
+    fn rewind_fork(&mut self) -> Option<Command> {
+        let index = self.visual_boundary;
+        self.mode = Mode::Normal;
+        let Some(Block::You(text)) = self.transcript.get(index) else {
+            self.last_error = Some("rewind: no message selected".to_owned());
+            return None;
+        };
+        let text = text.clone();
+        let Some(session_id) = self.session_id.clone() else {
+            self.last_error = Some("rewind: no open session".to_owned());
+            return None;
+        };
+        let preceding = self.transcript[..index]
+            .iter()
+            .rposition(|block| matches!(block, Block::You(_) | Block::Arc { .. }));
+        let Some(fork_point) = preceding.and_then(|at| self.seqs.get(at).copied().flatten()) else {
+            self.last_error = Some("rewind: no earlier message to fork before".to_owned());
+            return None;
+        };
+        self.pending_rewind_text = Some(text);
+        Some(Command::ForkSession {
+            session_id,
+            fork_point,
+        })
+    }
+
     fn open_review(&mut self) -> Command {
         self.review = Some(Review {
             items: Vec::new(),
@@ -1044,6 +1174,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
             KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
+            KeyCode::Char('m') => {
+                return self.mark_selected_branch(selected, branch_marked::Disposition::Real);
+            }
+            KeyCode::Char('X') => {
+                return self.mark_selected_branch(selected, branch_marked::Disposition::Abandoned);
+            }
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
                 self.picker = None;
@@ -1052,6 +1188,25 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// `m`/`X` on a picker row (row 2.4): a branch's disposition is a
+    /// verdict, not a wire call worth making on a root — that's an
+    /// instructive status line instead.
+    fn mark_selected_branch(
+        &mut self,
+        row: usize,
+        disposition: branch_marked::Disposition,
+    ) -> Option<Command> {
+        let session = self.picker_session(row)?;
+        if session.parent_session.is_empty() {
+            self.last_error = Some("mark: only a branch has a disposition".to_owned());
+            return None;
+        }
+        Some(Command::MarkBranch {
+            session_id: session.id.clone(),
+            disposition,
+        })
     }
 
     /// The filter query lives in `self.input`, same mechanism as the steer prompt.
@@ -1129,8 +1284,20 @@ impl App {
     }
 
     /// The session list in recency order, narrowed to conversations unless
-    /// `a` revealed jobs too, then narrowed further by the filter query if any.
+    /// `a` revealed jobs too, narrowed further by the filter query if any,
+    /// then nested (row 2.3) so each branch renders directly under its parent.
     pub fn picker_rows(&self) -> Vec<&SessionInfo> {
+        self.picker_tree().into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// `picker_rows`, paired with fork depth: how many parent hops stay
+    /// inside this same filtered list. A parent filtered out or elsewhere
+    /// reads as depth 0, same as an actual root.
+    pub fn picker_tree(&self) -> Vec<(&SessionInfo, usize)> {
+        tree_order(&self.picker_candidates())
+    }
+
+    fn picker_candidates(&self) -> Vec<&SessionInfo> {
         let show_all = self.picker.as_ref().is_some_and(|picker| picker.show_all);
         let order: Vec<&SessionInfo> = self
             .by_recency()
@@ -1309,9 +1476,12 @@ impl App {
             NetEvent::History {
                 session_id,
                 entries,
+                parent_session,
+                fork_point,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    let (rebuilt, rebuilt_seqs) = history_blocks(entries);
+                    let (rebuilt, rebuilt_seqs) =
+                        history_blocks(entries, &parent_session, fork_point);
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
                         && rebuilt.starts_with(&self.transcript);
@@ -1449,6 +1619,7 @@ impl App {
             NetEvent::Failed { code, msg } => {
                 self.steer_turn_pending = false;
                 self.pending_first = None;
+                self.pending_rewind_text = None;
                 self.finalize_thinking();
                 self.pop_empty_reply();
                 self.turn_started = None;
@@ -1525,8 +1696,17 @@ impl App {
                 Some(self.send(first))
             }
             // the composed gesture that IS rewind: open the branch exactly
-            // like the picker opens any session
-            NetEvent::SessionForked { session_id } => self.start_session(Some(session_id)),
+            // like the picker opens any session, then refill the retyped
+            // message if `R`'s Enter is what forked it
+            NetEvent::SessionForked { session_id } => {
+                let command = self.start_session(Some(session_id));
+                if let Some(text) = self.pending_rewind_text.take() {
+                    self.input = text;
+                    self.cursor = self.input.len();
+                    self.mode = Mode::Insert;
+                }
+                command
+            }
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
                 self.last_error = Some("disconnected".to_owned());
@@ -1663,6 +1843,53 @@ fn is_running(job: &JobInfo) -> bool {
 /// fails toward hiding it as noise.
 pub fn is_job_session(session: &SessionInfo) -> bool {
     session.source != Source::User as i32
+}
+
+/// `candidates`, depth-first: each root in its given order, immediately
+/// followed by its own children (recursively) in theirs — a branch whose
+/// `parent_session` isn't among `candidates` counts as a root.
+fn tree_order<'a>(candidates: &[&'a SessionInfo]) -> Vec<(&'a SessionInfo, usize)> {
+    let ids: HashSet<&str> = candidates.iter().map(|s| s.id.as_str()).collect();
+    let mut children: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
+    let mut roots: Vec<&SessionInfo> = Vec::new();
+    for &session in candidates {
+        let parent = session.parent_session.as_str();
+        if !parent.is_empty() && ids.contains(parent) {
+            children.entry(parent).or_default().push(session);
+        } else {
+            roots.push(session);
+        }
+    }
+    let mut out = Vec::with_capacity(candidates.len());
+    for root in roots {
+        push_branch(root, 0, &children, &mut out);
+    }
+    // a parent cycle in a corrupt log would orphan its members from every
+    // root; an unreachable session is worse than an oddly-sorted one
+    if out.len() < candidates.len() {
+        let placed: HashSet<&str> = out.iter().map(|(s, _)| s.id.as_str()).collect();
+        out.extend(
+            candidates
+                .iter()
+                .filter(|s| !placed.contains(s.id.as_str()))
+                .map(|&s| (s, 0)),
+        );
+    }
+    out
+}
+
+fn push_branch<'a>(
+    session: &'a SessionInfo,
+    depth: usize,
+    children: &HashMap<&str, Vec<&'a SessionInfo>>,
+    out: &mut Vec<(&'a SessionInfo, usize)>,
+) {
+    out.push((session, depth));
+    if let Some(kids) = children.get(session.id.as_str()) {
+        for kid in kids {
+            push_branch(kid, depth + 1, children, out);
+        }
+    }
 }
 
 fn short_id(id: &str) -> &str {
@@ -1821,7 +2048,11 @@ fn prose_block(message: HistoryMessage) -> Option<Block> {
 // the parallel Vec carries each block's history seq, `None` for a block with
 // no row of its own (a derived Sources/Cost line, or a ToolResult that only
 // mutates its call's block); forking reads only the paired vector's `Some`s
-fn history_blocks(entries: Vec<HistoryEntry>) -> (Vec<Block>, Vec<Option<u64>>) {
+fn history_blocks(
+    entries: Vec<HistoryEntry>,
+    parent_session: &str,
+    fork_point: u64,
+) -> (Vec<Block>, Vec<Option<u64>>) {
     let mut blocks = Vec::new();
     let mut seqs = Vec::new();
     for entry in entries {
@@ -1889,6 +2120,20 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> (Vec<Block>, Vec<Option<u64>>) 
             *outcome = Some("unknown");
         }
     }
+    if !parent_session.is_empty() {
+        if let Some(cut) = seqs
+            .iter()
+            .rposition(|seq| seq.is_some_and(|s| s <= fork_point))
+        {
+            let mut at = cut + 1;
+            while at < blocks.len() && seqs[at].is_none() {
+                at += 1;
+            }
+            let head = &parent_session[..parent_session.len().min(8)];
+            blocks.insert(at, Block::Note(format!("branched from {head} here")));
+            seqs.insert(at, None);
+        }
+    }
     (blocks, seqs)
 }
 
@@ -1930,6 +2175,8 @@ mod tests {
             project: String::new(),
             dispatched_by: String::new(),
             source: Source::User as i32,
+            parent_session: String::new(),
+            disposition: 0,
         }
     }
 
@@ -1944,6 +2191,8 @@ mod tests {
             project: String::new(),
             dispatched_by: String::new(),
             source: Source::User as i32,
+            parent_session: String::new(),
+            disposition: 0,
         }
     }
 
@@ -2408,6 +2657,8 @@ mod tests {
                 })),
                 seq: 0,
             }],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -2507,13 +2758,49 @@ mod tests {
             })),
             seq: 0,
         }];
-        let (blocks, _seqs) = history_blocks(entries);
+        let (blocks, _seqs) = history_blocks(entries, "", 0);
         assert!(
             matches!(
                 blocks.as_slice(),
                 [Block::Arc { .. }, Block::Sources(sources)] if sources.len() == 2
             ),
             "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn a_branched_session_gets_a_marker_after_the_last_inherited_row() {
+        let entries = vec![
+            prose_entry_at(1, Role::User as i32, "inherited question", false),
+            prose_entry_at(2, Role::Assistant as i32, "inherited answer", false),
+            prose_entry_at(3, Role::User as i32, "own question", false),
+        ];
+        let (blocks, seqs) = history_blocks(entries, "s-parent-uuid", 2);
+
+        assert_eq!(
+            blocks,
+            [
+                Block::You("inherited question".to_owned()),
+                Block::Arc {
+                    text: "inherited answer".to_owned(),
+                    partial: false,
+                },
+                Block::Note("branched from s-parent here".to_owned()),
+                Block::You("own question".to_owned()),
+            ],
+            "the marker lands right after the last inherited row"
+        );
+        assert_eq!(seqs, [Some(1), Some(2), None, Some(3)]);
+    }
+
+    #[test]
+    fn a_parentless_session_gets_no_marker() {
+        let entries = vec![prose_entry_at(1, Role::User as i32, "hi", false)];
+        let (blocks, _seqs) = history_blocks(entries, "", 0);
+
+        assert!(
+            !blocks.iter().any(|b| matches!(b, Block::Note(_))),
+            "no lineage, no marker"
         );
     }
 
@@ -2539,6 +2826,59 @@ mod tests {
             app.visual_range(),
             Some((2, 2)),
             "walks back down and clamps at the end"
+        );
+    }
+
+    #[test]
+    fn point_visual_skips_a_tool_block_between_two_messages() {
+        let mut app = App::new();
+        app.transcript = vec![
+            Block::You("one".to_owned()),
+            Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: String::new(),
+                outcome: Some("ok"),
+            },
+            Block::Arc {
+                text: "two".to_owned(),
+                partial: false,
+            },
+        ];
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(
+            app.visual_range(),
+            Some((2, 2)),
+            "starts on the last message"
+        );
+
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.visual_range(),
+            Some((0, 0)),
+            "the tool block is skipped"
+        );
+
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.visual_range(),
+            Some((0, 0)),
+            "no earlier message: stays put"
+        );
+
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.visual_range(),
+            Some((2, 2)),
+            "skips the tool block going down too"
+        );
+
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.visual_range(),
+            Some((2, 2)),
+            "no later message: stays put"
         );
     }
 
@@ -3040,6 +3380,8 @@ mod tests {
                 project: String::new(),
                 dispatched_by: String::new(),
                 source: Source::User as i32,
+                parent_session: String::new(),
+                disposition: 0,
             }
         }
 
@@ -3127,6 +3469,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_picker_nests_a_branch_directly_under_its_parent() {
+        let mut app = App::new();
+        let mut fork = session_with("child-of-1", "the fork", "hi");
+        fork.parent_session = "s-1".to_owned();
+        app.on_net(NetEvent::Sessions(vec![
+            fork,
+            session_with("s-1", "root one", "hi"),
+            session_with("s-2", "root two", "hi"),
+        ]));
+
+        let ids: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["s-1", "child-of-1", "s-2"],
+            "the branch renders directly after its parent, not by plain recency"
+        );
+        assert_eq!(
+            app.picker_tree()
+                .into_iter()
+                .map(|(_, depth)| depth)
+                .collect::<Vec<_>>(),
+            [0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn m_and_shift_x_mark_the_selected_branch_only() {
+        let mut app = App::new();
+        let mut fork = session_with("s-fork", "the fork", "hi");
+        fork.parent_session = "s-root".to_owned();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("s-root", "root", "hi"),
+            fork,
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.picker_session(2).map(|s| s.id.as_str()), Some("s-fork"));
+
+        let command = app.on_key(key(KeyCode::Char('m')));
+
+        assert_eq!(
+            command,
+            Some(Command::MarkBranch {
+                session_id: "s-fork".to_owned(),
+                disposition: branch_marked::Disposition::Real,
+            })
+        );
+
+        let command = app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(
+            command,
+            Some(Command::MarkBranch {
+                session_id: "s-fork".to_owned(),
+                disposition: branch_marked::Disposition::Abandoned,
+            })
+        );
+    }
+
+    #[test]
+    fn m_on_a_root_row_is_an_instructive_error_with_no_wire_call() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session_with(
+            "s-root", "root", "hi",
+        )]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.picker_session(1).map(|s| s.id.as_str()), Some("s-root"));
+
+        let command = app.on_key(key(KeyCode::Char('X')));
+
+        assert_eq!(command, None, "a root has nothing to mark");
+        assert!(app.last_error.is_some());
+    }
+
     fn prose(role: i32, content: &str, partial: bool) -> HistoryMessage {
         HistoryMessage {
             role,
@@ -3203,6 +3621,8 @@ mod tests {
                 prose_entry(Role::Assistant as i32, "a thin end-to-end slice", true),
                 prose_entry(Role::System as i32, "the identity file", false),
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -3237,6 +3657,8 @@ mod tests {
                     seq: 0,
                 },
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -3263,6 +3685,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: vec![prose_entry(Role::Assistant as i32, "hello there", false)],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert!(
@@ -3286,6 +3710,8 @@ mod tests {
                 })),
                 seq: 0,
             }],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -3321,6 +3747,8 @@ mod tests {
                 result_entry("t1", ToolOutcome::Ok as i32),
                 prose_entry(Role::Assistant as i32, "answer", false),
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(reopened.transcript, live.transcript);
@@ -3337,6 +3765,8 @@ mod tests {
                 call_entry("b", "beta"),
                 result_entry("b", 42),
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -3367,6 +3797,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "first".to_owned(),
             entries: vec![prose_entry(Role::User as i32, "stale", false)],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -3937,6 +4369,35 @@ mod tests {
         assert!(!jobs.loaded, "nothing has been answered yet");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":jobs is a command, not E492");
+    }
+
+    #[test]
+    fn question_mark_opens_help_from_normal_mode() {
+        let mut app = normal_app();
+
+        assert_eq!(app.on_key(key(KeyCode::Char('?'))), None);
+
+        assert!(app.help);
+    }
+
+    #[test]
+    fn shift_j_opens_jobs_from_normal_mode_same_as_colon_jobs() {
+        let mut app = normal_app();
+
+        let command = app.on_key(key(KeyCode::Char('J')));
+
+        assert_eq!(command, Some(Command::ListJobs));
+        assert!(app.jobs.is_some());
+    }
+
+    #[test]
+    fn shift_m_opens_review_from_normal_mode_same_as_colon_review() {
+        let mut app = normal_app();
+
+        let command = app.on_key(key(KeyCode::Char('M')));
+
+        assert!(matches!(command, Some(Command::ReviewList { .. })));
+        assert!(app.review.is_some());
     }
 
     #[test]
@@ -4580,6 +5041,8 @@ mod tests {
         let landed = app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: vec![],
+            parent_session: String::new(),
+            fork_point: 0,
         });
         assert_eq!(landed, None);
 
@@ -4670,6 +5133,8 @@ mod tests {
             entries: vec![handback_entry(&format!(
                 "Job {JOB_ID} finished.\nfixed the flaky test"
             ))],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -4692,6 +5157,8 @@ mod tests {
             entries: vec![handback_entry(&format!(
                 "Job {JOB_ID} stopped: token budget exhausted (500/400).\npartial work"
             ))],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -4715,6 +5182,8 @@ mod tests {
                 handback_entry("Job finished.\nno id in the header"),
                 handback_entry(&format!("Job {JOB_ID} finished.")),
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -5029,6 +5498,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: vec![prose_entry(Role::User as i32, "fresh", false)],
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(app.mode, Mode::Normal);
@@ -5045,6 +5516,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: base.clone(),
+            parent_session: String::new(),
+            fork_point: 0,
         });
         app.on_key(key(KeyCode::Char('V')));
         assert_eq!(app.mode, Mode::Visual);
@@ -5054,6 +5527,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: grown,
+            parent_session: String::new(),
+            fork_point: 0,
         });
 
         assert_eq!(
@@ -5098,6 +5573,8 @@ mod tests {
                 call_entry("t1", "bash"),
                 result_entry("t1", ToolOutcome::Ok as i32),
             ],
+            parent_session: String::new(),
+            fork_point: 0,
         });
         app.on_key(key(KeyCode::Esc));
         app
@@ -5172,6 +5649,117 @@ mod tests {
                 session_id: "s-2".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn f_in_visual_mode_forks_exactly_like_colon_fork() {
+        let mut app = conversation_from_history();
+
+        app.on_key(key(KeyCode::Char('V')));
+        // boundary starts on the folded tool block (last); one 'k' lands on
+        // the assistant's answer, seq 4
+        app.on_key(key(KeyCode::Char('k')));
+        let command = app.on_key(key(KeyCode::Char('f')));
+
+        assert_eq!(
+            command,
+            Some(Command::ForkSession {
+                session_id: "s-1".to_owned(),
+                fork_point: 4,
+            })
+        );
+        assert_eq!(app.mode, Mode::Normal, "the key consumes the selection");
+    }
+
+    // built through History with two full turns, so a preceding message
+    // block exists for rewind to fork before
+    fn conversation_with_two_turns() -> App {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![
+                prose_entry_at(1, Role::User as i32, "first", false),
+                prose_entry_at(2, Role::Assistant as i32, "first reply", false),
+                prose_entry_at(3, Role::User as i32, "second", false),
+            ],
+            parent_session: String::new(),
+            fork_point: 0,
+        });
+        app.on_key(key(KeyCode::Esc));
+        app
+    }
+
+    #[test]
+    fn r_positions_on_the_last_you_block_and_walks_only_you_blocks() {
+        let mut app = conversation_with_two_turns();
+
+        app.on_key(key(KeyCode::Char('R')));
+
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(
+            app.visual_range(),
+            Some((2, 2)),
+            "starts on the last You block"
+        );
+
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.visual_range(),
+            Some((0, 0)),
+            "walks past the Arc reply straight to the earlier You block"
+        );
+
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.visual_range(),
+            Some((0, 0)),
+            "no earlier You block: stays put"
+        );
+    }
+
+    #[test]
+    fn rewind_enter_forks_before_the_chosen_message_and_prefills_it() {
+        let mut app = conversation_with_two_turns();
+        app.on_key(key(KeyCode::Char('R')));
+
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::ForkSession {
+                session_id: "s-1".to_owned(),
+                fork_point: 2,
+            }),
+            "forks at the preceding reply's seq, excluding the chosen message"
+        );
+        assert_eq!(app.mode, Mode::Normal);
+
+        let followup = app.on_net(NetEvent::SessionForked {
+            session_id: "s-2".to_owned(),
+        });
+
+        assert_eq!(
+            followup,
+            Some(Command::History {
+                session_id: "s-2".to_owned(),
+            })
+        );
+        assert_eq!(app.input, "second", "the chosen message refills the input");
+        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn rewind_on_the_first_message_is_an_instructive_error() {
+        let mut app = conversation_from_history();
+
+        app.on_key(key(KeyCode::Char('R')));
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, None);
+        assert!(app.last_error.is_some());
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     fn search(app: &mut App, query: &str) {
@@ -5400,6 +5988,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: entries.clone(),
+            parent_session: String::new(),
+            fork_point: 0,
         });
         search(&mut app, "needle");
         assert!(app.search.is_some());
@@ -5414,6 +6004,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: appended,
+            parent_session: String::new(),
+            fork_point: 0,
         });
         assert!(
             app.search.is_some(),
@@ -5430,6 +6022,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries,
+            parent_session: String::new(),
+            fork_point: 0,
         });
         search(&mut app, "needle");
         assert!(app.search.is_some());
@@ -5442,6 +6036,8 @@ mod tests {
         app.on_net(NetEvent::History {
             session_id: "s-1".to_owned(),
             entries: rewritten,
+            parent_session: String::new(),
+            fork_point: 0,
         });
         assert!(app.search.is_none(), "a changed prefix drops it");
     }

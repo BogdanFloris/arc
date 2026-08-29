@@ -563,7 +563,7 @@ fn popup(frame: &mut Frame, full: Rect, want_width: u16, content: u16, title: &s
 }
 
 fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Picker) {
-    let sessions = app.picker_rows();
+    let sessions = app.picker_tree();
     let rows = sessions.len() + 1;
     let area = popup(
         frame,
@@ -590,7 +590,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 };
                 vec![Span::styled(format!("{prefix}new session"), style)]
             }
-            Some(session) => {
+            Some((session, depth)) => {
                 let job = crate::app::is_job_session(session);
                 let style = if job {
                     theme::DIM
@@ -599,21 +599,48 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 } else {
                     theme::DIM
                 };
-                vec![
-                    Span::styled(
-                        format!("{prefix}{:<room$}", picker_label(session, room, job)),
-                        style,
-                    ),
-                    Span::styled(
-                        format!("  {:>TIME_WIDTH$}", last_active(session, now)),
-                        theme::DIM,
-                    ),
-                ]
+                let indent = branch_indent(*depth);
+                let tag = disposition_tag(session)
+                    .map(|c| format!("{c} "))
+                    .unwrap_or_default();
+                let room = room.saturating_sub(indent.chars().count() + tag.chars().count());
+                let mut spans = vec![Span::styled(format!("{prefix}{indent}"), style)];
+                if !tag.is_empty() {
+                    spans.push(Span::styled(tag, theme::DIM));
+                }
+                spans.push(Span::styled(
+                    format!("{:<room$}", picker_label(session, room, job)),
+                    style,
+                ));
+                spans.push(Span::styled(
+                    format!("  {:>TIME_WIDTH$}", last_active(session, now)),
+                    theme::DIM,
+                ));
+                spans
             }
         };
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+// a branch renders under its parent, pure ASCII: two spaces, a backslash,
+// a space, per fork hop (row 2.3)
+fn branch_indent(depth: usize) -> String {
+    "  \\ ".repeat(depth)
+}
+
+// a root has no disposition to show; a branch's is unmarked/real/abandoned
+fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
+    use arc_proto::v1::branch_marked::Disposition;
+    if session.parent_session.is_empty() {
+        return None;
+    }
+    Some(match Disposition::try_from(session.disposition) {
+        Ok(Disposition::Real) => '+',
+        Ok(Disposition::Abandoned) => 'x',
+        Ok(Disposition::Unspecified) | Err(_) => '?',
+    })
 }
 
 // a job's role/project tag rides after its title
@@ -784,9 +811,11 @@ const HELP: &[(&str, &[&str])] = &[
             "Y                 yank the whole conversation",
             "V                 visual mode: select a block range",
             "v                 point visual: walk one block (:fork acts there)",
+            "R                 rewind: walk your messages; enter reforks before it, refills the input",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces / handback summaries",
+            "? J M             help / jobs / review popups",
             "ctrl-c            quit",
             ":                 command mode",
         ],
@@ -797,6 +826,7 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               move the selection boundary (v: the point)",
             "gg G              selection to the first / last block",
             "y                 yank the selection",
+            "f                 fork at the pointed message and open it",
             ":fork             branch at the pointed message and open it",
             "esc               back to normal mode",
         ],
@@ -826,6 +856,8 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               move selection",
             "/                 filter by title/preview",
             "space a           toggle showing dispatched jobs",
+            "m                 mark the selected branch real",
+            "X                 mark the selected branch abandoned",
             "enter             open the selected session",
             "q esc             close (esc also clears an active filter)",
         ],
@@ -1027,7 +1059,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{draw, job_label, label, last_active, picker_label, strip_label, wrap_input};
+    use super::{
+        disposition_tag, draw, job_label, label, last_active, picker_label, strip_label, wrap_input,
+    };
     use crate::app::{App, Block, Mode, Search, Status};
 
     /// Renders `app` into a 100×30 buffer and returns it, so tests can
@@ -1196,6 +1230,8 @@ mod tests {
             project: String::new(),
             dispatched_by: String::new(),
             source: 0,
+            parent_session: String::new(),
+            disposition: 0,
         }
     }
 
@@ -1214,6 +1250,8 @@ mod tests {
             project: String::new(),
             dispatched_by: String::new(),
             source: 0,
+            parent_session: String::new(),
+            disposition: 0,
         }
     }
 
@@ -1287,6 +1325,59 @@ mod tests {
         assert_eq!(
             picker_label(&job, 40, true),
             "Fix the flaky test executor/arc"
+        );
+    }
+
+    #[test]
+    fn disposition_tag_is_none_for_a_root_and_a_char_per_disposition_for_a_branch() {
+        use arc_proto::v1::branch_marked::Disposition;
+
+        let root = session("s-01", "root", "");
+        assert_eq!(disposition_tag(&root), None, "a root has nothing to mark");
+
+        let mut branch = session("s-02", "branch", "");
+        branch.parent_session = "s-01".to_owned();
+        assert_eq!(disposition_tag(&branch), Some('?'), "unmarked is scratch");
+
+        branch.disposition = Disposition::Real as i32;
+        assert_eq!(disposition_tag(&branch), Some('+'));
+
+        branch.disposition = Disposition::Abandoned as i32;
+        assert_eq!(disposition_tag(&branch), Some('x'));
+    }
+
+    #[test]
+    fn the_picker_indents_a_branch_under_its_parent_and_shows_its_tag() {
+        use crate::app::{App, NetEvent};
+        use arc_proto::v1::branch_marked::Disposition;
+
+        let mut app = App::new();
+        let mut root = session("s-root", "root conversation", "hi");
+        root.source = arc_proto::v1::Source::User as i32;
+        let mut fork = session("s-fork", "fixing the parser", "hi");
+        fork.source = arc_proto::v1::Source::User as i32;
+        fork.parent_session = "s-root".to_owned();
+        fork.disposition = Disposition::Real as i32;
+        app.on_net(NetEvent::Sessions(vec![root, fork]));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.contains("\\ + fixing the parser"),
+            "the branch renders indented under its parent with its real tag, got:\n{text}"
+        );
+        let root_line = text
+            .lines()
+            .find(|line| line.contains("root conversation"))
+            .expect("the root row renders");
+        assert!(
+            !root_line.contains('\\'),
+            "a root is not indented, got: {root_line:?}"
+        );
+        assert!(
+            !root_line.contains('+') && !root_line.contains('?'),
+            "a root carries no disposition tag, got: {root_line:?}"
         );
     }
 

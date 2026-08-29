@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role, ServerCallRecorded,
-    SessionAppended, SessionCreated, SessionEvent, SessionRole, Source, ToolCallIssued,
-    ToolOutcome, ToolResultRecorded, WorkspaceGrant,
+    BranchMarked, Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role,
+    ServerCallRecorded, SessionAppended, SessionCreated, SessionEvent, SessionRole, Source,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, branch_marked,
 };
 use arc_proto::v1::{event, memory_event, notification, session_event};
 use futures::StreamExt as _;
@@ -184,6 +184,9 @@ pub enum Error {
          message, not a tool call or another session's sequence"
     )]
     InvalidForkPoint { session_id: String, fork_point: u64 },
+
+    #[error("session {session_id} is a root conversation; only a fork has a disposition to mark")]
+    NotABranch { session_id: String },
 }
 
 impl Engine {
@@ -447,6 +450,34 @@ impl Engine {
             }),
         )?;
         Ok(session_id)
+    }
+
+    /// A branch's standing (row 2.4): latest wins, reversible. Only a fork
+    /// has one to mark — a root conversation errors instructively rather
+    /// than silently doing nothing.
+    pub fn mark_branch(
+        &self,
+        session_id: &str,
+        disposition: branch_marked::Disposition,
+    ) -> Result<(), Error> {
+        self.with_store(|store| store.projection().session_role(session_id))?
+            .ok_or_else(|| Error::UnknownSession {
+                session_id: session_id.to_owned(),
+            })?;
+        let ancestors = self.with_store(|store| store.projection().ancestors(session_id))?;
+        if ancestors.is_empty() {
+            return Err(Error::NotABranch {
+                session_id: session_id.to_owned(),
+            });
+        }
+        self.record(
+            Source::User,
+            session_event::Event::BranchMarked(BranchMarked {
+                session_id: session_id.to_owned(),
+                disposition: disposition as i32,
+            }),
+        )?;
+        Ok(())
     }
 
     /// Acts on a `dispatch` tool call: creates the child session durably and
@@ -1810,7 +1841,7 @@ mod tests {
 
     use super::{
         ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters,
-        ProjectSpec, Runner,
+        ProjectSpec, Runner, branch_marked,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -4907,6 +4938,83 @@ mod tests {
             .expect_err("a foreign session's seq must be refused");
 
         assert!(matches!(err, Error::InvalidForkPoint { .. }));
+    }
+
+    #[tokio::test]
+    async fn mark_branch_records_the_disposition_durably() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+        let fork_id = engine
+            .fork_session(&reply.session_id, reply.seq)
+            .expect("fork_session");
+
+        engine
+            .mark_branch(&fork_id, branch_marked::Disposition::Real)
+            .expect("mark_branch");
+
+        let events = replay_log(dir.path());
+        match events.last().expect("an event") {
+            session_event::Event::BranchMarked(marked) => {
+                assert_eq!(marked.session_id, fork_id);
+                assert_eq!(marked.disposition, branch_marked::Disposition::Real as i32);
+            }
+            other => panic!("expected BranchMarked, got {other:?}"),
+        }
+
+        let (reopened, _run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let sessions = reopened.sessions().expect("sessions");
+        let forked = sessions.iter().find(|s| s.id == fork_id).expect("listed");
+        assert_eq!(
+            forked.disposition,
+            branch_marked::Disposition::Real as i32,
+            "replay shows the mark"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_branch_rejects_a_root_session() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let err = engine
+            .mark_branch(&reply.session_id, branch_marked::Disposition::Real)
+            .expect_err("a root conversation has nothing to mark");
+
+        assert!(
+            matches!(err, Error::NotABranch { ref session_id } if *session_id == reply.session_id)
+        );
+        assert!(
+            replay_log(dir.path())
+                .iter()
+                .all(|event| !matches!(event, session_event::Event::BranchMarked(_))),
+            "nothing was appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_branch_rejects_an_unknown_session() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _run) = engine(&provider, &dir);
+
+        let err = engine
+            .mark_branch("ghost", branch_marked::Disposition::Abandoned)
+            .expect_err("an unknown session must be refused");
+
+        assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
+        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
     }
 
     #[tokio::test]

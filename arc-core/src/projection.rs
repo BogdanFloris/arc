@@ -168,6 +168,10 @@ pub struct SessionSummary {
     /// Who created the session (row 9.5): the picker's actual conversation/job
     /// split, correct for all history unlike `dispatched_by` alone.
     pub source: i32,
+    /// The FORK parent (row 2.3); empty for a root conversation.
+    pub parent_session: String,
+    /// A branch's standing; `DISPOSITION_UNSPECIFIED` for a root or an unmarked branch.
+    pub disposition: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,6 +826,13 @@ impl Reader {
         memory_active_at(&self.conn(), at_micros)
     }
 
+    /// `session_id`'s own fork parent and point, if it has one: what
+    /// `fetch_history` stamps `SessionHistory` with for the client's
+    /// branched-from marker (row 2.3).
+    pub fn fork_parent(&self, session_id: &str) -> Result<Option<(String, u64)>, Error> {
+        session_parent(&self.conn(), session_id)
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1019,7 +1030,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                           ORDER BY m.seq LIMIT 1), ''),
                 (SELECT MAX(m.ts) FROM messages m
                  WHERE m.session_id = s.id AND m.kind = ?2),
-                s.role, s.project, coalesce(s.dispatched_by, ''), s.source
+                s.role, s.project, coalesce(s.dispatched_by, ''), s.source,
+                coalesce(s.parent_session, ''), coalesce(s.disposition, 0)
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -1033,6 +1045,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
             project: row.get(6)?,
             dispatched_by: row.get(7)?,
             source: row.get(8)?,
+            parent_session: row.get(9)?,
+            disposition: row.get(10)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -2932,6 +2946,8 @@ mod tests {
                 project: None,
                 dispatched_by: String::new(),
                 source: Source::User as i32,
+                parent_session: String::new(),
+                disposition: arc_proto::v1::branch_marked::Disposition::Unspecified as i32,
             }
         );
         assert_eq!(sessions[0].started_at, None);
