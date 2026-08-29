@@ -4,6 +4,15 @@ use tokio::sync::mpsc;
 
 use crate::app::{Command, NetEvent, ReviewEntry};
 
+// what the forward marker names: the branch's title, or its id prefix
+fn branch_label(branch: &arc_proto::v1::BranchPointer) -> String {
+    if branch.title.is_empty() {
+        branch.session_id.chars().take(8).collect()
+    } else {
+        branch.title.clone()
+    }
+}
+
 // with no request in flight, a pushed frame just sits unread in the socket;
 // selecting over commands and the client's own frame read is what makes
 // notifications arrive without a poll timer
@@ -169,6 +178,11 @@ async fn history(
     match client.fetch_history(session_id).await {
         Ok(answer) => {
             let _ = events.send(NetEvent::History {
+                branches: answer
+                    .branches
+                    .into_iter()
+                    .map(|b| (b.fork_point, branch_label(&b)))
+                    .collect(),
                 session_id: session_id.to_owned(),
                 entries: answer.entries,
                 parent_session: answer.parent_session,

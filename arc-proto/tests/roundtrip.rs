@@ -331,6 +331,11 @@ fn server_frame_arms_round_trip() {
             session_id: "s-01".to_string(),
             parent_session: "s-parent".to_string(),
             fork_point: 5,
+            branches: vec![arc_proto::v1::BranchPointer {
+                session_id: "s-02".to_string(),
+                fork_point: 9,
+                title: "an alternate take".to_string(),
+            }],
             entries: vec![
                 HistoryEntry {
                     entry: Some(history_entry::Entry::Message(HistoryMessage {

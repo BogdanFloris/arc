@@ -833,6 +833,26 @@ impl Reader {
         session_parent(&self.conn(), session_id)
     }
 
+    /// The forks out of `session_id`: (branch id, fork point, title),
+    /// fork-point order, so a transcript can point forward at them.
+    pub fn branches_of(&self, session_id: &str) -> Result<Vec<(String, u64, String)>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, fork_point, coalesce(title, '') FROM sessions
+             WHERE parent_session = ?1 AND fork_point IS NOT NULL
+             ORDER BY fork_point, id",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let fork_point: i64 = row.get(1)?;
+            Ok((
+                row.get(0)?,
+                u64::try_from(fork_point).unwrap_or_default(),
+                row.get(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }

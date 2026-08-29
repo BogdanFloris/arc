@@ -61,6 +61,9 @@ pub enum NetEvent {
         /// mark where its inherited rows end. Empty/0 for a parentless session.
         parent_session: String,
         fork_point: u64,
+        /// forks out of this session: (fork point, label) — the transcript
+        /// points forward at them
+        branches: Vec<(u64, String)>,
     },
     Accepted {
         session_id: String,
@@ -1497,10 +1500,11 @@ impl App {
                 entries,
                 parent_session,
                 fork_point,
+                branches,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
                     let (rebuilt, rebuilt_seqs) =
-                        history_blocks(entries, &parent_session, fork_point);
+                        history_blocks(entries, &parent_session, fork_point, &branches);
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
                         && rebuilt.starts_with(&self.transcript);
@@ -2075,11 +2079,13 @@ fn history_blocks(
     entries: Vec<HistoryEntry>,
     parent_session: &str,
     fork_point: u64,
+    branches: &[(u64, String)],
 ) -> (Vec<Block>, Vec<Option<u64>>) {
     let mut blocks = Vec::new();
     let mut seqs = Vec::new();
     for entry in entries {
         let seq = entry.seq;
+        let was_len = blocks.len();
         match entry.entry {
             Some(history_entry::Entry::Message(message)) => {
                 let input_tokens = message.input_tokens;
@@ -2132,6 +2138,15 @@ fn history_blocks(
                 seqs.push(Some(seq));
             }
             None => {}
+        }
+        // the door out: a fork leaving from this entry gets its signpost
+        if blocks.len() > was_len {
+            for (_, label) in branches.iter().filter(|(at, _)| *at == seq) {
+                blocks.push(Block::Note(format!(
+                    "a branch continues from here: {label}"
+                )));
+                seqs.push(None);
+            }
         }
     }
     for block in &mut blocks {
@@ -2682,6 +2697,7 @@ mod tests {
             }],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -2781,7 +2797,7 @@ mod tests {
             })),
             seq: 0,
         }];
-        let (blocks, _seqs) = history_blocks(entries, "", 0);
+        let (blocks, _seqs) = history_blocks(entries, "", 0, &[]);
         assert!(
             matches!(
                 blocks.as_slice(),
@@ -2798,7 +2814,7 @@ mod tests {
             prose_entry_at(2, Role::Assistant as i32, "inherited answer", false),
             prose_entry_at(3, Role::User as i32, "own question", false),
         ];
-        let (blocks, seqs) = history_blocks(entries, "s-parent-uuid", 2);
+        let (blocks, seqs) = history_blocks(entries, "s-parent-uuid", 2, &[]);
 
         assert_eq!(
             blocks,
@@ -2819,7 +2835,7 @@ mod tests {
     #[test]
     fn a_parentless_session_gets_no_marker() {
         let entries = vec![prose_entry_at(1, Role::User as i32, "hi", false)];
-        let (blocks, _seqs) = history_blocks(entries, "", 0);
+        let (blocks, _seqs) = history_blocks(entries, "", 0, &[]);
 
         assert!(
             !blocks.iter().any(|b| matches!(b, Block::Note(_))),
@@ -2973,6 +2989,38 @@ mod tests {
             listed,
             ["s-root", "s-dead"],
             "x brings the abandoned branch back under its parent"
+        );
+    }
+
+    #[test]
+    fn a_fork_out_of_a_session_gets_a_forward_marker_after_its_entry() {
+        let entries = vec![
+            HistoryEntry {
+                entry: Some(history_entry::Entry::Message(HistoryMessage {
+                    role: Role::User as i32,
+                    content: "keep this".to_owned(),
+                    ..Default::default()
+                })),
+                seq: 4,
+            },
+            HistoryEntry {
+                entry: Some(history_entry::Entry::Message(HistoryMessage {
+                    role: Role::Assistant as i32,
+                    content: "the dead path starts here".to_owned(),
+                    ..Default::default()
+                })),
+                seq: 6,
+            },
+        ];
+        let branches = vec![(4, "an alternate take".to_owned())];
+        let (blocks, _seqs) = history_blocks(entries, "", 0, &branches);
+        assert!(
+            matches!(
+                &blocks[..],
+                [Block::You(_), Block::Note(note), Block::Arc { .. }]
+                    if note == "a branch continues from here: an alternate take"
+            ),
+            "the signpost sits right after the fork point, got {blocks:?}"
         );
     }
 
@@ -3696,6 +3744,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -3732,6 +3781,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -3760,6 +3810,7 @@ mod tests {
             entries: vec![prose_entry(Role::Assistant as i32, "hello there", false)],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert!(
@@ -3785,6 +3836,7 @@ mod tests {
             }],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -3822,6 +3874,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(reopened.transcript, live.transcript);
@@ -3840,6 +3893,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -3872,6 +3926,7 @@ mod tests {
             entries: vec![prose_entry(Role::User as i32, "stale", false)],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -5116,6 +5171,7 @@ mod tests {
             entries: vec![],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         assert_eq!(landed, None);
 
@@ -5208,6 +5264,7 @@ mod tests {
             ))],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -5232,6 +5289,7 @@ mod tests {
             ))],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -5257,6 +5315,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -5573,6 +5632,7 @@ mod tests {
             entries: vec![prose_entry(Role::User as i32, "fresh", false)],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(app.mode, Mode::Normal);
@@ -5591,6 +5651,7 @@ mod tests {
             entries: base.clone(),
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         app.on_key(key(KeyCode::Char('V')));
         assert_eq!(app.mode, Mode::Visual);
@@ -5602,6 +5663,7 @@ mod tests {
             entries: grown,
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
 
         assert_eq!(
@@ -5648,6 +5710,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         app.on_key(key(KeyCode::Esc));
         app
@@ -5758,6 +5821,7 @@ mod tests {
             ],
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         app.on_key(key(KeyCode::Esc));
         app
@@ -6063,6 +6127,7 @@ mod tests {
             entries: entries.clone(),
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         search(&mut app, "needle");
         assert!(app.search.is_some());
@@ -6079,6 +6144,7 @@ mod tests {
             entries: appended,
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         assert!(
             app.search.is_some(),
@@ -6097,6 +6163,7 @@ mod tests {
             entries,
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         search(&mut app, "needle");
         assert!(app.search.is_some());
@@ -6111,6 +6178,7 @@ mod tests {
             entries: rewritten,
             parent_session: String::new(),
             fork_point: 0,
+            branches: Vec::new(),
         });
         assert!(app.search.is_none(), "a changed prefix drops it");
     }

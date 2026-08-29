@@ -265,6 +265,13 @@ message HistoryEntry {
   uint64 seq = 5;
 }
 
+// a fork out of a session, so its transcript can point forward at it
+message BranchPointer {
+  string session_id = 1;
+  uint64 fork_point = 2;
+  string title = 3;
+}
+
 message SessionHistory {
   reserved 2;  // was `messages`, a prose-only copy of `entries`
   string session_id = 1;
@@ -273,6 +280,7 @@ message SessionHistory {
   // inherited rows end; empty/0 for a parentless session
   string parent_session = 4;
   uint64 fork_point = 5;
+  repeated BranchPointer branches = 6;
 }
 
 message MemoryReviewItem {

@@ -688,17 +688,31 @@ async fn fetch_history(
     request_id: u64,
     session_id: &str,
 ) -> ControlFlow<()> {
-    let read = reads
-        .transcript(session_id)
-        .and_then(|entries| Ok((entries, reads.fork_parent(session_id)?)));
+    let read = reads.transcript(session_id).and_then(|entries| {
+        Ok((
+            entries,
+            reads.fork_parent(session_id)?,
+            reads.branches_of(session_id)?,
+        ))
+    });
     let msg = match read {
-        Ok((entries, parent)) => {
+        Ok((entries, parent, branches)) => {
             let (parent_session, fork_point) = parent.unwrap_or_default();
             server_frame::Msg::SessionHistory(SessionHistory {
                 session_id: session_id.to_owned(),
                 entries,
                 parent_session,
                 fork_point,
+                branches: branches
+                    .into_iter()
+                    .map(
+                        |(session_id, fork_point, title)| arc_proto::v1::BranchPointer {
+                            session_id,
+                            fork_point,
+                            title,
+                        },
+                    )
+                    .collect(),
             })
         }
         Err(error) => {
