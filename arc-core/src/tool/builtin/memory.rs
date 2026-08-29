@@ -86,6 +86,7 @@ impl MemorySearch {
 struct SearchArgs {
     query: String,
     namespace: Option<String>,
+    as_of: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -108,6 +109,12 @@ impl Tool for MemorySearch {
                     "namespace": {
                         "type": "string",
                         "description": "Only this namespace; omit for all."
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": "Search what was believed at this past time instead \
+                            of now (RFC 3339 datetime, or a date meaning that day's end). \
+                            Matches may include records since superseded."
                     }
                 },
                 "required": ["query"]
@@ -134,9 +141,14 @@ impl Tool for MemorySearch {
                     ));
                 }
             };
+            let as_of = match args.as_of.as_deref().map(parse_as_of) {
+                Some(Ok(micros)) => Some(micros),
+                Some(Err(message)) => return ToolReply::error(format!("ERROR: {message}")),
+                None => None,
+            };
             match self
                 .archive
-                .memory_search(&args.query, args.namespace.as_deref())
+                .memory_search(&args.query, args.namespace.as_deref(), as_of)
             {
                 Ok(records) if records.is_empty() => ToolReply::ok(
                     "No memory records match. For something from a past conversation, \
@@ -457,6 +469,22 @@ pub(crate) fn mint_record(
     }
 }
 
+fn parse_as_of(raw: &str) -> Result<i64, String> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.timestamp_micros());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let end_of_day = date
+            .and_hms_micro_opt(23, 59, 59, 999_999)
+            .expect("a fixed time of day is always valid");
+        return Ok(end_of_day.and_utc().timestamp_micros());
+    }
+    Err(format!(
+        "as_of {raw:?} is not a recognized time — use an RFC 3339 datetime \
+         (e.g. 2026-03-15T14:00:00Z) or a bare date (e.g. 2026-03-15) meaning that day's end."
+    ))
+}
+
 fn unknown_record(id: &str) -> ToolReply {
     ToolReply::error(format!(
         "ERROR: no memory record {id}. Ids come from the memory index or memory_search."
@@ -474,7 +502,7 @@ mod tests {
     use super::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
     use crate::testkit::{
         ScriptedProvider, archive_at, call, channel, done_reply, engine_with_tools_at,
-        replay_events, seed_memory_log, tool_stop,
+        replay_events, seed_memory_log, seed_memory_log_each, tool_stop,
     };
     use crate::tool::{Registry, Tool as _, TurnContext};
 
@@ -879,6 +907,58 @@ mod tests {
             "the empty reply must point at sessions_search, got: {}",
             reply.content
         );
+    }
+
+    #[tokio::test]
+    async fn a_bare_date_as_of_reaches_the_archive_as_that_days_end() {
+        let dir = TempDir::new().expect("temp dir");
+        let same_day = chrono::DateTime::parse_from_rfc3339("2026-03-10T10:00:00Z")
+            .expect("valid")
+            .timestamp_micros();
+        let next_day = chrono::DateTime::parse_from_rfc3339("2026-03-11T10:00:00Z")
+            .expect("valid")
+            .timestamp_micros();
+        seed_memory_log_each(
+            &dir,
+            vec![
+                (seeded("mr-same", "Same day", "created same day"), same_day),
+                (seeded("mr-next", "Next day", "created next day"), next_day),
+            ],
+        );
+        let tool = MemorySearch::new(archive_at(&dir));
+
+        let reply = tool
+            .execute(
+                r#"{"query":"created","as_of":"2026-03-10"}"#.to_owned(),
+                TurnContext::default(),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(reply.content.contains("mr-same"), "{}", reply.content);
+        assert!(
+            !reply.content.contains("mr-next"),
+            "a bare date means that day's end, excluding the next day's record: {}",
+            reply.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_garbage_as_of_is_an_error_naming_the_accepted_forms() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
+        let tool = MemorySearch::new(archive_at(&dir));
+
+        let reply = tool
+            .execute(
+                r#"{"query":"real","as_of":"not a time"}"#.to_owned(),
+                TurnContext::default(),
+            )
+            .await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("RFC 3339"), "{}", reply.content);
+        assert!(reply.content.contains("bare date"), "{}", reply.content);
     }
 
     #[tokio::test]

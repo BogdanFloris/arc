@@ -93,6 +93,10 @@ pub(crate) struct MemoryHit {
     pub kind: String,
     pub title: String,
     pub summary: String,
+    // Some(true) only under as_of, when the hit is a since-superseded record;
+    // absent otherwise so today's reply JSON is unchanged
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,46 +344,26 @@ impl Archive {
         &self,
         query: &str,
         namespace: Option<&str>,
+        as_of: Option<i64>,
     ) -> Result<Vec<MemoryHit>, Error> {
-        let words: Vec<String> = query.split_whitespace().map(like_pattern).collect();
-        if words.is_empty() {
+        let sanitized = sanitize_query(query);
+        if sanitized.is_empty() {
             return Err(Error::Query {
                 message: "no searchable words in the query".to_owned(),
             });
         }
         let active = memory_record::Status::Active as i32;
-        let mut sql = format!(
-            "SELECT id, namespace, kind, title, summary FROM memory_records
-             WHERE status = {active} AND (?1 IS NULL OR namespace = ?1)"
-        );
-        let mut params: Vec<Option<String>> = vec![namespace.map(str::to_owned)];
-        for word in words {
-            params.push(Some(word));
-            let n = params.len();
-            let _ = write!(
-                sql,
-                " AND (title LIKE ?{n} ESCAPE '\\'
-                    OR summary LIKE ?{n} ESCAPE '\\'
-                    OR body LIKE ?{n} ESCAPE '\\')"
-            );
-        }
-        sql.push_str(" ORDER BY namespace, kind, title, id");
-
         let conn = self.lock();
-        let mut stmt = conn.prepare(&sql)?;
-        let mapped = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok(MemoryHit {
-                id: row.get(0)?,
-                namespace: row.get(1)?,
-                kind: kind_name(row.get(2)?),
-                title: row.get(3)?,
-                summary: row.get(4)?,
-            })
-        })?;
-        let mut hits = Vec::new();
-        for hit in mapped {
-            hits.push(hit?);
-        }
+
+        let hits = match memory_search_fts(&conn, &sanitized, namespace, as_of, active) {
+            Ok(hits) if !hits.is_empty() => hits,
+            Ok(_) => memory_search_like(&conn, query, namespace, as_of, active)?,
+            Err(error) => {
+                tracing::warn!(error = %error, "memory_fts match failed; falling back to LIKE");
+                memory_search_like(&conn, query, namespace, as_of, active)?
+            }
+        };
+
         tracing::Span::current().record("hits", hits.len());
         Ok(hits)
     }
@@ -387,6 +371,104 @@ impl Archive {
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+// shared by the FTS and LIKE paths: an as_of'd row is held if it was
+// created by then and either still active or superseded after that instant
+fn memory_time_filter(ns_idx: usize, as_of_idx: usize, active: i32) -> String {
+    format!(
+        "(?{ns_idx} IS NULL OR r.namespace = ?{ns_idx})
+         AND (
+           (?{as_of_idx} IS NULL AND r.status = {active})
+           OR (?{as_of_idx} IS NOT NULL
+               AND r.created_at IS NOT NULL AND r.created_at <= ?{as_of_idx}
+               AND (r.status = {active}
+                    OR (r.superseded_at IS NOT NULL AND r.superseded_at > ?{as_of_idx})))
+         )"
+    )
+}
+
+fn memory_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryHit> {
+    let status: i32 = row.get(5)?;
+    Ok(MemoryHit {
+        id: row.get(0)?,
+        namespace: row.get(1)?,
+        kind: kind_name(row.get(2)?),
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        superseded: (status == memory_record::Status::Superseded as i32).then_some(true),
+    })
+}
+
+fn memory_search_fts(
+    conn: &Connection,
+    query: &str,
+    namespace: Option<&str>,
+    as_of: Option<i64>,
+    active: i32,
+) -> Result<Vec<MemoryHit>, Error> {
+    let sql = format!(
+        "SELECT r.id, r.namespace, r.kind, r.title, r.summary, r.status
+         FROM memory_fts f JOIN memory_records r ON r.id = f.record_id
+         WHERE memory_fts MATCH ?1
+           AND {}
+         ORDER BY bm25(memory_fts, 0.0, 4.0, 2.0, 1.0)",
+        memory_time_filter(2, 3, active)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map(rusqlite::params![query, namespace, as_of], memory_hit_row)?;
+    let mut hits = Vec::new();
+    for hit in mapped {
+        hits.push(hit?);
+    }
+    Ok(hits)
+}
+
+fn memory_search_like(
+    conn: &Connection,
+    query: &str,
+    namespace: Option<&str>,
+    as_of: Option<i64>,
+    active: i32,
+) -> Result<Vec<MemoryHit>, Error> {
+    let words: Vec<String> = query.split_whitespace().map(like_pattern).collect();
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = format!(
+        "SELECT r.id, r.namespace, r.kind, r.title, r.summary, r.status
+         FROM memory_records r
+         WHERE {}",
+        memory_time_filter(1, 2, active)
+    );
+    let mut params: Vec<rusqlite::types::Value> = vec![
+        namespace.map_or(rusqlite::types::Value::Null, |ns| {
+            rusqlite::types::Value::Text(ns.to_owned())
+        }),
+        as_of.map_or(
+            rusqlite::types::Value::Null,
+            rusqlite::types::Value::Integer,
+        ),
+    ];
+    for word in words {
+        params.push(rusqlite::types::Value::Text(word));
+        let n = params.len();
+        let _ = write!(
+            sql,
+            " AND (r.title LIKE ?{n} ESCAPE '\\'
+                OR r.summary LIKE ?{n} ESCAPE '\\'
+                OR r.body LIKE ?{n} ESCAPE '\\')"
+        );
+    }
+    sql.push_str(" ORDER BY r.namespace, r.kind, r.title, r.id");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map(rusqlite::params_from_iter(params), memory_hit_row)?;
+    let mut hits = Vec::new();
+    for hit in mapped {
+        hits.push(hit?);
+    }
+    Ok(hits)
 }
 
 pub(crate) fn sanitize_query(raw: &str) -> String {
@@ -613,9 +695,9 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Provenance,
-        ProvenanceEntry, Role, SessionCreated, SessionRole, ToolOutcome, ToolResultRecorded,
-        memory_event, memory_record, session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded,
+        MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionCreated,
+        SessionRole, ToolOutcome, ToolResultRecorded, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -991,6 +1073,15 @@ mod tests {
         (dir, archive)
     }
 
+    fn memory_archive_over_each(
+        events: Vec<(memory_event::Event, i64)>,
+    ) -> (TempDir, Arc<Archive>) {
+        let dir = TempDir::new().expect("temp dir");
+        testkit::seed_memory_log_each(&dir, events);
+        let archive = testkit::archive_at(&dir);
+        (dir, archive)
+    }
+
     #[test]
     fn memory_search_matches_words_case_insensitively_across_fields() {
         let (_dir, archive) = memory_archive_over(vec![
@@ -1011,7 +1102,7 @@ mod tests {
         ]);
 
         for query in ["PALETTE", "gruvbox terminal", "Terminal Palette"] {
-            let hits = archive.memory_search(query, None).expect(query);
+            let hits = archive.memory_search(query, None, None).expect(query);
             assert_eq!(hits.len(), 1, "query: {query}");
             assert_eq!(hits[0].id, "mr-1", "query: {query}");
             assert_eq!(hits[0].kind, "fact");
@@ -1019,7 +1110,7 @@ mod tests {
         }
         assert!(
             archive
-                .memory_search("gruvbox vulkan1", None)
+                .memory_search("gruvbox vulkan1", None, None)
                 .expect("search")
                 .is_empty()
         );
@@ -1039,12 +1130,14 @@ mod tests {
         ]);
 
         let hits = archive
-            .memory_search("gruvbox", Some("arc"))
+            .memory_search("gruvbox", Some("arc"), None)
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "mr-p");
 
-        let hits = archive.memory_search("gruvbox", None).expect("search");
+        let hits = archive
+            .memory_search("gruvbox", None, None)
+            .expect("search");
         assert_eq!(hits.len(), 2, "no namespace means all namespaces");
     }
 
@@ -1070,7 +1163,7 @@ mod tests {
             }),
         ]);
 
-        let hits = archive.memory_search("lives", None).expect("search");
+        let hits = archive.memory_search("lives", None, None).expect("search");
         assert_eq!(hits.len(), 1, "the retired record stays out");
         assert_eq!(hits[0].id, "mr-new");
     }
@@ -1090,7 +1183,7 @@ mod tests {
             )),
         ]);
 
-        let hits = archive.memory_search("50%", None).expect("search");
+        let hits = archive.memory_search("50%", None, None).expect("search");
         assert_eq!(hits.len(), 1, "% must not act as a wildcard");
         assert_eq!(hits[0].id, "mr-pct");
     }
@@ -1100,9 +1193,250 @@ mod tests {
         let (_dir, archive) = memory_archive_over(vec![]);
 
         let err = archive
-            .memory_search("   ", None)
+            .memory_search("   ", None, None)
             .expect_err("nothing searchable must be a query error");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_title_match_ranks_above_a_body_only_match() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-body",
+                "global",
+                "Unrelated title",
+                "unrelated summary",
+                "prefers gruvbox in the terminal",
+            )),
+            written(record(
+                "mr-title",
+                "global",
+                "Gruvbox setup",
+                "terminal colors",
+                "no matching word here",
+            )),
+        ]);
+
+        let hits = archive
+            .memory_search("gruvbox", None, None)
+            .expect("search");
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["mr-title", "mr-body"],
+            "bm25 title weight outranks a body-only hit"
+        );
+    }
+
+    #[test]
+    fn as_of_surfaces_a_since_superseded_record_and_marks_it_so() {
+        let (_dir, archive) = memory_archive_over_each(vec![
+            (
+                written(record(
+                    "mr-old",
+                    "global",
+                    "Home",
+                    "lives at X",
+                    "lives at X",
+                )),
+                100,
+            ),
+            (
+                memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                    superseded_id: "mr-old".to_owned(),
+                    record: Some(record(
+                        "mr-new",
+                        "global",
+                        "Home",
+                        "lives at Y",
+                        "lives at Y",
+                    )),
+                }),
+                200,
+            ),
+        ]);
+
+        let hits = archive
+            .memory_search("lives", None, Some(150))
+            .expect("search");
+        assert_eq!(hits.len(), 1, "held at t150: only the original");
+        assert_eq!(hits[0].id, "mr-old");
+        assert_eq!(hits[0].superseded, Some(true));
+
+        let json = serde_json::to_string(&hits[0]).expect("json");
+        assert!(json.contains("\"superseded\":true"), "{json}");
+
+        let hits = archive.memory_search("lives", None, None).expect("search");
+        assert_eq!(hits.len(), 1, "without as_of, only the active replacement");
+        assert_eq!(hits[0].id, "mr-new");
+        assert_eq!(hits[0].superseded, None);
+        let json = serde_json::to_string(&hits[0]).expect("json");
+        assert!(
+            !json.contains("superseded"),
+            "the field stays out of the reply when unused: {json}"
+        );
+    }
+
+    #[test]
+    fn as_of_before_creation_excludes_a_record_and_a_purge_excludes_it_at_any_as_of() {
+        let (_dir, archive) = memory_archive_over_each(vec![(
+            written(record(
+                "mr-early",
+                "global",
+                "Early",
+                "created late",
+                "created late",
+            )),
+            200,
+        )]);
+
+        let hits = archive
+            .memory_search("created", None, Some(100))
+            .expect("search");
+        assert!(hits.is_empty(), "as_of before created_at excludes the row");
+
+        let (_dir, archive) = memory_archive_over_each(vec![
+            (
+                written(record(
+                    "mr-gone",
+                    "global",
+                    "Gone",
+                    "purged later",
+                    "purged later",
+                )),
+                100,
+            ),
+            (
+                memory_event::Event::RecordDeleted(MemoryRecordDeleted {
+                    id: "mr-gone".to_owned(),
+                }),
+                300,
+            ),
+        ]);
+
+        let hits = archive
+            .memory_search("purged", None, Some(200))
+            .expect("search");
+        assert!(
+            hits.is_empty(),
+            "a purged record is gone from history too, even under as_of"
+        );
+    }
+
+    #[test]
+    fn a_substring_query_still_hits_via_the_like_fallback() {
+        let (_dir, archive) = memory_archive_over(vec![written(record(
+            "mr-1",
+            "global",
+            "Gruvbox",
+            "the palette everywhere",
+            "User prefers gruvbox via the terminal palette.",
+        ))]);
+
+        let hits = archive.memory_search("gruv", None, None).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "FTS tokens don't match inside words; the LIKE fallback does"
+        );
+        assert_eq!(hits[0].id, "mr-1");
+    }
+
+    #[test]
+    fn namespace_filter_works_on_the_fts_path() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record("mr-g", "global", "Palette", "gruvbox", "gruvbox")),
+            written(record(
+                "mr-p",
+                "arc",
+                "Palette",
+                "gruvbox in arc",
+                "gruvbox",
+            )),
+        ]);
+
+        let hits = archive
+            .memory_search("gruvbox", Some("arc"), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "mr-p");
+    }
+
+    #[test]
+    fn an_updated_record_is_searchable_by_new_content_not_old() {
+        let (_dir, archive) = memory_archive_over(vec![
+            written(record(
+                "mr-1",
+                "global",
+                "Old title",
+                "old summary",
+                "mentions gruvbox",
+            )),
+            memory_event::Event::RecordUpdated(MemoryRecordUpdated {
+                record: Some(record(
+                    "mr-1",
+                    "global",
+                    "New title",
+                    "new summary",
+                    "mentions vulkan1",
+                )),
+            }),
+        ]);
+
+        let hits = archive
+            .memory_search("vulkan1", None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "the FTS row resyncs to the new content");
+        assert_eq!(hits[0].id, "mr-1");
+
+        let hits = archive
+            .memory_search("gruvbox", None, None)
+            .expect("search");
+        assert!(hits.is_empty(), "the old content no longer matches");
+    }
+
+    #[test]
+    fn a_supersede_leaves_both_rows_findable_the_original_only_under_as_of() {
+        let (_dir, archive) = memory_archive_over_each(vec![
+            (
+                written(record(
+                    "mr-old",
+                    "global",
+                    "Address",
+                    "lives at X",
+                    "lives at X",
+                )),
+                100,
+            ),
+            (
+                memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
+                    superseded_id: "mr-old".to_owned(),
+                    record: Some(record(
+                        "mr-new",
+                        "global",
+                        "Address",
+                        "lives at Y",
+                        "lives at Y",
+                    )),
+                }),
+                200,
+            ),
+        ]);
+
+        let hits = archive.memory_search("lives", None, None).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].id, "mr-new",
+            "the replacement's FTS row was written"
+        );
+
+        let hits = archive
+            .memory_search("lives", None, Some(150))
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].id, "mr-old",
+            "the target's FTS row survived the supersede, untouched"
+        );
     }
 
     #[test]

@@ -241,6 +241,24 @@ pub fn seed_memory_log_at(dir: &TempDir, events: Vec<memory_event::Event>, at_mi
     }
 }
 
+pub fn seed_memory_log_each(dir: &TempDir, events: Vec<(memory_event::Event, i64)>) {
+    let mut log = Log::open(dir.path()).expect("open log");
+    for (event, at_micros) in events {
+        log.append(arc_proto::v1::Event {
+            seq: 0,
+            ts: Some(prost_types::Timestamp {
+                seconds: at_micros / 1_000_000,
+                nanos: i32::try_from((at_micros % 1_000_000) * 1_000).expect("in range"),
+            }),
+            source: arc_proto::v1::Source::System as i32,
+            payload: Some(arc_proto::v1::event::Payload::Memory(
+                arc_proto::v1::MemoryEvent { event: Some(event) },
+            )),
+        })
+        .expect("append");
+    }
+}
+
 pub fn seed_log_payloads(dir: &TempDir, payloads: Vec<arc_proto::v1::event::Payload>) {
     let mut log = Log::open(dir.path()).expect("open log");
     for payload in payloads {

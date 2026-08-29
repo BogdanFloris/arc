@@ -20,7 +20,8 @@ use crate::log;
 // 11: sessions gained provider, model columns
 // 12: sessions gained the source column
 // 13: memory_records gained created_at, superseded_at
-pub(crate) const SCHEMA_VERSION: u32 = 13;
+// 14: memory_fts indexes memory records for ranked search
+pub(crate) const SCHEMA_VERSION: u32 = 14;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -88,6 +89,11 @@ CREATE TABLE IF NOT EXISTS memory_records (
     reviewed_at    INTEGER,
     created_at     INTEGER,
     superseded_at  INTEGER
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    record_id UNINDEXED,
+    title, summary, body
 );
 
 CREATE TABLE IF NOT EXISTS projection_meta (
@@ -1296,6 +1302,19 @@ fn index_content(tx: &Transaction<'_>, seq: u64, content: &str) -> Result<(), Er
     Ok(())
 }
 
+fn index_memory_record(tx: &Transaction<'_>, record: &MemoryRecord) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO memory_fts (record_id, title, summary, body) VALUES (?1, ?2, ?3, ?4)",
+        (&record.id, &record.title, &record.summary, &record.body),
+    )?;
+    Ok(())
+}
+
+fn unindex_memory_record(tx: &Transaction<'_>, id: &str) -> Result<(), Error> {
+    tx.execute("DELETE FROM memory_fts WHERE record_id = ?1", [id])?;
+    Ok(())
+}
+
 fn create_memory_record(
     tx: &Transaction<'_>,
     event: &Event,
@@ -1324,6 +1343,7 @@ fn create_memory_record(
             epoch_micros(event.ts.as_ref()),
         ],
     )?;
+    index_memory_record(tx, record)?;
     Ok(())
 }
 
@@ -1362,6 +1382,8 @@ fn update_memory_record(
             id: record.id.clone(),
         });
     }
+    unindex_memory_record(tx, &record.id)?;
+    index_memory_record(tx, record)?;
     Ok(())
 }
 
@@ -1446,6 +1468,10 @@ fn upsert_memory_record(
             id: record.id.clone(),
         });
     }
+    // the supersede target's own row is untouched here — its content didn't
+    // change and it must stay searchable for as_of
+    unindex_memory_record(tx, &record.id)?;
+    index_memory_record(tx, record)?;
     Ok(())
 }
 
@@ -1458,6 +1484,9 @@ fn delete_memory_record(
         "DELETE FROM memory_records WHERE id = ?1 AND last_event_seq < ?2",
         rusqlite::params![&deleted.id, seq_param(event.seq)?],
     )?;
+    if changed > 0 {
+        unindex_memory_record(tx, &deleted.id)?;
+    }
     if changed == 0 {
         if memory_record_exists(tx, &deleted.id)? {
             return Err(Error::StaleMemoryEvent {
@@ -1768,6 +1797,12 @@ mod tests {
 
     fn expected_tables() -> Vec<String> {
         [
+            "memory_fts",
+            "memory_fts_config",
+            "memory_fts_content",
+            "memory_fts_data",
+            "memory_fts_docsize",
+            "memory_fts_idx",
             "memory_records",
             "messages",
             "messages_fts",
