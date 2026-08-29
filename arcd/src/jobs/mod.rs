@@ -154,12 +154,7 @@ impl Supervisor {
     /// if the job isn't live — the same honest signal `steer` gives for an
     /// unknown or already-finished job.
     pub fn cancel(&self, session_id: &str) -> bool {
-        let live = self.live.lock().expect("live");
-        let Some(job) = live.get(session_id) else {
-            return false;
-        };
-        let _ = job.cancel.send(true);
-        true
+        cancel_live(&self.live, session_id)
     }
 
     /// Empties a live job's queued steers (row 6.33) without touching its
@@ -292,6 +287,26 @@ fn route_continues(ctx: &HandbackCtx<'_>, continues: Vec<ContinuedJob>) {
     for cont in continues {
         route_continue(ctx, cont);
     }
+}
+
+/// Acts on every `cancel_job` a turn produced: the cancelled handback
+/// (already existing) lands in the target's own parent and is the
+/// confirmation — no new event is needed here.
+fn route_cancels(ctx: &HandbackCtx<'_>, cancels: Vec<String>) {
+    for session_id in cancels {
+        if !cancel_live(ctx.live, &session_id) {
+            warn!(session_id, "cancel_job named a job that wasn't live");
+        }
+    }
+}
+
+fn cancel_live(live: &LiveMap, session_id: &str) -> bool {
+    let live = live.lock().expect("live");
+    let Some(job) = live.get(session_id) else {
+        return false;
+    };
+    let _ = job.cancel.send(true);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1416,5 +1431,116 @@ mod tests {
             "the job already finished cleanly"
         );
         assert!(!supervisor.cancel("s-never-existed"), "an unknown session");
+    }
+
+    #[tokio::test]
+    async fn a_jobs_own_cancel_job_stops_a_live_sibling_and_its_handback_lands() {
+        use arc_core::provider::{Provider, Thinking};
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        // the sibling: never notified, so it stays live until cancel_job stops it
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let archivist_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: gate,
+            after: Vec::new(),
+        }]);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::cancel_job::CancelJob));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
+                },
+            )])),
+        );
+
+        let bootstrap_provider = ScriptedProvider::scripted(vec![]);
+        let parent_id = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Concierge,
+                None,
+            )
+            .expect("create the parent durably");
+        let sibling = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Archivist,
+                None,
+            )
+            .expect("create the sibling durably");
+        let canceller = engine
+            .create_bound_session(
+                &runner(&bootstrap_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the canceller durably");
+
+        let cancel_args = serde_json::json!({ "session_id": sibling }).to_string();
+        let executor_provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call("c1", 0, "cancel_job", &cancel_args)),
+                Ok(tool_stop()),
+            ],
+            done_reply("stopped it"),
+        ]);
+
+        let runners = BTreeMap::from([
+            (SessionRole::Executor, executor_runner(&executor_provider)),
+            (
+                SessionRole::Archivist,
+                Runner {
+                    role: SessionRole::Archivist,
+                    provider: Arc::clone(&archivist_provider) as Arc<dyn Provider>,
+                    model: "test-model".to_owned(),
+                    thinking: Thinking::Default,
+                    system: None,
+                },
+            ),
+        ]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: sibling.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Archivist,
+            project: "arc".to_owned(),
+            brief: "sit and wait".to_owned(),
+            budget: None,
+        });
+        wait_for_message_count(dir.path(), &sibling, 1).await;
+
+        supervisor.spawn(DispatchedJob {
+            session_id: canceller,
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "stop the sibling".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        assert_eq!(
+            child_user_messages(dir.path(), &parent_id)
+                .into_iter()
+                .filter(|(_, content)| content.contains("stopped: cancelled by the user"))
+                .count(),
+            1,
+            "the sibling's cancelled handback landed in the shared parent"
+        );
     }
 }

@@ -12,6 +12,7 @@ use futures::StreamExt as _;
 
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::memory::render_memory_index;
 use crate::projection::{self, MessageRow, SessionSummary};
@@ -70,6 +71,10 @@ pub struct Engine {
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // live turns only: a drive_turn registers on entry and a drop guard
+    // deregisters on every exit, so a session appears here only while its
+    // turn is actually running
+    cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
     notifier: Option<broadcast::Sender<Notification>>,
 }
 
@@ -102,6 +107,10 @@ pub struct Reply {
     pub grounding_json: String,
     pub jobs: Vec<DispatchedJob>,
     pub continues: Vec<ContinuedJob>,
+    /// `cancel_job` targets a turn validated: the engine only confirms the
+    /// shape, the same as `jobs`/`continues` — whether each is still live,
+    /// and stopping it, is the supervisor's.
+    pub cancels: Vec<String>,
 }
 
 /// A child session `dispatch` created durably during this turn. The engine
@@ -166,6 +175,9 @@ pub enum Error {
     #[error("the model produced no reply")]
     EmptyReply,
 
+    #[error("the turn was cancelled before it produced anything durable")]
+    Cancelled,
+
     #[error("project {project} is not configured")]
     UnknownProject { project: String },
 
@@ -198,6 +210,7 @@ impl Engine {
             role_identities: BTreeMap::new(),
             expert_enabled: false,
             turns: StdMutex::new(HashMap::new()),
+            cancels: StdMutex::new(HashMap::new()),
             notifier: None,
         }
     }
@@ -222,6 +235,21 @@ impl Engine {
     pub fn review_delete(&self, record_id: &str) -> Result<(), Error> {
         self.with_store_mut(|store| store.review_delete(record_id))?;
         self.notify_review_changed()
+    }
+
+    /// Fires a live turn's cancel signal (row 2.5, the user's own Esc, not
+    /// the job supervisor's separate drop-the-future cancel). `true` only if
+    /// `session_id` had a turn actually registered right now — an idle or
+    /// unknown session, or one whose turn already ended, honestly gets `false`.
+    pub fn cancel_turn(&self, session_id: &str) -> bool {
+        let cancels = self.cancels.lock().expect("cancels lock poisoned");
+        match cancels.get(session_id) {
+            Some(tx) => {
+                let _ = tx.send(true);
+                true
+            }
+            None => false,
+        }
     }
 
     fn turn_guard(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -975,8 +1003,21 @@ impl Engine {
         let mut memory = MemoryCounters::default();
         let mut jobs: Vec<DispatchedJob> = Vec::new();
         let mut continues: Vec<ContinuedJob> = Vec::new();
+        let mut cancel_requests: Vec<String> = Vec::new();
         let mut server_calls = ServerCalls::default();
         let mut grounding: Option<String> = None;
+
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        self.cancels
+            .lock()
+            .expect("cancels lock poisoned")
+            .insert(session_id.to_owned(), cancel_tx);
+        // the drop guard is the honest shape: every exit from this loop,
+        // including a `?` early return, must deregister the same entry
+        let _cancel_guard = CancelGuard {
+            cancels: &self.cancels,
+            session_id,
+        };
 
         let reply = loop {
             // the last step offers no tools, so the model has to answer
@@ -999,6 +1040,7 @@ impl Engine {
                     &mut total_usage,
                     &mut server_calls,
                     &mut grounding,
+                    &mut cancel_rx,
                 )
                 .await?;
 
@@ -1006,23 +1048,42 @@ impl Engine {
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
                     steps += 1;
                     span.record("tool_steps", steps);
-                    self.tool_step(
-                        runner,
-                        session_id,
-                        turn_id,
-                        text,
-                        reasoning,
-                        calls,
-                        sources,
-                        grants,
-                        command_prefix,
-                        &mut transcript,
-                        &mut memory,
-                        &mut jobs,
-                        &mut continues,
-                        events,
-                    )
-                    .await?;
+                    let cancelled = self
+                        .tool_step(
+                            runner,
+                            session_id,
+                            turn_id,
+                            text,
+                            reasoning,
+                            calls,
+                            sources,
+                            grants,
+                            command_prefix,
+                            &mut transcript,
+                            &mut memory,
+                            &mut jobs,
+                            &mut continues,
+                            &mut cancel_requests,
+                            events,
+                            &mut cancel_rx,
+                        )
+                        .await?;
+                    if cancelled {
+                        span.record("outcome", "cancelled");
+                        // the step's own text, if any, already landed as a
+                        // durable message above tool_step; nothing new to add
+                        break Ok(Reply {
+                            session_id: session_id.to_owned(),
+                            seq: 0,
+                            usage: total_usage,
+                            partial: true,
+                            step_capped: false,
+                            grounding_json: grounding.clone().unwrap_or_default(),
+                            jobs,
+                            continues,
+                            cancels: cancel_requests,
+                        });
+                    }
                 }
                 Ending::Done(_) => {
                     let elapsed_ms = elapsed_ms_since(turn_start);
@@ -1046,13 +1107,18 @@ impl Engine {
                         grounding_json: grounding.clone().unwrap_or_default(),
                         jobs,
                         continues,
+                        cancels: cancel_requests,
                     });
                 }
-                Ending::Cut if text.is_empty() => {
-                    span.record("outcome", "error");
-                    break Err(Error::EmptyReply);
+                Ending::Cut { cancelled } if text.is_empty() => {
+                    span.record("outcome", if cancelled { "cancelled" } else { "error" });
+                    break Err(if cancelled {
+                        Error::Cancelled
+                    } else {
+                        Error::EmptyReply
+                    });
                 }
-                Ending::Cut => {
+                Ending::Cut { cancelled } => {
                     let elapsed_ms = elapsed_ms_since(turn_start);
                     let seq = self.append_reply(
                         session_id,
@@ -1063,7 +1129,7 @@ impl Engine {
                         elapsed_ms,
                         grounding.clone().unwrap_or_default(),
                     )?;
-                    span.record("outcome", "partial");
+                    span.record("outcome", if cancelled { "cancelled" } else { "partial" });
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
                         session_id: session_id.to_owned(),
@@ -1074,6 +1140,7 @@ impl Engine {
                         grounding_json: grounding.clone().unwrap_or_default(),
                         jobs,
                         continues,
+                        cancels: cancel_requests,
                     });
                 }
                 Ending::Failed(error) => {
@@ -1127,13 +1194,18 @@ impl Engine {
         total_usage: &mut Option<Usage>,
         server_calls: &mut ServerCalls,
         grounding: &mut Option<String>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<(Ending, String, String, Vec<ToolCall>), Error> {
         let mut stream = runner.provider.complete(request).await?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();
         let ending = loop {
-            match stream.next().await {
+            let delta = tokio::select! {
+                _ = cancel_rx.changed() => break Ending::Cut { cancelled: true },
+                delta = stream.next() => delta,
+            };
+            match delta {
                 Some(Ok(CompletionDelta::Text(chunk))) => {
                     text.push_str(&chunk);
                     let _ = events.send(EngineEvent::Delta(chunk)).await;
@@ -1207,7 +1279,7 @@ impl Engine {
                     break Ending::Done(stop);
                 }
                 Some(Err(error)) => break Ending::Failed(error),
-                None => break Ending::Cut,
+                None => break Ending::Cut { cancelled: false },
             }
         };
         Ok((ending, text, reasoning, calls))
@@ -1229,8 +1301,10 @@ impl Engine {
         memory: &mut MemoryCounters,
         jobs: &mut Vec<DispatchedJob>,
         continues: &mut Vec<ContinuedJob>,
+        cancels: &mut Vec<String>,
         events: &mpsc::Sender<EngineEvent>,
-    ) -> Result<(), Error> {
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<bool, Error> {
         if !text.is_empty() {
             self.record(
                 Source::Model,
@@ -1284,12 +1358,29 @@ impl Engine {
         }
 
         let mut results = Vec::with_capacity(calls.len());
+        let mut cancelled = false;
         for call in &calls {
+            if cancelled {
+                break;
+            }
             let ctx = TurnContext {
                 session_id: session_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 grants: grants.cloned(),
                 command_prefix: command_prefix.to_vec(),
+            };
+            let dispatch = self
+                .registry
+                .dispatch(&call.name, call.arguments.clone(), ctx, sources);
+            // dropping `dispatch` here abandons whatever the tool was doing;
+            // a bash child keeps running to its own timeout regardless —
+            // threading cancel into tools themselves is later work
+            let outcome = tokio::select! {
+                outcome = dispatch => outcome,
+                _ = cancel_rx.changed() => {
+                    cancelled = true;
+                    continue;
+                }
             };
             let DispatchOutcome {
                 content,
@@ -1298,10 +1389,8 @@ impl Engine {
                 memory_events,
                 job_request,
                 continue_request,
-            } = self
-                .registry
-                .dispatch(&call.name, call.arguments.clone(), ctx, sources)
-                .await;
+                cancel_request,
+            } = outcome;
             for memory_event in memory_events {
                 memory.observe_event(&memory_event);
                 self.record_memory(Source::Model, memory_event)?;
@@ -1319,6 +1408,9 @@ impl Engine {
                     continues.push(cont);
                 }
                 (outcome, content)
+            } else if let Some(cancel_request) = cancel_request {
+                cancels.push(cancel_request);
+                (ToolOutcome::Ok, content)
             } else {
                 memory.observe_call(&call.name, &call.arguments, &content);
                 (
@@ -1350,6 +1442,34 @@ impl Engine {
             results.push((call.id.clone(), content));
         }
 
+        if cancelled {
+            let answered: HashSet<String> = results.iter().map(|(id, _)| id.clone()).collect();
+            for call in &calls {
+                if answered.contains(call.id.as_str()) {
+                    continue;
+                }
+                let content = "cancelled by the user".to_owned();
+                self.record(
+                    Source::System,
+                    session_event::Event::ToolResultRecorded(ToolResultRecorded {
+                        session_id: session_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        call_id: call.id.clone(),
+                        outcome: ToolOutcome::Error as i32,
+                        content: content.clone(),
+                        truncated: false,
+                    }),
+                )?;
+                let _ = events
+                    .send(EngineEvent::ToolCallEnded {
+                        call_id: call.id.clone(),
+                        outcome: ToolOutcome::Error,
+                    })
+                    .await;
+                results.push((call.id.clone(), content));
+            }
+        }
+
         transcript.push(Message::ToolCalls {
             calls,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
@@ -1357,7 +1477,7 @@ impl Engine {
         for (call_id, content) in results {
             transcript.push(Message::ToolResult { call_id, content });
         }
-        Ok(())
+        Ok(cancelled)
     }
 
     fn enforce_pin(&self, runner: &Runner, session_id: &str) -> Result<(), Error> {
@@ -1823,8 +1943,24 @@ impl MemoryCounters {
 
 enum Ending {
     Done(Stop),
-    Cut,
+    Cut { cancelled: bool },
     Failed(provider::Error),
+}
+
+/// Deregisters a turn's cancel signal on every exit from `drive_turn`,
+/// including an early `?` return.
+struct CancelGuard<'a> {
+    cancels: &'a StdMutex<HashMap<String, watch::Sender<bool>>>,
+    session_id: &'a str,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        self.cancels
+            .lock()
+            .expect("cancels lock poisoned")
+            .remove(self.session_id);
+    }
 }
 
 #[cfg(test)]
@@ -1850,11 +1986,11 @@ mod tests {
     };
     use crate::store::{self, Store};
     use crate::testkit::{
-        Canned, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying,
-        channel, counter_samples, done_reply, drain, engine, engine_with_role, engine_with_tools,
-        engine_with_tools_at, issued, reopened_engine, replay_events, replay_log, resulted, runner,
-        runner_with_role, seed_log, seed_memory_log, seed_memory_log_at, server_called, tool_stop,
-        tools, turn, usage,
+        Canned, Gated, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call,
+        call_carrying, channel, counter_samples, done_reply, drain, engine, engine_with_role,
+        engine_with_tools, engine_with_tools_at, issued, reopened_engine, replay_events,
+        replay_log, resulted, runner, runner_with_role, seed_log, seed_memory_log,
+        seed_memory_log_at, server_called, tool_stop, tools, turn, usage,
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
@@ -2342,6 +2478,150 @@ mod tests {
 
         assert!(matches!(err, Error::EmptyReply), "got: {err:?}");
         assert_eq!(replay_log(dir.path()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_on_an_idle_session_returns_false() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _run) = engine(&provider, &dir);
+
+        assert!(!engine.cancel_turn("s-never-existed"));
+    }
+
+    #[tokio::test]
+    async fn the_cancel_registry_is_empty_after_a_normal_turn() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("all done")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert!(
+            !engine.cancel_turn(&reply.session_id),
+            "the turn already ended; a second cancel finds nothing registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_stream_lands_the_partial_text_durably_and_ends_the_turn() {
+        // the first turn only exists to learn a session id ahead of time;
+        // the second is the one a background task gets cancelled mid-flight
+        let provider = ScriptedProvider::scripted_steps(vec![
+            Step::Immediate(done_reply("hi")),
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("partial".to_owned()))],
+                notify: Arc::new(tokio::sync::Notify::new()),
+                after: Vec::new(),
+            },
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Arc::new(engine);
+
+        let (tx, _rx) = channel();
+        let session_id = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("first turn")
+            .session_id;
+
+        let (tx, mut rx) = channel();
+        let handle = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let run = run.clone();
+            let session_id = session_id.clone();
+            async move { engine.send_message(&run, Some(&session_id), "go", tx).await }
+        });
+
+        loop {
+            if let EngineEvent::Delta(text) = rx.recv().await.expect("events channel stays open") {
+                assert_eq!(text, "partial");
+                break;
+            }
+        }
+        assert!(engine.cancel_turn(&session_id), "the turn is live");
+
+        let reply = handle
+            .await
+            .expect("task")
+            .expect("a clean partial reply, not an error");
+        assert!(reply.partial);
+
+        let events = replay_log(dir.path());
+        let assistant = appended(events.last().expect("an appended event"));
+        assert!(assistant.partial);
+        assert_eq!(assistant.content, "partial");
+
+        assert!(
+            !engine.cancel_turn(&session_id),
+            "the turn ended; the registry is clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_a_gated_tool_call_closes_the_issued_call_as_cancelled_with_no_orphan()
+     {
+        // never notified: the tool call stalls until the cancel drops it
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::scripted(vec![vec![
+            Ok(call("c1", 0, "slow", "{}")),
+            Ok(tool_stop()),
+        ]]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Gated {
+            name: "slow",
+            notify: Arc::clone(&gate),
+        }));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = Arc::new(engine);
+
+        let (tx, mut rx) = channel();
+        let handle = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let run = run.clone();
+            async move { engine.send_message(&run, None, "go", tx).await }
+        });
+
+        let session_id = loop {
+            if let EngineEvent::Accepted { session_id } =
+                rx.recv().await.expect("events channel stays open")
+            {
+                break session_id;
+            }
+        };
+        loop {
+            if let EngineEvent::ToolCallStarted { .. } =
+                rx.recv().await.expect("events channel stays open")
+            {
+                break;
+            }
+        }
+        assert!(engine.cancel_turn(&session_id), "the turn is live");
+
+        let reply = handle
+            .await
+            .expect("task")
+            .expect("a clean partial reply, not an error");
+        assert!(reply.partial);
+
+        let events = replay_log(dir.path());
+        let results: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::ToolResultRecorded(r) if r.call_id == "c1" => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "the issued call was closed exactly once");
+        assert_eq!(results[0].outcome, ToolOutcome::Error as i32);
+        assert_eq!(results[0].content, "cancelled by the user");
+        assert!(!results[0].truncated);
     }
 
     #[tokio::test]
@@ -3813,6 +4093,7 @@ mod tests {
                         )],
                         job_request: None,
                         continue_request: None,
+                        cancel_request: None,
                     }
                 })
             }
@@ -6348,6 +6629,7 @@ mod tests {
                             intent: Intent::Implement,
                         }),
                         continue_request: None,
+                        cancel_request: None,
                     }
                 })
             }

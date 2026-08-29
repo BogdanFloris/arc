@@ -89,6 +89,7 @@ impl Tool for ContinueJob {
                     session_id: args.session_id,
                     message: args.message,
                 }),
+                cancel_request: None,
             }
         })
     }

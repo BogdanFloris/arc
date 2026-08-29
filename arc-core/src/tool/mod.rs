@@ -55,6 +55,10 @@ pub struct ToolReply {
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
     pub continue_request: Option<ContinueRequest>,
+    /// A validated `cancel_job` target: the engine only carries it out to
+    /// `Reply.cancels`, since acting on it is the supervisor's, not the
+    /// engine's — the engine has no notion of a job being "live".
+    pub cancel_request: Option<String>,
 }
 
 impl ToolReply {
@@ -65,6 +69,7 @@ impl ToolReply {
             memory_events: Vec::new(),
             job_request: None,
             continue_request: None,
+            cancel_request: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl ToolReply {
             memory_events: Vec::new(),
             job_request: None,
             continue_request: None,
+            cancel_request: None,
         }
     }
 }
@@ -86,6 +92,7 @@ pub(crate) struct DispatchOutcome {
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
     pub continue_request: Option<ContinueRequest>,
+    pub cancel_request: Option<String>,
 }
 
 /// Where a tool comes from. A session declares the sources it gets, so a tool
@@ -176,6 +183,7 @@ impl Registry {
                 memory_events: Vec::new(),
                 job_request: None,
                 continue_request: None,
+                cancel_request: None,
             };
         };
         if !sources.contains(&tool.source()) {
@@ -187,6 +195,7 @@ impl Registry {
                 memory_events: Vec::new(),
                 job_request: None,
                 continue_request: None,
+                cancel_request: None,
             };
         }
         let reply = tool.execute(arguments_json, ctx).await;
@@ -199,6 +208,7 @@ impl Registry {
             memory_events: reply.memory_events,
             job_request: reply.job_request,
             continue_request: reply.continue_request,
+            cancel_request: reply.cancel_request,
         }
     }
 

@@ -15,7 +15,7 @@ use super::handback::{
     handback_over_budget,
 };
 use super::status::{JobState, JobStatuses, notify_job_changed};
-use super::{Handles, LiveMap, route_continues, spawn_dispatched};
+use super::{Handles, LiveMap, route_cancels, route_continues, spawn_dispatched};
 
 pub(super) const EVENT_BUFFER: usize = 64;
 /// How long a turn may go without an engine event (a delta, reasoning, or
@@ -77,6 +77,7 @@ pub(super) async fn run_job(
             usage,
             jobs,
             continues,
+            cancels,
         } => {
             spent_tokens += usage_tokens(usage);
             if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
@@ -84,6 +85,7 @@ pub(super) async fn run_job(
             }
             spawn_dispatched(&ctx, jobs);
             route_continues(&ctx, continues);
+            route_cancels(&ctx, cancels);
         }
         TurnOutcome::Failure => {
             end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
@@ -146,6 +148,7 @@ pub(super) async fn run_job(
                 usage,
                 jobs,
                 continues,
+                cancels,
             } => {
                 spent_tokens += usage_tokens(usage);
                 if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
@@ -153,6 +156,7 @@ pub(super) async fn run_job(
                 }
                 spawn_dispatched(&ctx, jobs);
                 route_continues(&ctx, continues);
+                route_cancels(&ctx, cancels);
             }
             TurnOutcome::Failure => {
                 end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
@@ -201,6 +205,7 @@ enum TurnOutcome {
         usage: Option<Usage>,
         jobs: Vec<DispatchedJob>,
         continues: Vec<ContinuedJob>,
+        cancels: Vec<String>,
     },
     Failure,
     Cancelled,
@@ -383,6 +388,7 @@ async fn run_turn(
                 usage: reply.usage,
                 jobs: reply.jobs,
                 continues: reply.continues,
+                cancels: reply.cancels,
             }
         }
         RawOutcome::Sent(Err(error)) => {

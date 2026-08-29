@@ -313,6 +313,7 @@ impl Tool for MemoryWrite {
                 })],
                 job_request: None,
                 continue_request: None,
+                cancel_request: None,
             }
         })
     }
@@ -386,6 +387,7 @@ impl Tool for MemorySupersede {
                 )],
                 job_request: None,
                 continue_request: None,
+                cancel_request: None,
             }
         })
     }

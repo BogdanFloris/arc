@@ -70,8 +70,10 @@ fn url_from_args() -> Result<Option<String>> {
 
 async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> {
     let (commands, command_rx) = mpsc::unbounded_channel();
+    let (control_commands, control_command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut events) = mpsc::unbounded_channel();
-    tokio::spawn(net::run(url, command_rx, event_tx));
+    tokio::spawn(net::run(url.clone(), command_rx, event_tx.clone()));
+    tokio::spawn(net::run_control(url, control_command_rx, event_tx));
 
     let mut app = App::new();
     let _ = commands.send(Command::List);
@@ -103,6 +105,9 @@ async fn run(mut terminal: ratatui::DefaultTerminal, url: String) -> Result<()> 
 
         match command {
             Some(Command::Yank(text)) => yank(&text),
+            Some(command @ Command::CancelTurn { .. }) => {
+                control_commands.send(command).expect("control task alive");
+            }
             Some(command) => commands.send(command).expect("connection task alive"),
             None => {}
         }

@@ -33,6 +33,11 @@ pub enum Command {
     CancelJob {
         session_id: String,
     },
+    /// The user's own Esc on a streaming turn (row 2.5): routed to its own
+    /// connection, since the main one is busy inside `Send` for the whole turn.
+    CancelTurn {
+        session_id: String,
+    },
     DropSteers {
         session_id: String,
     },
@@ -501,6 +506,7 @@ impl App {
             return None;
         }
         match code {
+            KeyCode::Esc if self.status == Status::Streaming => return self.cancel_turn(),
             KeyCode::Esc if self.search.is_some() => self.search = None,
             KeyCode::Enter => return self.submit(),
             KeyCode::Char('i') => self.mode = Mode::Insert,
@@ -1473,6 +1479,14 @@ impl App {
             }
         }
         Some(self.send(content))
+    }
+
+    /// Esc on a streaming turn: fires on the open session, if one is already
+    /// named. A turn still waiting on its own `Accepted` (a brand new
+    /// session) has nothing to name yet, so Esc is a no-op there.
+    fn cancel_turn(&mut self) -> Option<Command> {
+        let session_id = self.session_id.clone()?;
+        Some(Command::CancelTurn { session_id })
     }
 
     fn send(&mut self, content: String) -> Command {
@@ -6068,6 +6082,46 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(app.search.is_none());
         assert_eq!(app.search_block(), None);
+    }
+
+    #[test]
+    fn esc_while_streaming_emits_cancel_turn_for_the_open_session() {
+        let mut app = App::new();
+        app.mode = Mode::Normal;
+        app.session_id = Some("s-live".to_owned());
+        app.status = Status::Streaming;
+
+        let command = app.on_key(key(KeyCode::Esc));
+
+        assert_eq!(
+            command,
+            Some(Command::CancelTurn {
+                session_id: "s-live".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn esc_while_streaming_with_no_named_session_yet_is_a_no_op() {
+        let mut app = App::new();
+        app.mode = Mode::Normal;
+        app.status = Status::Streaming;
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+    }
+
+    #[test]
+    fn esc_while_idle_keeps_clearing_the_search_not_cancelling() {
+        let mut app = conversation();
+        app.session_id = Some("s-live".to_owned());
+        search(&mut app, "question");
+        assert!(app.search.is_some());
+        assert_eq!(app.status, Status::Idle);
+
+        let command = app.on_key(key(KeyCode::Esc));
+
+        assert_eq!(command, None, "idle Esc never cancels a turn");
+        assert!(app.search.is_none());
     }
 
     #[test]

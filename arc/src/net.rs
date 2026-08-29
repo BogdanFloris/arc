@@ -56,6 +56,46 @@ pub async fn run(
     }
 }
 
+/// A second connection, for `CancelTurn` alone: the main task in `run` is
+/// busy inside `send()` for the whole streaming turn Esc needs to interrupt,
+/// so a cancel needs a socket of its own. Connects lazily, on first use.
+pub async fn run_control(
+    url: String,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    events: mpsc::UnboundedSender<NetEvent>,
+) {
+    let mut client: Option<Client> = None;
+    while let Some(command) = commands.recv().await {
+        let Command::CancelTurn { session_id } = command else {
+            continue;
+        };
+        let mut connected = match client.take() {
+            Some(connected) => connected,
+            None => match Client::connect(&url).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    let _ = events.send(NetEvent::Disconnected {
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            },
+        };
+        match connected.cancel_turn(&session_id).await {
+            Ok(()) => client = Some(connected),
+            Err(Error::Server { code, msg }) => {
+                let _ = events.send(NetEvent::Failed { code, msg });
+                client = Some(connected);
+            }
+            Err(error) => {
+                let _ = events.send(NetEvent::Disconnected {
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
 async fn connect(url: &str, events: &mpsc::UnboundedSender<NetEvent>) -> Option<Client> {
     let mut client = match Client::connect(url).await {
         Ok(client) => client,
@@ -142,7 +182,8 @@ async fn handle(
             disposition,
         } => mark_branch(&mut client, &session_id, disposition, events).await,
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
-        Command::Yank(_) => Ok(()),
+        // and CancelTurn goes to run_control's own connection instead
+        Command::CancelTurn { .. } | Command::Yank(_) => Ok(()),
     };
     match result {
         Ok(()) => Some(client),
@@ -523,6 +564,59 @@ mod tests {
             next_event(&mut events).await,
             NetEvent::JobItems(vec![job]),
             "a browsing command, not a send, drove the reconnect"
+        );
+
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("server finishes within PATIENCE")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn run_control_sends_cancel_turn_and_surfaces_a_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("local addr"));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let frame = expect_frame(&mut ws).await;
+            assert!(
+                matches!(
+                    &frame.msg,
+                    Some(client_frame::Msg::CancelTurn(c)) if c.session_id == "s-idle"
+                ),
+                "got: {:?}",
+                frame.msg
+            );
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::Error(arc_proto::v1::Error {
+                    code: "no_turn".to_owned(),
+                    msg: "no turn is running on session s-idle".to_owned(),
+                }),
+            )
+            .await;
+        });
+
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        tokio::spawn(run_control(url, command_rx, event_tx));
+
+        commands
+            .send(Command::CancelTurn {
+                session_id: "s-idle".to_owned(),
+            })
+            .expect("control task alive");
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::Failed {
+                code: "no_turn".to_owned(),
+                msg: "no turn is running on session s-idle".to_owned(),
+            }
         );
 
         tokio::time::timeout(PATIENCE, server)

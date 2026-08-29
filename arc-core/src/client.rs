@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
 use arc_proto::v1::{
-    CancelJob, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession, JobInfo,
-    ListJobs, ListSessions, MarkBranch, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
-    MemoryReviewList, Notification, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionRole, Subscribe, branch_marked, client_frame, server_frame,
+    CancelJob, CancelTurn, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession,
+    JobInfo, ListJobs, ListSessions, MarkBranch, MemoryReviewAccept, MemoryReviewDelete,
+    MemoryReviewItem, MemoryReviewList, Notification, SendMessage, ServerFrame, SessionHistory,
+    SessionInfo, SessionRole, Subscribe, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -208,6 +208,18 @@ impl Client {
     pub async fn cancel_job(&mut self, session_id: &str) -> Result<(), Error> {
         let id = self
             .send(client_frame::Msg::CancelJob(CancelJob {
+                session_id: session_id.to_owned(),
+            }))
+            .await?;
+        self.verdict_ack(id).await
+    }
+
+    /// The user's own Esc (row 2.5): a graceful cut on `session_id`'s own
+    /// live turn, distinct from `cancel_job`'s stop on a dispatched job.
+    #[tracing::instrument(name = "client.cancel_turn", skip_all, fields(session_id))]
+    pub async fn cancel_turn(&mut self, session_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::CancelTurn(CancelTurn {
                 session_id: session_id.to_owned(),
             }))
             .await?;
@@ -780,6 +792,41 @@ mod tests {
                     if m.session_id == "s-root"
                         && m.disposition == branch_marked::Disposition::Abandoned as i32
             ),
+            "got: {:?}",
+            sent[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_acks_and_a_refusal_is_a_server_error() {
+        let (url, handle) = server(vec![
+            vec![echo(accepted("s-live"))],
+            vec![echo(error(
+                "no_turn",
+                "no turn is running on session s-idle",
+            ))],
+        ])
+        .await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        client.cancel_turn("s-live").await.expect("cancel");
+        match client.cancel_turn("s-idle").await {
+            Err(Error::Server { code, .. }) => assert_eq!(code, "no_turn"),
+            other => panic!("expected Error::Server, got {other:?}"),
+        }
+
+        let sent: Vec<_> = received(handle)
+            .await
+            .into_iter()
+            .map(|frame| frame.msg.expect("a message"))
+            .collect();
+        assert!(
+            matches!(&sent[0], client_frame::Msg::CancelTurn(c) if c.session_id == "s-live"),
+            "got: {:?}",
+            sent[0]
+        );
+        assert!(
+            matches!(&sent[1], client_frame::Msg::CancelTurn(c) if c.session_id == "s-idle"),
             "got: {:?}",
             sent[1]
         );

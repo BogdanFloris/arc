@@ -379,6 +379,39 @@ impl Tool for Canned {
     }
 }
 
+/// A tool that blocks on a `Notify` before returning: drives a cancel test,
+/// where the turn needs to be caught mid-dispatch and never notified.
+pub struct Gated {
+    pub name: &'static str,
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl Tool for Gated {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
+
+    fn execute(
+        &self,
+        _arguments_json: String,
+        _ctx: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
+        let notify = Arc::clone(&self.notify);
+        Box::pin(async move {
+            notify.notified().await;
+            ToolReply::ok("done".to_owned())
+        })
+    }
+}
+
 /// Echoes `ctx.command_prefix` back as its reply, joined by commas, so tests
 /// can see what a real turn resolved without a subprocess.
 pub struct PrefixEcho {

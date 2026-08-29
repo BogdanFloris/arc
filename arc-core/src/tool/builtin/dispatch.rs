@@ -186,6 +186,7 @@ impl Tool for Dispatch {
                     intent,
                 }),
                 continue_request: None,
+                cancel_request: None,
             }
         })
     }

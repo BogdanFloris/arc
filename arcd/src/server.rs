@@ -267,6 +267,9 @@ async fn request(
         Some(client_frame::Msg::MarkBranch(mark)) => {
             mark_branch(ws, engine, frame.request_id, mark).await
         }
+        Some(client_frame::Msg::CancelTurn(cancel)) => {
+            cancel_turn(ws, engine, frame.request_id, &cancel.session_id).await
+        }
         // no reply frame: the subscription's frames are the notifications,
         // pushed from the connection loop's select, not from here
         Some(client_frame::Msg::Subscribe(_)) => {
@@ -324,6 +327,11 @@ async fn send_message(
             }
             for cont in reply.continues {
                 supervisor.continue_job(cont);
+            }
+            for id in reply.cancels {
+                if !supervisor.cancel(&id) {
+                    warn!(session_id = %id, "cancel_job named a job that wasn't live");
+                }
             }
             msg
         }
@@ -490,6 +498,27 @@ async fn cancel_job(
         })
     } else {
         error_frame("unknown_job", format!("no live job named {session_id}"))
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+/// The user's own Esc (row 2.5): a graceful cut on the session's own live
+/// turn, distinct from `cancel_job`'s drop-the-future stop on a job.
+async fn cancel_turn(
+    ws: &mut Socket,
+    engine: &Engine,
+    request_id: u64,
+    session_id: &str,
+) -> ControlFlow<()> {
+    let msg = if engine.cancel_turn(session_id) {
+        server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: session_id.to_owned(),
+        })
+    } else {
+        error_frame(
+            "no_turn",
+            format!("no turn is running on session {session_id}"),
+        )
     };
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -734,6 +763,7 @@ fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
         SessionError::EmptyReply => "empty_reply",
+        SessionError::Cancelled => "cancelled",
         SessionError::RoleMismatch { .. } => "role_mismatch",
         SessionError::ModelMismatch { .. } => "model_mismatch",
         SessionError::Provider(_) => "provider",
@@ -762,6 +792,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::CreateSession(_)) => "create_session",
         Some(client_frame::Msg::ForkSession(_)) => "fork_session",
         Some(client_frame::Msg::MarkBranch(_)) => "mark_branch",
+        Some(client_frame::Msg::CancelTurn(_)) => "cancel_turn",
         None => "unknown",
     }
 }
@@ -811,11 +842,11 @@ mod tests {
     use arc_core::store::Store;
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
-        CancelJob, DropSteers, Event, FetchHistory, HistoryEntry, HistoryMessage, HistoryToolCall,
-        HistoryToolResult, ListJobs, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
-        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Notification, Role,
-        SessionCreated, SessionEvent, SessionRole, Source, Subscribe, ToolOutcome, event, job_info,
-        memory_event, memory_record, notification, session_event,
+        CancelJob, CancelTurn, DropSteers, Event, FetchHistory, HistoryEntry, HistoryMessage,
+        HistoryToolCall, HistoryToolResult, ListJobs, ListSessions, MemoryEvent, MemoryRecord,
+        MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList,
+        Notification, Role, SessionCreated, SessionEvent, SessionRole, Source, Subscribe,
+        ToolOutcome, event, job_info, memory_event, memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1067,6 +1098,63 @@ mod tests {
             Self {
                 addr,
                 provider,
+                supervisor,
+                shutdown: Some(shutdown),
+                server,
+                dir,
+            }
+        }
+
+        /// Like `with_seed`, but the concierge's own provider is given
+        /// directly: lets a test gate the concierge's turn itself (not a
+        /// job's), which `Script`/`MockProvider` has no equivalent of. The
+        /// harness's `provider` field is a placeholder, unused by callers of
+        /// this constructor.
+        async fn with_concierge_provider(
+            concierge_provider: Arc<dyn Provider>,
+            registry: Registry,
+        ) -> Self {
+            let dir = TempDir::new().expect("temp dir");
+            let log = Log::open(dir.path()).expect("open log");
+            let index = dir.path().join("index.db");
+            let mut projection = Projection::open(&index).expect("open projection");
+            arc_core::projection::replay(log.reader().expect("reader"), &mut projection)
+                .expect("replay");
+            let (notifier, _receiver) = broadcast::channel(256);
+            let engine = Arc::new(
+                Engine::new(Store::new(log, projection), registry).with_notifier(notifier.clone()),
+            );
+            let runner = Runner {
+                role: SessionRole::Concierge,
+                provider: concierge_provider,
+                model: "test-model".to_owned(),
+                thinking: Thinking::Default,
+                system: Some("be terse".to_owned()),
+            };
+            let reads = Arc::new(Reader::open(&index).expect("open reads"));
+            let supervisor = Arc::new(
+                Supervisor::new(Arc::clone(&engine), BTreeMap::new())
+                    .with_notifier(notifier.clone()),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let (shutdown, signal) = oneshot::channel();
+            let server = tokio::spawn(serve(
+                listener,
+                engine,
+                runner,
+                reads,
+                Arc::clone(&supervisor),
+                notifier,
+                async {
+                    let _ = signal.await;
+                },
+            ));
+
+            Self {
+                addr,
+                provider: MockProvider::new(Script::Echo),
                 supervisor,
                 shutdown: Some(shutdown),
                 server,
@@ -2482,6 +2570,101 @@ mod tests {
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.request_id, 1);
         assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_on_a_live_concierge_turn_ends_it_as_a_partial_reply() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&gate),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]) as Arc<dyn Provider>;
+
+        let mut harness =
+            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let accepted = next_frame(&mut ws).await;
+        let session_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+
+        wait_for_child_message_count(&harness, &session_id, 1).await;
+
+        let mut cancel_ws = harness.connect().await;
+        send(
+            &mut cancel_ws,
+            2,
+            client_frame::Msg::CancelTurn(CancelTurn {
+                session_id: session_id.clone(),
+            }),
+        )
+        .await;
+        let answer = next_frame(&mut cancel_ws).await;
+        assert_eq!(answer.request_id, 2);
+        match answer.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, session_id),
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+
+        let mut text = String::new();
+        let closing = loop {
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.request_id, 1);
+            match frame.msg {
+                Some(server_frame::Msg::Delta(delta)) => text.push_str(&delta.text),
+                Some(closing) => break closing,
+                None => panic!("a server frame with no message"),
+            }
+        };
+        assert_eq!(text, "working");
+        assert!(
+            ended(closing).partial,
+            "the cancelled turn lands as a partial reply, not an error"
+        );
+
+        let assistant = harness
+            .logged_events()
+            .into_iter()
+            .find_map(|event| match event {
+                session_event::Event::MessageAppended(m)
+                    if m.session_id == session_id && m.role == Role::Assistant as i32 =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            })
+            .expect("the partial reply landed durably");
+        assert_eq!(assistant.content, "working");
+        assert!(assistant.partial);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_on_an_idle_session_is_an_honest_error() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::CancelTurn(CancelTurn {
+                session_id: "s-unknown".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        assert_eq!(failed(frame.msg.expect("a message")).code, "no_turn");
 
         harness.stop().await;
     }

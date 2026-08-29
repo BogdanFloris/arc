@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::status::JobStatuses;
 use super::turn::{BudgetBreach, EVENT_BUFFER};
-use super::{Handles, LiveMap, route_continues, spawn_job};
+use super::{Handles, LiveMap, route_cancels, route_continues, spawn_job};
 
 pub(super) const NO_REPLY: &str = "(the job produced no reply)";
 
@@ -283,6 +283,7 @@ async fn run_one_handback_turn(
                 );
             }
             route_continues(ctx, reply.continues);
+            route_cancels(ctx, reply.cancels);
         }
         Err(error) => warn!(parent_session, %error, "handback turn failed"),
     }
