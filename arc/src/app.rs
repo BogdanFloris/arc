@@ -1605,15 +1605,22 @@ fn block_yank_text(block: &Block) -> Option<String> {
 
 /// The first meaningful string value in the call's arguments: the bash
 /// command, the read/write/edit path, and so on for anything shaped alike.
+// the map is a BTreeMap, so "first value" is alphabetical-key order —
+// `project` would beat `question`; known payload keys are tried first
+const SUMMARY_KEYS: &[&str] = &["question", "command", "query", "brief", "path", "id"];
+
 fn tool_summary(arguments_json: &str) -> String {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arguments_json) else {
         return String::new();
     };
-    map.values()
-        .find_map(|value| match value {
-            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-            _ => None,
-        })
+    let string_of = |value: &serde_json::Value| match value {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    SUMMARY_KEYS
+        .iter()
+        .find_map(|key| map.get(*key).and_then(string_of))
+        .or_else(|| map.values().find_map(string_of))
         .unwrap_or_default()
 }
 
@@ -2246,6 +2253,20 @@ mod tests {
             tool_summary(r#"{"count":3}"#),
             "",
             "no string field to show"
+        );
+    }
+
+    #[test]
+    fn the_summary_prefers_the_payload_key_over_alphabetical_order() {
+        assert_eq!(
+            tool_summary(r#"{"project":"arc","question":"is this the simplest?"}"#),
+            "is this the simplest?",
+            "consult_expert shows what was asked, not where"
+        );
+        assert_eq!(
+            tool_summary(r#"{"namespace":"global","zz":"other"}"#),
+            "global",
+            "no known key falls back to the first string value, as before"
         );
     }
 
