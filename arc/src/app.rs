@@ -428,7 +428,7 @@ impl App {
             KeyCode::Char('p') if self.searching => self.search_live_step(false),
             KeyCode::Char('n') if self.picker.is_some() => self.move_picker_selection(false),
             KeyCode::Char('p') if self.picker.is_some() => self.move_picker_selection(true),
-            KeyCode::Char('p') => self.open_picker(),
+            KeyCode::Char('p') => return self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
             }
@@ -533,7 +533,7 @@ impl App {
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
-            KeyCode::Char('s') => self.open_picker(),
+            KeyCode::Char('s') => return self.open_picker(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('J') => return Some(self.open_jobs()),
             KeyCode::Char('M') => return Some(self.open_review()),
@@ -1268,14 +1268,17 @@ impl App {
         picker.selected = picker.selected.min(last);
     }
 
-    fn open_picker(&mut self) {
+    // refreshes on every open: a branch forked seconds ago must be in the tree
+    fn open_picker(&mut self) -> Option<Command> {
         if self.status != Status::Streaming && self.review.is_none() && self.jobs.is_none() {
             self.picker = Some(Picker {
                 selected: 0,
                 filtering: false,
                 show_all: false,
             });
+            return Some(Command::List);
         }
+        None
     }
 
     pub fn picker_session(&self, row: usize) -> Option<&SessionInfo> {
@@ -2913,6 +2916,18 @@ mod tests {
         app.on_key(key(KeyCode::Char('q')));
         assert!(!app.help);
         assert_eq!(app.help_scroll, 0, "closing forgets the scroll");
+    }
+
+    #[test]
+    fn opening_the_picker_requests_a_fresh_session_list() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('s'))),
+            Some(Command::List),
+            "a branch forked seconds ago must appear without a restart"
+        );
+        assert!(app.picker.is_some());
     }
 
     #[test]
