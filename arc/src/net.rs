@@ -85,6 +85,12 @@ fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>
         Some(notification::Event::ReviewChanged(changed)) => {
             let _ = events.send(NetEvent::ReviewChanged(changed.pending));
         }
+        Some(notification::Event::JobReasoning(delta)) => {
+            let _ = events.send(NetEvent::JobReasoning {
+                session_id: delta.session_id,
+                text: delta.text,
+            });
+        }
         None => {}
     }
 }
@@ -458,6 +464,29 @@ mod tests {
             .await
             .expect("server finishes within PATIENCE")
             .expect("server task");
+    }
+
+    #[test]
+    fn a_pushed_job_reasoning_notification_dispatches_with_its_session_id() {
+        let (events, mut rx) = mpsc::unbounded_channel();
+        dispatch(
+            Notification {
+                event: Some(notification::Event::JobReasoning(
+                    arc_proto::v1::ReasoningDelta {
+                        session_id: "s-job".to_owned(),
+                        text: "weighing options".to_owned(),
+                    },
+                )),
+            },
+            &events,
+        );
+        assert_eq!(
+            rx.try_recv().expect("dispatched"),
+            NetEvent::JobReasoning {
+                session_id: "s-job".to_owned(),
+                text: "weighing options".to_owned(),
+            }
+        );
     }
 
     #[test]

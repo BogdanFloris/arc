@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arc_core::provider::Usage;
 use arc_core::session::{ContinuedJob, DispatchedJob, Engine, EngineEvent, Runner};
-use arc_proto::v1::{Budget, Notification, SessionRole};
+use arc_proto::v1::{Budget, Notification, ReasoningDelta, SessionRole, notification};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -283,6 +283,19 @@ fn handle_job_event(
             *pending_tool_calls = pending_tool_calls.saturating_sub(1);
             ctx.statuses.touch_engine(session_id);
         }
+        // no socket initiated this turn, so the broadcast is the only path
+        // a watching client has to the model's thinking
+        EngineEvent::Reasoning(text) => {
+            ctx.statuses.touch_engine(session_id);
+            if let Some(notifier) = ctx.notifier {
+                let _ = notifier.send(Notification {
+                    event: Some(notification::Event::JobReasoning(ReasoningDelta {
+                        session_id: session_id.to_owned(),
+                        text: text.clone(),
+                    })),
+                });
+            }
+        }
         _ => ctx.statuses.touch_engine(session_id),
     }
     debug!(session_id = %session_id, ?event, "job event");
@@ -480,6 +493,55 @@ mod tests {
         GatedTool, child_session, child_user_messages, engine_for_project, executor_runner,
         only_job, parent_session, wait_for_message_count, wait_for_tool_call_issued,
     };
+
+    #[tokio::test]
+    async fn a_jobs_reasoning_deltas_broadcast_with_its_session_id() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![vec![
+            Ok(CompletionDelta::Reasoning("weighing".to_owned())),
+            Ok(CompletionDelta::Reasoning(" options".to_owned())),
+            Ok(CompletionDelta::Text("done".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]);
+
+        let (notifier, mut notifications) = broadcast::channel(64);
+        let engine = engine_for_project(&dir, &root);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: "s-parent".to_owned(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "fix the failing test".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let mut reasoning = Vec::new();
+        while let Ok(received) = notifications.try_recv() {
+            if let Some(arc_proto::v1::notification::Event::JobReasoning(delta)) = received.event {
+                assert_eq!(delta.session_id, child_id, "tagged with the job's session");
+                reasoning.push(delta.text);
+            }
+        }
+        assert_eq!(
+            reasoning.concat(),
+            "weighing options",
+            "every reasoning delta fanned out, in order"
+        );
+    }
 
     #[tokio::test]
     async fn a_failed_turn_drops_queued_steers_and_removes_the_live_entry() {

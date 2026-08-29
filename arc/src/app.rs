@@ -83,6 +83,10 @@ pub enum NetEvent {
     SessionAppended {
         session_id: String,
     },
+    JobReasoning {
+        session_id: String,
+        text: String,
+    },
     JobChanged(JobInfo),
     SessionCreated {
         session_id: String,
@@ -1257,24 +1261,15 @@ impl App {
             }
             NetEvent::Reasoning(text) => {
                 self.streamed_chars += text.chars().count();
-                if let Some(Block::Thought {
-                    text: thinking,
-                    seconds,
-                    done: false,
-                    ..
-                }) = self.transcript.last_mut()
-                {
-                    thinking.push_str(&text);
-                    *seconds = Self::thought_seconds(self.thinking_since);
-                } else {
-                    self.pop_empty_reply();
-                    self.thinking_since = Some(Instant::now());
-                    self.transcript.push(Block::Thought {
-                        text,
-                        seconds: 1,
-                        done: false,
-                        open: false,
-                    });
+                self.stream_thought(text);
+                None
+            }
+            // a watched job's thinking, pushed over the subscription; only
+            // the session on screen renders it, and never over an own turn
+            NetEvent::JobReasoning { session_id, text } => {
+                let open = self.session_id.as_deref() == Some(session_id.as_str());
+                if open && self.status != Status::Streaming {
+                    self.stream_thought(text);
                 }
                 None
             }
@@ -1425,6 +1420,28 @@ impl App {
         self.status = status;
         let next = self.queued.pop_front()?;
         Some(self.send(next))
+    }
+
+    fn stream_thought(&mut self, text: String) {
+        if let Some(Block::Thought {
+            text: thinking,
+            seconds,
+            done: false,
+            ..
+        }) = self.transcript.last_mut()
+        {
+            thinking.push_str(&text);
+            *seconds = Self::thought_seconds(self.thinking_since);
+        } else {
+            self.pop_empty_reply();
+            self.thinking_since = Some(Instant::now());
+            self.transcript.push(Block::Thought {
+                text,
+                seconds: 1,
+                done: false,
+                open: false,
+            });
+        }
     }
 
     fn finalize_thinking(&mut self) {
@@ -2342,6 +2359,54 @@ mod tests {
         app.on_net(NetEvent::Reasoning("thinking".to_owned())); // 8 chars
         app.on_net(NetEvent::Delta("hello world".to_owned())); // 11 chars
         assert_eq!(app.streamed_tokens_estimate(), (8 + 11) / 4);
+    }
+
+    #[test]
+    fn watched_job_reasoning_streams_a_thought_block_for_the_open_session_only() {
+        let mut app = App::new();
+        app.session_id = Some("s-job".to_owned());
+
+        app.on_net(NetEvent::JobReasoning {
+            session_id: "s-other".to_owned(),
+            text: "not mine".to_owned(),
+        });
+        assert!(
+            app.transcript.is_empty(),
+            "another session's thinking never lands on screen"
+        );
+
+        app.on_net(NetEvent::JobReasoning {
+            session_id: "s-job".to_owned(),
+            text: "weighing".to_owned(),
+        });
+        app.on_net(NetEvent::JobReasoning {
+            session_id: "s-job".to_owned(),
+            text: " options".to_owned(),
+        });
+        assert!(
+            matches!(
+                app.transcript.as_slice(),
+                [Block::Thought { text, done: false, .. }] if text == "weighing options"
+            ),
+            "one open thought block accumulates the deltas, got {:?}",
+            app.transcript
+        );
+    }
+
+    #[test]
+    fn watched_job_reasoning_is_dropped_while_an_own_turn_streams() {
+        let mut app = App::new();
+        app.session_id = Some("s-job".to_owned());
+        app.status = Status::Streaming;
+
+        app.on_net(NetEvent::JobReasoning {
+            session_id: "s-job".to_owned(),
+            text: "late".to_owned(),
+        });
+        assert!(
+            app.transcript.is_empty(),
+            "a watched push must not interleave with an own turn's stream"
+        );
     }
 
     #[test]

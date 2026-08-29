@@ -93,6 +93,8 @@ message Notification {
     JobInfo job_changed = 2;
     // the review queue changed; `pending` is its new size
     ReviewChanged review_changed = 3;
+    // a job session's model is thinking; ephemeral, never in the log
+    ReasoningDelta job_reasoning = 4;
   }
 }
 
