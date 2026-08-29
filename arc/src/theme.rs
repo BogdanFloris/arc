@@ -28,6 +28,8 @@ pub const EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
 
 pub const MARKER: Style = Style::new().fg(Color::DarkGray);
 
+pub const LINK: Style = Style::new().add_modifier(Modifier::UNDERLINED);
+
 pub const SYN_COMMENT: Style = Style::new().fg(Color::DarkGray);
 
 pub const SYN_STRING: Style = Style::new().fg(Color::Green);
