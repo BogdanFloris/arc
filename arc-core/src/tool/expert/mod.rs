@@ -185,7 +185,7 @@ async fn run(spec: &CounselSpec, question: &str, root: &Path, timeout: Duration)
     let start = std::time::Instant::now();
     let reply = match spec.command {
         CounselCommand::Claude => run_claude(spec, question, root, timeout).await,
-        CounselCommand::Codex => run_codex(question, root, timeout).await,
+        CounselCommand::Codex => run_codex(spec, question, root, timeout).await,
     };
     tracing::info!(
         command = spec.command.label(),
@@ -226,11 +226,13 @@ fn claude_argv(spec: &CounselSpec, question: &str) -> Vec<String> {
     argv
 }
 
-fn codex_argv(question: &str, root: &Path, result_file: &Path) -> Vec<String> {
+fn codex_argv(spec: &CounselSpec, question: &str, root: &Path, result_file: &Path) -> Vec<String> {
     vec![
         "codex".to_owned(),
         "exec".to_owned(),
         question.to_owned(),
+        "-m".to_owned(),
+        spec.model.clone(),
         "-s".to_owned(),
         "read-only".to_owned(),
         "--json".to_owned(),
@@ -266,7 +268,12 @@ async fn run_claude(
     }
 }
 
-async fn run_codex(question: &str, root: &Path, timeout: Duration) -> ToolReply {
+async fn run_codex(
+    spec: &CounselSpec,
+    question: &str,
+    root: &Path,
+    timeout: Duration,
+) -> ToolReply {
     let temp = match tempfile::tempdir() {
         Ok(temp) => temp,
         Err(error) => {
@@ -276,7 +283,7 @@ async fn run_codex(question: &str, root: &Path, timeout: Duration) -> ToolReply 
         }
     };
     let result_file = temp.path().join("result.json");
-    let argv = codex_argv(question, root, &result_file);
+    let argv = codex_argv(spec, question, root, &result_file);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.current_dir(root);
@@ -561,13 +568,20 @@ mod tests {
     fn codex_argv_carries_the_load_bearing_flags() {
         let root = std::path::Path::new("/tmp/proj");
         let result_file = std::path::Path::new("/tmp/scratch/result.json");
-        let argv = codex_argv("what is broken?", root, result_file);
+        let argv = codex_argv(
+            &spec(CounselCommand::Codex, None),
+            "what is broken?",
+            root,
+            result_file,
+        );
         assert_eq!(
             argv,
             [
                 "codex",
                 "exec",
                 "what is broken?",
+                "-m",
+                "opus",
                 "-s",
                 "read-only",
                 "--json",
@@ -887,7 +901,13 @@ mod tests {
         let _path_guard = PathGuard::set(&stub_dir);
         let root = TempDir::new().expect("root");
 
-        let reply = run_codex("what is broken?", root.path(), Duration::from_secs(5)).await;
+        let reply = run_codex(
+            &spec(CounselCommand::Codex, None),
+            "what is broken?",
+            root.path(),
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(reply.content.trim_end(), "looks fine from codex");
@@ -904,7 +924,13 @@ mod tests {
         let _path_guard = PathGuard::set(&stub_dir);
         let root = TempDir::new().expect("root");
 
-        let reply = run_codex("q", root.path(), Duration::from_secs(5)).await;
+        let reply = run_codex(
+            &spec(CounselCommand::Codex, None),
+            "q",
+            root.path(),
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert!(!reply.ok);
         assert!(reply.content.contains('7'), "{}", reply.content);
@@ -923,7 +949,13 @@ mod tests {
         let root = TempDir::new().expect("root");
 
         let start = Instant::now();
-        let reply = run_codex("q", root.path(), Duration::from_secs(1)).await;
+        let reply = run_codex(
+            &spec(CounselCommand::Codex, None),
+            "q",
+            root.path(),
+            Duration::from_secs(1),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(!reply.ok);
