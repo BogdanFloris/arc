@@ -40,6 +40,10 @@ pub enum Command {
         role: SessionRole,
         project: String,
     },
+    ForkSession {
+        session_id: String,
+        fork_point: u64,
+    },
     Yank(String),
 }
 
@@ -90,6 +94,9 @@ pub enum NetEvent {
     },
     JobChanged(JobInfo),
     SessionCreated {
+        session_id: String,
+    },
+    SessionForked {
         session_id: String,
     },
 }
@@ -203,6 +210,9 @@ pub enum Mode {
 
 pub struct App {
     pub transcript: Vec<Block>,
+    /// Parallel to `transcript`: the history seq a block came from, `None`
+    /// for one built live — forking reads from history only.
+    seqs: Vec<Option<u64>>,
     pub input: String,
     pub cursor: usize,
     pub mode: Mode,
@@ -214,6 +224,8 @@ pub struct App {
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
     pub help: bool,
+    /// first help line on screen; the draw clamps it to what fits
+    pub help_scroll: usize,
     pub search: Option<Search>,
     /// True while the input line is owned by the search prompt.
     pub searching: bool,
@@ -238,9 +250,15 @@ pub struct App {
     /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
     /// The transcript index visual mode never moves: where `V` was pressed.
+    /// In point visual (`v`) it follows the boundary, so one block is lit.
     visual_anchor: usize,
+    visual_point: bool,
     /// The transcript index `j`/`k`/`gg`/`G` move; the selection spans it to the anchor.
     visual_boundary: usize,
+    /// The selection's boundary block at the moment `:` was pressed from
+    /// visual mode, so a typed command still knows it — by the time Enter
+    /// runs the command, `mode` has already left `Visual`.
+    visual_at_cmd: Option<usize>,
     /// Every session fact seen so far — from a sessions list, a jobs push, or a `:code`
     /// create — so the rule line can name the open door without waiting on a refetch.
     session_meta: HashMap<String, (SessionRole, String, Source)>,
@@ -258,6 +276,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             transcript: Vec::new(),
+            seqs: Vec::new(),
             input: String::new(),
             cursor: 0,
             mode: Mode::Insert,
@@ -269,6 +288,7 @@ impl App {
             review: None,
             jobs: None,
             help: false,
+            help_scroll: 0,
             search: None,
             searching: false,
             status: Status::Idle,
@@ -289,12 +309,26 @@ impl App {
             search_stash: None,
             steer_turn_pending: false,
             visual_anchor: 0,
+            visual_point: false,
             visual_boundary: 0,
+            visual_at_cmd: None,
             session_meta: HashMap::new(),
             pending_code: None,
             pending_first: None,
             review_pending: 0,
         }
+    }
+
+    /// A block built live, off the wire as it streams: no history seq yet,
+    /// so it never survives to be a `:fork` target until a refetch gives it one.
+    fn push_block(&mut self, block: Block) {
+        self.transcript.push(block);
+        self.seqs.push(None);
+    }
+
+    fn pop_block(&mut self) -> Option<Block> {
+        self.seqs.pop();
+        self.transcript.pop()
     }
 
     pub fn on_scroll(&mut self, up: bool, lines: usize) {
@@ -487,11 +521,13 @@ impl App {
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
-            KeyCode::Char('V') if self.status != Status::Streaming => self.enter_visual(),
+            KeyCode::Char('V') if self.status != Status::Streaming => self.enter_visual(false),
+            KeyCode::Char('v') if self.status != Status::Streaming => self.enter_visual(true),
             KeyCode::Char('Y') if self.status != Status::Streaming => return self.yank_all(),
             KeyCode::Char(':') => {
                 self.cmd.clear();
                 self.mode = Mode::Cmd;
+                self.visual_at_cmd = None;
             }
             _ => {}
         }
@@ -512,32 +548,64 @@ impl App {
         }
     }
 
-    fn enter_visual(&mut self) {
+    fn enter_visual(&mut self, point: bool) {
         let Some(last) = self.transcript.len().checked_sub(1) else {
             return;
         };
         self.pending = None;
         self.visual_anchor = last;
         self.visual_boundary = last;
+        self.visual_point = point;
         self.mode = Mode::Visual;
+    }
+
+    fn follow_point(&mut self) {
+        if self.visual_point {
+            self.visual_anchor = self.visual_boundary;
+        }
     }
 
     fn on_visual(&mut self, code: KeyCode) -> Option<Command> {
         if let Some(pending) = self.pending.take() {
             if pending == 'g' && code == KeyCode::Char('g') {
                 self.visual_boundary = 0;
+                self.follow_point();
             }
             return None;
         }
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('j') => {
-                self.visual_boundary = (self.visual_boundary + 1).min(self.visual_anchor);
+                let cap = if self.visual_point {
+                    self.transcript.len().saturating_sub(1)
+                } else {
+                    // a range never extends below its anchor
+                    self.visual_anchor
+                };
+                self.visual_boundary = (self.visual_boundary + 1).min(cap);
+                self.follow_point();
             }
-            KeyCode::Char('k') => self.visual_boundary = self.visual_boundary.saturating_sub(1),
-            KeyCode::Char('G') => self.visual_boundary = self.visual_anchor,
+            KeyCode::Char('k') => {
+                self.visual_boundary = self.visual_boundary.saturating_sub(1);
+                self.follow_point();
+            }
+            KeyCode::Char('G') => {
+                self.visual_boundary = if self.visual_point {
+                    self.transcript.len().saturating_sub(1)
+                } else {
+                    self.visual_anchor
+                };
+                self.follow_point();
+            }
             KeyCode::Char('g') => self.pending = Some('g'),
             KeyCode::Char('y') => return self.yank_visual(),
+            // `visual_boundary()` reads `mode`, which Enter flips to Normal
+            // before the typed command runs — stash the selection now
+            KeyCode::Char(':') => {
+                self.visual_at_cmd = self.visual_boundary();
+                self.cmd.clear();
+                self.mode = Mode::Cmd;
+            }
             _ => {}
         }
         None
@@ -716,6 +784,7 @@ impl App {
                     "review" => return Some(self.open_review()),
                     "jobs" => return Some(self.open_jobs()),
                     "help" => self.help = true,
+                    "fork" => return self.fork_selected(),
                     cmd => match cmd.strip_prefix("code ") {
                         Some(project) => return self.open_code(project.trim()),
                         None => self.last_error = Some("E492".to_owned()),
@@ -740,6 +809,35 @@ impl App {
         let command = self.start_session(None);
         self.pending_code = Some((SessionRole::Executor, project.to_owned()));
         command
+    }
+
+    /// `:fork` (row 2.2): rewind is not separate machinery, it is a fork at
+    /// an earlier seq that the client then opens — the open half rides in
+    /// on `NetEvent::SessionForked`. Only a selected message block with a
+    /// known history seq can be a fork point.
+    fn fork_selected(&mut self) -> Option<Command> {
+        let Some(index) = self.visual_at_cmd.take() else {
+            self.last_error = Some("fork: select a message in visual mode first".to_owned());
+            return None;
+        };
+        let Some(session_id) = self.session_id.clone() else {
+            self.last_error = Some("fork: no open session".to_owned());
+            return None;
+        };
+        let is_message = matches!(
+            self.transcript.get(index),
+            Some(Block::You(_) | Block::Arc { .. })
+        );
+        if let (true, Some(fork_point)) = (is_message, self.seqs.get(index).copied().flatten()) {
+            Some(Command::ForkSession {
+                session_id,
+                fork_point,
+            })
+        } else {
+            self.last_error =
+                Some("fork: select a sent message, not a tool or live block".to_owned());
+            None
+        }
     }
 
     fn open_review(&mut self) -> Command {
@@ -803,8 +901,20 @@ impl App {
     }
 
     fn on_help_key(&mut self, code: KeyCode) -> Option<Command> {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.help = false;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.help = false;
+                self.help_scroll = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('G') => self.help_scroll = usize::MAX,
+            KeyCode::Char('g') => self.help_scroll = 0,
+            _ => {}
         }
         None
     }
@@ -1134,12 +1244,13 @@ impl App {
         }
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
+        self.seqs.clear();
         self.scroll_back = 0;
         self.search = None;
         self.last_error = None;
         self.refetch_in_flight = false;
         let session_id = session_id?;
-        self.transcript.push(Block::Note("loading".to_owned()));
+        self.push_block(Block::Note("loading".to_owned()));
         Some(Command::History { session_id })
     }
 
@@ -1151,7 +1262,7 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.scroll_back = 0;
-        self.transcript.push(Block::You(content.clone()));
+        self.push_block(Block::You(content.clone()));
         if self.status == Status::Streaming {
             self.queued.push_back(content);
             return None;
@@ -1200,7 +1311,7 @@ impl App {
                 entries,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    let rebuilt = history_blocks(entries);
+                    let (rebuilt, rebuilt_seqs) = history_blocks(entries);
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
                         && rebuilt.starts_with(&self.transcript);
@@ -1215,6 +1326,7 @@ impl App {
                                 )
                             });
                     self.transcript = rebuilt;
+                    self.seqs = rebuilt_seqs;
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
                     self.search = kept_search.and_then(|(query, selected_block)| {
@@ -1243,7 +1355,7 @@ impl App {
                 }
                 let created = self.session_id.is_none();
                 self.session_id = Some(session_id);
-                self.transcript.push(Block::Arc {
+                self.push_block(Block::Arc {
                     text: String::new(),
                     partial: false,
                 });
@@ -1255,7 +1367,7 @@ impl App {
                 if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
                     reply.push_str(&text);
                 } else {
-                    self.transcript.push(Block::Arc {
+                    self.push_block(Block::Arc {
                         text,
                         partial: false,
                     });
@@ -1283,7 +1395,7 @@ impl App {
             } => {
                 self.finalize_thinking();
                 self.pop_empty_reply();
-                self.transcript.push(Block::Tool {
+                self.push_block(Block::Tool {
                     call_id,
                     name,
                     args: tool_summary(&arguments_json),
@@ -1318,7 +1430,7 @@ impl App {
                 let elapsed = self.turn_started.take().map(|since| since.elapsed());
                 if let Some(elapsed) = elapsed {
                     if input_tokens != 0 || output_tokens != 0 {
-                        self.transcript.push(Block::Cost {
+                        self.push_block(Block::Cost {
                             input_tokens,
                             output_tokens,
                             seconds: elapsed.as_secs_f32(),
@@ -1326,11 +1438,11 @@ impl App {
                     }
                 }
                 if step_capped {
-                    self.transcript.push(Block::StepCapped);
+                    self.push_block(Block::StepCapped);
                 }
                 let sources = grounding_sources(&grounding_json);
                 if !sources.is_empty() {
-                    self.transcript.push(Block::Sources(sources));
+                    self.push_block(Block::Sources(sources));
                 }
                 self.turn_over(Status::Idle)
             }
@@ -1341,7 +1453,7 @@ impl App {
                 self.pop_empty_reply();
                 self.turn_started = None;
                 self.last_error = Some(code.clone());
-                self.transcript.push(Block::Fault { code, msg });
+                self.push_block(Block::Fault { code, msg });
                 self.turn_over(Status::Idle)
             }
             NetEvent::ReviewItems(items) => {
@@ -1412,10 +1524,13 @@ impl App {
                 let first = self.pending_first.take()?;
                 Some(self.send(first))
             }
+            // the composed gesture that IS rewind: open the branch exactly
+            // like the picker opens any session
+            NetEvent::SessionForked { session_id } => self.start_session(Some(session_id)),
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
                 self.last_error = Some("disconnected".to_owned());
-                self.transcript.push(Block::Fault {
+                self.push_block(Block::Fault {
                     code: "disconnected".to_owned(),
                     msg: reason,
                 });
@@ -1443,7 +1558,7 @@ impl App {
         } else {
             self.pop_empty_reply();
             self.thinking_since = Some(Instant::now());
-            self.transcript.push(Block::Thought {
+            self.push_block(Block::Thought {
                 text,
                 seconds: 1,
                 done: false,
@@ -1485,7 +1600,7 @@ impl App {
 
     fn pop_empty_reply(&mut self) {
         if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty()) {
-            self.transcript.pop();
+            self.pop_block();
             // a shrunk transcript can dangle a selection
             if self.mode == Mode::Visual {
                 self.mode = Mode::Normal;
@@ -1703,9 +1818,14 @@ fn prose_block(message: HistoryMessage) -> Option<Block> {
     }
 }
 
-fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
+// the parallel Vec carries each block's history seq, `None` for a block with
+// no row of its own (a derived Sources/Cost line, or a ToolResult that only
+// mutates its call's block); forking reads only the paired vector's `Some`s
+fn history_blocks(entries: Vec<HistoryEntry>) -> (Vec<Block>, Vec<Option<u64>>) {
     let mut blocks = Vec::new();
+    let mut seqs = Vec::new();
     for entry in entries {
+        let seq = entry.seq;
         match entry.entry {
             Some(history_entry::Entry::Message(message)) => {
                 let input_tokens = message.input_tokens;
@@ -1715,8 +1835,10 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                 if let Some(block) = prose_block(message) {
                     let is_arc = matches!(block, Block::Arc { .. });
                     blocks.push(block);
+                    seqs.push(Some(seq));
                     if is_arc && !sources.is_empty() {
                         blocks.push(Block::Sources(sources));
+                        seqs.push(None);
                     }
                     if is_arc && (input_tokens != 0 || output_tokens != 0) {
                         blocks.push(Block::Cost {
@@ -1724,15 +1846,19 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                             output_tokens,
                             seconds: elapsed_ms as f32 / 1000.0,
                         });
+                        seqs.push(None);
                     }
                 }
             }
-            Some(history_entry::Entry::ToolCall(call)) => blocks.push(Block::Tool {
-                call_id: call.call_id,
-                name: call.name,
-                args: tool_summary(&call.arguments_json),
-                outcome: None,
-            }),
+            Some(history_entry::Entry::ToolCall(call)) => {
+                blocks.push(Block::Tool {
+                    call_id: call.call_id,
+                    name: call.name,
+                    args: tool_summary(&call.arguments_json),
+                    outcome: None,
+                });
+                seqs.push(Some(seq));
+            }
             Some(history_entry::Entry::ToolResult(result)) => {
                 let ended = blocks.iter_mut().rev().find(
                     |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
@@ -1742,12 +1868,15 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
                 }
             }
             // provider-side, arrives resolved; styled like a finished tool line
-            Some(history_entry::Entry::ServerCall(call)) => blocks.push(Block::Tool {
-                call_id: String::new(),
-                name: call.name,
-                args: tool_summary(&call.arguments_json),
-                outcome: Some("web"),
-            }),
+            Some(history_entry::Entry::ServerCall(call)) => {
+                blocks.push(Block::Tool {
+                    call_id: String::new(),
+                    name: call.name,
+                    args: tool_summary(&call.arguments_json),
+                    outcome: Some("web"),
+                });
+                seqs.push(Some(seq));
+            }
             None => {}
         }
     }
@@ -1760,7 +1889,7 @@ fn history_blocks(entries: Vec<HistoryEntry>) -> Vec<Block> {
             *outcome = Some("unknown");
         }
     }
-    blocks
+    (blocks, seqs)
 }
 
 #[cfg(test)]
@@ -2277,6 +2406,7 @@ mod tests {
                     name: "read".to_owned(),
                     arguments_json: r#"{"path":"src/main.rs"}"#.to_owned(),
                 })),
+                seq: 0,
             }],
         });
 
@@ -2375,8 +2505,9 @@ mod tests {
                 elapsed_ms: 0,
                 grounding_json: GROUNDING.to_owned(),
             })),
+            seq: 0,
         }];
-        let blocks = history_blocks(entries);
+        let (blocks, _seqs) = history_blocks(entries);
         assert!(
             matches!(
                 blocks.as_slice(),
@@ -2384,6 +2515,64 @@ mod tests {
             ),
             "got {blocks:?}"
         );
+    }
+
+    #[test]
+    fn point_visual_lights_exactly_one_block_and_walks_both_ways() {
+        let mut app = App::new();
+        app.transcript = vec![
+            Block::You("one".to_owned()),
+            Block::Arc {
+                text: "two".to_owned(),
+                partial: false,
+            },
+            Block::You("three".to_owned()),
+        ];
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.visual_range(), Some((2, 2)), "starts at the last block");
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.visual_range(), Some((1, 1)), "one block, moved up");
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.visual_range(),
+            Some((2, 2)),
+            "walks back down and clamps at the end"
+        );
+    }
+
+    #[test]
+    fn range_visual_still_extends_upward_from_its_anchor() {
+        let mut app = App::new();
+        app.transcript = vec![
+            Block::You("one".to_owned()),
+            Block::Arc {
+                text: "two".to_owned(),
+                partial: false,
+            },
+            Block::You("three".to_owned()),
+        ];
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.visual_range(), Some((1, 2)), "a range, not a point");
+    }
+
+    #[test]
+    fn help_scrolling_moves_and_close_resets_it() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app.help = true;
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.help_scroll, 2);
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(app.help_scroll, 0);
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.help);
+        assert_eq!(app.help_scroll, 0, "closing forgets the scroll");
     }
 
     #[test]
@@ -2966,6 +3155,14 @@ mod tests {
     fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
         HistoryEntry {
             entry: Some(history_entry::Entry::Message(prose(role, content, partial))),
+            seq: 0,
+        }
+    }
+
+    fn prose_entry_at(seq: u64, role: i32, content: &str, partial: bool) -> HistoryEntry {
+        HistoryEntry {
+            seq,
+            ..prose_entry(role, content, partial)
         }
     }
 
@@ -2976,6 +3173,7 @@ mod tests {
                 name: name.to_owned(),
                 arguments_json: String::new(),
             })),
+            seq: 0,
         }
     }
 
@@ -2986,6 +3184,7 @@ mod tests {
                 outcome,
                 truncated: false,
             })),
+            seq: 0,
         }
     }
 
@@ -3035,6 +3234,7 @@ mod tests {
                         140,
                         1500,
                     ))),
+                    seq: 0,
                 },
             ],
         });
@@ -3084,6 +3284,7 @@ mod tests {
                     source: Source::System as i32,
                     ..prose_with_usage(Role::User as i32, "a handback note", 10, 20, 30)
                 })),
+                seq: 0,
             }],
         });
 
@@ -4456,6 +4657,7 @@ mod tests {
     fn handback_entry(content: &str) -> HistoryEntry {
         HistoryEntry {
             entry: Some(history_entry::Entry::Message(handback_message(content))),
+            seq: 0,
         }
     }
 
@@ -4882,6 +5084,94 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
         assert_ne!(app.mode, Mode::Visual);
+    }
+
+    // built through History, not raw pushes: only that path threads real seqs
+    fn conversation_from_history() -> App {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![
+                prose_entry_at(3, Role::User as i32, "question", false),
+                prose_entry_at(4, Role::Assistant as i32, "answer", false),
+                call_entry("t1", "bash"),
+                result_entry("t1", ToolOutcome::Ok as i32),
+            ],
+        });
+        app.on_key(key(KeyCode::Esc));
+        app
+    }
+
+    fn run_fork_command(app: &mut App) -> Option<Command> {
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "fork".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn fork_on_a_selected_message_block_sends_the_command_with_its_seq() {
+        let mut app = conversation_from_history();
+
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.mode, Mode::Visual);
+        // boundary starts on the folded tool block (last); one 'k' lands on
+        // the assistant's answer, seq 4
+        app.on_key(key(KeyCode::Char('k')));
+        let command = run_fork_command(&mut app);
+
+        assert_eq!(
+            command,
+            Some(Command::ForkSession {
+                session_id: "s-1".to_owned(),
+                fork_point: 4,
+            })
+        );
+        assert_eq!(app.mode, Mode::Normal, "the command consumes the selection");
+    }
+
+    #[test]
+    fn fork_on_a_tool_block_is_an_instructive_error() {
+        let mut app = conversation_from_history();
+
+        app.on_key(key(KeyCode::Char('V')));
+        // boundary starts on the last block: the tool result folded into its call
+        let command = run_fork_command(&mut app);
+
+        assert_eq!(command, None);
+        assert!(
+            app.last_error.is_some(),
+            "the block has a seq but is not a message"
+        );
+    }
+
+    #[test]
+    fn fork_outside_visual_mode_is_an_instructive_error() {
+        let mut app = conversation_from_history();
+
+        let command = run_fork_command(&mut app);
+
+        assert_eq!(command, None);
+        assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn a_session_forked_reply_opens_it_like_the_picker_opens_a_session() {
+        let mut app = conversation_from_history();
+
+        let command = app.on_net(NetEvent::SessionForked {
+            session_id: "s-2".to_owned(),
+        });
+
+        assert_eq!(app.session_id.as_deref(), Some("s-2"));
+        assert_eq!(
+            command,
+            Some(Command::History {
+                session_id: "s-2".to_owned(),
+            })
+        );
     }
 
     fn search(app: &mut App, query: &str) {

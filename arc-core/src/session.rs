@@ -175,6 +175,15 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("session {session_id} does not exist; nothing to fork")]
+    UnknownSession { session_id: String },
+
+    #[error(
+        "fork_point {fork_point} is not a message in session {session_id}; fork from a \
+         message, not a tool call or another session's sequence"
+    )]
+    InvalidForkPoint { session_id: String, fork_point: u64 },
 }
 
 impl Engine {
@@ -372,6 +381,69 @@ impl Engine {
                     })
                     .collect(),
                 dispatched_by: dispatched_by.unwrap_or_default().to_owned(),
+            }),
+        )?;
+        Ok(session_id)
+    }
+
+    /// Forks `parent_id` at `fork_point`, a seq of one of its own message rows
+    pub fn fork_session(&self, parent_id: &str, fork_point: u64) -> Result<String, Error> {
+        self.with_store(|store| store.projection().session_role(parent_id))?
+            .ok_or_else(|| Error::UnknownSession {
+                session_id: parent_id.to_owned(),
+            })?;
+        let owner = self.with_store(|store| store.projection().message_owner(fork_point))?;
+        let parent_id = match owner {
+            Some((owner_id, projection::KIND_MESSAGE)) if owner_id == parent_id => owner_id,
+            Some((owner_id, projection::KIND_MESSAGE)) => {
+                let ancestors = self.with_store(|store| store.projection().ancestors(parent_id))?;
+                if !ancestors.contains(&owner_id) {
+                    return Err(Error::InvalidForkPoint {
+                        session_id: parent_id.to_owned(),
+                        fork_point,
+                    });
+                }
+                owner_id
+            }
+            _ => {
+                return Err(Error::InvalidForkPoint {
+                    session_id: parent_id.to_owned(),
+                    fork_point,
+                });
+            }
+        };
+        let parent_id = parent_id.as_str();
+        let role = self
+            .with_store(|store| store.projection().session_role(parent_id))?
+            .ok_or_else(|| Error::UnknownSession {
+                session_id: parent_id.to_owned(),
+            })?;
+        let (provider, model) = self
+            .with_store(|store| store.projection().session_identity(parent_id))?
+            .unwrap_or_default();
+        let project = self
+            .with_store(|store| store.projection().session_project(parent_id))?
+            .unwrap_or_default();
+        let grants = self.with_store(|store| store.projection().session_grants(parent_id))?;
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        self.record(
+            Source::User,
+            session_event::Event::SessionCreated(SessionCreated {
+                session_id: session_id.clone(),
+                parent_session: parent_id.to_owned(),
+                fork_point,
+                title: String::new(),
+                provider,
+                model,
+                role,
+                project,
+                budget: None,
+                grants: grants
+                    .into_iter()
+                    .map(|(root, read_write)| WorkspaceGrant { root, read_write })
+                    .collect(),
+                dispatched_by: String::new(),
             }),
         )?;
         Ok(session_id)
@@ -1436,7 +1508,7 @@ impl Engine {
     ) -> Result<(Vec<Message>, Option<String>), Error> {
         let (rows, memory_index, started_at) = self.with_store(|store| {
             Ok::<_, Error>((
-                store.projection().messages(session_id)?,
+                store.projection().lineage_messages(session_id)?,
                 store.projection().memory_index()?,
                 store.projection().session_started_at(session_id)?,
             ))
@@ -1816,6 +1888,7 @@ mod tests {
                 source: source as i32,
                 ..Default::default()
             })),
+            seq: 0,
         }
     }
 
@@ -1833,6 +1906,7 @@ mod tests {
                 source: source as i32,
                 ..Default::default()
             })),
+            seq: 0,
         }
     }
 
@@ -1851,6 +1925,7 @@ mod tests {
                 output_tokens,
                 ..Default::default()
             })),
+            seq: 0,
         }
     }
 
@@ -2832,6 +2907,7 @@ mod tests {
                         name: "lookup".to_owned(),
                         arguments_json: "{}".to_owned(),
                     })),
+                    seq: 0,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
@@ -2839,6 +2915,7 @@ mod tests {
                         outcome: 42,
                         truncated: true,
                     })),
+                    seq: 0,
                 },
             ]
         );
@@ -4675,6 +4752,282 @@ mod tests {
         assert_eq!(
             result.content, "true colors",
             "the session kept the grants recorded at creation, not the reconfigured ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_the_parents_recorded_identity_grants_and_role() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let creating_provider = ScriptedProvider::scripted(vec![done_reply("first")]);
+        let (creating_engine, _run) =
+            engine_with_tools(&creating_provider, &dir, Registry::new(512));
+        let creating_engine = creating_engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin, ToolSource::Workspace],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_identities(BTreeMap::from([(
+                SessionRole::Executor,
+                ("codex-legacy".to_owned(), "gpt-5-legacy".to_owned()),
+            )]));
+        let creating_run = runner_with_role(&creating_provider, SessionRole::Executor);
+        let parent_id = creating_engine
+            .create_bound_session(&creating_run, "arc", SessionRole::Executor, None)
+            .expect("create a bound session");
+        let (tx, _rx) = channel();
+        let reply = creating_engine
+            .send_message(&creating_run, Some(&parent_id), "hi", tx)
+            .await
+            .expect("send");
+        drop(creating_engine);
+
+        // reconfigured before the fork: a changed root and a different executor identity
+        let changed_root = TempDir::new().expect("temp dir 2");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let projects = projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(changed_root.path(), Mode::ReadWrite)],
+        );
+        let (engine, _run) =
+            reopened_engine_with_projects(&provider, &dir, Registry::new(512), projects);
+        let engine = engine.with_role_identities(BTreeMap::from([(
+            SessionRole::Executor,
+            ("codex-new".to_owned(), "gpt-6-new".to_owned()),
+        )]));
+
+        let fork_id = engine
+            .fork_session(&parent_id, reply.seq)
+            .expect("fork_session");
+
+        assert_ne!(fork_id, parent_id);
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = events.last().expect("an event") else {
+            panic!(
+                "expected the fork's SessionCreated last, got {:?}",
+                events.last()
+            );
+        };
+        assert_eq!(created.session_id, fork_id);
+        assert_eq!(created.parent_session, parent_id);
+        assert_eq!(created.fork_point, reply.seq);
+        assert_eq!(created.role, SessionRole::Executor as i32);
+        assert_eq!(created.project, "arc");
+        assert_eq!(
+            (created.provider.as_str(), created.model.as_str()),
+            ("codex-legacy", "gpt-5-legacy"),
+            "the parent's recorded identity, not the reconfigured one"
+        );
+        assert_eq!(
+            created.grants,
+            [arc_proto::v1::WorkspaceGrant {
+                root: root
+                    .canonicalize()
+                    .expect("canon")
+                    .to_string_lossy()
+                    .into_owned(),
+                read_write: true,
+            }],
+            "the parent's recorded grants, not the reconfigured root"
+        );
+        assert_eq!(created.dispatched_by, "");
+        assert_eq!(created.budget, None);
+
+        let raw_events = replay_events(dir.path());
+        assert_eq!(
+            raw_events.last().expect("an event").source,
+            Source::User as i32,
+            "a person forked, not a model"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_rejects_an_unknown_parent() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (engine, _run) = engine(&provider, &dir);
+
+        let err = engine
+            .fork_session("ghost", 1)
+            .expect_err("an unknown parent must be refused");
+
+        assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
+        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+    }
+
+    #[tokio::test]
+    async fn fork_session_rejects_a_fork_point_that_is_a_tool_call_seq() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
+            done_reply("final text"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "question", tx)
+            .await
+            .expect("send");
+
+        // SessionCreated(0), user(1), ToolCallIssued(2), ToolResultRecorded(3), assistant(4)
+        let tool_call_seq = 2;
+        let err = engine
+            .fork_session(&reply.session_id, tool_call_seq)
+            .expect_err("a tool-call seq must be refused");
+
+        assert!(
+            matches!(err, Error::InvalidForkPoint { fork_point, .. } if fork_point == tool_call_seq)
+        );
+        assert_eq!(replay_log(dir.path()).len(), 5, "nothing new was appended");
+    }
+
+    #[tokio::test]
+    async fn fork_session_rejects_a_foreign_sessions_seq() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("a"), done_reply("b")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let first = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+        let (tx, _rx) = channel();
+        let second = engine
+            .send_message(&run, None, "yo", tx)
+            .await
+            .expect("send");
+
+        let err = engine
+            .fork_session(&first.session_id, second.seq)
+            .expect_err("a foreign session's seq must be refused");
+
+        assert!(matches!(err, Error::InvalidForkPoint { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_fork_at_an_inherited_seq_forks_the_ancestor_that_owns_it() {
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("one"),
+            done_reply("two"),
+            done_reply("three"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+
+        let (tx, _rx) = channel();
+        let first = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+        let root = first.session_id.clone();
+        let root_user_seq = first.seq - 1;
+
+        let branch = engine
+            .fork_session(&root, first.seq)
+            .expect("fork at the root's reply");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&branch), "branch turn", tx)
+            .await
+            .expect("send on the branch");
+
+        // rewinding past the fork boundary: the selected message belongs to
+        // the root, so the new branch's parent is the root, not the branch
+        let rewound = engine
+            .fork_session(&branch, root_user_seq)
+            .expect("a rewind through the fork boundary forks the owner");
+        let parent = engine
+            .with_store(|store| {
+                store
+                    .projection()
+                    .ancestors(&rewound)
+                    .map(|chain| chain.first().cloned())
+            })
+            .expect("ancestors")
+            .expect("a parent");
+        assert_eq!(
+            parent, root,
+            "the inherited seq's owner became the recorded parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forked_session_is_pinned_to_the_parents_role_like_any_other_session() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
+        let (engine, _run) = engine(&provider, &dir);
+        let executor_run = runner_with_role(&provider, SessionRole::Executor);
+
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&executor_run, None, "hi", tx)
+            .await
+            .expect("send");
+        let fork_id = engine
+            .fork_session(&reply.session_id, reply.seq)
+            .expect("fork_session");
+
+        let concierge_run = runner(&provider);
+        let (tx, _rx) = channel();
+        let err = engine
+            .send_message(&concierge_run, Some(&fork_id), "continue", tx)
+            .await
+            .expect_err("a concierge engine must refuse an executor branch");
+        assert!(matches!(err, Error::RoleMismatch { .. }));
+
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&executor_run, Some(&fork_id), "continue", tx)
+            .await
+            .expect("the parent's own role continues it");
+    }
+
+    #[tokio::test]
+    async fn a_turn_on_a_forked_session_sends_the_parents_prefix_transcript() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("first answer"),
+            done_reply("second answer"),
+            done_reply("branch answer"),
+        ]);
+        let (engine, run) = engine(&provider, &dir);
+
+        let (tx, _rx) = channel();
+        let first = engine
+            .send_message(&run, None, "question one", tx)
+            .await
+            .expect("send");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&first.session_id), "question two", tx)
+            .await
+            .expect("send");
+
+        // forked right after the first exchange: the branch must not see "question two"
+        let fork_id = engine
+            .fork_session(&first.session_id, first.seq)
+            .expect("fork_session");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&fork_id), "branch question", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        let turns: Vec<(Role, &str)> = requests[2].messages.iter().map(turn).collect();
+        assert_eq!(
+            turns,
+            [
+                (Role::User, "question one"),
+                (Role::Assistant, "first answer"),
+                (Role::User, "branch question"),
+            ],
+            "the branch inherits the parent prefix through its fork point, not what came after"
         );
     }
 

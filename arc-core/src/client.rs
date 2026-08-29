@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
 use arc_proto::v1::{
-    CancelJob, ClientFrame, CreateSession, DropSteers, FetchHistory, JobInfo, ListJobs,
-    ListSessions, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList,
-    Notification, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe,
-    client_frame, server_frame,
+    CancelJob, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession, JobInfo,
+    ListJobs, ListSessions, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem,
+    MemoryReviewList, Notification, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionRole, Subscribe, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -236,6 +236,30 @@ impl Client {
             .send(client_frame::Msg::CreateSession(CreateSession {
                 role: role as i32,
                 project: project.to_owned(),
+            }))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::MessageAccepted(accepted) => Ok(accepted.session_id),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("MessageAccepted", &other)),
+        }
+    }
+
+    /// Forks `session_id` at `fork_point`: a durable branch the caller then
+    /// opens like any other session — that composed gesture is rewind.
+    #[tracing::instrument(name = "client.fork_session", skip_all, fields(session_id))]
+    pub async fn fork_session(
+        &mut self,
+        session_id: &str,
+        fork_point: u64,
+    ) -> Result<String, Error> {
+        let id = self
+            .send(client_frame::Msg::ForkSession(ForkSession {
+                session_id: session_id.to_owned(),
+                fork_point,
             }))
             .await?;
         match self.answer(id).await? {
@@ -653,6 +677,42 @@ mod tests {
             .expect_err("a non-executor role is refused");
 
         assert!(matches!(err, Error::Server { code, .. } if code == "unsupported_role"));
+        received(handle).await;
+    }
+
+    #[tokio::test]
+    async fn fork_session_round_trips_the_new_sessions_id() {
+        let (url, handle) = server(vec![vec![echo(accepted("s-fork"))]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let session_id = client
+            .fork_session("s-parent", 7)
+            .await
+            .expect("fork_session");
+
+        assert_eq!(session_id, "s-fork");
+        let frames = received(handle).await;
+        match &frames[0].msg {
+            Some(client_frame::Msg::ForkSession(fork)) => {
+                assert_eq!(fork.session_id, "s-parent");
+                assert_eq!(fork.fork_point, 7);
+            }
+            other => panic!("expected ForkSession, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_session_surfaces_the_daemons_refusal() {
+        let (url, handle) =
+            server(vec![vec![echo(error("unknown_session", "no such parent"))]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let err = client
+            .fork_session("ghost", 1)
+            .await
+            .expect_err("an unknown parent is refused");
+
+        assert!(matches!(err, Error::Server { code, .. } if code == "unknown_session"));
         received(handle).await;
     }
 

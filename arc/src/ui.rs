@@ -64,7 +64,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_jobs(frame, frame.area(), jobs);
     }
     if app.help {
-        draw_help(frame, frame.area());
+        draw_help(frame, app, frame.area());
     }
 }
 
@@ -783,6 +783,7 @@ const HELP: &[(&str, &[&str])] = &[
             "y                 yank the last reply (V for a range)",
             "Y                 yank the whole conversation",
             "V                 visual mode: select a block range",
+            "v                 point visual: walk one block (:fork acts there)",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces / handback summaries",
@@ -793,9 +794,10 @@ const HELP: &[(&str, &[&str])] = &[
     (
         "visual mode",
         &[
-            "j k               move the selection boundary",
+            "j k               move the selection boundary (v: the point)",
             "gg G              selection to the first / last block",
             "y                 yank the selection",
+            ":fork             branch at the pointed message and open it",
             "esc               back to normal mode",
         ],
     ),
@@ -814,7 +816,8 @@ const HELP: &[(&str, &[&str])] = &[
             ":review           open the review pane",
             ":jobs             open the jobs pane",
             ":code <project>   open a bound executor session, no dispatch",
-            ":help             this popup",
+            ":fork             branch at the visual selection",
+            ":help             this popup (j k scroll it)",
         ],
     ),
     (
@@ -851,7 +854,12 @@ const HELP: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn draw_help(frame: &mut Frame, full: Rect) {
+fn draw_help(frame: &mut Frame, app: &App, full: Rect) {
+    let total = u16::try_from(help_line_count()).unwrap_or(u16::MAX);
+    let area = popup(frame, full, 60, total, "help");
+    let width = area.width.saturating_sub(2).max(8) as usize;
+
+    // wrap first, then window: long entries fold instead of clipping
     let mut lines = Vec::new();
     for (i, (group, keys)) in HELP.iter().enumerate() {
         if i > 0 {
@@ -859,17 +867,29 @@ fn draw_help(frame: &mut Frame, full: Rect) {
         }
         lines.push(Line::styled(format!(" {group}"), theme::DIM));
         for key in *keys {
-            lines.push(Line::styled(format!("   {key}"), theme::DIM));
+            for folded in textwrap::wrap(key, width.saturating_sub(3).max(8)) {
+                lines.push(Line::styled(format!("   {folded}"), theme::DIM));
+            }
         }
     }
 
-    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let area = popup(frame, full, 60, total, "help");
-    if (area.height as usize) < lines.len() {
-        lines.truncate((area.height as usize).saturating_sub(1));
-        lines.push(Line::styled("   ...", theme::DIM));
+    let visible = area.height as usize;
+    let top = app.help_scroll.min(lines.len().saturating_sub(visible));
+    let more_below = lines.len() > top + visible;
+    let mut lines: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
+    if more_below {
+        if let Some(last) = lines.last_mut() {
+            *last = Line::styled("   ... j to scroll", theme::CUT);
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn help_line_count() -> usize {
+    HELP.iter()
+        .map(|(_, keys)| keys.len() + 2)
+        .sum::<usize>()
+        .saturating_sub(1)
 }
 
 fn job_subject(job: &JobInfo) -> String {

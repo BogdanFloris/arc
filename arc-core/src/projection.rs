@@ -547,6 +547,44 @@ impl Projection {
         messages(&self.conn, session_id)
     }
 
+    /// `session_id`'s own rows, prefixed with whatever ancestry its fork
+    /// chain includes: what a branch's provider transcript and its own
+    /// history view are both built from.
+    pub(crate) fn lineage_messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
+        lineage_messages(&self.conn, session_id)
+    }
+
+    /// The `kind` column at `(session_id, seq)`, or `None` if no row there
+    /// belongs to that session: a fork point must name a `KIND_MESSAGE` row
+    /// of its own parent, not a tool call or another session's sequence.
+    /// Which session a seq's row belongs to, and its kind — a fork at an
+    /// inherited seq forks the ancestor that owns it, not the viewed session.
+    pub(crate) fn message_owner(&self, seq: u64) -> Result<Option<(String, i64)>, Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT session_id, kind FROM messages WHERE seq = ?1",
+                rusqlite::params![seq_param(seq)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The ancestor chain of `session_id`, nearest parent first, cycle-guarded.
+    pub(crate) fn ancestors(&self, session_id: &str) -> Result<Vec<String>, Error> {
+        let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
+        let mut chain = Vec::new();
+        let mut current = session_id.to_owned();
+        while let Some((parent, _)) = session_parent(&self.conn, &current)? {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            chain.push(parent.clone());
+            current = parent;
+        }
+        Ok(chain)
+    }
+
     pub fn call_ids(&self, session_id: &str) -> Result<HashSet<String>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT call_id FROM messages
@@ -623,18 +661,25 @@ impl Projection {
         &self,
         idle_cutoff_micros: i64,
     ) -> Result<Vec<DueSession>, Error> {
+        // a branch never marked REAL is scratch: it never writes distilled
+        // memory, fuller semantics (mark, unmark) are row 2.4's
         let mut stmt = self.conn.prepare(
             "SELECT s.id, MAX(m.seq)
              FROM sessions s JOIN messages m ON m.session_id = s.id
+             WHERE s.parent_session IS NULL OR s.disposition = ?2
              GROUP BY s.id
              HAVING MAX(m.ts) < ?1
                 AND (s.consolidated_through IS NULL
                      OR MAX(m.seq) > s.consolidated_through)
              ORDER BY MAX(m.ts), s.id",
         )?;
-        let rows = stmt.query_map([idle_cutoff_micros], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                idle_cutoff_micros,
+                arc_proto::v1::branch_marked::Disposition::Real as i32
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
         rows.map(|row| {
             let (session_id, seq) = row?;
             Ok(DueSession {
@@ -757,10 +802,15 @@ impl Reader {
         sessions(&self.conn())
     }
 
+    // the user rewinding must see the inherited history, so a branch's view
+    // is its own rows plus ancestry, same walk `open_turn` sends the model
     pub fn transcript(&self, session_id: &str) -> Result<Vec<HistoryEntry>, Error> {
-        Ok(messages(&self.conn(), session_id)?
+        Ok(lineage_rows(&self.conn(), session_id)?
             .into_iter()
-            .map(history_entry)
+            .map(|(seq, row)| HistoryEntry {
+                seq,
+                ..history_entry(row)
+            })
             .collect())
     }
 
@@ -989,50 +1039,125 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
 }
 
 pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>, Error> {
+    Ok(messages_with_seq(conn, session_id)?
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
+}
+
+fn messages_with_seq(conn: &Connection, session_id: &str) -> Result<Vec<(u64, MessageRow)>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT kind, role, content, partial, turn_id,
+        "SELECT seq, kind, role, content, partial, turn_id,
                 call_id, call_index, name, arguments_json, outcome, truncated,
                 provider_roundtrip, source, input_tokens, output_tokens, elapsed_ms,
                 grounding_json
          FROM messages WHERE session_id = ?1 ORDER BY seq",
     )?;
-    let rows = stmt.query_map([session_id], |row| match row.get::<_, i64>(0)? {
-        KIND_MESSAGE => Ok(MessageRow::Message {
-            role: row.get(1)?,
-            content: row.get(2)?,
-            partial: row.get(3)?,
-            turn_id: row.get(4)?,
-            source: row.get::<_, Option<i32>>(12)?.unwrap_or(0),
-            input_tokens: nonneg_u32(row.get::<_, Option<i64>>(13)?),
-            output_tokens: nonneg_u32(row.get::<_, Option<i64>>(14)?),
-            elapsed_ms: nonneg_u32(row.get::<_, Option<i64>>(15)?),
-            grounding_json: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
-        }),
-        KIND_TOOL_CALL => Ok(MessageRow::ToolCall {
-            call_id: row.get(5)?,
-            call_index: u32::try_from(row.get::<_, i64>(6)?)
-                .map_err(|_| bad_column(6, "call_index out of range"))?,
-            name: row.get(7)?,
-            arguments_json: row.get(8)?,
-            turn_id: row.get(4)?,
-            provider_roundtrip: row.get::<_, Option<Vec<u8>>>(11)?.unwrap_or_default(),
-        }),
-        KIND_TOOL_RESULT => Ok(MessageRow::ToolResult {
-            call_id: row.get(5)?,
-            outcome: row.get(9)?,
-            content: row.get(2)?,
-            truncated: row.get(10)?,
-            turn_id: row.get(4)?,
-        }),
-        KIND_SERVER_CALL => Ok(MessageRow::ServerCall {
-            name: row.get(7)?,
-            arguments_json: row.get(8)?,
-            response_json: row.get(2)?,
-            turn_id: row.get(4)?,
-        }),
-        other => Err(bad_column(0, &format!("unknown message kind {other}"))),
+    let rows = stmt.query_map([session_id], |row| {
+        let seq =
+            u64::try_from(row.get::<_, i64>(0)?).map_err(|_| bad_column(0, "seq out of range"))?;
+        let message = match row.get::<_, i64>(1)? {
+            KIND_MESSAGE => MessageRow::Message {
+                role: row.get(2)?,
+                content: row.get(3)?,
+                partial: row.get(4)?,
+                turn_id: row.get(5)?,
+                source: row.get::<_, Option<i32>>(13)?.unwrap_or(0),
+                input_tokens: nonneg_u32(row.get::<_, Option<i64>>(14)?),
+                output_tokens: nonneg_u32(row.get::<_, Option<i64>>(15)?),
+                elapsed_ms: nonneg_u32(row.get::<_, Option<i64>>(16)?),
+                grounding_json: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+            },
+            KIND_TOOL_CALL => MessageRow::ToolCall {
+                call_id: row.get(6)?,
+                call_index: u32::try_from(row.get::<_, i64>(7)?)
+                    .map_err(|_| bad_column(7, "call_index out of range"))?,
+                name: row.get(8)?,
+                arguments_json: row.get(9)?,
+                turn_id: row.get(5)?,
+                provider_roundtrip: row.get::<_, Option<Vec<u8>>>(12)?.unwrap_or_default(),
+            },
+            KIND_TOOL_RESULT => MessageRow::ToolResult {
+                call_id: row.get(6)?,
+                outcome: row.get(10)?,
+                content: row.get(3)?,
+                truncated: row.get(11)?,
+                turn_id: row.get(5)?,
+            },
+            KIND_SERVER_CALL => MessageRow::ServerCall {
+                name: row.get(8)?,
+                arguments_json: row.get(9)?,
+                response_json: row.get(3)?,
+                turn_id: row.get(5)?,
+            },
+            other => return Err(bad_column(1, &format!("unknown message kind {other}"))),
+        };
+        Ok((seq, message))
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// `session_id`'s own rows, prefixed with its ancestry: the oldest
+/// ancestor's rows up to where its child forked, down through each fork
+/// point, ending in `session_id`'s own rows untruncated. A session with no
+/// parent returns exactly what `messages` returns.
+pub(crate) fn lineage_messages(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<MessageRow>, Error> {
+    Ok(lineage_rows(conn, session_id)?
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
+}
+
+fn lineage_rows(conn: &Connection, session_id: &str) -> Result<Vec<(u64, MessageRow)>, Error> {
+    let mut chain: Vec<(String, u64)> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
+    let mut current = session_id.to_owned();
+    loop {
+        let Some((parent, fork_point)) = session_parent(conn, &current)? else {
+            break;
+        };
+        if !visited.insert(parent.clone()) {
+            tracing::warn!(session_id = %parent, "lineage cycle detected; stopping the walk");
+            break;
+        }
+        chain.push((parent.clone(), fork_point));
+        current = parent;
+    }
+    chain.reverse();
+
+    let mut rows = Vec::new();
+    for (ancestor_id, truncate_at) in chain {
+        rows.extend(
+            messages_with_seq(conn, &ancestor_id)?
+                .into_iter()
+                .filter(|(seq, _)| *seq <= truncate_at),
+        );
+    }
+    rows.extend(messages_with_seq(conn, session_id)?);
+    Ok(rows)
+}
+
+fn session_parent(conn: &Connection, session_id: &str) -> Result<Option<(String, u64)>, Error> {
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT parent_session, fork_point FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(parent, fork_point)| {
+        parent.map(|parent| {
+            (
+                parent,
+                fork_point
+                    .and_then(|fp| u64::try_from(fp).ok())
+                    .unwrap_or(0),
+            )
+        })
+    }))
 }
 
 /// The `:review` pane's default lookback; the queue's live count uses the
@@ -1157,7 +1282,10 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             response_json,
         }),
     };
-    HistoryEntry { entry: Some(entry) }
+    HistoryEntry {
+        entry: Some(entry),
+        seq: 0,
+    }
 }
 
 fn event_kind(payload: &event::Payload) -> &'static str {
@@ -2510,6 +2638,131 @@ mod tests {
             (None, None, Some("s-01".to_owned()), None),
             "a dispatch is supervision, never lineage"
         );
+    }
+
+    fn message_appended_for(seq: u64, session_id: &str, content: &str) -> Event {
+        let mut event = message_appended(seq, content);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(m)),
+        })) = event.payload.as_mut()
+        {
+            m.session_id = session_id.to_owned();
+        }
+        event
+    }
+
+    fn fork_created(seq: u64, id: &str, parent: &str, fork_point: u64) -> Event {
+        let mut event = session_created_as(seq, id, "", None);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = event.payload.as_mut()
+        {
+            created.parent_session = parent.to_owned();
+            created.fork_point = fork_point;
+        }
+        event
+    }
+
+    fn message_row(content: &str) -> MessageRow {
+        MessageRow::Message {
+            role: Role::User as i32,
+            content: content.to_owned(),
+            partial: false,
+            turn_id: String::new(),
+            source: Source::User as i32,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 0,
+            grounding_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_parentless_sessions_lineage_matches_plain_messages() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-01").expect("lineage"),
+            projection.messages("s-01").expect("messages"),
+        );
+    }
+
+    #[test]
+    fn lineage_walk_includes_the_parent_prefix_through_the_fork_point() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=5 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        // forked at the seq of message 3: the branch inherits m1..m3, not m4/m5
+        projection
+            .apply(&fork_created(6, "s-fork", "s-01", 3))
+            .expect("apply");
+        for (seq, content) in [(7, "b1"), (8, "b2")] {
+            projection
+                .apply(&message_appended_for(seq, "s-fork", content))
+                .expect("apply");
+        }
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
+            ["m1", "m2", "m3", "b1", "b2"].map(message_row)
+        );
+    }
+
+    #[test]
+    fn lineage_walk_chains_truncations_through_a_fork_of_a_fork() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=5 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        projection
+            .apply(&fork_created(6, "s-fork", "s-01", 3))
+            .expect("apply");
+        for (seq, content) in [(7, "b1"), (8, "b2")] {
+            projection
+                .apply(&message_appended_for(seq, "s-fork", content))
+                .expect("apply");
+        }
+        // forked from s-fork at seq 7 (b1): b2 must not ride along
+        projection
+            .apply(&fork_created(9, "s-fork-2", "s-fork", 7))
+            .expect("apply");
+        projection
+            .apply(&message_appended_for(10, "s-fork-2", "c1"))
+            .expect("apply");
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-fork-2").expect("lineage"),
+            ["m1", "m2", "m3", "b1", "c1"].map(message_row)
+        );
+    }
+
+    #[test]
+    fn a_lineage_cycle_warns_and_terminates() {
+        let mut projection = Projection::in_memory().expect("open");
+        // hand-seeded: two sessions each naming the other as parent
+        projection
+            .apply(&fork_created(0, "s-a", "s-b", 1))
+            .expect("apply");
+        projection
+            .apply(&fork_created(1, "s-b", "s-a", 1))
+            .expect("apply");
+
+        // must return rather than loop forever; content is secondary here
+        let lineage = super::lineage_messages(&projection.conn, "s-a").expect("lineage");
+        assert_eq!(lineage, []);
     }
 
     fn branch_marked(seq: u64, id: &str, disposition: i32) -> Event {
@@ -3928,6 +4181,60 @@ mod tests {
             .expect("apply");
 
         assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
+    }
+
+    #[test]
+    fn a_branch_is_due_only_once_marked_real_and_not_once_abandoned() {
+        use arc_proto::v1::branch_marked::Disposition;
+
+        let mut projection = Projection::in_memory().expect("open");
+        projection
+            .apply(&session_created_as(0, "s-01", "", Some(50)))
+            .expect("apply");
+        projection
+            .apply(&message_in(1, "s-01", Some(100)))
+            .expect("apply");
+        projection
+            .apply(&fork_created(2, "s-fork", "s-01", 1))
+            .expect("apply");
+        projection
+            .apply(&message_in(3, "s-fork", Some(200)))
+            .expect("apply");
+
+        assert_eq!(
+            projection
+                .due_for_consolidation(i64::MAX)
+                .expect("due")
+                .iter()
+                .map(|due| due.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s-01"],
+            "an idle unmarked branch never writes distilled memory"
+        );
+
+        projection
+            .apply(&branch_marked(4, "s-fork", Disposition::Real as i32))
+            .expect("apply");
+        assert!(
+            projection
+                .due_for_consolidation(i64::MAX)
+                .expect("due")
+                .iter()
+                .any(|due| due.session_id == "s-fork"),
+            "marked real, the branch counts like any session"
+        );
+
+        projection
+            .apply(&branch_marked(5, "s-fork", Disposition::Abandoned as i32))
+            .expect("apply");
+        assert!(
+            !projection
+                .due_for_consolidation(i64::MAX)
+                .expect("due")
+                .iter()
+                .any(|due| due.session_id == "s-fork"),
+            "abandoned again, it drops back out"
+        );
     }
 
     #[test]

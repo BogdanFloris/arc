@@ -124,6 +124,10 @@ async fn handle(
         Command::CreateSession { role, project } => {
             create_session(&mut client, role, &project, events).await
         }
+        Command::ForkSession {
+            session_id,
+            fork_point,
+        } => fork_session(&mut client, &session_id, fork_point, events).await,
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
         Command::Yank(_) => Ok(()),
     };
@@ -233,6 +237,27 @@ async fn create_session(
     match client.create_session(role, project).await {
         Ok(session_id) => {
             let _ = events.send(NetEvent::SessionCreated { session_id });
+            Ok(())
+        }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `SessionForked` composes into the picker's own open-session path: set
+/// `session_id`, fetch history — that IS rewind.
+async fn fork_session(
+    client: &mut Client,
+    session_id: &str,
+    fork_point: u64,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.fork_session(session_id, fork_point).await {
+        Ok(session_id) => {
+            let _ = events.send(NetEvent::SessionForked { session_id });
             Ok(())
         }
         Err(Error::Server { code, msg }) => {

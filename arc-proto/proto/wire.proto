@@ -59,6 +59,7 @@ message ClientFrame {
     CancelJob cancel_job = 19;
     DropSteers drop_steers = 20;
     CreateSession create_session = 21;
+    ForkSession fork_session = 22;
   }
 }
 
@@ -68,6 +69,14 @@ message ClientFrame {
 message CreateSession {
   SessionRole role = 1;
   string project = 2;
+}
+
+// Forks `session_id` at `fork_point` (a global log seq): a durable branch
+// the client then opens like any other session — that composed gesture is
+// rewind. The reply is the same session-id ack `CreateSession` answers with.
+message ForkSession {
+  string session_id = 1;
+  uint64 fork_point = 2;
 }
 
 // Stops a live job outright: drops its running turn, drains any queued
@@ -240,6 +249,7 @@ message HistoryEntry {
     HistoryToolResult tool_result = 3;
     HistoryServerCall server_call = 4;
   }
+  uint64 seq = 5;
 }
 
 message SessionHistory {

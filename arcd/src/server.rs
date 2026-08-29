@@ -9,7 +9,7 @@ use arc_core::provider::role_label;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, CreateSession, Delta, Error as WireError, JobList, MemoryReviewItem,
+    ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MemoryReviewItem,
     MemoryReviewItems, MessageAccepted, Notification, ReasoningDelta, SendMessage, ServerFrame,
     SessionHistory, SessionInfo, SessionList, SessionRole, StreamEnd, ToolCallEnded,
     ToolCallStarted, client_frame, server_frame,
@@ -260,6 +260,9 @@ async fn request(
         }
         Some(client_frame::Msg::CreateSession(create)) => {
             create_session(ws, engine, runner, frame.request_id, create).await
+        }
+        Some(client_frame::Msg::ForkSession(fork)) => {
+            fork_session(ws, engine, frame.request_id, fork).await
         }
         // no reply frame: the subscription's frames are the notifications,
         // pushed from the connection loop's select, not from here
@@ -534,6 +537,24 @@ async fn create_session(
     flow(send_frame(ws, request_id, msg).await)
 }
 
+/// Fork-then-open is rewind (2.2): the reply is the same session-id ack
+/// `create_session` answers with, so the client opens it the same way.
+async fn fork_session(
+    ws: &mut Socket,
+    engine: &Engine,
+    request_id: u64,
+    fork: ForkSession,
+) -> ControlFlow<()> {
+    let msg = match engine.fork_session(&fork.session_id, fork.fork_point) {
+        Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
+        Err(error) => {
+            warn!(%error, code = error_code(&error), "fork_session failed");
+            error_frame(error_code(&error), &error)
+        }
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
 async fn review_list(
     ws: &mut Socket,
     reads: &Reader,
@@ -671,6 +692,8 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::ModelMismatch { .. } => "model_mismatch",
         SessionError::Provider(_) => "provider",
         SessionError::UnknownProject { .. } => "unknown_project",
+        SessionError::UnknownSession { .. } => "unknown_session",
+        SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
         SessionError::Store(_) | SessionError::Projection(_) | SessionError::Grants { .. } => {
             "internal"
         }
@@ -690,6 +713,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
         Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
         Some(client_frame::Msg::CreateSession(_)) => "create_session",
+        Some(client_frame::Msg::ForkSession(_)) => "fork_session",
         None => "unknown",
     }
 }
@@ -1651,6 +1675,7 @@ mod tests {
             [
                 HistoryEntry {
                     entry: Some(history_entry::Entry::Message(prose(Role::User, "hi"))),
+                    seq: 1,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
@@ -1658,6 +1683,7 @@ mod tests {
                         name: "lookup".to_owned(),
                         arguments_json: "{}".to_owned(),
                     })),
+                    seq: 2,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
@@ -1665,8 +1691,10 @@ mod tests {
                         outcome: ToolOutcome::Ok as i32,
                         truncated: false,
                     })),
+                    seq: 3,
                 },
-            ]
+            ],
+            "the projection→history path stamps every entry with its log seq"
         );
         let Some(history_entry::Entry::Message(final_message)) = &answer.entries[3].entry else {
             panic!(
@@ -2679,6 +2707,68 @@ mod tests {
 
         let error = failed(msg);
         assert_eq!(error.code, "unknown_project");
+        assert!(error.msg.contains("ghost"), "{}", error.msg);
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn fork_session_opens_a_new_branch_that_carries_the_parents_prefix() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _text, closing) = turn(&mut ws, 1).await;
+        ended(closing);
+
+        let answer = history(&mut ws, 2, &session_id).await;
+        let fork_point = answer.entries[0].seq;
+
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::ForkSession(ForkSession {
+                session_id: session_id.clone(),
+                fork_point,
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 3);
+        let fork_id = match frame.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        assert_ne!(fork_id, session_id);
+
+        let forked_history = history(&mut ws, 4, &fork_id).await;
+        assert_eq!(
+            said(&forked_history),
+            [(Role::User, "hello")],
+            "the branch inherits the parent's prefix through the fork point"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn fork_session_names_an_unknown_parent() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::ForkSession(ForkSession {
+                session_id: "ghost".to_owned(),
+                fork_point: 1,
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        let error = failed(frame.msg.expect("a message"));
+        assert_eq!(error.code, "unknown_session");
         assert!(error.msg.contains("ghost"), "{}", error.msg);
 
         harness.stop().await;

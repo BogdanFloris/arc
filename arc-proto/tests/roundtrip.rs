@@ -328,6 +328,7 @@ fn server_frame_arms_round_trip() {
                         elapsed_ms: 5600,
                         grounding_json: String::new(),
                     })),
+                    seq: 1,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
@@ -335,6 +336,7 @@ fn server_frame_arms_round_trip() {
                         name: "memory_search".to_string(),
                         arguments_json: String::new(),
                     })),
+                    seq: 2,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
@@ -342,6 +344,7 @@ fn server_frame_arms_round_trip() {
                         outcome: ToolOutcome::Ok as i32,
                         truncated: true,
                     })),
+                    seq: 3,
                 },
             ],
         }),
