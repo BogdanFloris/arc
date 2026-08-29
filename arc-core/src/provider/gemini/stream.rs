@@ -25,6 +25,9 @@ impl FrameParser for Parser {
             for part in candidate.content.into_iter().flat_map(|it| it.parts) {
                 items.extend(self.part(part)?);
             }
+            if let Some(grounding) = candidate.grounding_metadata {
+                items.push(CompletionDelta::Grounding(grounding.to_string()));
+            }
             if candidate.finish_reason.is_some() {
                 finished = Some(if self.calls > 0 {
                     Stop::ToolCalls
@@ -62,12 +65,34 @@ impl Parser {
                 provider_roundtrip: part.thought_signature.unwrap_or_default().into_bytes(),
             })));
         }
+        if let Some(value) = part.tool_call {
+            return Ok(Some(CompletionDelta::ServerCall {
+                name: server_call_name(&value),
+                payload_json: value.to_string(),
+            }));
+        }
+        if let Some(value) = part.tool_response {
+            return Ok(Some(CompletionDelta::ServerResponse {
+                name: server_call_name(&value),
+                payload_json: value.to_string(),
+            }));
+        }
         // a signature-only part closes a text turn; only calls have to echo one
         Ok(part
             .text
             .filter(|text| !text.is_empty())
             .map(CompletionDelta::Text))
     }
+}
+
+// the inner shape is not guaranteed; a top-level name is the only thing we
+// trust, and google_search is the only server tool that exists today
+fn server_call_name(value: &serde_json::Value) -> String {
+    value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("google_search")
+        .to_owned()
 }
 
 #[derive(Deserialize)]
@@ -83,6 +108,7 @@ struct Chunk {
 struct Candidate {
     content: Option<ContentJson>,
     finish_reason: Option<String>,
+    grounding_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +123,8 @@ struct PartJson {
     text: Option<String>,
     function_call: Option<FunctionCallJson>,
     thought_signature: Option<String>,
+    tool_call: Option<serde_json::Value>,
+    tool_response: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +242,45 @@ mod tests {
             panic!("the stream must end with Done");
         };
         assert_eq!(*stop, Stop::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn a_server_call_and_its_response_and_grounding_arrive_verbatim_and_in_order() {
+        let deltas = drain("gemini_server_call_stream.sse").await;
+
+        let CompletionDelta::ServerCall { name, payload_json } = &deltas[0] else {
+            panic!("expected a server call first, got {:?}", deltas[0]);
+        };
+        assert_eq!(name, "google_search");
+        assert!(
+            payload_json.contains("arc-core release notes"),
+            "{payload_json}"
+        );
+
+        let CompletionDelta::ServerResponse { name, payload_json } = &deltas[1] else {
+            panic!("expected a server response second, got {:?}", deltas[1]);
+        };
+        assert_eq!(name, "google_search");
+        assert!(payload_json.contains("Arc Core 3.5"), "{payload_json}");
+
+        assert_eq!(
+            deltas[2],
+            CompletionDelta::Text("Arc Core shipped 3.5 this week.".to_owned())
+        );
+
+        let CompletionDelta::Grounding(json) = &deltas[3] else {
+            panic!("expected grounding metadata fourth, got {:?}", deltas[3]);
+        };
+        assert!(json.contains("groundingChunks"), "{json}");
+
+        let Some(CompletionDelta::Done { stop, .. }) = deltas.last() else {
+            panic!("the stream must end with Done");
+        };
+        assert_eq!(
+            *stop,
+            Stop::EndTurn,
+            "server calls are not our tool calls; they never trip ToolCalls"
+        );
     }
 
     #[test]

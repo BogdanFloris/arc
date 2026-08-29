@@ -319,6 +319,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             thinking: Thinking::Default,
+            web: false,
         }
     }
 

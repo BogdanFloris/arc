@@ -338,6 +338,13 @@ pub fn resulted(event: &session_event::Event) -> &arc_proto::v1::ToolResultRecor
     }
 }
 
+pub fn server_called(event: &session_event::Event) -> &arc_proto::v1::ServerCallRecorded {
+    match event {
+        session_event::Event::ServerCallRecorded(c) => c,
+        other => panic!("expected a server call, got {other:?}"),
+    }
+}
+
 pub struct Canned {
     pub name: &'static str,
     pub content: &'static str,

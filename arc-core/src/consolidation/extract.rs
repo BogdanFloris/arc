@@ -296,7 +296,10 @@ impl ModelExtractor {
         while let Some(item) = stream.next().await {
             match item.map_err(|error| ExtractError(format!("stream failed: {error}")))? {
                 CompletionDelta::Text(chunk) => text.push_str(&chunk),
-                CompletionDelta::Reasoning(_) => {}
+                CompletionDelta::Reasoning(_)
+                | CompletionDelta::ServerCall { .. }
+                | CompletionDelta::ServerResponse { .. }
+                | CompletionDelta::Grounding(_) => {}
                 CompletionDelta::ToolCall(call) => {
                     return Err(ExtractError(format!(
                         "the model called {} with no tools offered",
@@ -430,6 +433,7 @@ impl ModelExtractor {
             }],
             tools: Vec::new(),
             seed: Some(seed),
+            web: false,
         };
         let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
             Ok(Ok(text)) => text,
@@ -485,6 +489,7 @@ impl Extractor for ModelExtractor {
             }],
             tools: Vec::new(),
             seed: Some(seed),
+            web: false,
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
@@ -537,6 +542,7 @@ impl Extractor for ModelExtractor {
                 self.seed
                     .unwrap_or_else(|| session_seed(&session.session_id)),
             ),
+            web: false,
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await

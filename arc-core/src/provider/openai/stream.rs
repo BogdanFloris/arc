@@ -436,6 +436,9 @@ mod tests {
                 CompletionDelta::Reasoning(chunk) => gathered.reasoning.push_str(&chunk),
                 other @ CompletionDelta::ToolCall(_) => gathered.calls.push(other),
                 other @ CompletionDelta::Done { .. } => gathered.ending = Some(other),
+                CompletionDelta::ServerCall { .. }
+                | CompletionDelta::ServerResponse { .. }
+                | CompletionDelta::Grounding(_) => {}
             }
         }
         gathered

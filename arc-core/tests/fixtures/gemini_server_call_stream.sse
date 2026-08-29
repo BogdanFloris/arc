@@ -1,0 +1,6 @@
+data: {"candidates": [{"content": {"parts": [{"toolCall": {"name": "google_search","query": "arc-core release notes"}}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 20,"candidatesTokenCount": 0,"totalTokenCount": 20},"modelVersion": "gemini-3.6-flash","responseId": "abc123"}
+
+data: {"candidates": [{"content": {"parts": [{"toolResponse": {"name": "google_search","results": [{"title": "Arc Core 3.5","url": "https://example.test/arc"}]}}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 20,"candidatesTokenCount": 4,"totalTokenCount": 24},"modelVersion": "gemini-3.6-flash","responseId": "abc123"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "Arc Core shipped 3.5 this week."}],"role": "model"},"finishReason": "STOP","groundingMetadata": {"searchEntryPoint": {"renderedContent": "<div>search widget</div>"},"groundingChunks": [{"web": {"uri": "https://example.test/arc","title": "Arc Core 3.5"}}]},"index": 0}],"usageMetadata": {"promptTokenCount": 20,"candidatesTokenCount": 12,"totalTokenCount": 32},"modelVersion": "gemini-3.6-flash","responseId": "abc123"}
+

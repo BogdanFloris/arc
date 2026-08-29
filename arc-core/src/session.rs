@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role, SessionAppended,
-    SessionCreated, SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome,
-    ToolResultRecorded, WorkspaceGrant,
+    Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role, ServerCallRecorded,
+    SessionAppended, SessionCreated, SessionEvent, SessionRole, Source, ToolCallIssued,
+    ToolOutcome, ToolResultRecorded, WorkspaceGrant,
 };
 use arc_proto::v1::{event, memory_event, notification, session_event};
 use futures::StreamExt as _;
@@ -640,6 +640,10 @@ impl Engine {
         if self.expert_enabled && matches!(role, SessionRole::Concierge | SessionRole::Executor) {
             sources.push(ToolSource::Expert);
         }
+        // web is a concierge capability, no config gate (2026-08-24)
+        if role == SessionRole::Concierge {
+            sources.push(ToolSource::Web);
+        }
         Ok(sources)
     }
 
@@ -703,6 +707,8 @@ impl Engine {
             counter.memory_reads_from_search = tracing::field::Empty,
             counter.records_created = tracing::field::Empty,
             counter.records_superseded = tracing::field::Empty,
+            server_calls = tracing::field::Empty,
+            grounded = tracing::field::Empty,
         )
     )]
     pub async fn send_message(
@@ -798,6 +804,8 @@ impl Engine {
             counter.memory_reads_from_search = tracing::field::Empty,
             counter.records_created = tracing::field::Empty,
             counter.records_superseded = tracing::field::Empty,
+            server_calls = tracing::field::Empty,
+            grounded = tracing::field::Empty,
         )
     )]
     pub async fn continue_session(
@@ -859,6 +867,8 @@ impl Engine {
         let mut memory = MemoryCounters::default();
         let mut jobs: Vec<DispatchedJob> = Vec::new();
         let mut continues: Vec<ContinuedJob> = Vec::new();
+        let mut server_calls = ServerCalls::default();
+        let mut grounding: Option<String> = None;
 
         let reply = loop {
             // the last step offers no tools, so the model has to answer
@@ -872,7 +882,16 @@ impl Engine {
             );
 
             let (ending, text, reasoning, calls) = self
-                .run_completion(runner, request, events, &mut total_usage)
+                .run_completion(
+                    runner,
+                    session_id,
+                    turn_id,
+                    request,
+                    events,
+                    &mut total_usage,
+                    &mut server_calls,
+                    &mut grounding,
+                )
                 .await?;
 
             match ending {
@@ -906,6 +925,7 @@ impl Engine {
                         false,
                         total_usage,
                         elapsed_ms,
+                        grounding.clone().unwrap_or_default(),
                     )?;
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
@@ -932,6 +952,7 @@ impl Engine {
                         true,
                         total_usage,
                         elapsed_ms,
+                        grounding.clone().unwrap_or_default(),
                     )?;
                     span.record("outcome", "partial");
                     span.record("assistant_seq", seq);
@@ -955,6 +976,7 @@ impl Engine {
                             true,
                             total_usage,
                             elapsed_ms,
+                            grounding.clone().unwrap_or_default(),
                         )?;
                         span.record("assistant_seq", seq);
                     }
@@ -963,16 +985,38 @@ impl Engine {
                 }
             }
         };
+        // a call the model saw but never got a response for still happened
+        while let Some((_, name, payload_json)) = server_calls.open.pop_front() {
+            self.record(
+                Source::Model,
+                session_event::Event::ServerCallRecorded(ServerCallRecorded {
+                    session_id: session_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    name,
+                    arguments_json: payload_json,
+                    response_json: String::new(),
+                    provider_roundtrip: Vec::new(),
+                }),
+            )?;
+            server_calls.recorded += 1;
+        }
+        span.record("server_calls", server_calls.recorded);
+        span.record("grounded", grounding.is_some());
         memory.record_on(&span);
         reply
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_completion(
         &self,
         runner: &Runner,
+        session_id: &str,
+        turn_id: &str,
         request: CompletionRequest,
         events: &mpsc::Sender<EngineEvent>,
         total_usage: &mut Option<Usage>,
+        server_calls: &mut ServerCalls,
+        grounding: &mut Option<String>,
     ) -> Result<(Ending, String, String, Vec<ToolCall>), Error> {
         let mut stream = runner.provider.complete(request).await?;
         let mut text = String::new();
@@ -989,6 +1033,63 @@ impl Engine {
                     let _ = events.send(EngineEvent::Reasoning(chunk)).await;
                 }
                 Some(Ok(CompletionDelta::ToolCall(call))) => calls.push(call),
+                Some(Ok(CompletionDelta::ServerCall { name, payload_json })) => {
+                    let call_id = server_calls.synthetic_id();
+                    server_calls.open.push_back((
+                        call_id.clone(),
+                        name.clone(),
+                        payload_json.clone(),
+                    ));
+                    let _ = events
+                        .send(EngineEvent::ToolCallStarted {
+                            call_id,
+                            index: 0,
+                            name,
+                            arguments_json: payload_json,
+                        })
+                        .await;
+                }
+                Some(Ok(CompletionDelta::ServerResponse { name, payload_json })) => {
+                    if let Some((call_id, call_name, call_payload)) = server_calls.open.pop_front()
+                    {
+                        self.record(
+                            Source::Model,
+                            session_event::Event::ServerCallRecorded(ServerCallRecorded {
+                                session_id: session_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                name: call_name,
+                                arguments_json: call_payload,
+                                response_json: payload_json,
+                                provider_roundtrip: Vec::new(),
+                            }),
+                        )?;
+                        server_calls.recorded += 1;
+                        let _ = events
+                            .send(EngineEvent::ToolCallEnded {
+                                call_id,
+                                outcome: ToolOutcome::Ok,
+                            })
+                            .await;
+                    } else {
+                        tracing::warn!(
+                            name = %name,
+                            "a server response arrived with no open server call"
+                        );
+                        self.record(
+                            Source::Model,
+                            session_event::Event::ServerCallRecorded(ServerCallRecorded {
+                                session_id: session_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                name,
+                                arguments_json: String::new(),
+                                response_json: payload_json,
+                                provider_roundtrip: Vec::new(),
+                            }),
+                        )?;
+                        server_calls.recorded += 1;
+                    }
+                }
+                Some(Ok(CompletionDelta::Grounding(json))) => *grounding = Some(json),
                 Some(Ok(CompletionDelta::Done { usage, stop })) => {
                     let total = total_usage.get_or_insert(Usage::default());
                     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -1293,6 +1394,7 @@ impl Engine {
         Ok(seq)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_reply(
         &self,
         session_id: &str,
@@ -1301,6 +1403,7 @@ impl Engine {
         partial: bool,
         usage: Option<Usage>,
         elapsed_ms: u32,
+        grounding_json: String,
     ) -> Result<u64, Error> {
         let usage = usage.unwrap_or_default();
         self.record(
@@ -1314,8 +1417,7 @@ impl Engine {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 elapsed_ms,
-                // filled once the provider loop hands grounding through (row 1.3)
-                grounding_json: String::new(),
+                grounding_json,
             }),
         )
     }
@@ -1363,6 +1465,7 @@ impl Engine {
                 self.registry.definitions(sources)
             },
             seed: None,
+            web: sources.contains(&ToolSource::Web),
         }
     }
 }
@@ -1516,6 +1619,24 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
     messages
 }
 
+// server-side calls a provider resolves inside its own turn (Gemini's
+// google_search): tracked separately from `calls` because they never touch
+// the tool-step counter or the orphan machinery
+#[derive(Debug, Default)]
+struct ServerCalls {
+    open: VecDeque<(String, String, String)>, // (synthetic call_id, name, payload_json)
+    next_id: u32,
+    recorded: u32,
+}
+
+impl ServerCalls {
+    fn synthetic_id(&mut self) -> String {
+        let id = format!("web-{}", self.next_id);
+        self.next_id += 1;
+        id
+    }
+}
+
 #[derive(Debug, Default)]
 struct MemoryCounters {
     surfaced: HashSet<String>,
@@ -1619,10 +1740,10 @@ mod tests {
     use crate::store::{self, Store};
     use crate::testkit::{
         Canned, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying,
-        channel, counter_samples, done_reply, drain, engine, engine_with_tools,
+        channel, counter_samples, done_reply, drain, engine, engine_with_role, engine_with_tools,
         engine_with_tools_at, issued, reopened_engine, replay_events, replay_log, resulted, runner,
-        runner_with_role, seed_log, seed_memory_log, seed_memory_log_at, tool_stop, tools, turn,
-        usage,
+        runner_with_role, seed_log, seed_memory_log, seed_memory_log_at, server_called, tool_stop,
+        tools, turn, usage,
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
@@ -2263,6 +2384,109 @@ mod tests {
                 },
                 EngineEvent::Delta("answer".to_owned()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_call_records_durably_paints_the_client_and_never_touches_the_step_counter() {
+        let provider = ScriptedProvider::scripted(vec![vec![
+            Ok(CompletionDelta::ServerCall {
+                name: "google_search".to_owned(),
+                payload_json: r#"{"query":"arc release"}"#.to_owned(),
+            }),
+            Ok(CompletionDelta::ServerResponse {
+                name: "google_search".to_owned(),
+                payload_json: r#"{"results":["arc 3.5"]}"#.to_owned(),
+            }),
+            Ok(CompletionDelta::Text("arc shipped 3.5".to_owned())),
+            Ok(CompletionDelta::Grounding(r#"{"chunks":["x"]}"#.to_owned())),
+            // a stray ToolCalls stop with no real calls must not start a tool
+            // step; the script has only one entry, so a second request panics
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::ToolCalls,
+            }),
+        ]]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, mut rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert!(!reply.step_capped, "server calls are not tool steps");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 4, "created, user message, server call, reply");
+        let user = appended(&events[1]);
+        let call = server_called(&events[2]);
+        let assistant = appended(&events[3]);
+
+        assert_eq!(call.turn_id, user.turn_id, "one turn, one id");
+        assert_eq!(call.name, "google_search");
+        assert_eq!(call.arguments_json, r#"{"query":"arc release"}"#);
+        assert_eq!(call.response_json, r#"{"results":["arc 3.5"]}"#);
+
+        assert_eq!(assistant.content, "arc shipped 3.5");
+        assert_eq!(assistant.grounding_json, r#"{"chunks":["x"]}"#);
+
+        assert_eq!(
+            drain(&mut rx),
+            [
+                EngineEvent::Accepted {
+                    session_id: reply.session_id.clone()
+                },
+                EngineEvent::ToolCallStarted {
+                    call_id: "web-0".to_owned(),
+                    index: 0,
+                    name: "google_search".to_owned(),
+                    arguments_json: r#"{"query":"arc release"}"#.to_owned(),
+                },
+                EngineEvent::ToolCallEnded {
+                    call_id: "web-0".to_owned(),
+                    outcome: ToolOutcome::Ok,
+                },
+                EngineEvent::Delta("arc shipped 3.5".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unclosed_server_call_lands_with_an_empty_response_at_turn_end() {
+        let provider = ScriptedProvider::scripted(vec![vec![
+            Ok(CompletionDelta::ServerCall {
+                name: "google_search".to_owned(),
+                payload_json: r#"{"query":"arc release"}"#.to_owned(),
+            }),
+            Ok(CompletionDelta::Text("still searching".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            }),
+        ]]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        assert_eq!(
+            events.len(),
+            4,
+            "created, user message, assistant reply, flushed server call"
+        );
+        let call = server_called(&events[3]);
+        assert_eq!(call.name, "google_search");
+        assert_eq!(call.arguments_json, r#"{"query":"arc release"}"#);
+        assert!(
+            call.response_json.is_empty(),
+            "the search happened; losing it would un-replay what the model saw"
         );
     }
 
@@ -3991,6 +4215,47 @@ mod tests {
                 .all(|request| request.tools.iter().all(|def| def.name != "consult_expert")),
             "{:?}",
             requests.iter().map(|r| &r.tools).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_concierge_session_asks_the_provider_for_web_grounding() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert!(provider.requests()[0].web, "concierge is a web capability");
+    }
+
+    #[tokio::test]
+    async fn executor_and_archivist_sessions_never_ask_for_web_grounding() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
+        let (engine, _) = engine(&provider, &dir);
+
+        for role in [SessionRole::Executor, SessionRole::Archivist] {
+            let run = runner_with_role(&provider, role);
+            let (tx, _rx) = channel();
+            engine
+                .send_message(&run, None, "hi", tx)
+                .await
+                .expect("send");
+        }
+
+        assert!(
+            provider.requests().iter().all(|request| !request.web),
+            "{:?}",
+            provider
+                .requests()
+                .iter()
+                .map(|r| r.web)
+                .collect::<Vec<_>>()
         );
     }
 

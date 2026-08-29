@@ -61,6 +61,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             seed: None,
+            web: false,
         }
     }
 

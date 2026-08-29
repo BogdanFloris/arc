@@ -113,7 +113,9 @@ struct Payload<'a> {
     system_instruction: Option<Content<'a>>,
     contents: Vec<Content<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<Tools<'a>>,
+    tools: Vec<ToolEntry<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<ToolConfig>,
     #[serde(skip_serializing_if = "GenerationConfig::is_empty")]
     generation_config: GenerationConfig,
 }
@@ -157,10 +159,28 @@ struct Output<'a> {
     output: &'a str,
 }
 
+// google_search rides its own entry in the tools array, never merged with
+// our function declarations
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ToolEntry<'a> {
+    Function {
+        #[serde(rename = "functionDeclarations")]
+        function_declarations: Vec<Declaration<'a>>,
+    },
+    GoogleSearch {
+        #[serde(rename = "googleSearch")]
+        google_search: GoogleSearch,
+    },
+}
+
+#[derive(Serialize)]
+struct GoogleSearch {}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Tools<'a> {
-    function_declarations: Vec<Declaration<'a>>,
+struct ToolConfig {
+    include_server_side_tool_invocations: bool,
 }
 
 #[derive(Serialize)]
@@ -216,19 +236,31 @@ impl<'a> Payload<'a> {
                     }],
                 }),
             contents: contents(&request.messages)?,
-            tools: if request.tools.is_empty() {
-                Vec::new()
-            } else {
-                vec![Tools {
-                    function_declarations: request.tools.iter().map(declaration).collect(),
-                }]
-            },
+            tools: tools(request),
+            tool_config: request.web.then_some(ToolConfig {
+                include_server_side_tool_invocations: true,
+            }),
             generation_config: GenerationConfig {
                 thinking_config,
                 seed: request.seed,
             },
         })
     }
+}
+
+fn tools(request: &CompletionRequest) -> Vec<ToolEntry<'_>> {
+    let mut tools = Vec::new();
+    if !request.tools.is_empty() {
+        tools.push(ToolEntry::Function {
+            function_declarations: request.tools.iter().map(declaration).collect(),
+        });
+    }
+    if request.web {
+        tools.push(ToolEntry::GoogleSearch {
+            google_search: GoogleSearch {},
+        });
+    }
+    tools
 }
 
 fn declaration(tool: &ToolDefinition) -> Declaration<'_> {
@@ -352,6 +384,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             seed: None,
+            web: false,
         }
     }
 
@@ -514,6 +547,62 @@ mod tests {
             body(&plain).get("generationConfig").is_none(),
             "an empty generationConfig should not be sent at all"
         );
+    }
+
+    #[test]
+    fn web_off_is_byte_identical_to_the_golden_request() {
+        let json = body(&request(vec![Message::Text {
+            role: Role::User,
+            content: "hi".to_owned(),
+            reasoning: None,
+        }]));
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "systemInstruction": {"parts": [{"text": "Be terse."}]},
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"thinkingConfig": {"thinkingLevel": "MINIMAL"}}
+            })
+        );
+    }
+
+    #[test]
+    fn web_on_adds_the_google_search_tool_and_tool_config() {
+        let mut turn = request(vec![Message::Text {
+            role: Role::User,
+            content: "hi".to_owned(),
+            reasoning: None,
+        }]);
+        turn.web = true;
+        let json = body(&turn);
+
+        assert_eq!(json["tools"], serde_json::json!([{"googleSearch": {}}]));
+        assert_eq!(
+            json["toolConfig"],
+            serde_json::json!({"includeServerSideToolInvocations": true})
+        );
+    }
+
+    #[test]
+    fn web_on_keeps_function_declarations_alongside_google_search() {
+        let mut turn = request(vec![Message::Text {
+            role: Role::User,
+            content: "hi".to_owned(),
+            reasoning: None,
+        }]);
+        turn.web = true;
+        turn.tools = vec![crate::provider::ToolDefinition {
+            name: "get_time".to_owned(),
+            description: "the current time".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let json = body(&turn);
+
+        let entries = json["tools"].as_array().expect("tools array");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["functionDeclarations"][0]["name"], "get_time");
+        assert_eq!(entries[1], serde_json::json!({"googleSearch": {}}));
     }
 
     #[test]

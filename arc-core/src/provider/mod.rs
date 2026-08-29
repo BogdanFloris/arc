@@ -27,6 +27,10 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
 
     pub seed: Option<u64>,
+
+    /// Concierge sessions only (row 1.3 §2026-08-24): ask the provider for
+    /// its own grounding. Providers that can't ground simply ignore it.
+    pub web: bool,
 }
 
 /// How much a role should think before answering. `Default` leaves the
@@ -118,7 +122,26 @@ pub enum CompletionDelta {
 
     ToolCall(ToolCall),
 
-    Done { usage: Usage, stop: Stop },
+    /// A provider-side tool invocation (Gemini's `google_search`, say):
+    /// resolved inside the model's own turn, never one of ours.
+    ServerCall {
+        name: String,
+        payload_json: String,
+    },
+
+    /// The response half of a `ServerCall`, verbatim.
+    ServerResponse {
+        name: String,
+        payload_json: String,
+    },
+
+    /// The provider's grounding metadata, verbatim; at most one per turn.
+    Grounding(String),
+
+    Done {
+        usage: Usage,
+        stop: Stop,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +331,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             thinking: Thinking::Default,
+            web: false,
         }
     }
 
@@ -330,6 +354,9 @@ mod tests {
                 CompletionDelta::Text(chunk) => drained.text.push_str(&chunk),
                 CompletionDelta::Reasoning(chunk) => drained.reasoning.push_str(&chunk),
                 CompletionDelta::ToolCall(call) => drained.calls.push(call),
+                CompletionDelta::ServerCall { .. }
+                | CompletionDelta::ServerResponse { .. }
+                | CompletionDelta::Grounding(_) => {}
                 CompletionDelta::Done { usage, stop } => drained.ending = Some((usage, stop)),
             }
         }
