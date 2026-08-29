@@ -8,6 +8,7 @@ Bogdan assigns each task; the other reviews it. Statuses are `todo` → `in prog
 
 | # | Task | Assignee | Status |
 |---|------|----------|--------|
+| 1 | herdr integration: the TUI reports its own lifecycle instead of being screen-scraped. herdr 0.8 gives each pane one status authority — Claude Code earns it through installed hooks; arc, owning its harness, earns it natively. When `HERDR_PANE_ID` is set, a fire-and-forget reporter (arc-core module, wired in the client) speaks newline-delimited JSON over the local socket (`HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`): `pane.report_agent` with source `custom:arc`, agent `arc`, mapping Streaming → working, a turn that ends before the next keypress → done, input or the idle prompt → idle, Disconnected → blocked; esc's cancel lands idle. `pane.report_metadata` carries the session name as title and running-job counts as tokens — presentation only; semantic state belongs to the interactive turn, never to background jobs. Reporting never blocks the UI, never surfaces its own failures, and is inert outside herdr; nothing touches the log — display only, no events, no proto change. Protocol: https://herdr.dev/docs/socket-api/ | — | todo |
 
 ## Standing watches, carried from Phase 3.5
 
