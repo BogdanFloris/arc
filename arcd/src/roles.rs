@@ -12,6 +12,32 @@ use arc_proto::v1::SessionRole;
 
 use crate::config::{Config, RoleConfig, RoleProvider};
 
+const RUNNING_JOBS: &str = r"Running jobs:
+- Dispatch, then end your reply. The handback arrives on its own.
+  continue_job never fetches a result; each message costs the job a
+  full turn.
+- If a finished job already holds the context — files it read, a repo
+  it analyzed — continue that job, even when the question is new.
+  A fresh dispatch starts from nothing.
+- analyze means look and report; nothing in the workspace changes.
+  Say implement only when the user asked for changes, and let the brief
+  say what may change.
+- Briefs are self-contained. The child sees nothing of this
+  conversation.
+- A handback is the job's claim, not a verified fact. Say what the job
+  reports, not what is proven, unless you checked.
+- A job cancelled by the user stays stopped. Acknowledge it; never
+  dispatch or continue that work again unless the user asks.
+- Hand the user conclusions, not transcripts.";
+
+/// The identity file when there is one, then the jobs instrutions
+fn concierge_system(identity: Option<String>) -> String {
+    match identity {
+        Some(identity) => format!("{}\n\n{RUNNING_JOBS}", identity.trim_end()),
+        None => RUNNING_JOBS.to_owned(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Roles {
     concierge: Runner,
@@ -28,12 +54,11 @@ impl Roles {
     ) -> Result<Self> {
         let mut built = Built::new(sidecar_endpoint, secrets);
         Ok(Self {
-            // the identity file loads for the concierge and nowhere else
             concierge: built.role(
                 SessionRole::Concierge,
                 config.roles.concierge.as_ref(),
                 config,
-                identity,
+                Some(concierge_system(identity)),
             )?,
             executor: built.role(
                 SessionRole::Executor,
@@ -227,6 +252,36 @@ mod tests {
         }
         let config: Config = toml::from_str(text).expect("parses");
         Roles::resolve(&config, SIDECAR, &Secrets::new(dir), None)
+    }
+
+    #[test]
+    fn the_concierge_system_is_identity_then_jobs_doctrine_and_job_roles_get_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config: Config = toml::from_str("").expect("parses");
+        let roles = Roles::resolve(
+            &config,
+            SIDECAR,
+            &Secrets::new(dir.path()),
+            Some("You are ARC.\n".to_owned()),
+        )
+        .expect("resolves");
+
+        let system = roles.concierge().system.as_deref().expect("a system");
+        assert!(system.starts_with("You are ARC."), "{system}");
+        assert!(
+            system.ends_with("conclusions, not transcripts."),
+            "{system}"
+        );
+        assert_eq!(roles.executor().system, None);
+        assert_eq!(roles.archivist().system, None);
+    }
+
+    #[test]
+    fn no_identity_file_still_gives_the_concierge_the_jobs_doctrine() {
+        let roles = resolved("");
+
+        let system = roles.concierge().system.as_deref().expect("a system");
+        assert!(system.starts_with("Running jobs:"), "{system}");
     }
 
     #[test]

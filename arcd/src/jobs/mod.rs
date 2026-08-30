@@ -25,10 +25,6 @@ use turn::run_job;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// A live job's handles: the steer queue's write end, a cancel signal
-/// (row 6.39), and a drop-queued-steers signal (row 6.33). All three share
-/// the entry's lifetime — inserted together on spawn, removed together
-/// when the job task itself finishes.
 struct LiveJob {
     steer_tx: mpsc::UnboundedSender<String>,
     cancel: watch::Sender<bool>,
@@ -38,24 +34,16 @@ struct LiveJob {
 type LiveMap = Mutex<HashMap<String, LiveJob>>;
 type Handles = Mutex<Vec<JoinHandle<()>>>;
 
-/// Runs the jobs `dispatch` created. One tokio task per job, driven to
-/// completion with `send_message`; nothing restarts a job that fails.
 pub struct Supervisor {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
-    /// Project name to root path, so a dispatched job's system prompt can
-    /// read `<root>/AGENTS.md`. A project absent here gets no system prompt.
     projects: BTreeMap<String, PathBuf>,
     handles: Arc<Handles>,
-    /// `session_id` -> steer sender, for jobs currently running. `steer`
-    /// sends under this lock; a job task removes its own entry under the
-    /// same lock, so an enqueue can never land in a channel nobody will read.
     live: Arc<LiveMap>,
-    /// Outlives `live`: a finished job keeps its status entry after its
-    /// steer sender is torn down, until eviction or a daemon restart.
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
     handback: Option<Arc<Handback>>,
+    identity: Option<String>,
 }
 
 impl Supervisor {
@@ -69,32 +57,31 @@ impl Supervisor {
             statuses: Arc::new(JobStatuses::new()),
             notifier: None,
             handback: None,
+            identity: None,
         }
     }
 
-    /// Project roots a dispatched job's system prompt is built from. Absent,
-    /// job runners get no system prompt at all.
     #[must_use]
     pub fn with_projects(mut self, projects: BTreeMap<String, PathBuf>) -> Self {
         self.projects = projects;
         self
     }
 
-    /// Wires the daemon's broadcast spine: job state transitions then also
-    /// fan out as `job_changed` pushes. Absent, nothing is sent.
     #[must_use]
     pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
         self.notifier = Some(notifier);
         self
     }
 
-    /// Wires the concierge runner a handback turn drives (DESIGN.md §4.1):
-    /// once a job's summary lands in a concierge parent, the supervisor
-    /// runs one turn over it so the concierge reacts. Absent, `record_handback`
-    /// still runs but no turn follows.
     #[must_use]
     pub fn with_concierge(mut self, runner: Runner) -> Self {
         self.handback = Some(Arc::new(Handback::new(runner)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_identity(mut self, identity: Option<String>) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -112,18 +99,12 @@ impl Supervisor {
         );
     }
 
-    /// Ends whatever chain of handback turns was running for `session_id`:
-    /// called from the server's send path, since a user message is what
-    /// ends autonomous narration (DESIGN.md §4.1). A no-op without a
-    /// concierge wired, or if the session has no counter yet.
     pub fn reset_autonomy(&self, session_id: &str) {
         if let Some(handback) = &self.handback {
             handback.reset_autonomy(session_id);
         }
     }
 
-    /// The daemon's live view of every job it remembers: running jobs first
-    /// (newest first), then terminal ones (newest first).
     pub fn list(&self) -> Vec<JobInfo> {
         let mut jobs = self.statuses.list();
         for job in &mut jobs {
@@ -136,9 +117,6 @@ impl Supervisor {
         job_title(&self.engine, session_id)
     }
 
-    /// Enqueues a steering message for a live job. `true` if the job was
-    /// live and the message was enqueued; `false` otherwise, meaning the
-    /// caller should fall through to a normal turn.
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
         let queued = steer_live(&self.live, session_id, text);
         if queued {
@@ -149,19 +127,10 @@ impl Supervisor {
         queued
     }
 
-    /// Cancels a live job (row 6.39): drops its running turn, drains
-    /// whatever's queued, and hands back that the user stopped it. `false`
-    /// if the job isn't live — the same honest signal `steer` gives for an
-    /// unknown or already-finished job.
     pub fn cancel(&self, session_id: &str) -> bool {
         cancel_live(&self.live, session_id)
     }
 
-    /// Empties a live job's queued steers (row 6.33) without touching its
-    /// running turn. Only signals the request here: the job's own task owns
-    /// the queue, so it drains it and reports the fresh count itself — a
-    /// steer that queues between this call and that drain must never be
-    /// silently discarded. `false` if the job isn't live.
     pub fn drop_steers(&self, session_id: &str) -> bool {
         let live = self.live.lock().expect("live");
         let Some(job) = live.get(session_id) else {
@@ -171,24 +140,18 @@ impl Supervisor {
         true
     }
 
-    /// The runner a job of this role is dispatched with — the same map,
-    /// shared rather than rebuilt, so the server can serve a follow-up turn
-    /// on a job's own session with its own role instead of the concierge's.
     pub fn job_runner(&self, role: SessionRole) -> Option<&Runner> {
         self.runners.get(&role)
     }
 
-    /// A configured project's root, for building an executor turn's system
-    /// prompt outside a job spawn (the `:code` door and any direct send into
-    /// an executor session, row 9.1). `None` if the project is unconfigured.
     pub(crate) fn project_root(&self, project: &str) -> Option<&Path> {
         self.projects.get(project).map(PathBuf::as_path)
     }
 
-    /// Routes a `continue_job` request (DESIGN.md §6.16): queued into the
-    /// job's steer channel if it's still running, or resumed as a fresh
-    /// task over the same child session, its full transcript intact, if it
-    /// already finished.
+    pub(crate) fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
     pub fn continue_job(&self, cont: ContinuedJob) {
         let ctx = HandbackCtx {
             engine: &self.engine,
@@ -203,14 +166,6 @@ impl Supervisor {
         route_continue(&ctx, cont);
     }
 
-    /// Startup repair (row 6.34): every job session left dispatched-but-
-    /// unconcluded when the daemon last died gets a "stopped: restarted"
-    /// handback now, through the same `record_handback` path a live job's
-    /// own ending uses — parent turn guard, narration turn, all of it. Runs
-    /// once, after orphan repair and before serving; idempotent across
-    /// repeated restarts, since a job already handed back is found
-    /// concluded and skipped. A job session that predates 6.34 has no
-    /// recorded parent and cannot be found here.
     pub async fn repair_restart_handbacks(&self) {
         let unfinished = match self.engine.unfinished_jobs() {
             Ok(unfinished) => unfinished,
@@ -239,10 +194,6 @@ impl Supervisor {
         }
     }
 
-    /// Gives outstanding jobs a grace period to finish, then abandons them.
-    /// Loops the drain to a fixed point: a job's own turn, or a handback
-    /// turn it triggers, can spawn further jobs (chains, DESIGN.md §4.1),
-    /// so one drain pass is not enough to wait out a whole chain.
     pub async fn shutdown(&self) {
         let draining = async {
             loop {
@@ -262,8 +213,6 @@ impl Supervisor {
     }
 }
 
-/// Spawns one job's task and registers its handle, whether the job came
-/// from a client's `dispatch` or from a handback turn's own `dispatch`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
     for job in jobs {
@@ -281,17 +230,12 @@ fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
     }
 }
 
-/// Routes every `continue_job` a turn produced, alongside whatever it
-/// dispatched.
 fn route_continues(ctx: &HandbackCtx<'_>, continues: Vec<ContinuedJob>) {
     for cont in continues {
         route_continue(ctx, cont);
     }
 }
 
-/// Acts on every `cancel_job` a turn produced: the cancelled handback
-/// (already existing) lands in the target's own parent and is the
-/// confirmation — no new event is needed here.
 fn route_cancels(ctx: &HandbackCtx<'_>, cancels: Vec<String>) {
     for session_id in cancels {
         if !cancel_live(ctx.live, &session_id) {
@@ -326,12 +270,6 @@ fn spawn_job(
     );
 }
 
-/// Spawns a job's task and registers its handle. `guard_absent` gates the
-/// `live` insert on `session_id` not already being there: a fresh dispatch
-/// never needs this (the `session_id` is brand new), but a `continue_job`
-/// resume does — two resumes racing on the same finished job must not both
-/// spawn a task and clobber each other's steer channel. Returns whether it
-/// actually spawned.
 #[allow(clippy::too_many_arguments)]
 fn spawn_job_checked(
     job: DispatchedJob,
@@ -402,10 +340,6 @@ fn spawn_job_checked(
     true
 }
 
-/// Spawns `run_job` under a wrapper task that watches for it panicking
-/// (any bare `expect`, any bug) instead of reaching a terminal state. The
-/// wrapper, not `run_job`, is what `handles` tracks, so `shutdown` still
-/// waits out the recovery path too.
 #[allow(clippy::too_many_arguments)]
 fn spawn_watched(
     job: DispatchedJob,
@@ -475,10 +409,6 @@ fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
         .is_some_and(|job| job.steer_tx.send(text.to_owned()).is_ok())
 }
 
-/// Routes one `ContinuedJob`: a steer if the job is still live, or a resume
-/// — a fresh task over the same child session, its `message` as the next
-/// turn — if it already finished. Shared by every turn driver that can
-/// produce one: a user turn, a handback turn, and a job's own turn.
 fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
     if steer_live(ctx.live, &cont.session_id, &cont.message) {
         if let Some(info) = ctx.statuses.record_steer_queued(&cont.session_id) {
@@ -666,9 +596,6 @@ mod tests {
         })
     }
 
-    /// An engine over a log seeded before this call, as a restart sees it:
-    /// opened fresh and replayed into a fresh index, no engine-driven append
-    /// in between.
     fn reopened_arc_engine(dir: &TempDir) -> Arc<Engine> {
         let log = Log::open(dir.path()).expect("open log");
         let mut projection = Projection::in_memory().expect("open projection");
@@ -703,8 +630,6 @@ mod tests {
             "the unconcluded job gets exactly one restart handback"
         );
 
-        // a second restart replays the same seeded log plus the handback
-        // just appended; it must not hand back a second time
         let engine = reopened_arc_engine(&dir);
         let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
         supervisor.repair_restart_handbacks().await;
@@ -747,7 +672,6 @@ mod tests {
         seed_log(
             &dir,
             vec![
-                // predates 6.34: no recorded dispatched_by
                 seeded_session("s-child", SessionRole::Executor, ""),
                 seeded_message("s-child", Role::User, "fix the bug"),
             ],
@@ -800,9 +724,6 @@ mod tests {
             budget: None,
         });
 
-        // the brief's user message lands as soon as the turn opens, before
-        // the provider stalls on the gate: waiting for it proves turn 1 is
-        // genuinely in flight when the steer below gets enqueued
         wait_for_message_count(dir.path(), &child_id, 1).await;
         assert!(
             supervisor.steer(&child_id, "also check the linter"),
@@ -863,8 +784,6 @@ mod tests {
             }),
         });
 
-        // both steers are enqueued while the brief turn is still gated, so
-        // the job's post-turn drain finds them already queued in order
         wait_for_message_count(dir.path(), &child_id, 1).await;
         assert!(supervisor.steer(&child_id, "first steer"));
         assert!(supervisor.steer(&child_id, "second steer"));

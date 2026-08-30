@@ -283,7 +283,9 @@ Identity is exempt from event-sourcing. It is a plain file, versioned in git and
 
 This is close to what `AGENTS.md` already asks of contributors, and deliberately so — one house style, applied to the assistant and to the people working on it.
 
-Identity loads into the **concierge** role only (§6). The roles that execute jobs have no voice and no personality preamble; paying for one on the bulk of the token spend is waste.
+Identity loads wherever the user is present: the concierge, and a direct executor session — the `:code` door and any follow-up sent into a finished job's own session (row 9.1). Dispatched jobs still get none; a job has no voice and no personality preamble, and paying for one on the bulk of the token spend is waste. The distinction is presence, not role.
+
+Operational doctrine is not identity and does not live in the file. The concierge's rules for running jobs — dispatch-then-stop, when to continue versus dispatch, handbacks are claims — are a constant in code, appended after the identity file in the concierge's system prompt: each line is coupled to the tool surface and must change in lockstep with it, at code cadence, not human cadence.
 
 ### 5.2 Distilled tier
 

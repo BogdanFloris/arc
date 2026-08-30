@@ -47,11 +47,19 @@ pub(super) fn job_system_prompt(root: &Path) -> String {
     with_agents_md(root, job_preamble(root))
 }
 
-/// The direct preamble, plus AGENTS.md. Re-derived per turn like `sources`
-/// (row 9.1) — byte-stable while AGENTS.md is unchanged, since caching
-/// depends on the prefix staying stable turn to turn.
-pub(crate) fn direct_system_prompt(root: &Path) -> String {
-    with_agents_md(root, direct_preamble(root))
+/// The direct preamble, then the identity file when one is loaded — the
+/// user is present in a direct session, so who ARC is and what it knows
+/// about them belongs in context, unlike in a dispatched job — then
+/// AGENTS.md, so the project's own rules land last and most specific.
+/// Re-derived per turn like `sources` (row 9.1) — byte-stable while the
+/// inputs are unchanged, since caching depends on the prefix staying
+/// stable turn to turn.
+pub(crate) fn direct_system_prompt(root: &Path, identity: Option<&str>) -> String {
+    let preamble = match identity {
+        Some(identity) => format!("{}\n\n{}", direct_preamble(root), identity.trim_end()),
+        None => direct_preamble(root),
+    };
+    with_agents_md(root, preamble)
 }
 
 #[cfg(test)]
@@ -153,7 +161,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir proj");
         std::fs::write(root.join("AGENTS.md"), "Use jj, not git.\n").expect("write AGENTS.md");
 
-        let system = direct_system_prompt(&root);
+        let system = direct_system_prompt(&root, None);
 
         assert!(
             system.contains("working interactively with the user"),
@@ -161,6 +169,21 @@ mod tests {
         );
         assert!(!system.contains("job's report"), "{system}");
         assert!(system.contains("Use jj, not git."), "{system}");
+    }
+
+    #[test]
+    fn a_direct_prompt_layers_identity_between_the_preamble_and_agents_md() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        std::fs::write(root.join("AGENTS.md"), "Use jj, not git.\n").expect("write AGENTS.md");
+
+        let system = direct_system_prompt(&root, Some("You are ARC.\n"));
+
+        let preamble = system.find("coding agent").expect("preamble");
+        let identity = system.find("You are ARC.").expect("identity");
+        let agents = system.find("Use jj, not git.").expect("AGENTS.md");
+        assert!(preamble < identity && identity < agents, "{system}");
     }
 
     #[test]

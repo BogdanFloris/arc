@@ -227,7 +227,8 @@ impl Daemon {
             Supervisor::new(Arc::clone(&self.engine), job_runners)
                 .with_projects(project_roots)
                 .with_notifier(self.notifier.clone())
-                .with_concierge(self.roles.concierge().clone()),
+                .with_concierge(self.roles.concierge().clone())
+                .with_identity(self.identity.clone()),
         );
         // after orphan repair (already done in `start`), before serving
         supervisor.repair_restart_handbacks().await;

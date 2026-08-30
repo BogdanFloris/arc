@@ -394,7 +394,10 @@ fn direct_system_prompt_for(
         return None;
     }
     let root = supervisor.project_root(&project)?;
-    Some(crate::jobs::prompt::direct_system_prompt(root))
+    Some(crate::jobs::prompt::direct_system_prompt(
+        root,
+        supervisor.identity(),
+    ))
 }
 
 /// A steered message never reaches the engine on this connection: its turn
@@ -938,6 +941,11 @@ mod tests {
 
     const SEEDED_AT_MICROS: i64 = 1_700_000_000_000_000;
 
+    /// What the harness wires as the identity file's text (row 2, phase
+    /// 3.6): present so tests can pin where it appears and where it never
+    /// does.
+    const TEST_IDENTITY: &str = "You are ARC, the test edition.";
+
     fn seeded_record(id: &str, title: &str) -> Event {
         Event {
             seq: 0,
@@ -1077,7 +1085,10 @@ mod tests {
             let supervisor = Arc::new(
                 Supervisor::new(Arc::clone(&engine), job_runners)
                     .with_projects(project_roots)
-                    .with_notifier(notifier.clone()),
+                    .with_notifier(notifier.clone())
+                    // mirrors daemon.rs: identity rides the supervisor for
+                    // direct executor turns, never for dispatched jobs
+                    .with_identity(Some(TEST_IDENTITY.to_owned())),
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2830,9 +2841,10 @@ mod tests {
     }
 
     /// Row 9.1: the `:code` door round-trips a fresh executor session, and
-    /// the first turn sent into it carries the direct preamble and
-    /// AGENTS.md — while a job dispatched into the same project still gets
-    /// the unchanged job preamble. Pins both variants side by side.
+    /// the first turn sent into it carries the direct preamble, the
+    /// identity file, and AGENTS.md — while a job dispatched into the same
+    /// project still gets the unchanged, identity-free job preamble. Pins
+    /// both variants side by side.
     #[tokio::test]
     async fn create_session_opens_a_code_session_with_the_direct_prompt_and_a_job_keeps_its_own() {
         let (registry, project_dir, projects) = dispatch_registry_and_projects();
@@ -2886,6 +2898,10 @@ mod tests {
             "{job_system}"
         );
         assert!(job_system.contains("Keep commits small."), "{job_system}");
+        assert!(
+            !job_system.contains(TEST_IDENTITY),
+            "a dispatched job never carries identity: {job_system}"
+        );
 
         let direct_system = requests[1]
             .system
@@ -2899,6 +2915,10 @@ mod tests {
         assert!(
             direct_system.contains("Keep commits small."),
             "{direct_system}"
+        );
+        assert!(
+            direct_system.contains(TEST_IDENTITY),
+            "the user is present, so the direct turn carries identity: {direct_system}"
         );
 
         let sessions = list(&mut ws, 4).await;
