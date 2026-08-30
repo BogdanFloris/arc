@@ -10,9 +10,10 @@ use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runne
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MarkBranch,
-    MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ReasoningDelta,
-    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList, SessionRole, StreamEnd,
-    ToolCallEnded, ToolCallStarted, branch_marked, client_frame, server_frame,
+    MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ProjectList,
+    ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList,
+    SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked, client_frame,
+    server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -252,6 +253,9 @@ async fn request(
             review_delete(ws, engine, frame.request_id, &delete.record_id).await
         }
         Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
+        Some(client_frame::Msg::ListProjects(_)) => {
+            list_projects(ws, supervisor, frame.request_id).await
+        }
         Some(client_frame::Msg::CancelJob(cancel)) => {
             cancel_job(ws, supervisor, frame.request_id, &cancel.session_id).await
         }
@@ -485,6 +489,17 @@ async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> Cont
 async fn list_jobs(ws: &mut Socket, supervisor: &Supervisor, request_id: u64) -> ControlFlow<()> {
     let msg = server_frame::Msg::JobList(JobList {
         jobs: supervisor.list(),
+    });
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+async fn list_projects(
+    ws: &mut Socket,
+    supervisor: &Supervisor,
+    request_id: u64,
+) -> ControlFlow<()> {
+    let msg = server_frame::Msg::ProjectList(ProjectList {
+        projects: supervisor.project_list().to_vec(),
     });
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -789,6 +804,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
+        Some(client_frame::Msg::ListProjects(_)) => "list_projects",
         Some(client_frame::Msg::Subscribe(_)) => "subscribe",
         Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
         Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
@@ -846,10 +862,11 @@ mod tests {
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
         CancelJob, CancelTurn, DropSteers, Event, FetchHistory, HistoryEntry, HistoryMessage,
-        HistoryToolCall, HistoryToolResult, ListJobs, ListSessions, MemoryEvent, MemoryRecord,
-        MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList,
-        Notification, Role, SessionCreated, SessionEvent, SessionRole, Source, Subscribe,
-        ToolOutcome, event, job_info, memory_event, memory_record, notification, session_event,
+        HistoryToolCall, HistoryToolResult, ListJobs, ListProjects, ListSessions, MemoryEvent,
+        MemoryRecord, MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete,
+        MemoryReviewList, Notification, ProjectInfo, Role, SessionCreated, SessionEvent,
+        SessionRole, Source, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
+        notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1068,6 +1085,16 @@ mod tests {
                         .map(|grant| (name.clone(), grant.root.clone()))
                 })
                 .collect();
+            // mirrors daemon.rs: the picker's slate is the configured
+            // projects; specs carry no description, so the test list
+            // derives one from the name
+            let project_list = projects
+                .keys()
+                .map(|name| ProjectInfo {
+                    name: name.clone(),
+                    description: format!("about {name}"),
+                })
+                .collect();
             let engine = Arc::new(
                 Engine::new(Store::new(log, projection), registry)
                     .with_projects(projects)
@@ -1088,7 +1115,8 @@ mod tests {
                     .with_notifier(notifier.clone())
                     // mirrors daemon.rs: identity rides the supervisor for
                     // direct executor turns, never for dispatched jobs
-                    .with_identity(Some(TEST_IDENTITY.to_owned())),
+                    .with_identity(Some(TEST_IDENTITY.to_owned()))
+                    .with_project_list(project_list),
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3192,6 +3220,38 @@ mod tests {
             Some(server_frame::Msg::JobList(list)) => list.jobs,
             other => panic!("expected JobList, got {other:?}"),
         }
+    }
+
+    /// Row 3 (phase 3.6): the picker's slate — every configured project's
+    /// name and description, straight from config, no session involved.
+    #[tokio::test]
+    async fn list_projects_names_every_configured_project() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let mut harness = Harness::with_executor(
+            Script::Canned(VecDeque::new()),
+            registry,
+            Script::Canned(VecDeque::new()),
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, client_frame::Msg::ListProjects(ListProjects {})).await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 1);
+        let listed = match frame.msg {
+            Some(server_frame::Msg::ProjectList(list)) => list.projects,
+            other => panic!("expected ProjectList, got {other:?}"),
+        };
+        assert_eq!(
+            listed,
+            vec![ProjectInfo {
+                name: "arc".to_owned(),
+                description: "about arc".to_owned(),
+            }]
+        );
+
+        harness.stop().await;
     }
 
     #[tokio::test]

@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 
 use arc_proto::v1::{
     CancelJob, CancelTurn, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession,
-    JobInfo, ListJobs, ListSessions, MarkBranch, MemoryReviewAccept, MemoryReviewDelete,
-    MemoryReviewItem, MemoryReviewList, Notification, SendMessage, ServerFrame, SessionHistory,
-    SessionInfo, SessionRole, Subscribe, branch_marked, client_frame, server_frame,
+    JobInfo, ListJobs, ListProjects, ListSessions, MarkBranch, MemoryReviewAccept,
+    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification, ProjectInfo, SendMessage,
+    ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe, branch_marked, client_frame,
+    server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -201,6 +202,22 @@ impl Client {
                 msg: error.msg,
             }),
             other => Err(unexpected("JobList", &other)),
+        }
+    }
+
+    /// The projects `:code` may bind to (row 3, phase 3.6), for the picker.
+    #[tracing::instrument(name = "client.projects", skip_all)]
+    pub async fn projects(&mut self) -> Result<Vec<ProjectInfo>, Error> {
+        let id = self
+            .send(client_frame::Msg::ListProjects(ListProjects {}))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::ProjectList(list) => Ok(list.projects),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("ProjectList", &other)),
         }
     }
 
@@ -438,6 +455,7 @@ impl Turn<'_> {
             | server_frame::Msg::SessionHistory(_)
             | server_frame::Msg::MemoryReviewItems(_)
             | server_frame::Msg::JobList(_)
+            | server_frame::Msg::ProjectList(_)
             | server_frame::Msg::Notification(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
@@ -459,6 +477,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
         server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
         server_frame::Msg::JobList(_) => "JobList",
+        server_frame::Msg::ProjectList(_) => "ProjectList",
         server_frame::Msg::Notification(_) => "Notification",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))

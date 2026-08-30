@@ -67,6 +67,7 @@ message ClientFrame {
     ForkSession fork_session = 22;
     MarkBranch mark_branch = 23;
     CancelTurn cancel_turn = 24;
+    ListProjects list_projects = 25;
   }
 }
 
@@ -83,6 +84,20 @@ message CancelTurn {
 message CreateSession {
   SessionRole role = 1;
   string project = 2;
+}
+
+// Asks for the configured projects `:code` (and `dispatch`) may bind to,
+// for the TUI's project picker. Static config, served fresh per request.
+message ListProjects {}
+
+message ProjectInfo {
+  string name = 1;
+  // one line grounding what the project is, from its config
+  string description = 2;
+}
+
+message ProjectList {
+  repeated ProjectInfo projects = 1;
 }
 
 // Forks `session_id` at `fork_point` (a global log seq): a durable branch
@@ -316,5 +331,6 @@ message ServerFrame {
     MemoryReviewItems memory_review_items = 19;
     JobList job_list = 20;
     Notification notification = 21;
+    ProjectList project_list = 22;
   }
 }

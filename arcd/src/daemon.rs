@@ -223,12 +223,22 @@ impl Daemon {
             .iter()
             .map(|(name, project)| (name.clone(), project.root.clone()))
             .collect();
+        let project_list = self
+            .config
+            .projects
+            .iter()
+            .map(|(name, project)| arc_proto::v1::ProjectInfo {
+                name: name.clone(),
+                description: project.description.clone(),
+            })
+            .collect();
         let supervisor = Arc::new(
             Supervisor::new(Arc::clone(&self.engine), job_runners)
                 .with_projects(project_roots)
                 .with_notifier(self.notifier.clone())
                 .with_concierge(self.roles.concierge().clone())
-                .with_identity(self.identity.clone()),
+                .with_identity(self.identity.clone())
+                .with_project_list(project_list),
         );
         // after orphan repair (already done in `start`), before serving
         supervisor.repair_restart_handbacks().await;

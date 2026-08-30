@@ -63,6 +63,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(jobs) = &app.jobs {
         draw_jobs(frame, frame.area(), jobs);
     }
+    if let Some(projects) = &app.projects {
+        draw_projects(frame, frame.area(), projects);
+    }
     if app.help {
         draw_help(frame, app, frame.area());
     }
@@ -479,12 +482,16 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else if filtering || app.searching {
         ("/", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
-        let style =
-            if app.picker.is_some() || app.review.is_some() || app.jobs.is_some() || app.help {
-                theme::DIM
-            } else {
-                theme::PLAIN
-            };
+        let style = if app.picker.is_some()
+            || app.review.is_some()
+            || app.jobs.is_some()
+            || app.projects.is_some()
+            || app.help
+        {
+            theme::DIM
+        } else {
+            theme::PLAIN
+        };
         ("> ", theme::ACCENT, &app.input, style, app.cursor)
     };
 
@@ -519,7 +526,11 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         || steering
         || filtering
         || app.searching
-        || (app.picker.is_none() && app.review.is_none() && app.jobs.is_none() && !app.help)
+        || (app.picker.is_none()
+            && app.review.is_none()
+            && app.jobs.is_none()
+            && app.projects.is_none()
+            && !app.help)
     {
         let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
         let row = u16::try_from(cursor_row.saturating_sub(start)).unwrap_or(u16::MAX);
@@ -792,6 +803,56 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects) {
+    let rows = projects.items.len().max(1);
+    let area = popup(
+        frame,
+        full,
+        72,
+        u16::try_from(rows).unwrap_or(u16::MAX),
+        "code",
+    );
+
+    let mut lines = Vec::new();
+    if projects.items.is_empty() {
+        let word = if projects.loaded {
+            "no projects configured"
+        } else {
+            "loading"
+        };
+        lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let name_width = projects
+        .items
+        .iter()
+        .map(|p| p.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let visible = area.height as usize;
+    let start = projects.selected.saturating_sub(visible.saturating_sub(1));
+    let room = (area.width as usize).saturating_sub(name_width + 5);
+    let end = projects.items.len().min(start + visible);
+    for (row, project) in projects.items.iter().enumerate().take(end).skip(start) {
+        let selected = row == projects.selected;
+        let (prefix, style) = if selected {
+            (" > ", theme::ACCENT)
+        } else {
+            ("   ", theme::PLAIN)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{:<name_width$}", project.name), style),
+            Span::styled(
+                format!("  {}", elide(&project.description, room)),
+                theme::DIM,
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 // grouped and built from the table below so a changed key and its
 // documentation land in the same diff
 const HELP: &[(&str, &[&str])] = &[
@@ -817,6 +878,7 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces / handback summaries",
             "? J M             help / jobs / review popups",
+            "C                 pick a project; enter opens it like :code",
             "ctrl-c            quit",
             ":                 command mode",
         ],

@@ -166,6 +166,7 @@ async fn handle(
             verdict(client.review_delete(&record_id).await, events)
         }
         Command::ListJobs => list_jobs(&mut client, events).await,
+        Command::ListProjects => list_projects(&mut client, events).await,
         Command::CancelJob { session_id } => verdict(client.cancel_job(&session_id).await, events),
         Command::DropSteers { session_id } => {
             verdict(client.drop_steers(&session_id).await, events)
@@ -279,6 +280,23 @@ async fn list_jobs(
     match client.jobs().await {
         Ok(jobs) => {
             let _ = events.send(NetEvent::JobItems(jobs));
+            Ok(())
+        }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn list_projects(
+    client: &mut Client,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.projects().await {
+        Ok(projects) => {
+            let _ = events.send(NetEvent::ProjectItems(projects));
             Ok(())
         }
         Err(Error::Server { code, msg }) => {

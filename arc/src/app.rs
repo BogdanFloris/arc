@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, Role, SessionInfo, SessionRole, Source, ToolOutcome,
-    branch_marked, history_entry, job_info,
+    HistoryEntry, HistoryMessage, JobInfo, ProjectInfo, Role, SessionInfo, SessionRole, Source,
+    ToolOutcome, branch_marked, history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -30,6 +30,7 @@ pub enum Command {
         record_id: String,
     },
     ListJobs,
+    ListProjects,
     CancelJob {
         session_id: String,
     },
@@ -101,6 +102,7 @@ pub enum NetEvent {
     ReviewItems(Vec<ReviewEntry>),
     ReviewChanged(u32),
     JobItems(Vec<JobInfo>),
+    ProjectItems(Vec<ProjectInfo>),
     SessionAppended {
         session_id: String,
     },
@@ -145,6 +147,13 @@ pub struct Picker {
     pub show_all: bool,
     /// abandoned branches are hidden until asked for; x toggles
     pub show_abandoned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projects {
+    pub items: Vec<ProjectInfo>,
+    pub selected: usize,
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +250,9 @@ pub struct App {
     pub picker: Option<Picker>,
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
+    /// The `C` picker (row 3, phase 3.6): configured projects `:code` may
+    /// bind to; enter opens one without typing its name.
+    pub projects: Option<Projects>,
     pub help: bool,
     /// first help line on screen; the draw clamps it to what fits
     pub help_scroll: usize,
@@ -311,6 +323,7 @@ impl App {
             picker: None,
             review: None,
             jobs: None,
+            projects: None,
             help: false,
             help_scroll: 0,
             search: None,
@@ -410,6 +423,9 @@ impl App {
         }
         if self.jobs.is_some() {
             return self.on_jobs_key(key.code);
+        }
+        if self.projects.is_some() {
+            return self.on_projects_key(key.code);
         }
         if self.picker.is_some() {
             return self.on_picker_key(key.code);
@@ -548,6 +564,7 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('J') => return Some(self.open_jobs()),
             KeyCode::Char('M') => return Some(self.open_review()),
+            KeyCode::Char('C') => return Some(self.open_projects()),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
@@ -1055,6 +1072,43 @@ impl App {
             }
             KeyCode::Char('G') => self.help_scroll = usize::MAX,
             KeyCode::Char('g') => self.help_scroll = 0,
+            _ => {}
+        }
+        None
+    }
+
+    /// `C` (row 3, phase 3.6): the project picker over `:code`'s door —
+    /// same session machinery, the name chosen from a list instead of typed.
+    fn open_projects(&mut self) -> Command {
+        self.projects = Some(Projects {
+            items: Vec::new(),
+            selected: 0,
+            loaded: false,
+        });
+        Command::ListProjects
+    }
+
+    fn on_projects_key(&mut self, code: KeyCode) -> Option<Command> {
+        let projects = self.projects.as_mut().expect("projects is open");
+        let last = projects.items.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.projects = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                projects.selected = projects.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                projects.selected = (projects.selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                let chosen = projects
+                    .items
+                    .get(projects.selected)
+                    .map(|p| p.name.clone());
+                if let Some(name) = chosen {
+                    self.projects = None;
+                    return self.open_code(&name);
+                }
+            }
             _ => {}
         }
         None
@@ -1684,6 +1738,14 @@ impl App {
             }
             NetEvent::ReviewChanged(pending) => {
                 self.review_pending = pending;
+                None
+            }
+            NetEvent::ProjectItems(items) => {
+                if let Some(projects) = self.projects.as_mut() {
+                    projects.selected = 0;
+                    projects.items = items;
+                    projects.loaded = true;
+                }
                 None
             }
             NetEvent::JobItems(items) => {
@@ -4504,6 +4566,61 @@ mod tests {
 
         assert!(matches!(command, Some(Command::ReviewList { .. })));
         assert!(app.review.is_some());
+    }
+
+    /// Row 3 (phase 3.6): `C` is `:code` with the name picked, not typed —
+    /// the same pending-door flow from enter on.
+    #[test]
+    fn capital_c_picks_a_project_and_enter_walks_the_code_door() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        let command = app.on_key(key(KeyCode::Char('C')));
+        assert_eq!(command, Some(Command::ListProjects));
+        assert!(!app.projects.as_ref().expect("picker is open").loaded);
+
+        app.on_net(NetEvent::ProjectItems(vec![
+            ProjectInfo {
+                name: "arc".to_owned(),
+                description: "ARC's own repo".to_owned(),
+            },
+            ProjectInfo {
+                name: "scratch".to_owned(),
+                description: String::new(),
+            },
+        ]));
+        app.on_key(key(KeyCode::Char('j')));
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, None, "nothing durable for an unsent pick");
+        assert_eq!(app.projects, None, "enter closes the picker");
+        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
+
+        app.on_key(key(KeyCode::Char('i')));
+        typed(&mut app, "hello");
+        let command = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            command,
+            Some(Command::CreateSession {
+                role: SessionRole::Executor,
+                project: "scratch".to_owned(),
+            }),
+            "from the pick on, this is exactly the :code flow"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_unloaded_project_picker_swallows_enter_and_esc_closes() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('C')));
+
+        let command = app.on_key(key(KeyCode::Enter));
+        assert_eq!(command, None, "enter on a loading list picks nothing");
+        assert!(app.projects.is_some(), "the picker stays open");
+        assert_eq!(app.open_door_label(), None);
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.projects, None);
     }
 
     #[test]

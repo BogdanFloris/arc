@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use arc_core::provider::role_label;
 use arc_core::session::{ContinuedJob, DispatchedJob, Engine, Runner};
-use arc_proto::v1::{JobInfo, Notification, SessionRole};
+use arc_proto::v1::{JobInfo, Notification, ProjectInfo, SessionRole};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -44,6 +44,7 @@ pub struct Supervisor {
     notifier: Option<broadcast::Sender<Notification>>,
     handback: Option<Arc<Handback>>,
     identity: Option<String>,
+    project_list: Vec<ProjectInfo>,
 }
 
 impl Supervisor {
@@ -58,6 +59,7 @@ impl Supervisor {
             notifier: None,
             handback: None,
             identity: None,
+            project_list: Vec::new(),
         }
     }
 
@@ -150,6 +152,18 @@ impl Supervisor {
 
     pub(crate) fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
+    }
+
+    /// What `ListProjects` answers with: the same slate `dispatch`
+    /// grounds its schema on.
+    #[must_use]
+    pub fn with_project_list(mut self, projects: Vec<ProjectInfo>) -> Self {
+        self.project_list = projects;
+        self
+    }
+
+    pub(crate) fn project_list(&self) -> &[ProjectInfo] {
+        &self.project_list
     }
 
     pub fn continue_job(&self, cont: ContinuedJob) {
