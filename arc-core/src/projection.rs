@@ -162,15 +162,11 @@ pub struct SessionSummary {
     pub last_at: Option<i64>,
     pub role: i32,
     pub project: Option<String>,
-    /// The session that dispatched it; empty for a root conversation, which
-    /// is what the picker's conversation/job split keys on (row 6.34/9.1).
     pub dispatched_by: String,
     /// Who created the session (row 9.5): the picker's actual conversation/job
     /// split, correct for all history unlike `dispatched_by` alone.
     pub source: i32,
-    /// The FORK parent (row 2.3); empty for a root conversation.
     pub parent_session: String,
-    /// A branch's standing; `DISPOSITION_UNSPECIFIED` for a root or an unmarked branch.
     pub disposition: i32,
 }
 
@@ -551,16 +547,10 @@ impl Projection {
         messages(&self.conn, session_id)
     }
 
-    /// `session_id`'s own rows, prefixed with whatever ancestry its fork
-    /// chain includes: what a branch's provider transcript and its own
-    /// history view are both built from.
     pub(crate) fn lineage_messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
         lineage_messages(&self.conn, session_id)
     }
 
-    /// The `kind` column at `(session_id, seq)`, or `None` if no row there
-    /// belongs to that session: a fork point must name a `KIND_MESSAGE` row
-    /// of its own parent, not a tool call or another session's sequence.
     /// Which session a seq's row belongs to, and its kind — a fork at an
     /// inherited seq forks the ancestor that owns it, not the viewed session.
     pub(crate) fn message_owner(&self, seq: u64) -> Result<Option<(String, i64)>, Error> {
@@ -574,7 +564,6 @@ impl Projection {
             .optional()?)
     }
 
-    /// The ancestor chain of `session_id`, nearest parent first, cycle-guarded.
     pub(crate) fn ancestors(&self, session_id: &str) -> Result<Vec<String>, Error> {
         let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
         let mut chain = Vec::new();
@@ -826,15 +815,10 @@ impl Reader {
         memory_active_at(&self.conn(), at_micros)
     }
 
-    /// `session_id`'s own fork parent and point, if it has one: what
-    /// `fetch_history` stamps `SessionHistory` with for the client's
-    /// branched-from marker (row 2.3).
     pub fn fork_parent(&self, session_id: &str) -> Result<Option<(String, u64)>, Error> {
         session_parent(&self.conn(), session_id)
     }
 
-    /// The forks out of `session_id`: (branch id, fork point, title),
-    /// fork-point order, so a transcript can point forward at them.
     pub fn branches_of(&self, session_id: &str) -> Result<Vec<(String, u64, String)>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -1131,10 +1115,6 @@ fn messages_with_seq(conn: &Connection, session_id: &str) -> Result<Vec<(u64, Me
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// `session_id`'s own rows, prefixed with its ancestry: the oldest
-/// ancestor's rows up to where its child forked, down through each fork
-/// point, ending in `session_id`'s own rows untruncated. A session with no
-/// parent returns exactly what `messages` returns.
 pub(crate) fn lineage_messages(
     conn: &Connection,
     session_id: &str,

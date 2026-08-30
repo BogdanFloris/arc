@@ -1,4 +1,3 @@
-//! Test-only helpers shared across the `jobs` submodules' own test modules.
 #![cfg(test)]
 
 use std::collections::BTreeMap;
@@ -22,9 +21,6 @@ use tokio::sync::broadcast;
 pub(crate) mod testkit {
     use super::*;
 
-    /// A tool that blocks on a `Notify` before returning: drives the
-    /// pending-tool-call test, where the engine goes event-silent for the
-    /// whole dispatch on purpose.
     pub(crate) struct GatedTool {
         pub(crate) notify: Arc<tokio::sync::Notify>,
     }
@@ -73,8 +69,6 @@ pub(crate) mod testkit {
             .expect("create the child durably, as dispatch already does")
     }
 
-    /// A stand-in for whatever session dispatched the job, so a test can
-    /// read its handback the same way `child_session` stands in for the job.
     pub(crate) fn parent_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
         engine
             .create_bound_session(&runner(concierge), "arc", SessionRole::Concierge, None)

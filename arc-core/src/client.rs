@@ -61,9 +61,7 @@ pub enum TurnEvent {
 pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     request_id: u64,
-    /// The `Subscribe` request's id, once sent: pushes arrive tagged with it.
     subscription: Option<u64>,
-    /// Notifications read while `answer` was waiting on a different request.
     notifications: VecDeque<Notification>,
 }
 
@@ -93,14 +91,10 @@ impl Client {
         Ok(())
     }
 
-    /// The next queued push, if one arrived while `answer` was waiting on a
-    /// different request. Never blocks.
     pub fn poll_notification(&mut self) -> Option<Notification> {
         self.notifications.pop_front()
     }
 
-    /// Awaits the next pushed notification with no request in flight. Any
-    /// other frame arriving here is a protocol violation.
     #[tracing::instrument(name = "client.next_notification", skip_all)]
     pub async fn next_notification(&mut self) -> Result<Notification, Error> {
         if let Some(notification) = self.notifications.pop_front() {
@@ -205,7 +199,6 @@ impl Client {
         }
     }
 
-    /// The projects `:code` may bind to (row 3, phase 3.6), for the picker.
     #[tracing::instrument(name = "client.projects", skip_all)]
     pub async fn projects(&mut self) -> Result<Vec<ProjectInfo>, Error> {
         let id = self
@@ -231,8 +224,6 @@ impl Client {
         self.verdict_ack(id).await
     }
 
-    /// The user's own Esc (row 2.5): a graceful cut on `session_id`'s own
-    /// live turn, distinct from `cancel_job`'s stop on a dispatched job.
     #[tracing::instrument(name = "client.cancel_turn", skip_all, fields(session_id))]
     pub async fn cancel_turn(&mut self, session_id: &str) -> Result<(), Error> {
         let id = self
@@ -253,8 +244,6 @@ impl Client {
         self.verdict_ack(id).await
     }
 
-    /// The `:code` door (row 9.1): opens a bound session directly, no
-    /// dispatch. The daemon accepts only `SessionRole::Executor` for now.
     #[tracing::instrument(name = "client.create_session", skip_all, fields(project))]
     pub async fn create_session(
         &mut self,
@@ -277,8 +266,6 @@ impl Client {
         }
     }
 
-    /// Forks `session_id` at `fork_point`: a durable branch the caller then
-    /// opens like any other session — that composed gesture is rewind.
     #[tracing::instrument(name = "client.fork_session", skip_all, fields(session_id))]
     pub async fn fork_session(
         &mut self,
@@ -301,7 +288,6 @@ impl Client {
         }
     }
 
-    /// A branch's standing (row 2.4): reversible, latest wins.
     #[tracing::instrument(name = "client.mark_branch", skip_all, fields(session_id))]
     pub async fn mark_branch(
         &mut self,

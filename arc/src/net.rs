@@ -4,7 +4,6 @@ use tokio::sync::mpsc;
 
 use crate::app::{Command, NetEvent, ReviewEntry};
 
-// what the forward marker names: the branch's title, or its id prefix
 fn branch_label(branch: &arc_proto::v1::BranchPointer) -> String {
     if branch.title.is_empty() {
         branch.session_id.chars().take(8).collect()
@@ -326,8 +325,6 @@ async fn create_session(
     }
 }
 
-/// `SessionForked` composes into the picker's own open-session path: set
-/// `session_id`, fetch history — that IS rewind.
 async fn fork_session(
     client: &mut Client,
     session_id: &str,
@@ -347,8 +344,6 @@ async fn fork_session(
     }
 }
 
-/// A branch's standing (row 2.4): a bare verdict wire-side, but the picker
-/// wants the fresh disposition on screen, so a success also refreshes the list.
 async fn mark_branch(
     client: &mut Client,
     session_id: &str,

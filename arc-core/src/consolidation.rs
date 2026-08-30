@@ -18,8 +18,6 @@ pub trait Extractor: Send + Sync {
         session: &SessionSnapshot,
     ) -> impl Future<Output = Result<Vec<memory_event::Event>, ExtractError>> + Send;
 
-    /// A short title for the session, or `None` to leave it untitled this
-    /// pass. The default never calls a model — only `ModelExtractor` does.
     fn title(
         &self,
         _session: &SessionSnapshot,
@@ -186,8 +184,6 @@ async fn pass<E: Extractor>(
     })
 }
 
-/// Titling piggybacks the same due-session snapshot: it runs before
-/// extraction, under its own re-checked commit, and never blocks it.
 #[tracing::instrument(name = "consolidation.title", skip_all, fields(session_id = %snapshot.session_id))]
 async fn title_if_due<E: Extractor>(
     engine: &Engine,
@@ -320,8 +316,6 @@ mod tests {
         }
     }
 
-    /// Counts calls to `extract` and titles unconditionally, so a test can
-    /// assert the gate skipped (or didn't skip) the extractor.
     struct CountingExtractor {
         calls: Arc<AtomicUsize>,
         records: Vec<memory_event::Event>,

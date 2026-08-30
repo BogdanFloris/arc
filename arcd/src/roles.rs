@@ -30,7 +30,6 @@ const RUNNING_JOBS: &str = r"Running jobs:
   dispatch or continue that work again unless the user asks.
 - Hand the user conclusions, not transcripts.";
 
-/// The identity file when there is one, then the jobs instrutions
 fn concierge_system(identity: Option<String>) -> String {
     match identity {
         Some(identity) => format!("{}\n\n{RUNNING_JOBS}", identity.trim_end()),

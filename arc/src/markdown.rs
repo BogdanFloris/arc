@@ -143,8 +143,6 @@ const CELL_GAP: &str = "  ";
 
 const CELL_FLOOR: usize = 3;
 
-/// How many consecutive lines starting at `at` form a pipe table: a header
-/// row, a separator row, then any run of rows. `None` if this is not one.
 fn table_span(lines: &[&str], at: usize) -> Option<usize> {
     row_cells(lines[at])?;
     if !lines
@@ -174,10 +172,6 @@ fn row_cells(line: &str) -> Option<Vec<String>> {
     Some(body.split('|').map(|cell| cell.trim().to_owned()).collect())
 }
 
-/// The pipes themselves are not drawn: columns align on two-space gutters,
-/// the header holds bold, and a dash rule per column stands in for the
-/// separator row. Cells wrap within their column when the natural widths
-/// don't fit; the widest column gives ground first.
 fn push_table(out: &mut Vec<Line<'static>>, lines: &[&str], width: usize, base: Style) {
     let rows: Vec<Vec<String>> = lines
         .iter()
@@ -268,8 +262,6 @@ fn push_row(out: &mut Vec<Line<'static>>, row: &[Vec<(String, Style)>], widths: 
     }
 }
 
-/// Greedy word wrap of one cell into lines at most `width` wide; a single
-/// word wider than the column overflows rather than being cut.
 fn wrap_cell(segments: &[(String, Style)], width: usize) -> Vec<Vec<(String, Style)>> {
     let mut lines: Vec<Vec<(String, Style)>> = Vec::new();
     let mut current: Vec<(String, Style)> = Vec::new();
@@ -379,8 +371,6 @@ fn inline(line: &str, base: Style) -> Vec<(String, Style)> {
     out
 }
 
-/// `[text](url)`: the text underlined, the url dimmed beside it. Nested
-/// brackets and urls with spaces stay literal.
 fn link(rest: &str) -> Option<(&str, &str, usize)> {
     let after = rest.strip_prefix('[')?;
     let close = after.find(']')?;

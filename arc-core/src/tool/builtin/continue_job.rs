@@ -6,9 +6,6 @@ use serde::Deserialize;
 use crate::provider::ToolDefinition;
 use crate::tool::{ContinueRequest, Tool, ToolReply, ToolSource, TurnContext};
 
-/// Validates a `continue_job` call and hands the engine a `ContinueRequest`.
-/// It never touches the target session itself — whether it exists, and
-/// whether it is a job, is engine-side.
 pub struct ContinueJob;
 
 #[derive(Deserialize)]

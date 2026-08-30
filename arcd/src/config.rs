@@ -137,7 +137,6 @@ pub enum RoleProvider {
 pub struct ProjectConfig {
     pub root: PathBuf,
 
-    /// One line grounding what this project is, for `dispatch`'s schema.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 
@@ -146,7 +145,6 @@ pub struct ProjectConfig {
 
     pub sources: Vec<ToolSource>,
 
-    /// Wraps `bash`'s child invocation, e.g. `["nix", "develop", "-c"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_prefix: Vec<String>,
 }
@@ -281,7 +279,6 @@ pub struct LlamaConfig {
 
     pub model_file: PathBuf,
 
-    /// The alias the sidecar serves under. Defaults to the GGUF's file stem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 

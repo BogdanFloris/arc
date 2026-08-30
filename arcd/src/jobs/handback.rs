@@ -19,10 +19,6 @@ pub(super) const NO_REPLY: &str = "(the job produced no reply)";
 /// itself in the transcript (DESIGN.md §4.1).
 const MAX_HANDBACK_TURNS: u32 = 50;
 
-/// The handback turn's collapse and autonomy state, shared by every job's
-/// task since jobs finishing into the same parent contend on it together.
-/// Absent from a `Supervisor` that never called `with_concierge`, in which
-/// case a handback is recorded but no turn ever follows it.
 pub(super) struct Handback {
     runner: Runner,
     /// Parents with a handback turn in flight right now: a second handback
@@ -32,7 +28,6 @@ pub(super) struct Handback {
     /// running turn loops once more per flag once it finishes, bounded by
     /// `autonomy`, not by a count of its own.
     dirty: Mutex<HashSet<String>>,
-    /// Consecutive handback turns per parent since its last user message.
     autonomy: Mutex<HashMap<String, u32>>,
 }
 
@@ -51,9 +46,6 @@ impl Handback {
     }
 }
 
-/// Everything a handback turn needs to run and, if it dispatches, to spawn
-/// the child itself: bundled so `run_job` can build it once and pass it to
-/// all three of its finish paths.
 pub(super) struct HandbackCtx<'a> {
     pub(super) engine: &'a Arc<Engine>,
     pub(super) runners: &'a BTreeMap<SessionRole, Runner>,
@@ -75,9 +67,6 @@ pub(super) fn job_title(engine: &Engine, session_id: &str) -> String {
     }
 }
 
-/// The job's last assistant reply, or the fixed no-reply line: shared by
-/// every handback path, since an empty or missing reply reads the same way
-/// regardless of how the job ended.
 fn job_summary(engine: &Engine, job: &DispatchedJob) -> String {
     match engine.last_assistant_message(&job.session_id) {
         Ok(Some(text)) => text,
@@ -93,8 +82,6 @@ fn job_summary(engine: &Engine, job: &DispatchedJob) -> String {
     }
 }
 
-/// Appends the job's handback and, if that succeeds, requests the turn
-/// that reads it (DESIGN.md §4.1's "the daemon drives one model turn").
 pub(super) async fn record_handback(
     ctx: &HandbackCtx<'_>,
     job: &DispatchedJob,
@@ -153,13 +140,6 @@ pub(super) async fn handback_over_budget(
     record_handback(ctx, job, Some(&reason)).await;
 }
 
-/// Requests a handback turn on `parent_session`, collapsing into an
-/// already-pending one instead of queuing a second (DESIGN.md §4.1). Exact
-/// shape: a `pending` set claimed before the turn runs and cleared after;
-/// a handback arriving while claimed sets `dirty` instead of running its
-/// own turn; once the running turn finishes, a set `dirty` flag reruns the
-/// turn once more (looping until nothing landed meanwhile), bounded by the
-/// autonomy cap below rather than by a catch-up count of its own.
 async fn maybe_run_handback_turn(ctx: &HandbackCtx<'_>, parent_session: &str) {
     let Some(handback) = ctx.handback else {
         return;
@@ -195,9 +175,6 @@ fn mark_dirty(handback: &Handback, parent_session: &str) {
         .insert(parent_session.to_owned());
 }
 
-/// `true` if another handback collapsed into this parent while its turn
-/// ran: clears `dirty` and leaves `pending` set for one more turn. `false`
-/// releases `pending`: this parent's chain of turns is done for now.
 fn release_or_rerun(handback: &Handback, parent_session: &str) -> bool {
     if handback.dirty.lock().expect("dirty").remove(parent_session) {
         return true;
@@ -210,8 +187,6 @@ fn release_or_rerun(handback: &Handback, parent_session: &str) -> bool {
     false
 }
 
-/// Runs one handback turn, if the parent is (still) a concierge session and
-/// under the autonomy cap, and spawns whatever it dispatches.
 async fn run_one_handback_turn(
     ctx: &HandbackCtx<'_>,
     handback: &Arc<Handback>,

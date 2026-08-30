@@ -7,8 +7,6 @@ use serde::Deserialize;
 use crate::provider::{ToolDefinition, role_label};
 use crate::tool::{Intent, JobRequest, Tool, ToolReply, ToolSource, TurnContext};
 
-/// Validates a dispatch call and hands the engine a `JobRequest`. It never
-/// creates the child session itself — a tool cannot hold `&mut Engine`.
 pub struct Dispatch {
     projects: Vec<(String, String)>,
     scratch: Option<String>,

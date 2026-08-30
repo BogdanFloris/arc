@@ -15,8 +15,6 @@ const TIMEOUT: Duration = Duration::from_secs(600);
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
-/// What `[roles.counsel]` resolves to: a command template, never a
-/// `Provider` — the CLI runs its own read-only loop over the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounselSpec {
     pub command: CounselCommand,
@@ -39,9 +37,6 @@ impl CounselCommand {
     }
 }
 
-/// `consult_expert`: spawns a read-only `claude -p` or `codex exec` over a
-/// project root and returns its answer. Constructed with the resolved
-/// `[roles.counsel]` spec and the same project map dispatch gets.
 pub struct Expert {
     spec: CounselSpec,
     projects: Vec<(String, PathBuf)>,
@@ -559,8 +554,6 @@ mod tests {
         }
     }
 
-    // --- argv golden tests ---
-
     #[test]
     fn claude_argv_carries_the_load_bearing_flags() {
         let argv = claude_argv(&spec(CounselCommand::Claude, None), "what is broken?");
@@ -665,8 +658,6 @@ mod tests {
         assert!(!argv.contains(&"--model".to_owned()), "{argv:?}");
     }
 
-    // --- project resolution ---
-
     // `ToolReply` carries no `Debug`, so `.expect()` on the `Err` side won't compile
     fn ok_root(result: Result<std::path::PathBuf, crate::tool::ToolReply>) -> std::path::PathBuf {
         match result {
@@ -758,8 +749,6 @@ mod tests {
         assert!(error.content.contains("ghost"), "{}", error.content);
     }
 
-    // --- tool-level argument validation ---
-
     #[tokio::test]
     async fn an_empty_question_is_an_error() {
         let tool = Expert::new(spec(CounselCommand::Claude, None), vec![]);
@@ -815,8 +804,6 @@ mod tests {
         let tool = Expert::new(spec(CounselCommand::Claude, None), vec![]);
         assert_eq!(tool.source(), ToolSource::Expert);
     }
-
-    // --- stub subprocess runs ---
 
     fn stub(dir: &TempDir, name: &str, script: &str) {
         let path = dir.path().join(name);
@@ -1037,8 +1024,6 @@ mod tests {
         assert!(reply.content.contains("timed out"), "{}", reply.content);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
-
-    // --- capture truncation ---
 
     #[tokio::test]
     async fn stdout_capture_keeps_the_head_and_marks_the_dropped_tail() {

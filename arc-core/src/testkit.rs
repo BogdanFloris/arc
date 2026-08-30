@@ -22,9 +22,6 @@ use crate::session::{Engine, EngineEvent, Runner};
 use crate::store::Store;
 use crate::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
 
-/// One scripted response to a `complete` call. `Gated` lets a test stall a
-/// stream mid-turn: it yields `before`, then waits on `notify`, then yields
-/// `after` — so another session's turn can be driven to completion in between.
 #[derive(Debug)]
 pub enum Step {
     Immediate(Vec<Result<CompletionDelta, ProviderError>>),
@@ -33,8 +30,6 @@ pub enum Step {
         notify: Arc<tokio::sync::Notify>,
         after: Vec<Result<CompletionDelta, ProviderError>>,
     },
-    /// Panics when the provider is asked to complete: drives the panic
-    /// watchdog test without a second task or a real crashing tool.
     Panics,
 }
 
@@ -379,8 +374,6 @@ impl Tool for Canned {
     }
 }
 
-/// A tool that blocks on a `Notify` before returning: drives a cancel test,
-/// where the turn needs to be caught mid-dispatch and never notified.
 pub struct Gated {
     pub name: &'static str,
     pub notify: Arc<tokio::sync::Notify>,
@@ -412,8 +405,6 @@ impl Tool for Gated {
     }
 }
 
-/// Echoes `ctx.command_prefix` back as its reply, joined by commas, so tests
-/// can see what a real turn resolved without a subprocess.
 pub struct PrefixEcho {
     pub name: &'static str,
     pub source: ToolSource,

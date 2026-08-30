@@ -655,7 +655,6 @@ fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
     })
 }
 
-// a job's role/project tag rides after its title
 fn picker_label(session: &arc_proto::v1::SessionInfo, room: usize, job: bool) -> String {
     if !job {
         return label(session, room);
@@ -1128,8 +1127,6 @@ mod tests {
     };
     use crate::app::{App, Block, Mode, Search, Status};
 
-    /// Renders `app` into a 100×30 buffer and returns it, so tests can
-    /// read glyphs and styles off the terminal exactly as drawn.
     fn rendered(app: &mut App) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1162,8 +1159,6 @@ mod tests {
         rows.into_iter().filter(|row| row.contains(text)).collect()
     }
 
-    /// Every glyph in the buffer, styling ignored: for substring checks
-    /// against chrome like the rule line, not the transcript itself.
     fn plain_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
         for y in 0..buffer.area.height {

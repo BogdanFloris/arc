@@ -146,8 +146,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Its own idle re-check, separate from `commit_consolidation`: titling
-    /// runs before extraction, in a lock scope of its own.
     pub(crate) fn commit_title(
         &mut self,
         snapshot: &SessionSnapshot,

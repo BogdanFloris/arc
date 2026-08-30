@@ -328,9 +328,6 @@ impl ModelExtractor {
         Ok(text)
     }
 
-    /// Mechanical dedup between parsing and event conversion: stage 1 drops
-    /// exact matches in code, stage 2 finds neighbors in code, stage 3 asks
-    /// the model to judge only the ops with neighbors.
     async fn dedup(
         &self,
         operations: Vec<RawOperation>,
@@ -770,8 +767,6 @@ fn tokenize(normalized: &str) -> HashSet<&str> {
         .collect()
 }
 
-/// Entries sharing at least two content words with the op, top 3 by score,
-/// ties broken by index order.
 fn dedup_candidates<'a>(
     title: &str,
     summary: &str,
@@ -1093,8 +1088,6 @@ mod tests {
         extract_scripted(vec![script], index).await
     }
 
-    /// One script per model call the pass is expected to make, in order:
-    /// the extraction call, then a dedup call per write op with neighbors.
     /// `ScriptedProvider` panics on script exhaustion, which proves a test
     /// that supplies only the extraction reply made no dedup call.
     async fn extract_scripted(

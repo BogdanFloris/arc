@@ -176,7 +176,6 @@ pub(crate) fn ensure_fresh(
     }
 }
 
-/// The workspace source: bash, read, write, edit, all gated through `Grants`.
 pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(bash::Bash::new()),

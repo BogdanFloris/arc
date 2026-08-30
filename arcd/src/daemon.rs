@@ -390,9 +390,6 @@ fn idle_cutoff_micros(idle: Duration) -> Option<i64> {
     Some(now.saturating_sub(idle))
 }
 
-/// What `dispatch` may bind a job to: every configured project's name and
-/// description, plus the scratch project if a project is literally named
-/// `scratch`.
 fn dispatch_projects(config: &Config) -> (Vec<(String, String)>, Option<String>) {
     let names = config
         .projects

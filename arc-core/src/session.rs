@@ -38,7 +38,6 @@ fn elapsed_ms_since(start: std::time::Instant) -> u32 {
     u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
-/// What a project offers a session bound to it: the tools and the roots.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectSpec {
     pub sources: Vec<ToolSource>,
@@ -46,8 +45,6 @@ pub struct ProjectSpec {
     pub command_prefix: Vec<String>,
 }
 
-/// Who is running a turn. Resolved once per role and handed to the engine
-/// with each turn, so one log can serve a conversation and a job at once.
 #[derive(Clone, Debug)]
 pub struct Runner {
     pub role: SessionRole,
@@ -126,14 +123,9 @@ pub struct DispatchedJob {
     pub budget: Option<Budget>,
 }
 
-/// A validated `continue_job` request the engine handed off. The engine only
-/// confirms the target is a job; whether it's still live is the
-/// supervisor's to know, so this carries what a resume would need too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuedJob {
     pub session_id: String,
-    /// The session whose turn called `continue_job` — where a resumed job's
-    /// handback lands, same as a fresh dispatch's parent.
     pub parent_session: String,
     pub message: String,
     pub role: SessionRole,
@@ -225,8 +217,6 @@ impl Engine {
         f(&mut store)
     }
 
-    /// The verdict on a proposed memory record: accept the review queue's
-    /// suggestion, or delete the record outright.
     pub fn review_accept(&self, record_id: &str) -> Result<(), Error> {
         self.with_store_mut(|store| store.review_accept(record_id))?;
         self.notify_review_changed()
@@ -237,10 +227,6 @@ impl Engine {
         self.notify_review_changed()
     }
 
-    /// Fires a live turn's cancel signal (row 2.5, the user's own Esc, not
-    /// the job supervisor's separate drop-the-future cancel). `true` only if
-    /// `session_id` had a turn actually registered right now — an idle or
-    /// unknown session, or one whose turn already ended, honestly gets `false`.
     pub fn cancel_turn(&self, session_id: &str) -> bool {
         let cancels = self.cancels.lock().expect("cancels lock poisoned");
         match cancels.get(session_id) {
@@ -261,17 +247,12 @@ impl Engine {
         )
     }
 
-    /// The configured projects: name to sources and grants. Written once at
-    /// startup from config; a session's project resolves through this.
     #[must_use]
     pub fn with_projects(mut self, projects: BTreeMap<String, ProjectSpec>) -> Self {
         self.projects = projects;
         self
     }
 
-    /// The provider and model each role records for sessions it creates.
-    /// Written once at startup from the resolved roles; a role absent from
-    /// this map falls back to the creating runner's own identity.
     #[must_use]
     pub fn with_role_identities(
         mut self,
@@ -281,16 +262,12 @@ impl Engine {
         self
     }
 
-    /// Wires the daemon's broadcast spine: every durable session append then
-    /// also fans out as a `SessionAppended` push. Absent, `record` is silent.
     #[must_use]
     pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
         self.notifier = Some(notifier);
         self
     }
 
-    /// Whether `[roles.counsel]` is configured: true offers `consult_expert`
-    /// to concierge and executor sessions; false offers it to no one.
     #[must_use]
     pub fn with_expert_enabled(mut self, enabled: bool) -> Self {
         self.expert_enabled = enabled;
@@ -321,10 +298,6 @@ impl Engine {
         )
     }
 
-    /// The `:code` door (row 9.1): a bound session the user opened directly,
-    /// not a model's `dispatch`. Recorded `Source::User`, read-write grants
-    /// (implement-style, no downgrade), no budget, no `dispatched_by` — it
-    /// is a conversation, not a job.
     pub fn create_direct_session(
         &self,
         runner: &Runner,
@@ -342,12 +315,6 @@ impl Engine {
         )
     }
 
-    /// Same as `create_bound_session`, but `Intent::Analyze` records the
-    /// project root grant read-only instead of read-write. `dispatched_by`
-    /// is the parent recorded on a job's own creation (DESIGN.md/6.34); a
-    /// session the runner starts for itself passes `None`. `source` is
-    /// `Model` for a dispatch and `User` for the `:code` door — who asked
-    /// for the session, not who runs it.
     #[tracing::instrument(
         level = "info",
         name = "session.create_bound_session",
@@ -417,7 +384,6 @@ impl Engine {
         Ok(session_id)
     }
 
-    /// Forks `parent_id` at `fork_point`, a seq of one of its own message rows
     pub fn fork_session(&self, parent_id: &str, fork_point: u64) -> Result<String, Error> {
         self.with_store(|store| store.projection().session_role(parent_id))?
             .ok_or_else(|| Error::UnknownSession {
@@ -480,9 +446,6 @@ impl Engine {
         Ok(session_id)
     }
 
-    /// A branch's standing (row 2.4): latest wins, reversible. Only a fork
-    /// has one to mark — a root conversation errors instructively rather
-    /// than silently doing nothing.
     pub fn mark_branch(
         &self,
         session_id: &str,
@@ -508,9 +471,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Acts on a `dispatch` tool call: creates the child session durably and
-    /// returns what the parent's tool result should say. The child does not
-    /// start running here — that arrives with the supervised job task.
     fn dispatch_job(
         &self,
         runner: &Runner,
@@ -557,11 +517,6 @@ impl Engine {
         }
     }
 
-    /// Acts on a `continue_job` tool call: confirms `session_id` names a
-    /// recorded job (Executor or Archivist) and hands back what the
-    /// caller's tool result should say. Whether that job is still live is
-    /// the supervisor's knowledge, not the engine's — this only validates
-    /// identity.
     fn continue_job(
         &self,
         runner: &Runner,
@@ -680,10 +635,6 @@ impl Engine {
         Ok(())
     }
 
-    /// The most recent assistant reply in a session, straight from the
-    /// projection. `None` covers both "no assistant text yet" and "the last
-    /// reply was empty" — a handback treats an empty reply the same as no
-    /// reply at all.
     pub fn last_assistant_message(&self, session_id: &str) -> Result<Option<String>, Error> {
         let rows = self.with_store(|store| store.projection().messages(session_id))?;
         Ok(rows.into_iter().rev().find_map(|row| match row {
@@ -696,31 +647,19 @@ impl Engine {
         }))
     }
 
-    /// The role a session is pinned to, straight from the log. `None`
-    /// covers both an unknown session and one logged before roles existed;
-    /// a caller that needs to tell those apart wants `enforce_pin` instead.
     pub fn session_role(&self, session_id: &str) -> Result<Option<SessionRole>, Error> {
         let raw = self.with_store(|store| store.projection().session_role(session_id))?;
         Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
     }
 
-    /// The project a session was bound to at creation, straight from the
-    /// log. `None` for an unbound session or one predating project stamping.
     pub fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
         Ok(self.with_store(|store| store.projection().session_project(session_id))?)
     }
 
-    /// A session's summed input+output tokens across every message it
-    /// carries (row 6.37): what a resumed job's spent counter seeds from
-    /// instead of restarting at zero.
     pub fn session_usage_tokens(&self, session_id: &str) -> Result<u64, Error> {
         Ok(self.with_store(|store| store.projection().session_token_total(session_id))?)
     }
 
-    /// Job sessions left dispatched-but-unconcluded by the last restart
-    /// (row 6.34): executor/archivist sessions with a recorded parent and no
-    /// handback message in that parent yet. A job session created before
-    /// 6.34 has no recorded parent and cannot be found here.
     pub fn unfinished_jobs(&self) -> Result<Vec<DispatchedJob>, Error> {
         let candidates = self.with_store(|store| store.projection().parented_job_sessions())?;
         let mut unfinished = Vec::new();
@@ -781,8 +720,6 @@ impl Engine {
         Ok(sources)
     }
 
-    /// The `bash` wrapper argv for a session's project, re-derived from
-    /// config each turn like `sources`: never recorded in the log.
     fn command_prefix(&self, session_id: &str, new_session: bool) -> Result<Vec<String>, Error> {
         let project = if new_session {
             None
@@ -917,12 +854,6 @@ impl Engine {
         .await
     }
 
-    /// Runs one full model turn over `session_id`'s existing transcript,
-    /// appending no user message: the handback turn (DESIGN.md §4.1). Takes
-    /// the same turn guard as `send_message`, so a handback never lands
-    /// mid-turn and never overlaps a user turn on the same session. A
-    /// session with nothing new to react to is still just a turn — the
-    /// model sees the transcript as-is.
     #[tracing::instrument(
         level = "info",
         name = "session.continue_session",
@@ -974,10 +905,6 @@ impl Engine {
         .await
     }
 
-    /// The completion loop shared by `send_message` and `continue_session`:
-    /// opens the transcript, drives tool steps and dispatch, and appends the
-    /// reply. The caller has already taken the turn guard and resolved
-    /// sources/grants; this only reads and appends from `turn_id` onward.
     #[allow(clippy::too_many_arguments)]
     async fn drive_turn(
         &self,
@@ -1499,10 +1426,6 @@ impl Engine {
         }
     }
 
-    /// The 3.2 pin's model half (row 6.32): `role`'s identity right now
-    /// against what `session_id` was recorded on. `None` if they match, the
-    /// session predates provider/model stamping, or the session is unknown —
-    /// mirrors how an `Unspecified` recorded role stays unpinned.
     fn identity_mismatch(
         &self,
         runner: &Runner,
@@ -1594,8 +1517,6 @@ impl Engine {
         });
     }
 
-    /// The review queue's current size, over the same lookback the `:review`
-    /// pane defaults to, so a live count matches what opening it shows.
     pub fn review_pending(&self) -> Result<u32, Error> {
         let since = chrono::Utc::now().timestamp_micros() - projection::REVIEW_WINDOW_MICROS;
         let items = self.with_store(|store| store.projection().review_items(since))?;
@@ -1947,8 +1868,6 @@ enum Ending {
     Failed(provider::Error),
 }
 
-/// Deregisters a turn's cancel signal on every exit from `drive_turn`,
-/// including an early `?` return.
 struct CancelGuard<'a> {
     cancels: &'a StdMutex<HashMap<String, watch::Sender<bool>>>,
     session_id: &'a str,

@@ -4,8 +4,6 @@ use tracing::warn;
 
 use crate::identity;
 
-/// Under ~200 tokens: where the job is and what its final message is for,
-/// not a methodology essay. Pi-style: the model already knows how to code.
 fn job_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working non-interactively \
@@ -16,10 +14,6 @@ fn job_preamble(root: &Path) -> String {
     )
 }
 
-/// Same shape as `job_preamble`, for a session the user opened directly
-/// (`:code`, row 9.1) rather than a job dispatched to run alone: no report
-/// line, since the user is present and the turn is one message in an
-/// ongoing conversation, not a hand-back.
 fn direct_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working interactively with \
@@ -29,7 +23,6 @@ fn direct_preamble(root: &Path) -> String {
     )
 }
 
-/// `preamble`, plus the project's `AGENTS.md` verbatim if it has one.
 fn with_agents_md(root: &Path, preamble: String) -> String {
     match identity::load(&root.join("AGENTS.md")) {
         Ok(Some(agents)) => format!("{preamble}\n\n{agents}"),
@@ -47,10 +40,6 @@ pub(super) fn job_system_prompt(root: &Path) -> String {
     with_agents_md(root, job_preamble(root))
 }
 
-/// The direct preamble, then the identity file when one is loaded — the
-/// user is present in a direct session, so who ARC is and what it knows
-/// about them belongs in context, unlike in a dispatched job — then
-/// AGENTS.md, so the project's own rules land last and most specific.
 /// Re-derived per turn like `sources` (row 9.1) — byte-stable while the
 /// inputs are unchanged, since caching depends on the prefix staying
 /// stable turn to turn.

@@ -89,8 +89,6 @@ async fn drain(connections: &mut JoinSet<()>) {
     }
 }
 
-/// A connection's `Subscribe`, once seen: the request id every push on this
-/// socket is tagged with, and the receiver end of the daemon's broadcast.
 struct Subscription {
     request_id: u64,
     rx: broadcast::Receiver<Notification>,
@@ -347,16 +345,6 @@ async fn send_message(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// A turn on a job's own (finished) session is served by that job's role
-/// runner, not the concierge's: a real follow-up in the executor's own
-/// workspace, run outside the supervisor entirely (no budget, no steer
-/// queue, no handback). A fresh session, a concierge session, or a role the
-/// map has no runner for all fall through to the concierge runner, exactly
-/// as before — an unmapped role then surfaces as an honest `role_mismatch`.
-/// An executor session bound to a project gets that project's direct system
-/// prompt (row 9.1, closing 6.41's promptless gap): re-derived every turn
-/// from config, like `sources` is, not the once-at-spawn prompt a
-/// supervisor-run job builds for itself.
 fn turn_runner(
     engine: &Engine,
     supervisor: &Supervisor,
@@ -383,11 +371,6 @@ fn turn_runner(
     }
 }
 
-/// The `job_system_prompt`-shaped prompt for a direct turn into an executor
-/// session (`:code`, or a follow-up sent straight to a finished job's own
-/// session): built from the session's recorded project, not what dispatched
-/// it. `None` when the session names no project or the project is gone from
-/// config — the same fail-closed the tool sources already apply.
 fn direct_system_prompt_for(
     engine: &Engine,
     supervisor: &Supervisor,
@@ -520,8 +503,6 @@ async fn cancel_job(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// The user's own Esc (row 2.5): a graceful cut on the session's own live
-/// turn, distinct from `cancel_job`'s drop-the-future stop on a job.
 async fn cancel_turn(
     ws: &mut Socket,
     engine: &Engine,
@@ -557,8 +538,6 @@ async fn drop_steers(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// The `:code` door (row 9.1): opens a bound session directly, no dispatch.
-/// Only `SessionRole::Executor` is accepted for now.
 async fn create_session(
     ws: &mut Socket,
     engine: &Engine,
@@ -587,8 +566,6 @@ async fn create_session(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// Fork-then-open is rewind (2.2): the reply is the same session-id ack
-/// `create_session` answers with, so the client opens it the same way.
 async fn fork_session(
     ws: &mut Socket,
     engine: &Engine,
@@ -605,8 +582,6 @@ async fn fork_session(
     flow(send_frame(ws, request_id, msg).await)
 }
 
-/// A branch's standing (row 2.4): a verdict like a review accept/delete,
-/// answered with the same empty-id ack.
 async fn mark_branch(
     ws: &mut Socket,
     engine: &Engine,
@@ -958,9 +933,6 @@ mod tests {
 
     const SEEDED_AT_MICROS: i64 = 1_700_000_000_000_000;
 
-    /// What the harness wires as the identity file's text (row 2, phase
-    /// 3.6): present so tests can pin where it appears and where it never
-    /// does.
     const TEST_IDENTITY: &str = "You are ARC, the test edition.";
 
     fn seeded_record(id: &str, title: &str) -> Event {
@@ -1005,8 +977,6 @@ mod tests {
             .await
         }
 
-        /// A harness whose concierge can dispatch to a scripted executor: the
-        /// default harness has no runner mapped for a job's role at all.
         async fn with_executor(
             script: Script,
             registry: Registry,
@@ -1017,9 +987,6 @@ mod tests {
             Self::with_executor_provider(script, registry, executor_provider, projects).await
         }
 
-        /// Like `with_executor`, but takes the executor's provider directly:
-        /// lets a test use `arc_core::testkit::ScriptedProvider` for a gated
-        /// step, which `Script`/`MockProvider` here has no equivalent of.
         async fn with_executor_provider(
             script: Script,
             registry: Registry,
@@ -1144,11 +1111,6 @@ mod tests {
             }
         }
 
-        /// Like `with_seed`, but the concierge's own provider is given
-        /// directly: lets a test gate the concierge's turn itself (not a
-        /// job's), which `Script`/`MockProvider` has no equivalent of. The
-        /// harness's `provider` field is a placeholder, unused by callers of
-        /// this constructor.
         async fn with_concierge_provider(
             concierge_provider: Arc<dyn Provider>,
             registry: Registry,
@@ -1201,7 +1163,6 @@ mod tests {
             }
         }
 
-        /// Waits out every job the supervisor spawned so far.
         async fn drain_jobs(&self) {
             self.supervisor.shutdown().await;
         }
@@ -2868,11 +2829,6 @@ mod tests {
         harness.stop().await;
     }
 
-    /// Row 9.1: the `:code` door round-trips a fresh executor session, and
-    /// the first turn sent into it carries the direct preamble, the
-    /// identity file, and AGENTS.md — while a job dispatched into the same
-    /// project still gets the unchanged, identity-free job preamble. Pins
-    /// both variants side by side.
     #[tokio::test]
     async fn create_session_opens_a_code_session_with_the_direct_prompt_and_a_job_keeps_its_own() {
         let (registry, project_dir, projects) = dispatch_registry_and_projects();
@@ -3222,8 +3178,6 @@ mod tests {
         }
     }
 
-    /// Row 3 (phase 3.6): the picker's slate — every configured project's
-    /// name and description, straight from config, no session involved.
     #[tokio::test]
     async fn list_projects_names_every_configured_project() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();

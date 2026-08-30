@@ -28,13 +28,9 @@ pub struct CompletionRequest {
 
     pub seed: Option<u64>,
 
-    /// Concierge sessions only (row 1.3 §2026-08-24): ask the provider for
-    /// its own grounding. Providers that can't ground simply ignore it.
     pub web: bool,
 }
 
-/// How much a role should think before answering. `Default` leaves the
-/// decision to the provider.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
 )]
@@ -122,26 +118,13 @@ pub enum CompletionDelta {
 
     ToolCall(ToolCall),
 
-    /// A provider-side tool invocation (Gemini's `google_search`, say):
-    /// resolved inside the model's own turn, never one of ours.
-    ServerCall {
-        name: String,
-        payload_json: String,
-    },
+    ServerCall { name: String, payload_json: String },
 
-    /// The response half of a `ServerCall`, verbatim.
-    ServerResponse {
-        name: String,
-        payload_json: String,
-    },
+    ServerResponse { name: String, payload_json: String },
 
-    /// The provider's grounding metadata, verbatim; at most one per turn.
     Grounding(String),
 
-    Done {
-        usage: Usage,
-        stop: Stop,
-    },
+    Done { usage: Usage, stop: Stop },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

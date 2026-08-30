@@ -18,9 +18,6 @@ use crate::archive::Archive;
 use crate::tool::Tool;
 
 /// The builtin source: memory, the archive, the clock, dispatch,
-/// `continue_job`, and `cancel_job`. `projects` names what a job may bind
-/// to, paired with its configured description; `scratch`, if configured, is
-/// where `dispatch` sends a job with no natural project.
 pub fn tools(
     archive: Arc<Archive>,
     projects: Vec<(String, String)>,

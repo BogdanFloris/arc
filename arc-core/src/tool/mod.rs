@@ -20,9 +20,6 @@ pub struct TurnContext {
     pub command_prefix: Vec<String>,
 }
 
-/// A validated request to start a job. The tool that builds one never starts
-/// the session itself — it hands the request to the engine, which is the
-/// only thing that can hold `&mut Engine`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobRequest {
     pub role: SessionRole,
@@ -32,17 +29,12 @@ pub struct JobRequest {
     pub intent: Intent,
 }
 
-/// What a dispatched job may do to its workspace. `Analyze` records the
-/// project root grant read-only; `Implement` leaves it read-write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     Analyze,
     Implement,
 }
 
-/// A validated request to continue an existing job. Mirrors `JobRequest`:
-/// the tool checks only shape, the engine resolves whether `session_id` is
-/// actually a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinueRequest {
     pub session_id: String,
@@ -55,9 +47,6 @@ pub struct ToolReply {
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
     pub continue_request: Option<ContinueRequest>,
-    /// A validated `cancel_job` target: the engine only carries it out to
-    /// `Reply.cancels`, since acting on it is the supervisor's, not the
-    /// engine's — the engine has no notion of a job being "live".
     pub cancel_request: Option<String>,
 }
 
@@ -95,15 +84,11 @@ pub(crate) struct DispatchOutcome {
     pub cancel_request: Option<String>,
 }
 
-/// Where a tool comes from. A session declares the sources it gets, so a tool
-/// it was never offered is never in its context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolSource {
     Builtin,
-    /// Resolved from the session provider's own grounding; no tools of ours.
     Web,
     Workspace,
-    /// `consult_expert`; resolved by role, not project config (§6.2).
     Expert,
 }
 

@@ -5,7 +5,6 @@ use crate::provider::{CompletionRequest, CompletionStream, Error, Provider, Thin
 
 const NAME: &str = "local";
 
-/// The llama.cpp sidecar
 #[derive(Debug)]
 pub struct Sidecar(OpenAiCompat);
 

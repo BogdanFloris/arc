@@ -28,9 +28,6 @@ impl AgentState {
     }
 }
 
-/// Pushes lifecycle state to a surrounding herdr pane so its sidebar reads
-/// arc's real state instead of screen-scraping. Display only, never blocks,
-/// inert outside herdr.
 pub struct Reporter {
     tx: Option<mpsc::UnboundedSender<String>>,
     task: Option<tokio::task::JoinHandle<()>>,

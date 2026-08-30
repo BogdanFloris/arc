@@ -47,14 +47,10 @@ struct JobStatus {
     spent_tokens: u64,
     budget: Option<Budget>,
     started: Instant,
-    /// Frozen at the terminal transition; `None` while the job is running,
-    /// when `list` reports `started.elapsed()` instead.
     elapsed: Option<Duration>,
     /// Last write wins: bumped on start and again on the terminal
     /// transition, so "newest first" within a state needs no extra clock.
     ordinal: u64,
-    /// Wall-clock instant of the terminal transition, for `TERMINAL_TTL`
-    /// aging; `None` while the job is running.
     finished_at: Option<Instant>,
     /// Tool calls issued so far, one per started call; 0 reads as
     /// "thinking" in the strip until the first tool step.
@@ -63,11 +59,8 @@ struct JobStatus {
     /// the strip's idle readout counts from; the client ticks it forward
     /// locally between pushes.
     last_engine_event: Instant,
-    /// The session that dispatched it (row 6.38): scopes the ambient strip.
     parent_session: String,
-    /// `steer`/`continue_job` messages waiting for their own turn (row 6.33).
     queued_steers: u32,
-    /// The last issued tool call, elided; empty until the first call.
     last_call: String,
 }
 
@@ -127,9 +120,6 @@ impl JobStatuses {
         self.ordinal.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `initial_spent_tokens` seeds a resumed job's strip counter from its
-    /// durable usage (row 6.37) instead of restarting at zero; a fresh
-    /// dispatch passes 0.
     pub(super) fn start(&self, job: &DispatchedJob, initial_spent_tokens: u64) -> JobInfo {
         let entry = JobStatus {
             role: job.role,
@@ -162,8 +152,6 @@ impl JobStatuses {
         Some(entry.to_job_info(session_id))
     }
 
-    /// Counts an issued tool call and touches the idle clock, returning the
-    /// fresh info so the turn loop can broadcast the strip's new state.
     pub(super) fn record_tool_step(
         &self,
         session_id: &str,
@@ -178,8 +166,6 @@ impl JobStatuses {
         Some(entry.to_job_info(session_id))
     }
 
-    /// A steer or a live `continue_job` landed in the job's queue (row
-    /// 6.33), returning the fresh info so the caller can broadcast it.
     pub(super) fn record_steer_queued(&self, session_id: &str) -> Option<JobInfo> {
         let mut entries = self.entries.lock().expect("statuses");
         let entry = entries.get_mut(session_id)?;
@@ -187,7 +173,6 @@ impl JobStatuses {
         Some(entry.to_job_info(session_id))
     }
 
-    /// A queued steer was picked up to run as the job's next turn.
     pub(super) fn record_steer_consumed(&self, session_id: &str) -> Option<JobInfo> {
         let mut entries = self.entries.lock().expect("statuses");
         let entry = entries.get_mut(session_id)?;
@@ -195,8 +180,6 @@ impl JobStatuses {
         Some(entry.to_job_info(session_id))
     }
 
-    /// Zeroes the queued count outright: a drop, a cancel, or the job
-    /// ending with steers still queued.
     pub(super) fn drop_queued(&self, session_id: &str) -> Option<JobInfo> {
         let mut entries = self.entries.lock().expect("statuses");
         let entry = entries.get_mut(session_id)?;
@@ -204,8 +187,6 @@ impl JobStatuses {
         Some(entry.to_job_info(session_id))
     }
 
-    /// Resets the idle clock on any engine event; no broadcast, since the
-    /// strip ticks the seconds forward locally between pushes.
     pub(super) fn touch_engine(&self, session_id: &str) {
         if let Some(entry) = self.entries.lock().expect("statuses").get_mut(session_id) {
             entry.last_engine_event = Instant::now();

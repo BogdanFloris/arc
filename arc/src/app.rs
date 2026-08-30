@@ -34,8 +34,6 @@ pub enum Command {
     CancelJob {
         session_id: String,
     },
-    /// The user's own Esc on a streaming turn (row 2.5): routed to its own
-    /// connection, since the main one is busy inside `Send` for the whole turn.
     CancelTurn {
         session_id: String,
     },
@@ -63,12 +61,8 @@ pub enum NetEvent {
     History {
         session_id: String,
         entries: Vec<HistoryEntry>,
-        /// The FORK parent and point (row 2.3), so a reopened branch can
-        /// mark where its inherited rows end. Empty/0 for a parentless session.
         parent_session: String,
         fork_point: u64,
-        /// forks out of this session: (fork point, label) — the transcript
-        /// points forward at them
         branches: Vec<(u64, String)>,
     },
     Accepted {
@@ -141,11 +135,8 @@ pub struct Review {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub selected: usize,
-    /// True while the input line is owned by the filter query.
     pub filtering: bool,
-    /// True once `a` reveals dispatched job sessions alongside conversations.
     pub show_all: bool,
-    /// abandoned branches are hidden until asked for; x toggles
     pub show_abandoned: bool,
 }
 
@@ -161,18 +152,14 @@ pub struct Jobs {
     pub items: Vec<JobInfo>,
     pub selected: usize,
     pub loaded: bool,
-    /// The job being steered, if the input line is owned by the steer prompt.
     pub steering: Option<String>,
     pub confirmation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Search {
-    /// The confirmed query, kept to re-run the search across an append-only rebuild.
     pub query: String,
-    /// Matching block indices, newest first, so index 0 is match 1.
     pub matches: Vec<usize>,
-    /// Where the view sits in `matches`.
     pub current: usize,
 }
 
@@ -195,9 +182,6 @@ pub enum Block {
         done: bool,
         open: bool,
     },
-    /// A job's handback: `subject` is the `Job {id} finished.` header line,
-    /// `body` the child's summary. Folded like a thought — one dim line
-    /// until ctrl-o opens it.
     Handback {
         subject: String,
         body: String,
@@ -214,9 +198,7 @@ pub enum Block {
         output_tokens: u32,
         seconds: f32,
     },
-    /// The turn was forced to stop by the step cap, not a finished answer.
     StepCapped,
-    /// What a grounded reply cited: (title, uri) pairs, dim under the answer.
     Sources(Vec<(String, String)>),
 }
 
@@ -250,14 +232,10 @@ pub struct App {
     pub picker: Option<Picker>,
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
-    /// The `C` picker (row 3, phase 3.6): configured projects `:code` may
-    /// bind to; enter opens one without typing its name.
     pub projects: Option<Projects>,
     pub help: bool,
-    /// first help line on screen; the draw clamps it to what fits
     pub help_scroll: usize,
     pub search: Option<Search>,
-    /// True while the input line is owned by the search prompt.
     pub searching: bool,
     pub status: Status,
     pub last_error: Option<String>,
@@ -265,11 +243,9 @@ pub struct App {
     pub queued: VecDeque<String>,
     thinking_since: Option<Instant>,
     turn_started: Option<Instant>,
-    /// Chars applied from text and reasoning deltas since `turn_started`.
     streamed_chars: usize,
     pub scroll_back: usize,
     pub quit: bool,
-    /// Every `job_changed` push, oldest to newest touched; the strip reads only the running ones.
     pub ambient: Vec<JobInfo>,
     strip_since: Instant,
     refetch_in_flight: bool,
@@ -277,34 +253,16 @@ pub struct App {
     previous_session: Option<String>,
     picker_filter_stash: Option<String>,
     search_stash: Option<String>,
-    /// True between a steer's `Send` and its `Accepted`/`End`, so those don't touch the open conversation.
     steer_turn_pending: bool,
-    /// The transcript index visual mode never moves: where `V` was pressed.
-    /// In point visual (`v`) it follows the boundary, so one block is lit.
     visual_anchor: usize,
     visual_point: bool,
-    /// The transcript index `j`/`k`/`gg`/`G` move; the selection spans it to the anchor.
     visual_boundary: usize,
-    /// The selection's boundary block at the moment `:` was pressed from
-    /// visual mode, so a typed command still knows it — by the time Enter
-    /// runs the command, `mode` has already left `Visual`.
     visual_at_cmd: Option<usize>,
-    /// True while point visual is the rewind flavor (`R`): `j`/`k`/`gg`/`G`
-    /// then walk only `Block::You`, and Enter forks-then-prefills instead of nothing.
     visual_rewind: bool,
-    /// The rewound message's text, stashed between `R`'s Enter and the
-    /// `SessionForked` reply that opens the branch to prefill it into.
     pending_rewind_text: Option<String>,
-    /// Every session fact seen so far — from a sessions list, a jobs push, or a `:code`
-    /// create — so the rule line can name the open door without waiting on a refetch.
     session_meta: HashMap<String, (SessionRole, String, Source)>,
-    /// The role/project a `:code` command asked for, waiting for its `Accepted`.
     pending_code: Option<(SessionRole, String)>,
-    /// The first message typed behind a pending door, sent once the
-    /// created session's id arrives.
     pending_first: Option<String>,
-    /// The review queue's size: the server's word, not a local count.
-    /// Opening the pane never clears it; only a verdict shrinks it.
     pub review_pending: u32,
 }
 
@@ -358,8 +316,6 @@ impl App {
         }
     }
 
-    /// A block built live, off the wire as it streams: no history seq yet,
-    /// so it never survives to be a `:fork` target until a refetch gives it one.
     fn push_block(&mut self, block: Block) {
         self.transcript.push(block);
         self.seqs.push(None);
@@ -608,8 +564,6 @@ impl App {
         self.mode = Mode::Visual;
     }
 
-    /// `R` (row 2.3): point visual pre-positioned on the last message sent,
-    /// walking only `Block::You` — the flavor Enter reforks-and-refills from.
     fn enter_rewind(&mut self) {
         let Some(last_you) = self
             .transcript
@@ -632,8 +586,6 @@ impl App {
         }
     }
 
-    /// Whether `block` is a stop for `j`/`k`/`gg`/`G` in point visual: any
-    /// message normally, only a sent one (`Block::You`) in the rewind flavor.
     fn is_visual_stop(&self, block: &Block) -> bool {
         if self.visual_rewind {
             matches!(block, Block::You(_))
@@ -642,8 +594,6 @@ impl App {
         }
     }
 
-    /// Walks `visual_boundary` one stop toward `up` or down, skipping
-    /// non-stops; no stop that way leaves the boundary where it was.
     fn step_point(&mut self, up: bool) {
         let len = self.transcript.len();
         let mut at = self.visual_boundary;
@@ -668,7 +618,6 @@ impl App {
         }
     }
 
-    /// `gg`/`G` in point visual: the first or last stop in the transcript.
     fn jump_point(&mut self, to_end: bool) {
         let found = if to_end {
             self.transcript.iter().rposition(|b| self.is_visual_stop(b))
@@ -698,7 +647,6 @@ impl App {
                 if self.visual_point {
                     self.step_point(false);
                 } else {
-                    // a range never extends below its anchor
                     self.visual_boundary = (self.visual_boundary + 1).min(self.visual_anchor);
                 }
             }
@@ -732,7 +680,6 @@ impl App {
         None
     }
 
-    /// The selected block range, low to high; only meaningful in visual mode.
     pub fn visual_range(&self) -> Option<(usize, usize)> {
         if self.mode != Mode::Visual {
             return None;
@@ -743,7 +690,6 @@ impl App {
         Some((anchor.min(boundary), anchor.max(boundary)))
     }
 
-    /// The boundary block index the selection is currently anchored to by the cursor.
     pub fn visual_boundary(&self) -> Option<usize> {
         if self.mode != Mode::Visual || self.transcript.is_empty() {
             return None;
@@ -826,8 +772,6 @@ impl App {
     }
 
     // the yank text is the searchable surface: chrome never matches
-    /// Steps matches of the still-open prompt's query: the first press
-    /// lands on the newest match, later ones walk; an edited query recomputes.
     fn search_live_step(&mut self, older: bool) {
         let query = self.input.clone();
         if query.is_empty() {
@@ -881,7 +825,6 @@ impl App {
         ));
     }
 
-    /// The block the confirmed search sits on, if it still exists.
     pub fn search_block(&self) -> Option<usize> {
         let search = self.search.as_ref()?;
         let block = *search.matches.get(search.current)?;
@@ -917,11 +860,6 @@ impl App {
         None
     }
 
-    /// `:code <project>` (row 9.1): the direct door — a bound executor
-    /// session, no dispatch. An empty project name is a usage error, not a
-    /// request the daemon would refuse anyway.
-    /// Frontend-only until the first message: nothing durable exists for an
-    /// abandoned `:code`, exactly like an untyped-in concierge conversation.
     fn open_code(&mut self, project: &str) -> Option<Command> {
         if project.is_empty() {
             self.last_error = Some("E492".to_owned());
@@ -932,10 +870,6 @@ impl App {
         command
     }
 
-    /// `:fork` (row 2.2): rewind is not separate machinery, it is a fork at
-    /// an earlier seq that the client then opens — the open half rides in
-    /// on `NetEvent::SessionForked`. Only a selected message block with a
-    /// known history seq can be a fork point.
     fn fork_selected(&mut self) -> Option<Command> {
         let Some(index) = self.visual_at_cmd.take() else {
             self.last_error = Some("fork: select a message in visual mode first".to_owned());
@@ -961,17 +895,12 @@ impl App {
         }
     }
 
-    /// `f` in visual mode (row 2.3): `:fork` in one key, either flavor —
-    /// stash the pointed block exactly as `:` does before Enter runs it.
     fn fork_selected_visual(&mut self) -> Option<Command> {
         self.visual_at_cmd = self.visual_boundary();
         self.mode = Mode::Normal;
         self.fork_selected()
     }
 
-    /// Rewind's Enter (row 2.3): forks before the You block `R` is pointed
-    /// at — excluding it, so the retyped message replaces it on the branch —
-    /// and stashes its text for `SessionForked` to prefill.
     fn rewind_fork(&mut self) -> Option<Command> {
         let index = self.visual_boundary;
         self.mode = Mode::Normal;
@@ -1077,8 +1006,6 @@ impl App {
         None
     }
 
-    /// `C` (row 3, phase 3.6): the project picker over `:code`'s door —
-    /// same session machinery, the name chosen from a list instead of typed.
     fn open_projects(&mut self) -> Command {
         self.projects = Some(Projects {
             items: Vec::new(),
@@ -1154,10 +1081,6 @@ impl App {
         None
     }
 
-    /// `x` on a running row (row 6.39): stops the job through the
-    /// supervisor and leaves a footer note either way, mirroring `s`'s
-    /// plumbing — the confirmation is set optimistically here, before the
-    /// command even reaches the wire.
     fn cancel_selected_job(&mut self) -> Option<Command> {
         let jobs = self.jobs.as_mut().expect("jobs is open");
         let job = jobs.items.get(jobs.selected)?;
@@ -1170,8 +1093,6 @@ impl App {
         Some(Command::CancelJob { session_id })
     }
 
-    /// `d` on a running row with queued steers (row 6.33): a no-op, no
-    /// footer note, when there's nothing queued to drop.
     fn drop_selected_steers(&mut self) -> Option<Command> {
         let jobs = self.jobs.as_mut().expect("jobs is open");
         let job = jobs.items.get(jobs.selected)?;
@@ -1256,9 +1177,6 @@ impl App {
         None
     }
 
-    /// `m`/`X` on a picker row (row 2.4): a branch's disposition is a
-    /// verdict, not a wire call worth making on a root — that's an
-    /// instructive status line instead.
     fn mark_selected_branch(
         &mut self,
         row: usize,
@@ -1275,7 +1193,6 @@ impl App {
         })
     }
 
-    /// The filter query lives in `self.input`, same mechanism as the steer prompt.
     fn on_picker_filter_key(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Esc => self.cancel_picker_filter(),
@@ -1360,9 +1277,6 @@ impl App {
             .and_then(|i| self.picker_rows().get(i).copied())
     }
 
-    /// The session list in recency order, narrowed to conversations unless
-    /// `a` revealed jobs too, narrowed further by the filter query if any,
-    /// then nested (row 2.3) so each branch renders directly under its parent.
     pub fn picker_rows(&self) -> Vec<&SessionInfo> {
         self.picker_tree().into_iter().map(|(s, _)| s).collect()
     }
@@ -1414,10 +1328,6 @@ impl App {
             .collect()
     }
 
-    /// The most recently touched job the open session dispatched that's
-    /// still running (row 6.38); the strip's subject. No open session, or
-    /// none of its children running, means no strip line — the `:jobs`
-    /// popup stays global, only this ambient line scopes.
     pub fn strip_job(&self) -> Option<&JobInfo> {
         let parent = self.session_id.as_deref()?;
         self.ambient
@@ -1445,12 +1355,10 @@ impl App {
         u64::from(job.idle_seconds) + self.strip_since.elapsed().as_secs()
     }
 
-    /// Seconds since the in-flight turn started, while one is streaming.
     pub fn turn_elapsed_seconds(&self) -> Option<u64> {
         self.turn_started.map(|since| since.elapsed().as_secs())
     }
 
-    /// A rough token count for what's streamed so far this turn.
     pub fn streamed_tokens_estimate(&self) -> u64 {
         (self.streamed_chars / 4) as u64
     }
@@ -1468,9 +1376,6 @@ impl App {
             .insert(session_id.to_owned(), (role, project.to_owned(), source));
     }
 
-    /// Names the exceptional door the open session came through — `code/{project}` for a
-    /// user-opened executor session, `job/{project}` for one MODEL dispatched. Concierge and
-    /// unspecified sessions render nothing: the default door needs no label.
     pub fn open_door_label(&self) -> Option<String> {
         if self.session_id.is_none() {
             if let Some((SessionRole::Executor, project)) = &self.pending_code {
@@ -1497,7 +1402,6 @@ impl App {
         self.pending_code = None;
         self.pending_first = None;
         if self.session_id != session_id {
-            // only a named session is worth bouncing back to
             self.previous_session = self.session_id.clone();
         }
         self.session_id.clone_from(&session_id);
@@ -1535,9 +1439,6 @@ impl App {
         Some(self.send(content))
     }
 
-    /// Esc on a streaming turn: fires on the open session, if one is already
-    /// named. A turn still waiting on its own `Accepted` (a brand new
-    /// session) has nothing to name yet, so Esc is a no-op there.
     fn cancel_turn(&mut self) -> Option<Command> {
         let session_id = self.session_id.clone()?;
         Some(Command::CancelTurn { session_id })
@@ -1803,9 +1704,6 @@ impl App {
                 let first = self.pending_first.take()?;
                 Some(self.send(first))
             }
-            // the composed gesture that IS rewind: open the branch exactly
-            // like the picker opens any session, then refill the retyped
-            // message if `R`'s Enter is what forked it
             NetEvent::SessionForked { session_id } => {
                 let command = self.start_session(Some(session_id));
                 if let Some(text) = self.pending_rewind_text.take() {
@@ -1997,7 +1895,6 @@ fn is_uuid_like(text: &str) -> bool {
     (32..=36).contains(&text.len()) && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// You/Arc/System blocks, headered and blank-line separated; everything else is skipped.
 fn format_yank(blocks: &[Block]) -> Option<String> {
     let parts: Vec<String> = blocks.iter().filter_map(block_yank_text).collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
@@ -2019,14 +1916,10 @@ fn block_yank_text(block: &Block) -> Option<String> {
     }
 }
 
-/// The first meaningful string value in the call's arguments: the bash
-/// command, the read/write/edit path, and so on for anything shaped alike.
 // the map is a BTreeMap, so "first value" is alphabetical-key order —
 // `project` would beat `question`; known payload keys are tried first
 const SUMMARY_KEYS: &[&str] = &["question", "command", "query", "brief", "path", "id"];
 
-/// (title, uri) pairs out of Gemini's grounding metadata: any
-/// `groundingChunks[].web` with a uri counts; a missing title shows the uri.
 fn grounding_sources(grounding_json: &str) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(grounding_json) else {
         return Vec::new();
@@ -2282,8 +2175,6 @@ mod tests {
         }
     }
 
-    /// A `:code` session (row 9.1): bound to a project like a job, but
-    /// user-opened — the picker must list it as a conversation, not a job.
     fn code_session(id: &str, title: &str, project: &str) -> SessionInfo {
         SessionInfo {
             role: SessionRole::Executor as i32,
@@ -4568,8 +4459,6 @@ mod tests {
         assert!(app.review.is_some());
     }
 
-    /// Row 3 (phase 3.6): `C` is `:code` with the name picked, not typed —
-    /// the same pending-door flow from enter on.
     #[test]
     fn capital_c_picks_a_project_and_enter_walks_the_code_door() {
         let mut app = App::new();

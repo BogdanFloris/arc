@@ -6,9 +6,6 @@ use serde::Deserialize;
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
-/// Validates a `cancel_job` call and hands the engine the target session id.
-/// It never touches the job itself — whether it's live, and stopping it if
-/// so, is the supervisor's, once the turn's `Reply.cancels` reaches arcd.
 pub struct CancelJob;
 
 #[derive(Deserialize)]

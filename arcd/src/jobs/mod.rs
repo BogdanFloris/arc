@@ -154,8 +154,6 @@ impl Supervisor {
         self.identity.as_deref()
     }
 
-    /// What `ListProjects` answers with: the same slate `dispatch`
-    /// grounds its schema on.
     #[must_use]
     pub fn with_project_list(mut self, projects: Vec<ProjectInfo>) -> Self {
         self.project_list = projects;

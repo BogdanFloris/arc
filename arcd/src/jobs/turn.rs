@@ -175,8 +175,6 @@ pub(super) async fn run_job(
     handback_clean(&ctx, &job).await;
 }
 
-/// Shared tail for a turn loop stopping short of a clean finish: drains
-/// whatever's queued, marks the job terminal, and hands back the reason.
 async fn end_job(
     ctx: &HandbackCtx<'_>,
     job: &DispatchedJob,
@@ -197,9 +195,6 @@ async fn end_job(
     }
 }
 
-/// A completed turn's outcome. A failed or cancelled turn ends the job, so
-/// the caller stops draining steers; a successful turn carries whatever
-/// usage the provider reported, which may itself be absent.
 enum TurnOutcome {
     Success {
         usage: Option<Usage>,
@@ -217,7 +212,6 @@ fn usage_tokens(usage: Option<Usage>) -> u64 {
     })
 }
 
-/// Which dimension of a job's budget it went over, and by how much.
 pub(super) enum BudgetBreach {
     Tokens { spent: u64, allowed: u64 },
     WallClock { elapsed: u64, allowed: u64 },
@@ -258,11 +252,6 @@ fn warn_over_budget(session_id: &str, breach: &BudgetBreach) {
     }
 }
 
-/// One engine event for a job's running turn: a started tool call counts a
-/// step and broadcasts the strip's new state; every event refreshes the
-/// idle clock and the silence deadline. Shared by the live recv and the
-/// post-send drain, which exists because a fully-scripted turn can finish
-/// with events still buffered.
 fn handle_job_event(
     event: &EngineEvent,
     pending_tool_calls: &mut u32,
@@ -307,10 +296,6 @@ fn handle_job_event(
     *deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
 }
 
-/// One completed poll of `run_turn`'s select loop: either the send future
-/// resolved, or it timed out silent, or a cancel landed (row 6.39). Kept
-/// distinct from `TurnOutcome` because the caller still needs to log each
-/// case with its own message before collapsing them.
 enum RawOutcome {
     Sent(Result<arc_core::session::Reply, arc_core::session::Error>),
     SilentTimeout,
@@ -413,10 +398,6 @@ async fn run_turn(
     }
 }
 
-/// Physically empties the steer queue and reports the fresh (zero) count.
-/// Draining and counting happen together — the job's own task is the only
-/// reader of `steer_rx` — so a steer that queues after the request is never
-/// caught in the same net.
 fn drop_queued_steers(
     steer_rx: &mut mpsc::UnboundedReceiver<String>,
     ctx: &HandbackCtx<'_>,
@@ -434,10 +415,6 @@ fn drop_queued_steers(
     }
 }
 
-/// Whether any `DropSteers` request has landed since the last check
-/// (row 6.33); a no-op unless one has. The mid-turn select handles a
-/// request seen while a turn is in flight — this is only for the window
-/// between turns, in `run_job`'s own loop.
 fn drain_dropped_steers(
     drop_rx: &mut mpsc::UnboundedReceiver<()>,
     steer_rx: &mut mpsc::UnboundedReceiver<String>,
@@ -453,9 +430,6 @@ fn drain_dropped_steers(
     }
 }
 
-/// Ends a job now: removes its live entry, drops whatever steers are still
-/// queued, and zeroes the visible count — exactly as a failed, cancelled,
-/// or over-budget job must.
 fn finish_now(
     live: &LiveMap,
     steer_rx: &mut mpsc::UnboundedReceiver<String>,
