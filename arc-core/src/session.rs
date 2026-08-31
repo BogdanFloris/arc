@@ -482,6 +482,19 @@ impl Engine {
         let brief = job_request.brief;
         let budget = job_request.budget;
         let intent = job_request.intent;
+        if !job_request.fresh {
+            if let Some(warm) = self.warm_finished_job(parent_session, &project, role, intent) {
+                return (
+                    ToolOutcome::Error,
+                    format!(
+                        "ERROR: job {warm} already finished in {project} and keeps its \
+                         context. Continue it with continue_job, or re-send this dispatch \
+                         with fresh: true if that context is irrelevant to this task."
+                    ),
+                    None,
+                );
+            }
+        }
         match self.create_bound_session_with_intent(
             runner,
             &project,
@@ -515,6 +528,33 @@ impl Engine {
             ),
             Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
         }
+    }
+
+    fn warm_finished_job(
+        &self,
+        parent_session: &str,
+        project: &str,
+        role: SessionRole,
+        intent: Intent,
+    ) -> Option<String> {
+        let candidate = self
+            .with_store(|store| {
+                store
+                    .projection()
+                    .latest_finished_job(parent_session, project, role as i32)
+            })
+            .ok()
+            .flatten()?;
+        if intent == Intent::Implement {
+            let grants = self
+                .with_store(|store| store.projection().session_grants(&candidate))
+                .ok()?;
+            let read_only = !grants.is_empty() && grants.iter().all(|(_, read_write)| !read_write);
+            if read_only {
+                return None;
+            }
+        }
+        Some(candidate)
     }
 
     fn continue_job(
@@ -5635,6 +5675,203 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_dispatch_into_a_project_with_a_finished_job_is_bounced_toward_continue_job() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "fix the bug", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+            vec![
+                Ok(call(
+                    "c2",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "now check the docs", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("second try"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("send");
+        let child_id = reply.jobs[0].session_id.clone();
+        engine
+            .record_handback(&reply.session_id, &child_id, None, "fixed it")
+            .await
+            .expect("record_handback");
+
+        let (tx, _rx) = channel();
+        let second = engine
+            .send_message(&run, Some(&reply.session_id), "more work", tx)
+            .await
+            .expect("a bounced dispatch fails the call, not the turn");
+
+        assert!(second.jobs.is_empty(), "no second child was spawned");
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 11, "no SessionCreated in the second turn");
+        let result = resulted(&events[9]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains(&child_id), "{}", result.content);
+        assert!(
+            result.content.contains("continue_job"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("fresh: true"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn fresh_true_dispatches_past_the_finished_job() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let fresh_args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": "unrelated work",
+            "intent": "implement",
+            "fresh": true,
+        })
+        .to_string();
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "fix the bug", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+            vec![Ok(call("c2", 0, "dispatch", &fresh_args)), Ok(tool_stop())],
+            done_reply("dispatched fresh"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("send");
+        let child_id = reply.jobs[0].session_id.clone();
+        engine
+            .record_handback(&reply.session_id, &child_id, None, "fixed it")
+            .await
+            .expect("record_handback");
+
+        let (tx, _rx) = channel();
+        let second = engine
+            .send_message(&run, Some(&reply.session_id), "something else", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(second.jobs.len(), 1, "fresh passed the guard");
+        assert_ne!(
+            second.jobs[0].session_id, child_id,
+            "a new child, not a resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_implement_dispatch_is_not_bounced_toward_a_read_only_analyze_job() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "find the bug", "analyze"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+            vec![
+                Ok(call(
+                    "c2",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "arc", "fix the bug it found", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched the fix"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "look into it", tx)
+            .await
+            .expect("send");
+        let child_id = reply.jobs[0].session_id.clone();
+        engine
+            .record_handback(&reply.session_id, &child_id, None, "found it")
+            .await
+            .expect("record_handback");
+
+        let (tx, _rx) = channel();
+        let second = engine
+            .send_message(&run, Some(&reply.session_id), "fix it", tx)
+            .await
+            .expect("send");
+
+        assert_eq!(
+            second.jobs.len(),
+            1,
+            "a read-only job cannot take the change; the implement dispatch runs"
+        );
+        assert_ne!(second.jobs[0].session_id, child_id);
+    }
+
     fn continue_job_args(session_id: &str, message: &str) -> String {
         serde_json::json!({
             "session_id": session_id,
@@ -6546,6 +6783,7 @@ mod tests {
                             brief: "do it".to_owned(),
                             budget: None,
                             intent: Intent::Implement,
+                            fresh: false,
                         }),
                         continue_request: None,
                         cancel_request: None,

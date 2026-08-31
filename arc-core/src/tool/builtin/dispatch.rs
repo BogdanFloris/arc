@@ -72,6 +72,8 @@ struct DispatchArgs {
     project: String,
     brief: String,
     intent: String,
+    #[serde(default)]
+    fresh: bool,
 }
 
 impl Tool for Dispatch {
@@ -115,6 +117,13 @@ impl Tool for Dispatch {
                         "description": "analyze: the job reads and reports; the workspace \
                             stays untouched — its write tools are refused. implement: the \
                             job changes the workspace."
+                    },
+                    "fresh": {
+                        "type": "boolean",
+                        "description": "Start from nothing even though a finished job in \
+                            this project keeps its context. A dispatch refused for that \
+                            reason names the job to continue; set fresh only when its \
+                            context is irrelevant to this task."
                     },
                 },
                 "required": ["role", "project", "brief", "intent"]
@@ -182,6 +191,7 @@ impl Tool for Dispatch {
                     brief: args.brief,
                     budget,
                     intent,
+                    fresh: args.fresh,
                 }),
                 continue_request: None,
                 cancel_request: None,
@@ -234,6 +244,29 @@ mod tests {
         assert_eq!(job.brief, "fix the bug");
         assert_eq!(job.budget, None);
         assert_eq!(job.intent, crate::tool::Intent::Implement);
+        assert!(!job.fresh, "fresh defaults to false when absent");
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_with_fresh_true_carries_it_on_the_job_request() {
+        let tool = dispatch(&[("arc", "")], None);
+
+        let reply = tool
+            .execute(
+                serde_json::json!({
+                    "role": "executor",
+                    "project": "arc",
+                    "brief": "unrelated work",
+                    "intent": "implement",
+                    "fresh": true,
+                })
+                .to_string(),
+                TurnContext::default(),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(reply.job_request.expect("a job request").fresh);
     }
 
     #[tokio::test]
@@ -403,6 +436,10 @@ mod tests {
             .map(|v| v.as_str().expect("string"))
             .collect::<Vec<_>>();
         assert_eq!(required, ["role", "project", "brief", "intent"]);
+        assert!(
+            definition.parameters["properties"]["fresh"].is_object(),
+            "fresh is declared but never required"
+        );
 
         let role_enum = definition.parameters["properties"]["role"]["enum"]
             .as_array()

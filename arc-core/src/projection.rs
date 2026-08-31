@@ -638,6 +638,38 @@ impl Projection {
         )?)
     }
 
+    /// The parent's most recent job in `project` with `role` whose latest
+    /// handback reads `finished` — a job last handed back as `stopped`
+    /// (cancelled, crashed) is never offered for continuation.
+    pub(crate) fn latest_finished_job(
+        &self,
+        parent_session_id: &str,
+        project: &str,
+        role: i32,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.id FROM sessions s JOIN messages m
+                    ON m.session_id = ?1 AND m.kind = ?2 AND m.source = ?3
+                   AND m.content LIKE 'Job ' || s.id || ' %'
+                 WHERE s.dispatched_by = ?1 AND s.project = ?4 AND s.role = ?5
+                 GROUP BY s.id
+                 HAVING MAX(CASE WHEN m.content LIKE 'Job ' || s.id || ' finished.%'
+                                 THEN m.seq END) = MAX(m.seq)
+                 ORDER BY MAX(m.seq) DESC LIMIT 1",
+                rusqlite::params![
+                    parent_session_id,
+                    KIND_MESSAGE,
+                    arc_proto::v1::Source::System as i32,
+                    project,
+                    role
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// A job session's summed usage across every message it carries: what a
     /// resumed job's spent counter seeds from, instead of restarting at zero.
     pub(crate) fn session_token_total(&self, session_id: &str) -> Result<u64, Error> {
@@ -2651,6 +2683,165 @@ mod tests {
             session_lineage(&projection, "s-job"),
             (None, None, Some("s-01".to_owned()), None),
             "a dispatch is supervision, never lineage"
+        );
+    }
+
+    fn dispatched_job(seq: u64, id: &str, parent: &str, project: &str, role: SessionRole) -> Event {
+        let mut event = session_created_as(seq, id, "", None);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = event.payload.as_mut()
+        {
+            created.dispatched_by = parent.to_owned();
+            created.project = project.to_owned();
+            created.role = role as i32;
+        }
+        event
+    }
+
+    fn system_handback(seq: u64, parent: &str, content: &str) -> Event {
+        let mut event = message_appended_for(seq, parent, content);
+        event.source = Source::System as i32;
+        event
+    }
+
+    #[test]
+    fn latest_finished_job_is_the_most_recently_finished_child() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&dispatched_job(
+                1,
+                "s-a",
+                "s-01",
+                "arc",
+                SessionRole::Executor,
+            ))
+            .expect("apply");
+        projection
+            .apply(&dispatched_job(
+                2,
+                "s-b",
+                "s-01",
+                "arc",
+                SessionRole::Executor,
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                3,
+                "s-01",
+                "Job s-a finished.\ndid one thing",
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                4,
+                "s-01",
+                "Job s-b finished.\nand another",
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            projection
+                .latest_finished_job("s-01", "arc", SessionRole::Executor as i32)
+                .expect("query"),
+            Some("s-b".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_job_whose_latest_handback_is_stopped_is_never_offered() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&dispatched_job(
+                1,
+                "s-a",
+                "s-01",
+                "arc",
+                SessionRole::Executor,
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(2, "s-01", "Job s-a finished.\nfirst pass"))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                3,
+                "s-01",
+                "Job s-a stopped: cancelled by the user.\n(no reply)",
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            projection
+                .latest_finished_job("s-01", "arc", SessionRole::Executor as i32)
+                .expect("query"),
+            None,
+            "a resume cancelled after a clean finish stays stopped"
+        );
+    }
+
+    #[test]
+    fn latest_finished_job_matches_only_this_parents_project_and_role() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        projection
+            .apply(&dispatched_job(
+                1,
+                "s-a",
+                "s-01",
+                "other",
+                SessionRole::Executor,
+            ))
+            .expect("apply");
+        projection
+            .apply(&dispatched_job(
+                2,
+                "s-b",
+                "s-01",
+                "arc",
+                SessionRole::Archivist,
+            ))
+            .expect("apply");
+        projection
+            .apply(&dispatched_job(
+                3,
+                "s-c",
+                "s-02",
+                "arc",
+                SessionRole::Executor,
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                4,
+                "s-01",
+                "Job s-a finished.\nother project",
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                5,
+                "s-01",
+                "Job s-b finished.\narchivist work",
+            ))
+            .expect("apply");
+        projection
+            .apply(&system_handback(
+                6,
+                "s-02",
+                "Job s-c finished.\nanother parent",
+            ))
+            .expect("apply");
+
+        assert_eq!(
+            projection
+                .latest_finished_job("s-01", "arc", SessionRole::Executor as i32)
+                .expect("query"),
+            None,
+            "wrong project, wrong role, and wrong parent all stay out"
         );
     }
 
