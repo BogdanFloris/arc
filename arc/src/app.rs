@@ -397,6 +397,32 @@ impl App {
         }
     }
 
+    pub fn on_paste(&mut self, text: &str) -> Option<Command> {
+        self.yank_note = None;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let overlay = self.help
+            || self.review.is_some()
+            || self.jobs.is_some()
+            || self.projects.is_some()
+            || self.picker.is_some();
+        if overlay {
+            return None;
+        }
+        let first_line = || text.lines().next().unwrap_or_default().to_owned();
+        match self.mode {
+            Mode::Cmd => self.cmd.push_str(&first_line()),
+            _ if self.searching => self.insert_text(&first_line()),
+            Mode::Insert | Mode::Normal => self.insert_text(&text),
+            Mode::Visual => {}
+        }
+        None
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
     fn on_control(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Char('c') => self.quit = true,
@@ -2131,6 +2157,44 @@ mod tests {
         for c in keys.chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn a_paste_in_insert_mode_lands_verbatim_without_submitting() {
+        let mut app = App::new();
+        typed(&mut app, "ab");
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.on_paste("1\r\n2\n3"), None);
+        assert_eq!(app.input, "a1\n2\n3b");
+        assert_eq!(app.cursor, "a1\n2\n3".len());
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn a_paste_in_normal_mode_inserts_at_the_cursor() {
+        let mut app = App::new();
+        typed(&mut app, "abc");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.on_paste("X"), None);
+        assert_eq!(app.input, "abXc");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_paste_in_cmd_mode_keeps_only_the_first_line() {
+        let mut app = App::new();
+        normal(&mut app, ":");
+        assert_eq!(app.mode, Mode::Cmd);
+        assert_eq!(app.on_paste("review\nq"), None);
+        assert_eq!(app.cmd, "review");
+    }
+
+    #[test]
+    fn a_paste_over_an_overlay_is_ignored() {
+        let mut app = App::new();
+        app.help = true;
+        assert_eq!(app.on_paste("x"), None);
+        assert_eq!(app.input, "");
     }
 
     fn session(id: &str) -> SessionInfo {

@@ -23,7 +23,9 @@ use anyhow::Result;
 use arc_core::herdr::{AgentState, Reporter};
 use base64::Engine as _;
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+};
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
@@ -53,8 +55,10 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     let terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     let mut herdr = Reporter::from_env();
     let result = run(terminal, url, &mut herdr).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     let _ = crossterm::execute!(std::io::stdout(), SetCursorStyle::DefaultUserShape);
     herdr.shutdown().await;
@@ -99,6 +103,7 @@ async fn run(
         let command = tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Some(Ok(Event::Paste(text))) => app.on_paste(&text),
                 Some(Ok(_)) => None,
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
