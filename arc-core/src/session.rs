@@ -639,7 +639,7 @@ impl Engine {
         let guard = self.turn_guard(parent_session);
         let _turn = guard.lock().await;
 
-        let summary = truncate_summary(summary);
+        let summary = truncate_summary(summary, child_session);
         let content = match reason {
             None => {
                 let grants =
@@ -1669,9 +1669,9 @@ fn start_date_line(micros: i64) -> Option<String> {
     Some(format!("This conversation started on {date}."))
 }
 
-const MAX_HANDBACK_SUMMARY_BYTES: usize = 2048;
+const MAX_HANDBACK_SUMMARY_BYTES: usize = 16 * 1024;
 
-fn truncate_summary(summary: &str) -> String {
+fn truncate_summary(summary: &str, child_session: &str) -> String {
     if summary.len() <= MAX_HANDBACK_SUMMARY_BYTES {
         return summary.to_owned();
     }
@@ -1679,8 +1679,12 @@ fn truncate_summary(summary: &str) -> String {
     while !summary.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{} [truncated]", &summary[..cut])
+    format!(
+        "{} [truncated; the rest is in the job's own transcript — continue_job {child_session} reads it]",
+        &summary[..cut]
+    )
 }
+
 
 fn session_id_of(event: &session_event::Event) -> &str {
     match event {
@@ -6290,9 +6294,9 @@ mod tests {
             .await
             .expect("send");
 
-        // two-byte characters straddle the 2 KiB cap, exercising the
+        // two-byte characters straddle the 16 KiB cap, exercising the
         // char-boundary walk-back as well as the cap itself
-        let long_summary = "é".repeat(2000);
+        let long_summary = "é".repeat(9000);
         engine
             .record_handback(&reply.session_id, "child-1", None, &long_summary)
             .await
@@ -6303,7 +6307,10 @@ mod tests {
             Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
             other => panic!("expected a message entry, got {other:?}"),
         };
-        assert!(content.contains(" [truncated]\n"), "{content}");
+        assert!(
+            content.contains(" [truncated; the rest is in the job's own transcript — continue_job child-1 reads it]\n"),
+            "{content}"
+        );
         assert!(
             content.ends_with("a new dispatch starts from nothing."),
             "the continue_job affordance stays the closing line: {content}"
