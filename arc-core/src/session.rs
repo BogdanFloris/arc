@@ -1249,6 +1249,7 @@ impl Engine {
                 None => break Ending::Cut { cancelled: false },
             }
         };
+        let (text, reasoning) = split_leaked_thinking(text, reasoning);
         Ok((ending, text, reasoning, calls))
     }
 
@@ -1685,6 +1686,21 @@ fn truncate_summary(summary: &str, child_session: &str) -> String {
     )
 }
 
+// DeepSeek at long context sometimes thinks in the content channel and
+// closes with a bare tag; the head is reasoning, never a reply
+fn split_leaked_thinking(text: String, mut reasoning: String) -> (String, String) {
+    let Some((head, tail)) = text.split_once("</think>") else {
+        return (text, reasoning);
+    };
+    let head = head.strip_prefix("<think>").unwrap_or(head).trim();
+    if !head.is_empty() {
+        if !reasoning.is_empty() {
+            reasoning.push('\n');
+        }
+        reasoning.push_str(head);
+    }
+    (tail.trim_start().to_owned(), reasoning)
+}
 
 fn session_id_of(event: &session_event::Event) -> &str {
     match event {
@@ -3495,6 +3511,61 @@ mod tests {
             panic!("expected the calls, got {:?}", requests[1].messages[1]);
         };
         assert_eq!(reasoning.as_deref(), Some("checking the time"));
+    }
+
+    #[tokio::test]
+    async fn thinking_leaked_into_the_content_channel_is_reasoning_not_a_reply() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(CompletionDelta::Text(
+                    "let me check the clock</think>".to_owned(),
+                )),
+                Ok(call("t1", 0, "clock", "{}")),
+                Ok(tool_stop()),
+            ],
+            vec![
+                Ok(CompletionDelta::Text(
+                    "<think>noon then</think>it is noon".to_owned(),
+                )),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("clock", "noon", true)]));
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "what time is it?", tx)
+            .await
+            .expect("send");
+
+        let requests = provider.requests();
+        let Message::ToolCalls { reasoning, .. } = &requests[1].messages[1] else {
+            panic!("expected the calls, got {:?}", requests[1].messages[1]);
+        };
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("let me check the clock"),
+            "the head replays as reasoning on the next step"
+        );
+        let events = replay_log(dir.path());
+        let texts: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.role == Role::Assistant as i32 => {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["it is noon".to_owned()],
+            "neither head reaches the log; the empty first step appends nothing"
+        );
     }
 
     #[tokio::test]
