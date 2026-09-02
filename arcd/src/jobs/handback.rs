@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use arc_core::provider::role_label;
@@ -10,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::status::JobStatuses;
 use super::turn::{BudgetBreach, EVENT_BUFFER};
-use super::{Handles, LiveMap, route_cancels, route_continues, spawn_job};
+use super::{Handles, LiveMap, Project, route_cancels, route_continues, spawn_job};
 
 pub(super) const NO_REPLY: &str = "(the job produced no reply)";
 
@@ -49,7 +48,7 @@ impl Handback {
 pub(super) struct HandbackCtx<'a> {
     pub(super) engine: &'a Arc<Engine>,
     pub(super) runners: &'a BTreeMap<SessionRole, Runner>,
-    pub(super) projects: &'a BTreeMap<String, PathBuf>,
+    pub(super) projects: &'a BTreeMap<String, Project>,
     pub(super) live: &'a Arc<LiveMap>,
     pub(super) statuses: &'a Arc<JobStatuses>,
     pub(super) notifier: Option<&'a broadcast::Sender<Notification>>,
@@ -88,7 +87,7 @@ pub(super) async fn record_handback(
     reason: Option<&str>,
 ) {
     let summary = job_summary(ctx.engine, job);
-    record_handback_with(ctx, job, reason, summary).await;
+    record_handback_with(ctx, job, reason, summary, None).await;
 }
 
 async fn record_handback_with(
@@ -96,10 +95,17 @@ async fn record_handback_with(
     job: &DispatchedJob,
     reason: Option<&str>,
     summary: String,
+    footprint: Option<String>,
 ) {
     match ctx
         .engine
-        .record_handback(&job.parent_session, &job.session_id, reason, &summary)
+        .record_handback(
+            &job.parent_session,
+            &job.session_id,
+            reason,
+            &summary,
+            footprint.as_deref(),
+        )
         .await
     {
         Ok(()) => maybe_run_handback_turn(ctx, &job.parent_session).await,
@@ -112,15 +118,24 @@ async fn record_handback_with(
     }
 }
 
-pub(super) async fn handback_clean(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
-    record_handback(ctx, job, None).await;
+pub(super) async fn handback_clean(
+    ctx: &HandbackCtx<'_>,
+    job: &DispatchedJob,
+    footprint: Option<String>,
+) {
+    let summary = job_summary(ctx.engine, job);
+    record_handback_with(ctx, job, None, summary, footprint).await;
 }
 
 pub(super) const USER_REPLY_NOTE: &str = "This reply answers a message the user sent the job directly; the report before it still stands.";
 
-pub(super) async fn handback_user_reply(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+pub(super) async fn handback_user_reply(
+    ctx: &HandbackCtx<'_>,
+    job: &DispatchedJob,
+    footprint: Option<String>,
+) {
     let summary = format!("{USER_REPLY_NOTE}\n{}", job_summary(ctx.engine, job));
-    record_handback_with(ctx, job, None, summary).await;
+    record_handback_with(ctx, job, None, summary, footprint).await;
 }
 
 pub(super) async fn handback_failed(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
@@ -159,6 +174,7 @@ pub(super) async fn handback_over_budget(
         job,
         Some(&reason),
         "(its last reply was handed back when that turn ended)".to_owned(),
+        None,
     )
     .await;
 }
@@ -438,6 +454,53 @@ mod tests {
                     + " stopped: token budget exhausted (8/5).\n(its last reply was handed back when that turn ended)"
             ),
             "the reason names the spent and allowed token counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handback_from_a_jj_project_carries_the_daemons_footprint() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let init = std::process::Command::new("jj")
+            .args(["git", "init"])
+            .current_dir(&root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("jj runs");
+        assert!(init.success());
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("changed nothing")]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners)
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone().into())]));
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "look around".to_owned(),
+            budget: None,
+        });
+        supervisor.shutdown().await;
+
+        let handbacks = child_user_messages(dir.path(), &parent_id);
+        assert_eq!(handbacks.len(), 1, "{handbacks:?}");
+        assert!(
+            handbacks[0].1.contains(
+                "changed nothing\nFootprint since this turn began, counted by the daemon: nothing in the project changed.\nFor follow-ups"
+            ),
+            "the daemon's count sits between the report and the continue line: {:?}",
+            handbacks[0]
         );
     }
 

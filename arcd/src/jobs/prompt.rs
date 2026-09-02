@@ -89,7 +89,7 @@ mod tests {
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor = Supervisor::new(Arc::clone(&engine), runners)
-            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone().into())]));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -126,7 +126,7 @@ mod tests {
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor = Supervisor::new(Arc::clone(&engine), runners)
-            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone().into())]));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -215,7 +215,7 @@ mod tests {
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor = Supervisor::new(Arc::clone(&engine), runners)
-            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone())]));
+            .with_projects(BTreeMap::from([("arc".to_owned(), root.clone().into())]));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),

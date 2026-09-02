@@ -26,6 +26,10 @@ const RUNNING_JOBS: &str = r"Running jobs:
   conversation.
 - A handback is the job's claim, not a verified fact. Say what the job
   reports, not what is proven, unless you checked.
+- A handback's footprint is the daemon's count of what changed in the
+  project during that turn: commits by id and message, files by name.
+  Compare the report against it and say where they differ; a claim with
+  nothing in the footprint behind it is a claim.
 - A job cancelled by the user stays stopped. Acknowledge it; never
   dispatch or continue that work again unless the user asks.
 - Describe the codebase, its UI, or its commits only from a handback or

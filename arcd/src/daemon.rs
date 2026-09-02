@@ -221,7 +221,15 @@ impl Daemon {
             .config
             .projects
             .iter()
-            .map(|(name, project)| (name.clone(), project.root.clone()))
+            .map(|(name, project)| {
+                (
+                    name.clone(),
+                    crate::jobs::Project {
+                        root: project.root.clone(),
+                        command_prefix: project.command_prefix.clone(),
+                    },
+                )
+            })
             .collect();
         let project_list = self
             .config

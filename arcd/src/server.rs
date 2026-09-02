@@ -1085,7 +1085,12 @@ mod tests {
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
                 Supervisor::new(Arc::clone(&engine), job_runners)
-                    .with_projects(project_roots)
+                    .with_projects(
+                        project_roots
+                            .into_iter()
+                            .map(|(name, root)| (name, root.into()))
+                            .collect(),
+                    )
                     .with_notifier(notifier.clone())
                     // mirrors daemon.rs: identity rides the supervisor for
                     // direct executor turns, never for dispatched jobs

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_core::footprint::{self, Mark};
 use arc_core::provider::Usage;
 use arc_core::session::{ContinuedJob, DispatchedJob, Engine, EngineEvent, Runner};
 use arc_proto::v1::{Budget, Notification, ReasoningDelta, SessionRole, notification};
@@ -15,7 +15,7 @@ use super::handback::{
     handback_over_budget, handback_user_reply,
 };
 use super::status::{JobState, JobStatuses, notify_job_changed};
-use super::{Handles, LiveMap, Steer, route_cancels, route_continues, spawn_dispatched};
+use super::{Handles, LiveMap, Project, Steer, route_cancels, route_continues, spawn_dispatched};
 
 pub(super) const EVENT_BUFFER: usize = 64;
 /// How long a turn may go without an engine event (a delta, reasoning, or
@@ -44,7 +44,7 @@ pub(super) async fn run_job(
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
     runners: BTreeMap<SessionRole, Runner>,
-    projects: BTreeMap<String, PathBuf>,
+    projects: BTreeMap<String, Project>,
     handback: Option<Arc<Handback>>,
     handles: Arc<Handles>,
 ) {
@@ -62,6 +62,7 @@ pub(super) async fn run_job(
         handback: handback.as_ref(),
     };
 
+    let mark = footprint_mark(&ctx, &job).await;
     match run_turn(
         &ctx,
         &runner,
@@ -86,7 +87,8 @@ pub(super) async fn run_job(
             spawn_dispatched(&ctx, jobs);
             route_continues(&ctx, continues);
             route_cancels(&ctx, cancels);
-            handback_clean(&ctx, &job).await;
+            let footprint = footprint_since(&ctx, &job, mark).await;
+            handback_clean(&ctx, &job, footprint).await;
         }
         TurnOutcome::Failure => {
             end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
@@ -136,6 +138,7 @@ pub(super) async fn run_job(
         if let Some(info) = statuses.record_steer_consumed(&session_id) {
             notify_job_changed(notifier.as_ref(), &engine, info);
         }
+        let mark = footprint_mark(&ctx, &job).await;
         match run_turn(
             &ctx,
             &runner,
@@ -160,10 +163,11 @@ pub(super) async fn run_job(
                 spawn_dispatched(&ctx, jobs);
                 route_continues(&ctx, continues);
                 route_cancels(&ctx, cancels);
+                let footprint = footprint_since(&ctx, &job, mark).await;
                 if steer.from_user {
-                    handback_user_reply(&ctx, &job).await;
+                    handback_user_reply(&ctx, &job, footprint).await;
                 } else {
-                    handback_clean(&ctx, &job).await;
+                    handback_clean(&ctx, &job, footprint).await;
                 }
             }
             TurnOutcome::Failure => {
@@ -180,6 +184,20 @@ pub(super) async fn run_job(
     if let Some(info) = statuses.finish(&session_id, JobState::Finished, start.elapsed()) {
         notify_job_changed(notifier.as_ref(), &engine, info);
     }
+}
+
+async fn footprint_mark(ctx: &HandbackCtx<'_>, job: &DispatchedJob) -> Option<Mark> {
+    let project = ctx.projects.get(&job.project)?;
+    footprint::mark(&project.root, &project.command_prefix).await
+}
+
+async fn footprint_since(
+    ctx: &HandbackCtx<'_>,
+    job: &DispatchedJob,
+    mark: Option<Mark>,
+) -> Option<String> {
+    let project = ctx.projects.get(&job.project)?;
+    footprint::since(&mark?, &project.root, &project.command_prefix).await
 }
 
 async fn end_job(

@@ -30,6 +30,22 @@ pub(super) struct Steer {
     pub(super) from_user: bool,
 }
 
+/// The root a job works in and the wrapper its commands run under.
+#[derive(Debug, Clone)]
+pub struct Project {
+    pub root: PathBuf,
+    pub command_prefix: Vec<String>,
+}
+
+impl From<PathBuf> for Project {
+    fn from(root: PathBuf) -> Self {
+        Self {
+            root,
+            command_prefix: Vec::new(),
+        }
+    }
+}
+
 struct LiveJob {
     steer_tx: mpsc::UnboundedSender<Steer>,
     cancel: watch::Sender<bool>,
@@ -42,7 +58,7 @@ type Handles = Mutex<Vec<JoinHandle<()>>>;
 pub struct Supervisor {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
-    projects: BTreeMap<String, PathBuf>,
+    projects: BTreeMap<String, Project>,
     handles: Arc<Handles>,
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
@@ -69,7 +85,7 @@ impl Supervisor {
     }
 
     #[must_use]
-    pub fn with_projects(mut self, projects: BTreeMap<String, PathBuf>) -> Self {
+    pub fn with_projects(mut self, projects: BTreeMap<String, Project>) -> Self {
         self.projects = projects;
         self
     }
@@ -152,7 +168,9 @@ impl Supervisor {
     }
 
     pub(crate) fn project_root(&self, project: &str) -> Option<&Path> {
-        self.projects.get(project).map(PathBuf::as_path)
+        self.projects
+            .get(project)
+            .map(|project| project.root.as_path())
     }
 
     pub(crate) fn identity(&self) -> Option<&str> {
@@ -275,7 +293,7 @@ fn spawn_job(
     job: DispatchedJob,
     engine: &Arc<Engine>,
     runners: &BTreeMap<SessionRole, Runner>,
-    projects: &BTreeMap<String, PathBuf>,
+    projects: &BTreeMap<String, Project>,
     live: &Arc<LiveMap>,
     statuses: &Arc<JobStatuses>,
     notifier: Option<&broadcast::Sender<Notification>>,
@@ -292,7 +310,7 @@ fn spawn_job_checked(
     job: DispatchedJob,
     engine: &Arc<Engine>,
     runners: &BTreeMap<SessionRole, Runner>,
-    projects: &BTreeMap<String, PathBuf>,
+    projects: &BTreeMap<String, Project>,
     live: &Arc<LiveMap>,
     statuses: &Arc<JobStatuses>,
     notifier: Option<&broadcast::Sender<Notification>>,
@@ -309,8 +327,8 @@ fn spawn_job_checked(
         );
         return false;
     };
-    if let Some(root) = projects.get(&job.project) {
-        runner.system = Some(job_system_prompt(root));
+    if let Some(project) = projects.get(&job.project) {
+        runner.system = Some(job_system_prompt(&project.root));
     }
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -369,7 +387,7 @@ fn spawn_watched(
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
     runners: BTreeMap<SessionRole, Runner>,
-    projects: BTreeMap<String, PathBuf>,
+    projects: BTreeMap<String, Project>,
     handback: Option<Arc<Handback>>,
     handles: Arc<Handles>,
 ) -> JoinHandle<()> {
