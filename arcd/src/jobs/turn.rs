@@ -12,10 +12,10 @@ use tracing::{debug, info, warn};
 
 use super::handback::{
     Handback, HandbackCtx, handback_cancelled, handback_clean, handback_failed,
-    handback_over_budget,
+    handback_over_budget, handback_user_reply,
 };
 use super::status::{JobState, JobStatuses, notify_job_changed};
-use super::{Handles, LiveMap, route_cancels, route_continues, spawn_dispatched};
+use super::{Handles, LiveMap, Steer, route_cancels, route_continues, spawn_dispatched};
 
 pub(super) const EVENT_BUFFER: usize = 64;
 /// How long a turn may go without an engine event (a delta, reasoning, or
@@ -37,7 +37,7 @@ pub(super) async fn run_job(
     engine: Arc<Engine>,
     runner: Runner,
     job: DispatchedJob,
-    mut steer_rx: mpsc::UnboundedReceiver<String>,
+    mut steer_rx: mpsc::UnboundedReceiver<Steer>,
     mut cancel_rx: watch::Receiver<bool>,
     mut drop_rx: mpsc::UnboundedReceiver<()>,
     live: Arc<LiveMap>,
@@ -86,6 +86,7 @@ pub(super) async fn run_job(
             spawn_dispatched(&ctx, jobs);
             route_continues(&ctx, continues);
             route_cancels(&ctx, cancels);
+            handback_clean(&ctx, &job).await;
         }
         TurnOutcome::Failure => {
             end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
@@ -97,6 +98,8 @@ pub(super) async fn run_job(
         }
     }
 
+    // every turn hands back as it ends, so a steer queued behind a running
+    // turn can never swallow that turn's report
     loop {
         drain_dropped_steers(&mut drop_rx, &mut steer_rx, &ctx, &session_id);
 
@@ -117,19 +120,19 @@ pub(super) async fn run_job(
         }
 
         let steered = match steer_rx.try_recv() {
-            Ok(text) => Some(text),
+            Ok(steer) => Some(steer),
             Err(mpsc::error::TryRecvError::Disconnected) => None,
             Err(mpsc::error::TryRecvError::Empty) => {
                 let mut live = live.lock().expect("live");
-                if let Ok(text) = steer_rx.try_recv() {
-                    Some(text)
+                if let Ok(steer) = steer_rx.try_recv() {
+                    Some(steer)
                 } else {
                     live.remove(&session_id);
                     None
                 }
             }
         };
-        let Some(text) = steered else { break };
+        let Some(steer) = steered else { break };
         if let Some(info) = statuses.record_steer_consumed(&session_id) {
             notify_job_changed(notifier.as_ref(), &engine, info);
         }
@@ -137,7 +140,7 @@ pub(super) async fn run_job(
             &ctx,
             &runner,
             &session_id,
-            &text,
+            &steer.text,
             &mut steer_rx,
             &mut drop_rx,
             &mut cancel_rx,
@@ -157,6 +160,11 @@ pub(super) async fn run_job(
                 spawn_dispatched(&ctx, jobs);
                 route_continues(&ctx, continues);
                 route_cancels(&ctx, cancels);
+                if steer.from_user {
+                    handback_user_reply(&ctx, &job).await;
+                } else {
+                    handback_clean(&ctx, &job).await;
+                }
             }
             TurnOutcome::Failure => {
                 end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
@@ -172,13 +180,12 @@ pub(super) async fn run_job(
     if let Some(info) = statuses.finish(&session_id, JobState::Finished, start.elapsed()) {
         notify_job_changed(notifier.as_ref(), &engine, info);
     }
-    handback_clean(&ctx, &job).await;
 }
 
 async fn end_job(
     ctx: &HandbackCtx<'_>,
     job: &DispatchedJob,
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
     start: Instant,
     reason: EndReason,
 ) {
@@ -316,7 +323,7 @@ async fn run_turn(
     runner: &Runner,
     session_id: &str,
     text: &str,
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
     drop_rx: &mut mpsc::UnboundedReceiver<()>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> TurnOutcome {
@@ -399,7 +406,7 @@ async fn run_turn(
 }
 
 fn drop_queued_steers(
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
     ctx: &HandbackCtx<'_>,
     session_id: &str,
 ) {
@@ -417,7 +424,7 @@ fn drop_queued_steers(
 
 fn drain_dropped_steers(
     drop_rx: &mut mpsc::UnboundedReceiver<()>,
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
     ctx: &HandbackCtx<'_>,
     session_id: &str,
 ) {
@@ -432,7 +439,7 @@ fn drain_dropped_steers(
 
 fn finish_now(
     live: &LiveMap,
-    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
     statuses: &JobStatuses,
     session_id: &str,
 ) {

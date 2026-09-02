@@ -25,8 +25,13 @@ use turn::run_job;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+pub(super) struct Steer {
+    pub(super) text: String,
+    pub(super) from_user: bool,
+}
+
 struct LiveJob {
-    steer_tx: mpsc::UnboundedSender<String>,
+    steer_tx: mpsc::UnboundedSender<Steer>,
     cancel: watch::Sender<bool>,
     drop_tx: mpsc::UnboundedSender<()>,
 }
@@ -120,7 +125,7 @@ impl Supervisor {
     }
 
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
-        let queued = steer_live(&self.live, session_id, text);
+        let queued = steer_live(&self.live, session_id, text, true);
         if queued {
             if let Some(info) = self.statuses.record_steer_queued(session_id) {
                 notify_job_changed(self.notifier.as_ref(), &self.engine, info);
@@ -357,7 +362,7 @@ fn spawn_watched(
     job: DispatchedJob,
     engine: Arc<Engine>,
     runner: Runner,
-    steer_rx: mpsc::UnboundedReceiver<String>,
+    steer_rx: mpsc::UnboundedReceiver<Steer>,
     cancel_rx: watch::Receiver<bool>,
     drop_rx: mpsc::UnboundedReceiver<()>,
     live: Arc<LiveMap>,
@@ -415,14 +420,20 @@ fn spawn_watched(
     })
 }
 
-fn steer_live(live: &LiveMap, session_id: &str, text: &str) -> bool {
+fn steer_live(live: &LiveMap, session_id: &str, text: &str, from_user: bool) -> bool {
     let live = live.lock().expect("live");
-    live.get(session_id)
-        .is_some_and(|job| job.steer_tx.send(text.to_owned()).is_ok())
+    live.get(session_id).is_some_and(|job| {
+        job.steer_tx
+            .send(Steer {
+                text: text.to_owned(),
+                from_user,
+            })
+            .is_ok()
+    })
 }
 
 fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
-    if steer_live(ctx.live, &cont.session_id, &cont.message) {
+    if steer_live(ctx.live, &cont.session_id, &cont.message, false) {
         if let Some(info) = ctx.statuses.record_steer_queued(&cont.session_id) {
             notify_job_changed(ctx.notifier, ctx.engine, info);
         }

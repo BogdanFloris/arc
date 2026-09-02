@@ -88,6 +88,15 @@ pub(super) async fn record_handback(
     reason: Option<&str>,
 ) {
     let summary = job_summary(ctx.engine, job);
+    record_handback_with(ctx, job, reason, summary).await;
+}
+
+async fn record_handback_with(
+    ctx: &HandbackCtx<'_>,
+    job: &DispatchedJob,
+    reason: Option<&str>,
+    summary: String,
+) {
     match ctx
         .engine
         .record_handback(&job.parent_session, &job.session_id, reason, &summary)
@@ -105,6 +114,13 @@ pub(super) async fn record_handback(
 
 pub(super) async fn handback_clean(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
     record_handback(ctx, job, None).await;
+}
+
+pub(super) const USER_REPLY_NOTE: &str = "This reply answers a message the user sent the job directly; the report before it still stands.";
+
+pub(super) async fn handback_user_reply(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
+    let summary = format!("{USER_REPLY_NOTE}\n{}", job_summary(ctx.engine, job));
+    record_handback_with(ctx, job, None, summary).await;
 }
 
 pub(super) async fn handback_failed(ctx: &HandbackCtx<'_>, job: &DispatchedJob) {
@@ -137,7 +153,14 @@ pub(super) async fn handback_over_budget(
             format!("time budget exhausted ({elapsed}s/{allowed}s)")
         }
     };
-    record_handback(ctx, job, Some(&reason)).await;
+    // the turn that crossed the budget already handed its reply back
+    record_handback_with(
+        ctx,
+        job,
+        Some(&reason),
+        "(its last reply was handed back when that turn ended)".to_owned(),
+    )
+    .await;
 }
 
 async fn maybe_run_handback_turn(ctx: &HandbackCtx<'_>, parent_session: &str) {
@@ -275,7 +298,7 @@ mod tests {
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, call, done_reply, replay_log, runner, tool_stop, usage,
+        ScriptedProvider, Step, call, done_reply, replay_log, runner, tool_stop, usage,
     };
     use arc_core::tool::Registry;
     use arc_core::tool::ToolSource;
@@ -286,6 +309,7 @@ mod tests {
     use crate::jobs::Supervisor;
     use crate::jobs::tests_common::testkit::{
         child_session, child_user_messages, engine_for_project, executor_runner, parent_session,
+        wait_for_message_count,
     };
 
     #[tokio::test]
@@ -398,15 +422,81 @@ mod tests {
         });
         supervisor.shutdown().await;
 
+        let handbacks = child_user_messages(dir.path(), &parent_id);
+        assert_eq!(handbacks.len(), 2, "the turn's own handback, then the stop");
+        assert!(
+            handbacks[0].1.contains("partial progress"),
+            "the turn that crossed the budget still hands its reply back: {:?}",
+            handbacks[0]
+        );
         assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [(
+            handbacks[1],
+            (
                 Role::User,
                 "Job ".to_owned()
                     + &child_id
-                    + " stopped: token budget exhausted (8/5).\npartial progress"
-            )],
+                    + " stopped: token budget exhausted (8/5).\n(its last reply was handed back when that turn ended)"
+            ),
             "the reason names the spent and allowed token counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_turn_hands_back_and_a_users_own_steer_says_so() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("the report".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("agreed, jj split")),
+        ]);
+
+        let engine = engine_for_project(&dir, &root);
+        let parent_id = parent_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &concierge_provider);
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        supervisor.spawn(DispatchedJob {
+            session_id: child_id.clone(),
+            parent_session: parent_id.clone(),
+            role: SessionRole::Executor,
+            project: "arc".to_owned(),
+            brief: "make two commits".to_owned(),
+            budget: None,
+        });
+        wait_for_message_count(dir.path(), &child_id, 1).await;
+        assert!(supervisor.steer(&child_id, "you can use jj split"));
+        notify.notify_one();
+        supervisor.shutdown().await;
+
+        let handbacks = child_user_messages(dir.path(), &parent_id);
+        assert_eq!(handbacks.len(), 2, "one handback per turn: {handbacks:?}");
+        assert!(
+            handbacks[0]
+                .1
+                .starts_with(&format!("Job {child_id} finished.\nthe report\n")),
+            "the steer queued behind the brief turn does not swallow its report: {:?}",
+            handbacks[0]
+        );
+        assert!(
+            handbacks[1].1.starts_with(&format!(
+                "Job {child_id} finished.\n{USER_REPLY_NOTE}\nagreed, jj split\n"
+            )),
+            "a reply to the user's own message says so: {:?}",
+            handbacks[1]
         );
     }
 
