@@ -362,6 +362,14 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
         self.yank_note = None;
         match key.code {
+            KeyCode::PageUp if self.picker.is_some() => {
+                self.page_picker_selection(true);
+                return None;
+            }
+            KeyCode::PageDown if self.picker.is_some() => {
+                self.page_picker_selection(false);
+                return None;
+            }
             KeyCode::PageUp => {
                 self.on_scroll(true, PAGE);
                 return None;
@@ -430,6 +438,8 @@ impl App {
     fn on_control(&mut self, code: KeyCode) -> Option<Command> {
         match code {
             KeyCode::Char('c') => self.quit = true,
+            KeyCode::Char('u') if self.picker.is_some() => self.page_picker_selection(true),
+            KeyCode::Char('d') if self.picker.is_some() => self.page_picker_selection(false),
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
             KeyCode::Char('o') => self.toggle_thought(),
@@ -970,6 +980,9 @@ impl App {
     }
 
     fn on_review_key(&mut self, code: KeyCode) -> Option<Command> {
+        if code == KeyCode::Char('r') {
+            return Some(self.open_review());
+        }
         let review = self.review.as_mut().expect("review is open");
         let last = review.items.len().saturating_sub(1);
         match code {
@@ -1303,6 +1316,17 @@ impl App {
         };
     }
 
+    fn page_picker_selection(&mut self, up: bool) {
+        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let last = self.picker_rows().len();
+        let step = PAGE.min(last.max(1));
+        self.picker.as_mut().expect("picker is open").selected = if up {
+            selected.saturating_sub(step)
+        } else {
+            (selected + step).min(last)
+        };
+    }
+
     fn clamp_picker_selection(&mut self) {
         let last = self.picker_rows().len();
         let picker = self.picker.as_mut().expect("picker is open");
@@ -1585,6 +1609,10 @@ impl App {
                     );
                 }
                 self.sessions = sessions;
+                // a refresh can shrink the list
+                if self.picker.is_some() {
+                    self.clamp_picker_selection();
+                }
                 None
             }
             NetEvent::History {
@@ -3845,6 +3873,29 @@ mod tests {
     }
 
     #[test]
+    fn a_sessions_refresh_clamps_the_picker_selection() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            session_with("s-1", "one", "hi"),
+            session_with("s-2", "two", "hi"),
+            session_with("s-3", "three", "hi"),
+        ]));
+        normal(&mut app, "s");
+        for _ in 0..2 {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(app.picker.as_ref().expect("open").selected, 2);
+
+        app.on_net(NetEvent::Sessions(vec![session_with("s-1", "one", "hi")]));
+
+        assert_eq!(
+            app.picker.as_ref().expect("still open").selected,
+            1,
+            "a shrinking refresh clamps to the new last row"
+        );
+    }
+
+    #[test]
     fn tree_mode_survives_a_cyclic_parent_pointer() {
         let mut app = App::new();
         let mut a = session_with("s-a", "a", "hi");
@@ -3865,6 +3916,45 @@ mod tests {
         assert!(
             rows.iter().all(|(_, flags)| flags.is_empty()),
             "stranded sessions render as roots, not under a cyclic parent"
+        );
+    }
+
+    #[test]
+    fn page_keys_move_the_picker_selection_by_a_page() {
+        let mut app = App::new();
+        let sessions: Vec<_> = (0..25)
+            .map(|i| session_with(&format!("s-{i:02}"), &format!("session {i}"), "hi"))
+            .collect();
+        app.on_net(NetEvent::Sessions(sessions));
+        normal(&mut app, "s");
+        assert_eq!(app.picker.as_ref().expect("open").selected, 0);
+
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(
+            app.picker.as_ref().expect("open").selected,
+            PAGE,
+            "PageDown steps by a page"
+        );
+
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.picker.as_ref().expect("open").selected, PAGE * 2);
+
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.picker.as_ref().expect("open").selected, PAGE);
+
+        app.on_key(ctrl('d'));
+        assert_eq!(
+            app.picker.as_ref().expect("open").selected,
+            PAGE * 2,
+            "ctrl-d pages too"
+        );
+
+        app.on_key(ctrl('u'));
+        app.on_key(ctrl('u'));
+        assert_eq!(app.picker.as_ref().expect("open").selected, 0);
+        assert_eq!(
+            app.scroll_back, 0,
+            "paging keys over a picker move the picker, not the transcript"
         );
     }
 
@@ -4732,6 +4822,21 @@ mod tests {
         let review = app.review.as_ref().expect("still open");
         assert_eq!(review.items, [entry("mr-1", "one")]);
         assert!(!review.pending_delete);
+    }
+
+    #[test]
+    fn r_reloads_the_review_list_like_open_review() {
+        let mut app = reviewing(vec![entry("mr-1", "one")]);
+
+        let command = app.on_key(key(KeyCode::Char('r')));
+
+        let Some(Command::ReviewList { .. }) = command else {
+            panic!("expected a fresh ReviewList, got {command:?}");
+        };
+        let review = app.review.as_ref().expect("the pane stays open");
+        assert!(!review.loaded, "the list resets to loading");
+        assert!(review.items.is_empty(), "old items are dropped");
+        assert!(!review.pending_delete, "refresh disarms a pending dd");
     }
 
     #[test]

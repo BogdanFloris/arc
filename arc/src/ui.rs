@@ -721,15 +721,19 @@ fn picker_label(session: &arc_proto::v1::SessionInfo, room: usize, job: bool) ->
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
     let rows = review.items.len().max(1);
     let inner_width = 72.min(full.width.saturating_sub(4)).saturating_sub(2);
+    // sized to the deepest entry so the pane never resizes as the selection moves
     let detail = review
         .items
-        .get(review.selected)
-        .map_or(0, |entry| detail_height(entry, inner_width));
+        .iter()
+        .map(|entry| detail_height(entry, inner_width))
+        .max()
+        .unwrap_or(0)
+        .min(REVIEW_DETAIL_CAP);
     let area = popup(
         frame,
         full,
         72,
-        u16::try_from(rows + detail).unwrap_or(u16::MAX),
+        u16::try_from(rows + detail + 1).unwrap_or(u16::MAX),
         "review",
     );
     let width = area.width;
@@ -742,11 +746,12 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
             "loading"
         };
         lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        lines.push(review_footer(review));
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    let visible = (area.height as usize).saturating_sub(detail);
+    let visible = (area.height as usize).saturating_sub(detail + 1);
     let start = review.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(ID_WIDTH + 5);
     let end = review.items.len().min(start + visible);
@@ -755,46 +760,63 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         let (prefix, style) = if selected {
             (" > ", theme::ACCENT)
         } else {
-            ("   ", theme::DIM)
+            ("   ", theme::PLAIN)
         };
-        let label = elide(
-            &format!(
-                "{}/{}: {} — {}",
-                arc_core::memory::kind_name(entry.kind),
-                entry.namespace,
-                entry.title,
-                entry.summary
-            ),
-            room,
-        );
-        let mut spans = vec![
+        let label = elide(&review_label(entry), room);
+        lines.push(Line::from(vec![
             Span::styled(format!("{prefix}{label:<room$}"), style),
             Span::styled(
-                format!("  {:>ID_WIDTH$}", elide(&entry.id, ID_WIDTH)),
+                format!("  {:>ID_WIDTH$}", tail(&entry.id, ID_WIDTH)),
                 theme::DIM,
             ),
-        ];
-        if selected && review.pending_delete {
-            spans.push(Span::styled(" d deletes", theme::ERROR));
-        }
-        lines.push(Line::from(spans));
+        ]));
     }
     if let Some(entry) = review.items.get(review.selected) {
+        let mut room_left = detail;
         lines.push(Line::default());
+        room_left = room_left.saturating_sub(1);
         for line in wrapped(&entry.summary, width as usize) {
+            if room_left == 0 {
+                break;
+            }
             lines.push(Line::styled(format!("   {line}"), theme::PLAIN));
+            room_left -= 1;
         }
         for (id, title) in &entry.supersedes {
+            if room_left == 0 {
+                break;
+            }
             lines.push(Line::from(vec![
                 Span::styled(format!("   replaces {title}"), theme::ACCENT),
-                Span::styled(format!("  {}", elide(id, ID_WIDTH)), theme::DIM),
+                Span::styled(format!("  {}", tail(id, ID_WIDTH)), theme::DIM),
             ]));
+            room_left -= 1;
         }
         for line in wrapped(&entry.body, width as usize) {
+            if room_left == 0 {
+                break;
+            }
             lines.push(Line::styled(format!("   {line}"), theme::DIM));
+            room_left -= 1;
+        }
+        // a shorter entry leaves blanks behind it, holding the footer still
+        for _ in 0..room_left {
+            lines.push(Line::default());
         }
     }
+    lines.push(review_footer(review));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn review_footer(review: &crate::app::Review) -> Line<'static> {
+    if review.pending_delete {
+        Line::styled("   dd deletes the selected record", theme::ERROR)
+    } else {
+        Line::styled(
+            "   a accept · dd delete · f fix · r refresh · q close",
+            theme::DIM,
+        )
+    }
 }
 
 fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
@@ -1117,6 +1139,18 @@ fn detail_height(entry: &crate::app::ReviewEntry, width: u16) -> usize {
         + wrapped(&entry.body, width as usize).len()
 }
 
+const REVIEW_DETAIL_CAP: usize = 9;
+
+fn review_label(entry: &crate::app::ReviewEntry) -> String {
+    format!(
+        "{}/{}: {} — {}",
+        arc_core::memory::kind_name(entry.kind),
+        entry.namespace,
+        entry.title,
+        entry.summary
+    )
+}
+
 const ID_WIDTH: usize = 8;
 
 fn elide(text: &str, room: usize) -> String {
@@ -1326,6 +1360,137 @@ mod tests {
         let text = plain_text(&rendered(&mut app));
         assert!(text.contains("replaces old address"), "{text}");
         assert!(!text.contains("[superseded]"));
+    }
+
+    #[test]
+    fn the_review_picker_shows_an_action_footer_and_arms_delete_there() {
+        let mut app = App::new();
+        app.review = Some(crate::app::Review {
+            items: vec![crate::app::ReviewEntry {
+                id: "mr-new".to_owned(),
+                kind: 4,
+                namespace: "global".to_owned(),
+                title: "address".to_owned(),
+                summary: "lives at Y".to_owned(),
+                body: "moved in spring".to_owned(),
+                supersedes: Vec::new(),
+            }],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.contains("a accept · dd delete · f fix · r refresh · q close"),
+            "the footer teaches the keys, got: {text:?}"
+        );
+        assert!(
+            !text.contains("d deletes"),
+            "unarmed shows no delete warning"
+        );
+
+        app.review.as_mut().expect("open").pending_delete = true;
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.contains("dd deletes the selected record"),
+            "the armed state replaces the hint in the footer, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_review_detail_is_capped_so_the_pane_never_grows_with_the_body() {
+        let mut app = App::new();
+        let body = (0..60)
+            .map(|i| format!("body line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.review = Some(crate::app::Review {
+            items: vec![crate::app::ReviewEntry {
+                id: "mr-new".to_owned(),
+                kind: 4,
+                namespace: "global".to_owned(),
+                title: "address".to_owned(),
+                summary: "lives at Y".to_owned(),
+                body,
+                supersedes: Vec::new(),
+            }],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("body line 0"), "{text}");
+        for i in 30..60 {
+            assert!(
+                !text.contains(&format!("body line {i}")),
+                "the detail caps at a screen-filling body: {text:?}"
+            );
+        }
+    }
+
+    fn review_entry(id: &str, body: &str) -> crate::app::ReviewEntry {
+        crate::app::ReviewEntry {
+            id: id.to_owned(),
+            kind: 4,
+            namespace: "global".to_owned(),
+            title: format!("title {id}"),
+            summary: format!("summary {id}"),
+            body: body.to_owned(),
+            supersedes: Vec::new(),
+        }
+    }
+
+    fn footer_row(text: &str) -> usize {
+        text.lines()
+            .position(|line| line.contains("a accept · dd delete"))
+            .expect("the footer renders")
+    }
+
+    #[test]
+    fn the_review_pane_does_not_resize_as_the_selection_moves() {
+        let mut app = App::new();
+        let deep = (0..40)
+            .map(|i| format!("body line {i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.review = Some(crate::app::Review {
+            items: vec![
+                review_entry("mr-short", "tiny body"),
+                review_entry("mr-deep", &deep),
+            ],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let short = footer_row(&plain_text(&rendered(&mut app)));
+        app.review.as_mut().expect("open").selected = 1;
+        let deep = footer_row(&plain_text(&rendered(&mut app)));
+
+        assert_eq!(
+            short, deep,
+            "the pane is sized to the deepest entry, not the selected one"
+        );
+    }
+
+    #[test]
+    fn the_empty_review_pane_still_shows_the_close_footer() {
+        let mut app = App::new();
+        app.review = Some(crate::app::Review {
+            items: Vec::new(),
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("nothing to review"), "{text}");
+        assert!(
+            text.contains("q close"),
+            "the empty pane teaches its way out: {text:?}"
+        );
     }
 
     #[test]
