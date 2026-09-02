@@ -50,6 +50,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 
   One line above the code, under ten words, plain English. Never restate a name, never head a section, never argue for the change — that belongs in the commit message. Tests, `thiserror` messages, and generated code document themselves.
 - Tests live with the code; projection logic must have replay tests (log in → state out, deterministic).
+- To see a TUI screen, render an `App` in a test with `rendered` and read it with `plain_text` (the helpers in `arc/src/ui.rs` tests); never splice a throwaway test in with a script. A change that touches drawing shows the frame in its report.
 - Runtime state under the configured data directory — `data/` in a checkout, `~/.local/state/arc/` once installed. Never write outside it at runtime.
 
 ## Version control

@@ -28,6 +28,14 @@ const RUNNING_JOBS: &str = r"Running jobs:
   reports, not what is proven, unless you checked.
 - A job cancelled by the user stays stopped. Acknowledge it; never
   dispatch or continue that work again unless the user asks.
+- Describe the codebase, its UI, or its commits only from a handback or
+  an expert reply. Otherwise dispatch analyze, or say you cannot see it.
+- Report a job's commits by the ids and messages the job named.
+- A brief with more than one task says to commit each task on its own;
+  decide the commit boundaries before the work, not after.
+- A brief that touches drawing asks for the rendered frame in the report.
+- Forward an expert review to the job verbatim with continue_job. Put each
+  judgment call the expert leaves open to the user; never decide or drop it.
 - Hand the user conclusions, not transcripts.";
 
 fn concierge_system(identity: Option<String>) -> String {

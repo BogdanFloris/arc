@@ -8,8 +8,10 @@ fn job_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working non-interactively \
          in {}. Four workspace tools are available: read, write, edit, bash. Be \
-         concise. Show file paths clearly. When you are done, your final message \
-         is the job's report.",
+         concise. Show file paths clearly. Comments only where AGENTS.md allows \
+         one. When a brief asks for commits and holds several tasks, commit each \
+         task on its own. When you are done, your final message is the job's \
+         report.",
         root.display()
     )
 }
