@@ -729,11 +729,12 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         .max()
         .unwrap_or(0)
         .min(REVIEW_DETAIL_CAP);
+    // divider + footer
     let area = popup(
         frame,
         full,
         72,
-        u16::try_from(rows + detail + 1).unwrap_or(u16::MAX),
+        u16::try_from(rows + detail + 2).unwrap_or(u16::MAX),
         "review",
     );
     let width = area.width;
@@ -746,12 +747,13 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
             "loading"
         };
         lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        lines.push(review_rule(width));
         lines.push(review_footer(review));
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    let visible = (area.height as usize).saturating_sub(detail + 1);
+    let visible = (area.height as usize).saturating_sub(detail + 2);
     let start = review.selected.saturating_sub(visible.saturating_sub(1));
     let room = (width as usize).saturating_sub(ID_WIDTH + 5);
     let end = review.items.len().min(start + visible);
@@ -804,8 +806,13 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
             lines.push(Line::default());
         }
     }
+    lines.push(review_rule(width));
     lines.push(review_footer(review));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn review_rule(width: u16) -> Line<'static> {
+    Line::styled("─".repeat(width as usize), theme::DIM)
 }
 
 fn review_footer(review: &crate::app::Review) -> Line<'static> {
@@ -1472,6 +1479,31 @@ mod tests {
         assert_eq!(
             short, deep,
             "the pane is sized to the deepest entry, not the selected one"
+        );
+    }
+
+    #[test]
+    fn the_review_footer_is_separated_from_the_detail_by_a_rule() {
+        let mut app = App::new();
+        app.review = Some(crate::app::Review {
+            items: vec![review_entry("mr-1", "body text")],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+        let lines: Vec<&str> = text.lines().collect();
+        let footer = footer_row(&text);
+        let divider = lines[footer - 1];
+        assert!(
+            divider.contains('─') && !divider.contains("accept"),
+            "a dim rule sits directly above the footer, got: {divider:?}"
+        );
+        let detail_above = lines[footer - 2];
+        assert!(
+            detail_above.contains("body text") || detail_above.trim().is_empty(),
+            "the rule divides detail from controls, got: {detail_above:?}"
         );
     }
 
