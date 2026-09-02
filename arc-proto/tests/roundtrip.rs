@@ -293,6 +293,10 @@ fn server_frame_review_items_round_trips() {
                 record: Some(memory_record()),
                 changed_at_micros: 1_700_000_000_000_000,
                 superseded_by: "m-09".to_string(),
+                supersedes: vec![arc_proto::v1::ReviewPredecessor {
+                    id: "m-08".to_string(),
+                    title: "before".to_string(),
+                }],
             }],
         })),
     });

@@ -11,9 +11,9 @@ use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MarkBranch,
     MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ProjectList,
-    ReasoningDelta, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList,
-    SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked, client_frame,
-    server_frame,
+    ReasoningDelta, ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionList, SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked,
+    client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -664,8 +664,15 @@ fn review_item(item: ReviewItem) -> MemoryReviewItem {
     MemoryReviewItem {
         record: Some(item.record),
         changed_at_micros: item.changed_at,
-        superseded_by: item.superseded_by.unwrap_or_default(),
-        supersedes: Vec::new(),
+        superseded_by: String::new(),
+        supersedes: item
+            .supersedes
+            .into_iter()
+            .map(|p| ReviewPredecessor {
+                id: p.id,
+                title: p.title,
+            })
+            .collect(),
     }
 }
 
@@ -1977,15 +1984,15 @@ mod tests {
                     record.id.as_str(),
                     record.title.as_str(),
                     item.changed_at_micros,
-                    item.superseded_by.as_str(),
+                    item.supersedes.len(),
                 )
             })
             .collect();
         assert_eq!(
             listed,
             [
-                ("m-a", "alpha", SEEDED_AT_MICROS, ""),
-                ("m-b", "beta", SEEDED_AT_MICROS, ""),
+                ("m-a", "alpha", SEEDED_AT_MICROS, 0),
+                ("m-b", "beta", SEEDED_AT_MICROS, 0),
             ],
             "both records, whole, in (changed_at, id) order"
         );

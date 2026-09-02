@@ -227,7 +227,13 @@ pub(crate) struct DueSession {
 pub struct ReviewItem {
     pub record: MemoryRecord,
     pub changed_at: i64,
-    pub superseded_by: Option<String>,
+    pub supersedes: Vec<Predecessor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Predecessor {
+    pub id: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1213,13 +1219,17 @@ pub const REVIEW_WINDOW_MICROS: i64 = 7 * 24 * 3_600 * 1_000_000;
 pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
     let mut stmt = conn.prepare(
         "SELECT id, kind, namespace, title, summary, body, links, provenance,
-                status, superseded_by, changed_at
+                status, changed_at
          FROM memory_records
          WHERE changed_at >= ?1
+           AND status = ?2
            AND (reviewed_at IS NULL OR reviewed_at < changed_at)
          ORDER BY changed_at, id",
     )?;
-    let rows = stmt.query_map([since_micros], |row| {
+    let mut predecessors =
+        conn.prepare("SELECT id, title FROM memory_records WHERE superseded_by = ?1 ORDER BY id")?;
+    let active = memory_record::Status::Active as i32;
+    let rows = stmt.query_map(rusqlite::params![since_micros, active], |row| {
         Ok(ReviewItem {
             record: MemoryRecord {
                 id: row.get(0)?,
@@ -1234,11 +1244,21 @@ pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<R
                     .map_err(|e| bad_json_column(7, &e))?,
                 status: row.get(8)?,
             },
-            superseded_by: row.get(9)?,
-            changed_at: row.get(10)?,
+            supersedes: Vec::new(),
+            changed_at: row.get(9)?,
         })
     })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let mut items: Vec<ReviewItem> = rows.collect::<Result<_, _>>()?;
+    for item in &mut items {
+        let rows = predecessors.query_map([item.record.id.as_str()], |row| {
+            Ok(Predecessor {
+                id: row.get(0)?,
+                title: row.get(1)?,
+            })
+        })?;
+        item.supersedes = rows.collect::<Result<_, _>>()?;
+    }
+    Ok(items)
 }
 
 /// The records held at `at_micros`, each in its last-known form: a record
@@ -1940,8 +1960,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DueSession, Error, MemoryIndexEntry, MessageRow, Projection, ReplayError, ReplayStats,
-        ReviewItem, SessionSummary, replay,
+        DueSession, Error, MemoryIndexEntry, MessageRow, Predecessor, Projection, ReplayError,
+        ReplayStats, ReviewItem, SessionSummary, replay,
     };
     use crate::log::{Log, LogReader, discover_segments};
 
@@ -4516,7 +4536,7 @@ mod tests {
             ReviewItem {
                 record: created,
                 changed_at: 200,
-                superseded_by: None,
+                supersedes: Vec::new(),
             },
             "the record comes back whole, with its bookkeeping"
         );
@@ -4566,7 +4586,7 @@ mod tests {
     }
 
     #[test]
-    fn a_supersede_puts_both_rows_in_the_queue() {
+    fn a_supersede_queues_only_the_replacement_naming_what_it_replaced() {
         let mut projection = Projection::in_memory().expect("open");
         projection
             .apply(&memory_at(
@@ -4598,20 +4618,20 @@ mod tests {
                 .map(|item| (
                     item.record.id.as_str(),
                     item.record.status,
-                    item.superseded_by.as_deref(),
                     item.changed_at,
+                    item.supersedes.clone(),
                 ))
                 .collect::<Vec<_>>(),
-            [
-                ("mr-new", memory_record::Status::Active as i32, None, 200i64),
-                (
-                    "mr-old",
-                    memory_record::Status::Superseded as i32,
-                    Some("mr-new"),
-                    200
-                ),
-            ],
-            "the retired record and its replacement both await a verdict"
+            [(
+                "mr-new",
+                memory_record::Status::Active as i32,
+                200i64,
+                vec![Predecessor {
+                    id: "mr-old".to_string(),
+                    title: "address".to_string(),
+                }],
+            )],
+            "the retired record never queues; its replacement carries the lineage"
         );
     }
 
@@ -4755,8 +4775,8 @@ mod tests {
 
         assert_eq!(
             review_ids(&projection, 250),
-            ["mr-a", "mr-a2", "mr-b"],
-            "the supersede's own rows and mr-b, its link dependent, now land in the window"
+            ["mr-a2", "mr-b"],
+            "the replacement and mr-b, its link dependent, land in the window; retired mr-a never queues"
         );
         assert_eq!(
             changed_at(&projection, "mr-c"),

@@ -708,14 +708,9 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         } else {
             ("   ", theme::DIM)
         };
-        let tag = if entry.superseded {
-            " [superseded]"
-        } else {
-            ""
-        };
         let label = elide(
             &format!(
-                "{}/{}: {} — {}{tag}",
+                "{}/{}: {} — {}",
                 arc_core::memory::kind_name(entry.kind),
                 entry.namespace,
                 entry.title,
@@ -739,6 +734,12 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         lines.push(Line::default());
         for line in wrapped(&entry.summary, width as usize) {
             lines.push(Line::styled(format!("   {line}"), theme::PLAIN));
+        }
+        for (id, title) in &entry.supersedes {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   replaces {title}"), theme::ACCENT),
+                Span::styled(format!("  {}", elide(id, ID_WIDTH)), theme::DIM),
+            ]));
         }
         for line in wrapped(&entry.body, width as usize) {
             lines.push(Line::styled(format!("   {line}"), theme::DIM));
@@ -1060,7 +1061,9 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 }
 
 fn detail_height(entry: &crate::app::ReviewEntry, width: u16) -> usize {
-    1 + wrapped(&entry.summary, width as usize).len() + wrapped(&entry.body, width as usize).len()
+    1 + wrapped(&entry.summary, width as usize).len()
+        + entry.supersedes.len()
+        + wrapped(&entry.body, width as usize).len()
 }
 
 const ID_WIDTH: usize = 8;
@@ -1246,6 +1249,29 @@ mod tests {
 
         let buffer = rendered(&mut app);
         assert!(plain_text(&buffer).contains("review 2"));
+    }
+
+    #[test]
+    fn the_review_detail_names_the_record_a_supersede_replaced() {
+        let mut app = App::new();
+        app.review = Some(crate::app::Review {
+            items: vec![crate::app::ReviewEntry {
+                id: "mr-new".to_owned(),
+                kind: 4,
+                namespace: "global".to_owned(),
+                title: "address".to_owned(),
+                summary: "lives at Y".to_owned(),
+                body: "moved in spring".to_owned(),
+                supersedes: vec![("mr-old".to_owned(), "old address".to_owned())],
+            }],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("replaces old address"), "{text}");
+        assert!(!text.contains("[superseded]"));
     }
 
     #[test]

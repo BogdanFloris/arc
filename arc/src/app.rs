@@ -121,7 +121,7 @@ pub struct ReviewEntry {
     pub title: String,
     pub summary: String,
     pub body: String,
-    pub superseded: bool,
+    pub supersedes: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4261,7 +4261,7 @@ mod tests {
             title: title.to_owned(),
             summary: "a summary".to_owned(),
             body: "the full body".to_owned(),
-            superseded: false,
+            supersedes: Vec::new(),
         }
     }
 

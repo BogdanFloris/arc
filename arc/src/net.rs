@@ -257,7 +257,11 @@ async fn review_list(
                         title: record.title,
                         summary: record.summary,
                         body: record.body,
-                        superseded: !item.superseded_by.is_empty(),
+                        supersedes: item
+                            .supersedes
+                            .into_iter()
+                            .map(|p| (p.id, p.title))
+                            .collect(),
                     })
                 })
                 .collect();
