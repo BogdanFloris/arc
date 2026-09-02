@@ -665,6 +665,7 @@ fn review_item(item: ReviewItem) -> MemoryReviewItem {
         record: Some(item.record),
         changed_at_micros: item.changed_at,
         superseded_by: item.superseded_by.unwrap_or_default(),
+        supersedes: Vec::new(),
     }
 }
 
