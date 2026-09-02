@@ -573,14 +573,31 @@ fn popup(frame: &mut Frame, full: Rect, want_width: u16, content: u16, title: &s
     inner
 }
 
+// one display row in either view: the flat lineage annotation or the tree
+// connector geometry, never both
+enum PickerRow {
+    Flat(Option<String>),
+    Tree(Vec<bool>),
+}
+
 fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Picker) {
-    let sessions = app.picker_tree();
-    let rows = sessions.len() + 1;
+    let rows: Vec<(&arc_proto::v1::SessionInfo, PickerRow)> = if picker.tree {
+        app.picker_tree_rows()
+            .into_iter()
+            .map(|(session, flags)| (session, PickerRow::Tree(flags)))
+            .collect()
+    } else {
+        app.picker_flat_rows()
+            .into_iter()
+            .map(|(session, parent)| (session, PickerRow::Flat(parent)))
+            .collect()
+    };
+    let height = rows.len() + 1;
     let area = popup(
         frame,
         full,
         64,
-        u16::try_from(rows).unwrap_or(u16::MAX),
+        u16::try_from(height).unwrap_or(u16::MAX),
         "sessions",
     );
     let width = area.width;
@@ -589,10 +606,9 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     let mut lines = Vec::new();
     let visible = area.height as usize;
     let start = picker.selected.saturating_sub(visible.saturating_sub(1));
-    let room = (width as usize).saturating_sub(TIME_WIDTH + 5);
-    for row in start..rows.min(start + visible) {
+    for row in start..height.min(start + visible) {
         let prefix = if row == picker.selected { " > " } else { "   " };
-        let spans = match row.checked_sub(1).and_then(|i| sessions.get(i)) {
+        let spans = match row.checked_sub(1).and_then(|i| rows.get(i)) {
             None => {
                 let style = if row == picker.selected {
                     theme::ACCENT
@@ -601,31 +617,47 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 };
                 vec![Span::styled(format!("{prefix}new session"), style)]
             }
-            Some((session, parent)) => {
+            Some((session, row_view)) => {
                 let job = crate::app::is_job_session(session);
-                let style = if job {
-                    theme::DIM
-                } else if row == picker.selected {
+                let style = if row == picker.selected {
                     theme::ACCENT
                 } else {
                     theme::DIM
                 };
+                let (connectors, lineage) = match row_view {
+                    PickerRow::Flat(parent) => (
+                        String::new(),
+                        parent
+                            .as_ref()
+                            .map(|p| format!("  \\ of {p}"))
+                            .unwrap_or_default(),
+                    ),
+                    PickerRow::Tree(flags) => (tree_prefix(flags), String::new()),
+                };
+                // the bullet is every node's own column; connectors step one
+                // 3-char cell per depth so `│` lands under the parent bullet
+                let active = app.session_id.as_deref() == Some(session.id.as_str());
+                let bullet = if active { "● " } else { "○ " };
                 let tag = disposition_tag(session)
-                    .map(|c| format!("{c} "))
+                    .map(|c| format!("  [{c}]"))
                     .unwrap_or_default();
-                let lineage = parent
-                    .as_ref()
-                    .map(|p| format!("  \\ of {p}"))
-                    .unwrap_or_default();
-                let room = room.saturating_sub(tag.chars().count() + lineage.chars().count());
-                let mut spans = vec![Span::styled(prefix.to_owned(), style)];
-                if !tag.is_empty() {
-                    spans.push(Span::styled(tag, theme::DIM));
-                }
-                spans.push(Span::styled(
-                    format!("{:<room$}", picker_label(session, room, job)),
-                    style,
-                ));
+                let room = (width as usize).saturating_sub(
+                    3 + connectors.chars().count()
+                        + bullet.chars().count()
+                        + lineage.chars().count()
+                        + TIME_WIDTH
+                        + 2
+                        + TAG_WIDTH,
+                );
+                let mut spans = vec![
+                    Span::styled(prefix.to_owned(), style),
+                    Span::styled(connectors, theme::DIM),
+                    Span::styled(bullet, if active { theme::ACCENT } else { theme::DIM }),
+                    Span::styled(
+                        format!("{:<room$}", picker_label(session, room, job)),
+                        style,
+                    ),
+                ];
                 if !lineage.is_empty() {
                     spans.push(Span::styled(lineage, theme::DIM));
                 }
@@ -633,12 +665,29 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                     format!("  {:>TIME_WIDTH$}", last_active(session, now)),
                     theme::DIM,
                 ));
+                // the tag column is always reserved, so untagged rows keep the
+                // same time column
+                spans.push(Span::styled(format!("{tag:<TAG_WIDTH$}"), theme::DIM));
                 spans
             }
         };
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+// one column per ancestor level: `│` while the level continues below the
+// row's subtree, the row's own `├─`/`└─` connector in the last column
+fn tree_prefix(flags: &[bool]) -> String {
+    let mut prefix = String::new();
+    for (level, continues) in flags.iter().enumerate() {
+        if level + 1 == flags.len() {
+            prefix.push_str(if *continues { "├─ " } else { "└─ " });
+        } else {
+            prefix.push_str(if *continues { "│  " } else { "   " });
+        }
+    }
+    prefix
 }
 
 // lineage is an annotation, not a hierarchy: position stays pure recency.
@@ -917,6 +966,7 @@ const HELP: &[(&str, &[&str])] = &[
         "picker keys",
         &[
             "j k               move selection",
+            "tab               toggle flat recency / tree view",
             "/                 filter by title/preview",
             "space a           toggle showing dispatched jobs",
             "x                 toggle showing abandoned branches",
@@ -933,6 +983,7 @@ const HELP: &[(&str, &[&str])] = &[
             "a                 accept the selected record",
             "dd                delete the selected record",
             "f                 prefill a fix instruction and close",
+            "r                 refresh the list",
             "q esc             close",
         ],
     ),
@@ -1077,6 +1128,9 @@ fn elide(text: &str, room: usize) -> String {
 }
 
 const TIME_WIDTH: usize = 8;
+
+// `  [+]` and friends; reserved on every row so the time column holds still
+const TAG_WIDTH: usize = 5;
 
 fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
     let text = if session.title.is_empty() {
@@ -1453,12 +1507,16 @@ mod tests {
             .find(|line| line.contains("fixing the parser"))
             .expect("the branch row renders");
         assert!(
-            branch_line.contains("+ fixing the parser"),
-            "the branch carries its real tag, got: {branch_line:?}"
+            branch_line.contains("○ fixing the parser"),
+            "every node gets a bullet, got: {branch_line:?}"
         );
         assert!(
             branch_line.contains("\\ of s-root"),
             "lineage renders as an annotation, got: {branch_line:?}"
+        );
+        assert!(
+            branch_line.contains("[+]"),
+            "the real disposition sits at the end of the row, got: {branch_line:?}"
         );
         let root_line = text
             .lines()
@@ -1469,8 +1527,193 @@ mod tests {
             "a root carries no lineage annotation, got: {root_line:?}"
         );
         assert!(
-            !root_line.contains('+') && !root_line.contains('?'),
+            !root_line.contains('['),
             "a root carries no disposition tag, got: {root_line:?}"
+        );
+    }
+
+    #[test]
+    fn the_picker_tree_mode_renders_connectors_instead_of_lineage() {
+        use crate::app::{App, NetEvent};
+
+        let mut app = App::new();
+        let mut root = session("s-root", "root conversation", "hi");
+        root.source = arc_proto::v1::Source::User as i32;
+        let mut fork = session("s-fork", "fixing the parser", "hi");
+        fork.source = arc_proto::v1::Source::User as i32;
+        fork.parent_session = "s-root".to_owned();
+        app.on_net(NetEvent::Sessions(vec![root, fork]));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Tab));
+
+        let text = plain_text(&rendered(&mut app));
+        let branch_line = text
+            .lines()
+            .find(|line| line.contains("fixing the parser"))
+            .expect("the branch row renders");
+        assert!(
+            branch_line.contains("└─ ○ fixing the parser"),
+            "the elbow hands off straight to the child bullet, got: {branch_line:?}"
+        );
+        assert!(
+            !branch_line.contains("\\ of"),
+            "a tree has no lineage annotation, got: {branch_line:?}"
+        );
+        let root_line = text
+            .lines()
+            .find(|line| line.contains("root conversation"))
+            .expect("the root row renders");
+        assert!(
+            !root_line.contains("└─") && !root_line.contains("├─") && !root_line.contains('│'),
+            "a root carries no connectors, got: {root_line:?}"
+        );
+    }
+
+    #[test]
+    fn the_picker_marks_the_active_session_in_both_modes() {
+        use crate::app::{App, NetEvent};
+
+        let mut app = App::new();
+        let mut one = session("s-one", "the active one", "hi");
+        one.source = arc_proto::v1::Source::User as i32;
+        let mut two = session("s-two", "the other", "hi");
+        two.source = arc_proto::v1::Source::User as i32;
+        app.on_net(NetEvent::Sessions(vec![one, two]));
+        app.session_id = Some("s-two".to_owned());
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+
+        let text = plain_text(&rendered(&mut app));
+        let active = text
+            .lines()
+            .find(|line| line.contains("the other"))
+            .expect("the active session renders");
+        assert!(active.contains("● the other"), "got: {active:?}");
+        let inactive = text
+            .lines()
+            .find(|line| line.contains("the active one"))
+            .expect("the other session renders");
+        assert!(
+            inactive.contains("○ the active one"),
+            "an inactive session still shows its hollow bullet, got: {inactive:?}"
+        );
+        assert!(!inactive.contains('●'), "got: {inactive:?}");
+
+        app.on_key(key(KeyCode::Tab));
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.lines()
+                .find(|line| line.contains("the other"))
+                .expect("tree mode still lists it")
+                .contains('●'),
+            "the marker survives the view switch"
+        );
+    }
+
+    #[test]
+    fn the_picker_tree_connectors_align_under_the_parent_bullets() {
+        use crate::app::{App, NetEvent};
+        use arc_proto::v1::branch_marked::Disposition;
+
+        let mut app = App::new();
+        let mut root = session("s-root", "root", "hi");
+        root.source = arc_proto::v1::Source::User as i32;
+        let mut first = session("s-first", "first branch", "hi");
+        first.source = arc_proto::v1::Source::User as i32;
+        first.parent_session = "s-root".to_owned();
+        first.disposition = Disposition::Real as i32;
+        let mut deep = session("s-deep", "grandchild", "hi");
+        deep.source = arc_proto::v1::Source::User as i32;
+        deep.parent_session = "s-first".to_owned();
+        let mut last = session("s-last", "last branch", "hi");
+        last.source = arc_proto::v1::Source::User as i32;
+        last.parent_session = "s-root".to_owned();
+        app.on_net(NetEvent::Sessions(vec![root, first, deep, last]));
+        app.session_id = Some("s-first".to_owned());
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Tab));
+
+        let text = plain_text(&rendered(&mut app));
+        let column = |line: &str, needle: char| {
+            line.chars()
+                .position(|c| c == needle)
+                .expect("the glyph renders on the row")
+        };
+        let root_line = text.lines().find(|l| l.contains(" root")).unwrap();
+        let first_line = text.lines().find(|l| l.contains("first branch")).unwrap();
+        let deep_line = text.lines().find(|l| l.contains("grandchild")).unwrap();
+        let last_line = text.lines().find(|l| l.contains("last branch")).unwrap();
+        let root_bullet = column(root_line, '○');
+
+        assert_eq!(
+            column(first_line, '├'),
+            root_bullet,
+            "the first child's elbow starts under the root bullet: {first_line:?}"
+        );
+        assert_eq!(column(first_line, '●'), root_bullet + 3, "active child");
+        assert_eq!(
+            column(deep_line, '│'),
+            root_bullet,
+            "the continuation bar holds the root's column: {deep_line:?}"
+        );
+        assert_eq!(
+            column(deep_line, '○'),
+            root_bullet + 6,
+            "each depth steps the bullet one connector cell: {deep_line:?}"
+        );
+        assert_eq!(
+            column(last_line, '└'),
+            root_bullet,
+            "the last child's elbow starts under the root bullet: {last_line:?}"
+        );
+        assert_eq!(column(last_line, '○'), root_bullet + 3, "last child");
+        assert!(
+            first_line.contains("[+]"),
+            "the marked branch's tag reads at the end: {first_line:?}"
+        );
+    }
+
+    #[test]
+    fn the_time_column_ignores_whether_a_row_has_a_disposition_tag() {
+        use crate::app::{App, NetEvent};
+        use arc_proto::v1::branch_marked::Disposition;
+
+        let mut app = App::new();
+        let mut root = session("s-root", "conversation", "hi");
+        root.source = arc_proto::v1::Source::User as i32;
+        root.last_at = Some(prost_types::Timestamp {
+            seconds: chrono::Utc::now().timestamp(),
+            nanos: 0,
+        });
+        let mut fork = session("s-fork", "branch", "hi");
+        fork.source = arc_proto::v1::Source::User as i32;
+        fork.parent_session = "s-root".to_owned();
+        fork.disposition = Disposition::Unspecified as i32;
+        fork.last_at = Some(prost_types::Timestamp {
+            seconds: chrono::Utc::now().timestamp(),
+            nanos: 0,
+        });
+        app.on_net(NetEvent::Sessions(vec![root, fork]));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+
+        let text = plain_text(&rendered(&mut app));
+        let root_line = text.lines().find(|l| l.contains("conversation")).unwrap();
+        let fork_line = text.lines().find(|l| l.contains("branch")).unwrap();
+        assert!(
+            root_line.contains(" now") && fork_line.contains(" now"),
+            "both rows show the same time band for the alignment check"
+        );
+        assert_eq!(
+            fork_line.find("now"),
+            root_line.find("now"),
+            "a pending tag reserves the same column the untagged root gets: {root_line:?} / {fork_line:?}"
+        );
+        assert!(
+            fork_line.contains("now  [?]"),
+            "the tag still reads at the fixed column: {fork_line:?}"
         );
     }
 

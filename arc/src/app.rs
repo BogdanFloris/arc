@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
@@ -138,6 +138,7 @@ pub struct Picker {
     pub filtering: bool,
     pub show_all: bool,
     pub show_abandoned: bool,
+    pub tree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +231,8 @@ pub struct App {
     pub session_id: Option<String>,
     pub sessions: Vec<SessionInfo>,
     pub picker: Option<Picker>,
+    /// The picker's view mode, remembered across opens.
+    pub picker_tree: bool,
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
     pub projects: Option<Projects>,
@@ -279,6 +282,7 @@ impl App {
             session_id: None,
             sessions: Vec::new(),
             picker: None,
+            picker_tree: false,
             review: None,
             jobs: None,
             projects: None,
@@ -1181,9 +1185,10 @@ impl App {
         }
         let selected = self.picker.as_ref().expect("picker is open").selected;
         match code {
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
             KeyCode::Up | KeyCode::Char('k') => self.move_picker_selection(true),
             KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
+            KeyCode::Tab => self.toggle_picker_tree(),
             KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
             KeyCode::Char('x') => self.toggle_picker_show_abandoned(),
@@ -1223,6 +1228,7 @@ impl App {
         match code {
             KeyCode::Esc => self.cancel_picker_filter(),
             KeyCode::Enter => return self.open_filtered_session(),
+            KeyCode::Tab => self.toggle_picker_tree(),
             KeyCode::Up => self.move_picker_selection(true),
             KeyCode::Down => self.move_picker_selection(false),
             _ => {
@@ -1238,6 +1244,25 @@ impl App {
             picker.show_abandoned = !picker.show_abandoned;
             picker.selected = 0;
         }
+    }
+
+    fn toggle_picker_tree(&mut self) {
+        let selected_id = self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.selected.checked_sub(1))
+            .and_then(|i| self.picker_rows().get(i).map(|s| s.id.clone()));
+        let picker = self.picker.as_mut().expect("picker is open");
+        picker.tree = !picker.tree;
+        self.picker_tree = picker.tree;
+        // selected counts the "new session" row zero, so rows sit one past
+        // their 0-based position in the session list
+        let position =
+            selected_id.and_then(|id| self.picker_rows().iter().position(|s| s.id == id));
+        self.picker.as_mut().expect("picker is open").selected = match position {
+            Some(row) => row + 1,
+            None => 0,
+        };
     }
 
     fn toggle_picker_show_all(&mut self) {
@@ -1292,6 +1317,7 @@ impl App {
                 filtering: false,
                 show_all: false,
                 show_abandoned: false,
+                tree: self.picker_tree,
             });
             return Some(Command::List);
         }
@@ -1304,15 +1330,22 @@ impl App {
     }
 
     pub fn picker_rows(&self) -> Vec<&SessionInfo> {
-        self.picker_tree().into_iter().map(|(s, _)| s).collect()
+        if self.picker.as_ref().is_some_and(|picker| picker.tree) {
+            self.picker_tree_rows()
+                .into_iter()
+                .map(|(session, _)| session)
+                .collect()
+        } else {
+            self.picker_candidates()
+        }
     }
 
-    /// `picker_rows`, paired with the lineage annotation: the parent's id
-    /// prefix for a branch, `None` for a root. Position is pure recency —
+    /// `picker_candidates`, paired with the lineage annotation: the parent's
+    /// id prefix for a branch, `None` for a root. Position is pure recency —
     /// the freshest work is the first row; lineage is information, not
     /// hierarchy (decided 2026-08-29, after nesting made the dead parent
     /// the click target).
-    pub fn picker_tree(&self) -> Vec<(&SessionInfo, Option<String>)> {
+    pub fn picker_flat_rows(&self) -> Vec<(&SessionInfo, Option<String>)> {
         self.picker_candidates()
             .into_iter()
             .map(|session| {
@@ -1321,6 +1354,61 @@ impl App {
                 (session, parent)
             })
             .collect()
+    }
+
+    /// Tree mode's display rows: roots in recency order, branches depth-first.
+    /// One bool per ancestor level: `true` continues below — the `│`/`├─`
+    /// choice. A filtered-out parent orphans its branch as a root, so both
+    /// modes always list the same sessions.
+    pub fn picker_tree_rows(&self) -> Vec<(&SessionInfo, Vec<bool>)> {
+        fn walk<'a>(
+            session: &'a SessionInfo,
+            flags: &[bool],
+            children: &HashMap<&'a str, Vec<&'a SessionInfo>>,
+            rows: &mut Vec<(&'a SessionInfo, Vec<bool>)>,
+            visited: &mut HashSet<&'a str>,
+        ) {
+            // a cycle stops the walk; the sweep below still lists every session
+            if !visited.insert(session.id.as_str()) {
+                return;
+            }
+            rows.push((session, flags.to_owned()));
+            if let Some(kids) = children.get(session.id.as_str()) {
+                let last = kids.len() - 1;
+                for (i, kid) in kids.iter().enumerate() {
+                    let mut kid_flags = flags.to_owned();
+                    kid_flags.push(i < last);
+                    walk(kid, &kid_flags, children, rows, visited);
+                }
+            }
+        }
+        let candidates = self.picker_candidates();
+        let ids: HashSet<&str> = candidates.iter().map(|s| s.id.as_str()).collect();
+        let mut roots = Vec::new();
+        let mut children: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
+        for session in &candidates {
+            if session.parent_session.is_empty() || !ids.contains(session.parent_session.as_str()) {
+                roots.push(session);
+            } else {
+                children
+                    .entry(session.parent_session.as_str())
+                    .or_default()
+                    .push(session);
+            }
+        }
+        let mut rows = Vec::new();
+        let mut visited = HashSet::new();
+        for root in roots {
+            walk(root, &[], &children, &mut rows, &mut visited);
+        }
+        // a cycle strands a candidate; a broken parent pointer is no reason to
+        // hide the session
+        for session in &candidates {
+            if !visited.contains(session.id.as_str()) {
+                rows.push((session, Vec::new()));
+            }
+        }
+        rows
     }
 
     fn picker_candidates(&self) -> Vec<&SessionInfo> {
@@ -2962,7 +3050,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
 
         let listed: Vec<&str> = app
-            .picker_tree()
+            .picker_flat_rows()
             .iter()
             .map(|(s, _)| s.id.as_str())
             .collect();
@@ -2974,7 +3062,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('x')));
         let listed: Vec<&str> = app
-            .picker_tree()
+            .picker_flat_rows()
             .iter()
             .map(|(s, _)| s.id.as_str())
             .collect();
@@ -3594,7 +3682,7 @@ mod tests {
             session_with("s-2", "root two", "hi"),
         ]));
 
-        let rows = app.picker_tree();
+        let rows = app.picker_flat_rows();
         let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -3642,6 +3730,255 @@ mod tests {
                 session_id: "s-fork".to_owned(),
                 disposition: branch_marked::Disposition::Abandoned,
             })
+        );
+    }
+
+    #[test]
+    fn tab_toggles_the_picker_between_flat_and_tree() {
+        use arc_proto::v1::branch_marked::Disposition;
+        let mut app = App::new();
+        let mut branch = session_with("s-branch", "the branch", "hi");
+        branch.parent_session = "s-root".to_owned();
+        branch.disposition = Disposition::Real as i32;
+        app.on_net(NetEvent::Sessions(vec![
+            branch,
+            session_with("s-root", "the root", "hi"),
+        ]));
+        normal(&mut app, "s");
+
+        assert!(!app.picker.as_ref().expect("open").tree, "flat by default");
+
+        app.on_key(key(KeyCode::Tab));
+        let picker = app.picker.as_ref().expect("still open");
+        assert!(picker.tree);
+        assert_eq!(
+            picker.selected, 0,
+            "row zero is 'new session': it has no id to preserve, so the top"
+        );
+
+        app.on_key(key(KeyCode::Tab));
+        assert!(!app.picker.as_ref().expect("still open").tree);
+    }
+
+    #[test]
+    fn tab_keeps_the_highlighted_session_across_the_view_switch() {
+        use arc_proto::v1::branch_marked::Disposition;
+        let mut app = App::new();
+        let mut branch = session_with("s-branch", "the branch", "hi");
+        branch.parent_session = "s-root".to_owned();
+        branch.disposition = Disposition::Real as i32;
+        app.on_net(NetEvent::Sessions(vec![
+            branch,
+            session_with("s-root", "the root", "hi"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.picker_session(1).map(|s| s.id.as_str()),
+            Some("s-branch"),
+            "flat recency puts the fresh branch first"
+        );
+
+        app.on_key(key(KeyCode::Tab));
+
+        let picker = app.picker.as_ref().expect("still open");
+        assert!(picker.tree, "Tab switched to tree");
+        assert_eq!(
+            picker.selected, 2,
+            "the branch now sits under its root at row two, still highlighted"
+        );
+        assert_eq!(
+            app.picker_session(picker.selected).map(|s| s.id.as_str()),
+            Some("s-branch"),
+            "the same session stays highlighted"
+        );
+        assert!(
+            app.picker_tree,
+            "the preference is remembered on the app, not just the open pane"
+        );
+
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.picker_session(app.picker.as_ref().expect("open").selected)
+                .map(|s| s.id.as_str()),
+            Some("s-branch"),
+            "flipping back keeps the highlight too"
+        );
+    }
+
+    #[test]
+    fn tab_in_the_filter_prompt_switches_views_without_dropping_the_filter() {
+        let mut app = App::new();
+        let mut branch = session_with("s-branch", "parser work", "hi");
+        branch.parent_session = "s-root".to_owned();
+        app.on_net(NetEvent::Sessions(vec![
+            branch,
+            session_with("s-root", "root", "hi"),
+            session_with("s-other", "unrelated", "hi"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "parser");
+
+        let picker = app.picker.as_ref().expect("open");
+        assert!(picker.filtering, "the filter prompt is active");
+        assert!(!picker.tree, "still flat under the filter");
+
+        app.on_key(key(KeyCode::Tab));
+
+        let picker = app.picker.as_ref().expect("still open");
+        assert!(picker.filtering, "Tab inside the prompt keeps filtering");
+        assert!(picker.tree, "and switches the view");
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s-branch"],
+            "the query still narrows the tree"
+        );
+
+        app.on_key(key(KeyCode::Esc));
+        let picker = app.picker.as_ref().expect("still open");
+        assert!(!picker.filtering);
+        assert!(picker.tree, "closing the prompt keeps the tree mode");
+    }
+
+    #[test]
+    fn tree_mode_survives_a_cyclic_parent_pointer() {
+        let mut app = App::new();
+        let mut a = session_with("s-a", "a", "hi");
+        a.parent_session = "s-b".to_owned();
+        let mut b = session_with("s-b", "b", "hi");
+        b.parent_session = "s-a".to_owned();
+        app.on_net(NetEvent::Sessions(vec![a, b]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Tab));
+
+        let rows = app.picker_tree_rows();
+        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["s-a", "s-b"],
+            "a cycle strands no session: both still get a root row"
+        );
+        assert!(
+            rows.iter().all(|(_, flags)| flags.is_empty()),
+            "stranded sessions render as roots, not under a cyclic parent"
+        );
+    }
+
+    #[test]
+    fn the_tree_preference_survives_closing_and_reopening_the_picker() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![session_with(
+            "s-root", "root", "hi",
+        )]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Tab));
+        assert!(app.picker.as_ref().expect("open").tree);
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.picker.is_none());
+
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(
+            app.picker.as_ref().expect("reopened").tree,
+            "the reopened picker comes back in tree mode"
+        );
+    }
+
+    #[test]
+    fn tree_mode_lists_roots_then_branches_depth_first_with_connector_geometry() {
+        let mut app = App::new();
+        let mut a_branch = session_with("a-2", "branch", "hi");
+        a_branch.parent_session = "a-root".to_owned();
+        let mut deep = session_with("a-3", "deep", "hi");
+        deep.parent_session = "a-2".to_owned();
+        let mut b_branch = session_with("b-2", "branch b", "hi");
+        b_branch.parent_session = "b-root".to_owned();
+        app.on_net(NetEvent::Sessions(vec![
+            a_branch,
+            session_with("a-root", "root a", "hi"),
+            deep,
+            b_branch,
+            session_with("b-root", "root b", "hi"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Tab));
+
+        let rows = app.picker_tree_rows();
+        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a-root", "a-2", "a-3", "b-root", "b-2"],
+            "tree view nests the fresh branch under its root instead of leading with it"
+        );
+        assert_eq!(
+            rows.iter().map(|(_, f)| f.clone()).collect::<Vec<_>>(),
+            [
+                Vec::new(),
+                vec![false],
+                vec![false, false],
+                Vec::new(),
+                vec![false],
+            ],
+            "flags: a-2 ends its root's line, a-3 is a-2's only child, b-2 ends its root's line"
+        );
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ids,
+            "navigation follows the tree order"
+        );
+    }
+
+    #[test]
+    fn tree_mode_filters_with_the_same_gates_and_orphans_a_filtered_parent() {
+        use arc_proto::v1::branch_marked::Disposition;
+        let mut app = App::new();
+        let mut ordinary = session_with("s-ordinary", "conversation", "hi");
+        ordinary.parent_session = "s-job".to_owned(); // job parent hidden by default
+        let mut dead = session_with("s-dead", "wrong turn", "hi");
+        dead.parent_session = "s-root".to_owned();
+        dead.disposition = Disposition::Abandoned as i32;
+        let mut job = session_with("s-job", "the dispatch", "hi");
+        job.source = Source::Model as i32;
+        app.on_net(NetEvent::Sessions(vec![
+            ordinary,
+            dead,
+            job,
+            session_with("s-root", "root", "hi"),
+        ]));
+        normal(&mut app, "s");
+        app.on_key(key(KeyCode::Tab));
+
+        let rows = app.picker_tree_rows();
+        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["s-ordinary", "s-root"],
+            "abandoned branches and job sessions are hidden exactly as in flat mode"
+        );
+        let orphan = rows.iter().find(|(s, _)| s.id == "s-ordinary").unwrap();
+        assert_eq!(
+            orphan.1,
+            Vec::<bool>::new(),
+            "a branch whose parent is filtered out renders as its own root"
+        );
+
+        app.on_key(key(KeyCode::Char('x')));
+        let ids: Vec<&str> = app
+            .picker_tree_rows()
+            .iter()
+            .map(|(s, _)| s.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["s-ordinary", "s-root", "s-dead"],
+            "x nests the abandoned branch under its root in tree view"
         );
     }
 
