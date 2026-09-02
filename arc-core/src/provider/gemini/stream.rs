@@ -71,7 +71,14 @@ impl Parser {
                 payload_json: value.to_string(),
             }));
         }
-        if let Some(value) = part.tool_response {
+        if let Some(mut value) = part.tool_response {
+            // the rendered search widget is browser markup, not content the model read
+            if let Some(response) = value
+                .get_mut("response")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                response.remove("search_suggestions");
+            }
             return Ok(Some(CompletionDelta::ServerResponse {
                 name: server_call_name(&value),
                 payload_json: value.to_string(),
@@ -281,6 +288,24 @@ mod tests {
             Stop::EndTurn,
             "server calls are not our tool calls; they never trip ToolCalls"
         );
+    }
+
+    #[test]
+    fn a_server_responses_search_widget_is_dropped_before_it_is_recorded() {
+        let mut parser = Parser::default();
+        let deltas = parser
+            .frame(
+                r#"{"candidates":[{"content":{"parts":[{"toolResponse":{"id":"c1","response":{"search_suggestions":"<style>widget</style>","results":[{"title":"Arc Core 3.5"}]},"toolType":"GOOGLE_SEARCH_WEB"}}],"role":"model"},"index":0}]}"#,
+            )
+            .expect("parses");
+        let CompletionDelta::ServerResponse { payload_json, .. } = &deltas.items[0] else {
+            panic!("expected a server response, got {:?}", deltas.items);
+        };
+        assert!(
+            !payload_json.contains("search_suggestions"),
+            "{payload_json}"
+        );
+        assert!(payload_json.contains("Arc Core 3.5"), "{payload_json}");
     }
 
     #[test]
