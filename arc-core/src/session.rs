@@ -631,6 +631,7 @@ impl Engine {
         child_session: &str,
         reason: Option<&str>,
         summary: &str,
+        footprint: Option<&str>,
     ) -> Result<(), Error> {
         let span = tracing::Span::current();
         span.record("parent_session", parent_session);
@@ -640,6 +641,11 @@ impl Engine {
         let _turn = guard.lock().await;
 
         let summary = truncate_summary(summary, child_session);
+        // the daemon's count of what changed rides after the report, so a cut
+        // report never cuts it
+        let footprint = footprint
+            .map(|text| format!("\n{text}"))
+            .unwrap_or_default();
         let content = match reason {
             None => {
                 let grants =
@@ -657,9 +663,9 @@ impl Engine {
                          {child_session} keeps its context; a new dispatch starts from nothing."
                     )
                 };
-                format!("Job {child_session} finished.\n{summary}\n{tail}")
+                format!("Job {child_session} finished.\n{summary}{footprint}\n{tail}")
             }
-            Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}"),
+            Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}{footprint}"),
         };
         self.record(
             Source::System,
@@ -5796,7 +5802,7 @@ mod tests {
             .expect("send");
         let child_id = reply.jobs[0].session_id.clone();
         engine
-            .record_handback(&reply.session_id, &child_id, None, "fixed it")
+            .record_handback(&reply.session_id, &child_id, None, "fixed it", None)
             .await
             .expect("record_handback");
 
@@ -5866,7 +5872,7 @@ mod tests {
             .expect("send");
         let child_id = reply.jobs[0].session_id.clone();
         engine
-            .record_handback(&reply.session_id, &child_id, None, "fixed it")
+            .record_handback(&reply.session_id, &child_id, None, "fixed it", None)
             .await
             .expect("record_handback");
 
@@ -5929,7 +5935,7 @@ mod tests {
             .expect("send");
         let child_id = reply.jobs[0].session_id.clone();
         engine
-            .record_handback(&reply.session_id, &child_id, None, "found it")
+            .record_handback(&reply.session_id, &child_id, None, "found it", None)
             .await
             .expect("record_handback");
 
@@ -6294,6 +6300,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_footprint_rides_between_the_report_and_the_continue_line() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        engine
+            .record_handback(
+                &reply.session_id,
+                "child-1",
+                None,
+                "all done",
+                Some("Footprint: two files"),
+            )
+            .await
+            .expect("record_handback");
+
+        let entries = engine.transcript(&reply.session_id).expect("transcript");
+        let content = match &entries.last().expect("an entry").entry {
+            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
+            other => panic!("expected a message entry, got {other:?}"),
+        };
+        assert!(
+            content.contains("all done\nFootprint: two files\nFor follow-ups"),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
     async fn record_handback_appends_a_system_sourced_message_visible_in_the_parents_log() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
         let dir = TempDir::new().expect("temp dir");
@@ -6305,7 +6344,7 @@ mod tests {
             .expect("send");
 
         engine
-            .record_handback(&reply.session_id, "child-1", None, "all done")
+            .record_handback(&reply.session_id, "child-1", None, "all done", None)
             .await
             .expect("record_handback");
 
@@ -6369,7 +6408,7 @@ mod tests {
         // char-boundary walk-back as well as the cap itself
         let long_summary = "é".repeat(9000);
         engine
-            .record_handback(&reply.session_id, "child-1", None, &long_summary)
+            .record_handback(&reply.session_id, "child-1", None, &long_summary, None)
             .await
             .expect("record_handback");
 
@@ -6418,7 +6457,7 @@ mod tests {
             .expect("create an analyze child");
 
         engine
-            .record_handback(&parent_id, &child_id, None, "found the bug")
+            .record_handback(&parent_id, &child_id, None, "found the bug", None)
             .await
             .expect("record_handback");
 
@@ -6458,7 +6497,7 @@ mod tests {
             .expect("create an implement child");
 
         engine
-            .record_handback(&parent_id, &child_id, None, "fixed it")
+            .record_handback(&parent_id, &child_id, None, "fixed it", None)
             .await
             .expect("record_handback");
 
@@ -6491,7 +6530,13 @@ mod tests {
         // "child-2" was never created durably: its session_grants is empty,
         // the same shape a non-workspace job leaves behind
         engine
-            .record_handback(&reply.session_id, "child-2", None, "no workspace here")
+            .record_handback(
+                &reply.session_id,
+                "child-2",
+                None,
+                "no workspace here",
+                None,
+            )
             .await
             .expect("record_handback");
 
@@ -6553,7 +6598,7 @@ mod tests {
         let handback_engine = Arc::clone(&engine);
         let handback = tokio::spawn(async move {
             handback_engine
-                .record_handback("s-01", "child-1", None, "the child's report")
+                .record_handback("s-01", "child-1", None, "the child's report", None)
                 .await
                 .expect("record_handback");
         });
