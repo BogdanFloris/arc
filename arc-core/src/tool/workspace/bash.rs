@@ -105,20 +105,11 @@ impl Tool for Bash {
 }
 
 async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[String]) -> ToolReply {
-    let bash_args = ["bash", "--noprofile", "--norc", "-c", command];
-    let (program, mut cmd) = if let Some((wrapper, rest)) = command_prefix.split_first() {
-        let mut cmd = Command::new(wrapper);
-        cmd.args(rest).args(bash_args);
-        (wrapper.as_str(), cmd)
-    } else {
-        let mut cmd = Command::new("bash");
-        cmd.args(&bash_args[1..]);
-        ("bash", cmd)
-    };
-    cmd.current_dir(cwd);
-    scrub_env(&mut cmd);
-    // CLIs block on an open stdin.
-    cmd.stdin(Stdio::null());
+    let (program, mut cmd) = prefixed(
+        cwd,
+        command_prefix,
+        &["bash", "--noprofile", "--norc", "-c", command],
+    );
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // own process group so a timeout kill reaches every grandchild.
@@ -173,6 +164,28 @@ async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[Str
         Ok(status) => reply_for(status, &stdout, &stderr),
         Err(error) => ToolReply::error(format!("ERROR: bash did not run to completion ({error}).")),
     }
+}
+
+// the project's wrapper around argv, with the environment every child tool gets
+pub(crate) fn prefixed<'a>(
+    cwd: &Path,
+    command_prefix: &'a [String],
+    argv: &[&'a str],
+) -> (&'a str, Command) {
+    let (program, mut cmd) = if let Some((wrapper, rest)) = command_prefix.split_first() {
+        let mut cmd = Command::new(wrapper);
+        cmd.args(rest).args(argv);
+        (wrapper.as_str(), cmd)
+    } else {
+        let mut cmd = Command::new(argv[0]);
+        cmd.args(&argv[1..]);
+        (argv[0], cmd)
+    };
+    cmd.current_dir(cwd);
+    scrub_env(&mut cmd);
+    // CLIs block on an open stdin.
+    cmd.stdin(Stdio::null());
+    (program, cmd)
 }
 
 fn scrub_env(cmd: &mut Command) {

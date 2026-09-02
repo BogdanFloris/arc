@@ -11,6 +11,7 @@
 pub mod archive;
 pub mod client;
 pub mod consolidation;
+pub mod footprint;
 pub mod herdr;
 pub mod log;
 pub mod memory;
