@@ -664,7 +664,6 @@ fn review_item(item: ReviewItem) -> MemoryReviewItem {
     MemoryReviewItem {
         record: Some(item.record),
         changed_at_micros: item.changed_at,
-        superseded_by: String::new(),
         supersedes: item
             .supersedes
             .into_iter()

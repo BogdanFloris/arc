@@ -626,7 +626,6 @@ mod tests {
                 ..Default::default()
             }),
             changed_at_micros: 1_700_000_000_000_000,
-            superseded_by: String::new(),
             supersedes: Vec::new(),
         };
         let items = server_frame::Msg::MemoryReviewItems(MemoryReviewItems {

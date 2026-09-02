@@ -309,7 +309,7 @@ message SessionHistory {
 message MemoryReviewItem {
   MemoryRecord record = 1;
   int64 changed_at_micros = 2;
-  string superseded_by = 3;
+  reserved 3;
   repeated ReviewPredecessor supersedes = 4;
 }
 
