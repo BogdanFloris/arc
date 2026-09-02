@@ -573,8 +573,6 @@ fn popup(frame: &mut Frame, full: Rect, want_width: u16, content: u16, title: &s
     inner
 }
 
-// one display row in either view: the flat lineage annotation or the tree
-// connector geometry, never both
 enum PickerRow {
     Flat(Option<String>),
     Tree(Vec<bool>),
@@ -634,8 +632,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                     ),
                     PickerRow::Tree(flags) => (tree_prefix(flags), String::new()),
                 };
-                // the bullet is every node's own column; connectors step one
-                // 3-char cell per depth so `│` lands under the parent bullet
+                // connector cells are bullet-wide, so `│` lands under the parent
                 let active = app.session_id.as_deref() == Some(session.id.as_str());
                 let bullet = if active { "● " } else { "○ " };
                 let tag = disposition_tag(session)
@@ -665,8 +662,6 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                     format!("  {:>TIME_WIDTH$}", last_active(session, now)),
                     theme::DIM,
                 ));
-                // the tag column is always reserved, so untagged rows keep the
-                // same time column
                 spans.push(Span::styled(format!("{tag:<TAG_WIDTH$}"), theme::DIM));
                 spans
             }
@@ -676,8 +671,6 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-// one column per ancestor level: `│` while the level continues below the
-// row's subtree, the row's own `├─`/`└─` connector in the last column
 fn tree_prefix(flags: &[bool]) -> String {
     let mut prefix = String::new();
     for (level, continues) in flags.iter().enumerate() {
@@ -729,7 +722,6 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         .max()
         .unwrap_or(0)
         .min(REVIEW_DETAIL_CAP);
-    // divider + footer
     let area = popup(
         frame,
         full,
@@ -801,7 +793,6 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
             lines.push(Line::styled(format!("   {line}"), theme::DIM));
             room_left -= 1;
         }
-        // a shorter entry leaves blanks behind it, holding the footer still
         for _ in 0..room_left {
             lines.push(Line::default());
         }
@@ -1170,7 +1161,7 @@ fn elide(text: &str, room: usize) -> String {
 
 const TIME_WIDTH: usize = 8;
 
-// `  [+]` and friends; reserved on every row so the time column holds still
+// reserved on every row so the time column stays put
 const TAG_WIDTH: usize = 5;
 
 fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {

@@ -231,7 +231,6 @@ pub struct App {
     pub session_id: Option<String>,
     pub sessions: Vec<SessionInfo>,
     pub picker: Option<Picker>,
-    /// The picker's view mode, remembered across opens.
     pub picker_tree: bool,
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
@@ -1268,8 +1267,6 @@ impl App {
         let picker = self.picker.as_mut().expect("picker is open");
         picker.tree = !picker.tree;
         self.picker_tree = picker.tree;
-        // selected counts the "new session" row zero, so rows sit one past
-        // their 0-based position in the session list
         let position =
             selected_id.and_then(|id| self.picker_rows().iter().position(|s| s.id == id));
         self.picker.as_mut().expect("picker is open").selected = match position {
@@ -1380,10 +1377,6 @@ impl App {
             .collect()
     }
 
-    /// Tree mode's display rows: roots in recency order, branches depth-first.
-    /// One bool per ancestor level: `true` continues below — the `│`/`├─`
-    /// choice. A filtered-out parent orphans its branch as a root, so both
-    /// modes always list the same sessions.
     pub fn picker_tree_rows(&self) -> Vec<(&SessionInfo, Vec<bool>)> {
         fn walk<'a>(
             session: &'a SessionInfo,
@@ -1392,7 +1385,6 @@ impl App {
             rows: &mut Vec<(&'a SessionInfo, Vec<bool>)>,
             visited: &mut HashSet<&'a str>,
         ) {
-            // a cycle stops the walk; the sweep below still lists every session
             if !visited.insert(session.id.as_str()) {
                 return;
             }
@@ -1411,6 +1403,7 @@ impl App {
         let mut roots = Vec::new();
         let mut children: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
         for session in &candidates {
+            // a filtered-out parent leaves its branch a root
             if session.parent_session.is_empty() || !ids.contains(session.parent_session.as_str()) {
                 roots.push(session);
             } else {
@@ -1425,8 +1418,7 @@ impl App {
         for root in roots {
             walk(root, &[], &children, &mut rows, &mut visited);
         }
-        // a cycle strands a candidate; a broken parent pointer is no reason to
-        // hide the session
+        // a parent cycle strands sessions the walk never reaches
         for session in &candidates {
             if !visited.contains(session.id.as_str()) {
                 rows.push((session, Vec::new()));
@@ -1609,7 +1601,6 @@ impl App {
                     );
                 }
                 self.sessions = sessions;
-                // a refresh can shrink the list
                 if self.picker.is_some() {
                     self.clamp_picker_selection();
                 }
