@@ -22,7 +22,10 @@ const DEFAULT_IDLE_SECONDS: u64 = 1800;
 
 const DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS: u64 = 300;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+const DEFAULT_COMPACTION_FRACTION: f32 = 0.8;
+
+// f32's fraction field (compaction) keeps this PartialEq only, not Eq
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -34,6 +37,8 @@ pub struct Config {
     pub max_tool_result_bytes: usize,
 
     pub consolidation: ConsolidationConfig,
+
+    pub compaction: CompactionConfig,
 
     pub roles: RolesConfig,
 
@@ -121,6 +126,11 @@ pub struct RoleConfig {
 
     #[serde(default)]
     pub thinking: Thinking,
+
+    /// Tokens; compaction fires once a step's prompt tokens cross
+    /// `[compaction] fraction` of this. Absent means the role never compacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -272,6 +282,31 @@ impl Default for ConsolidationConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CompactionConfig {
+    pub fraction: f32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            fraction: DEFAULT_COMPACTION_FRACTION,
+        }
+    }
+}
+
+impl CompactionConfig {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            self.fraction > 0.0 && self.fraction <= 1.0,
+            "compaction fraction {} must be in (0, 1]",
+            self.fraction
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LlamaConfig {
@@ -298,6 +333,7 @@ impl Default for Config {
             llama: LlamaConfig::default(),
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             consolidation: ConsolidationConfig::default(),
+            compaction: CompactionConfig::default(),
             roles: RolesConfig::default(),
             projects: BTreeMap::new(),
         }
@@ -335,6 +371,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.compaction.validate()?;
         for (name, role) in self.roles.configured() {
             role.validate(name)?;
         }
@@ -380,6 +417,7 @@ mod tests {
         assert!(!config.consolidation.enabled, "off in code defaults");
         assert_eq!(config.consolidation.idle_seconds, 1800);
         assert_eq!(config.consolidation.timeout_seconds, 300);
+        assert!((config.compaction.fraction - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -416,6 +454,7 @@ mod tests {
                 idle_seconds: 600,
                 timeout_seconds: 120,
             },
+            compaction: super::CompactionConfig { fraction: 0.7 },
             roles: RolesConfig {
                 concierge: Some(RoleConfig {
                     provider: RoleProvider::Gemini,
@@ -423,6 +462,7 @@ mod tests {
                     endpoint: None,
                     key: Some("gemini".to_owned()),
                     thinking: Thinking::Low,
+                    context_window: None,
                 }),
                 executor: Some(RoleConfig {
                     provider: RoleProvider::OpenAiCompat,
@@ -430,6 +470,7 @@ mod tests {
                     endpoint: Some("http://127.0.0.1:4096".to_owned()),
                     key: Some("opencode-go".to_owned()),
                     thinking: Thinking::Default,
+                    context_window: Some(128_000),
                 }),
                 archivist: Some(RoleConfig {
                     provider: RoleProvider::Local,
@@ -437,6 +478,7 @@ mod tests {
                     endpoint: None,
                     key: None,
                     thinking: Thinking::Minimal,
+                    context_window: None,
                 }),
                 counsel: Some(super::CounselConfig {
                     command: super::CounselCommand::Claude,
@@ -777,6 +819,48 @@ command_prefix = ["nix", "develop", "-c"]
         let err = toml::from_str::<Config>("[consolidation]\nidle_secs = 60\n")
             .expect_err("a typo must not be ignored");
         assert!(err.to_string().contains("idle_secs"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_compaction_key_is_rejected() {
+        let err = toml::from_str::<Config>("[compaction]\nfracton = 0.5\n")
+            .expect_err("a typo must not be ignored");
+        assert!(err.to_string().contains("fracton"), "{err}");
+    }
+
+    #[test]
+    fn compaction_fraction_must_be_in_zero_to_one() {
+        let err = rejected("[compaction]\nfraction = 0.0\n");
+        assert!(err.contains("(0, 1]"), "{err}");
+
+        let err = rejected("[compaction]\nfraction = 1.5\n");
+        assert!(err.contains("(0, 1]"), "{err}");
+
+        // the upper bound is inclusive
+        parse("[compaction]\nfraction = 1.0\n");
+    }
+
+    #[test]
+    fn a_role_s_context_window_parses_and_defaults_to_none() {
+        let config = parse("[roles.executor]\nprovider = \"local\"\ncontext_window = 128000\n");
+        assert_eq!(
+            config
+                .roles
+                .executor
+                .expect("executor is configured")
+                .context_window,
+            Some(128_000)
+        );
+
+        let config = parse("[roles.executor]\nprovider = \"local\"\n");
+        assert_eq!(
+            config
+                .roles
+                .executor
+                .expect("executor is configured")
+                .context_window,
+            None
+        );
     }
 
     #[test]

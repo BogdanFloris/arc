@@ -62,6 +62,7 @@ pub(crate) mod testkit {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         }
     }
 

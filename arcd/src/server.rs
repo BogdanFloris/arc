@@ -274,18 +274,16 @@ async fn request(
             });
             ControlFlow::Continue(())
         }
-        // served by the compaction row; the schema lands first
-        Some(client_frame::Msg::CompactSession(compact)) => flow(
-            send_frame(
+        Some(client_frame::Msg::CompactSession(compact)) => {
+            compact_session(
                 ws,
+                engine,
+                supervisor,
                 frame.request_id,
-                error_frame(
-                    "unsupported",
-                    format!("compaction is not served yet ({})", compact.session_id),
-                ),
+                &compact.session_id,
             )
-            .await,
-        ),
+            .await
+        }
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
@@ -483,6 +481,46 @@ async fn cancel_turn(
             "no_turn",
             format!("no turn is running on session {session_id}"),
         )
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+/// The TUI's `:compact`. Refused while the session has a live turn — a
+/// concurrent compaction and turn would race the same log append; otherwise
+/// runs it on the session's own runner, the same one a turn would use.
+async fn compact_session(
+    ws: &mut Socket,
+    engine: &Engine,
+    supervisor: &Supervisor,
+    request_id: u64,
+    session_id: &str,
+) -> ControlFlow<()> {
+    if engine.turn_is_live(session_id) {
+        return flow(
+            send_frame(
+                ws,
+                request_id,
+                error_frame(
+                    "turn_running",
+                    format!("session {session_id} has a live turn"),
+                ),
+            )
+            .await,
+        );
+    }
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let compacted = match supervisor.turn_runner(session_id) {
+        Ok(served_by) => engine.compact(&served_by, session_id, &turn_id).await,
+        Err(error) => Err(error),
+    };
+    let msg = match compacted {
+        Ok(_) => server_frame::Msg::MessageAccepted(MessageAccepted {
+            session_id: session_id.to_owned(),
+        }),
+        Err(error) => {
+            warn!(%error, code = error_code(&error), "compact_session failed");
+            error_frame(error_code(&error), &error)
+        }
     };
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -813,9 +851,9 @@ mod tests {
     use arc_core::store::Store;
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
-        CancelJob, CancelTurn, DropSteers, Event, FetchHistory, HistoryEntry, HistoryMessage,
-        HistoryToolCall, HistoryToolResult, ListJobs, ListProjects, ListSessions, MemoryEvent,
-        MemoryRecord, MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete,
+        CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, HistoryEntry,
+        HistoryMessage, HistoryToolCall, HistoryToolResult, ListJobs, ListProjects, ListSessions,
+        MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete,
         MemoryReviewList, Notification, ProjectInfo, Role, SessionCreated, SessionEvent,
         SessionRole, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
         notification, session_event,
@@ -977,6 +1015,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
                 system: None,
+                compact_at: None,
             };
             Self::with_seed(
                 script,
@@ -1053,6 +1092,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
+                compact_at: None,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -1115,6 +1155,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
+                compact_at: None,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -2833,6 +2874,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_session_refuses_a_live_turn() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&gate),
+            after: vec![Ok(CompletionDelta::Done {
+                usage: usage(),
+                stop: Stop::EndTurn,
+            })],
+        }]) as Arc<dyn Provider>;
+
+        let mut harness =
+            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let accepted = next_frame(&mut ws).await;
+        let session_id = match accepted.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        wait_for_child_message_count(&harness, &session_id, 1).await;
+
+        let mut compact_ws = harness.connect().await;
+        send(
+            &mut compact_ws,
+            2,
+            client_frame::Msg::CompactSession(CompactSession {
+                session_id: session_id.clone(),
+            }),
+        )
+        .await;
+        let answer = next_frame(&mut compact_ws).await;
+        assert_eq!(answer.request_id, 2);
+        assert_eq!(failed(answer.msg.expect("a message")).code, "turn_running");
+
+        gate.notify_one();
+        loop {
+            let frame = next_frame(&mut ws).await;
+            if matches!(frame.msg, Some(server_frame::Msg::StreamEnd(_))) {
+                break;
+            }
+        }
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn compact_session_on_an_idle_session_is_accepted() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let (session_id, _, _closing) = turn(&mut ws, 1).await;
+
+        send(
+            &mut ws,
+            2,
+            client_frame::Msg::CompactSession(CompactSession {
+                session_id: session_id.clone(),
+            }),
+        )
+        .await;
+        let answer = next_frame(&mut ws).await;
+        assert_eq!(answer.request_id, 2);
+        match answer.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, session_id),
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
     async fn drop_steers_on_a_live_job_is_accepted_and_leaves_its_turn_alone() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
 
@@ -3585,6 +3700,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: Some("be terse".to_owned()),
+            compact_at: None,
         };
         let executor_runner = Runner {
             role: SessionRole::Executor,
@@ -3592,6 +3708,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let supervisor = Arc::new(
             Supervisor::new(

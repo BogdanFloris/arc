@@ -191,6 +191,10 @@ impl Supervisor {
 
     /// What a new session of this role would run under: the role's own
     /// runner, or the concierge's when the role has none configured.
+    pub(crate) fn turn_runner(&self, session_id: &str) -> Result<Runner, SessionError> {
+        turn_runner(&self.shared, session_id)
+    }
+
     pub(crate) fn role_runner(&self, role: SessionRole) -> Option<Runner> {
         self.shared
             .runners
@@ -1562,6 +1566,7 @@ mod tests {
                     model: "test-model".to_owned(),
                     thinking: Thinking::Default,
                     system: None,
+                    compact_at: None,
                 },
             ),
         ]);

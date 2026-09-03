@@ -42,6 +42,12 @@ const RUNNING_JOBS: &str = r"Running jobs:
   judgment call the expert leaves open to the user; never decide or drop it.
 - Hand the user conclusions, not transcripts.";
 
+// well under 2^32 tokens; the fractional token truncates harmlessly
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
+    (f64::from(context_window) * f64::from(fraction)) as u32
+}
+
 fn concierge_system(identity: Option<String>) -> String {
     match identity {
         Some(identity) => format!("{}\n\n{RUNNING_JOBS}", identity.trim_end()),
@@ -141,10 +147,14 @@ impl<'a> Built<'a> {
                 model: config.model(),
                 thinking: Thinking::Default,
                 system,
+                compact_at: None,
             });
         };
         let thinking = configured.thinking;
         let key = configured.key.clone();
+        let compact_at = configured
+            .context_window
+            .map(|window| compact_at_for(window, config.compaction.fraction));
         let (provider, model) = match configured.provider {
             RoleProvider::Local => (
                 self.sidecar(),
@@ -183,6 +193,7 @@ impl<'a> Built<'a> {
             model,
             thinking,
             system,
+            compact_at,
         })
     }
 
@@ -303,7 +314,29 @@ mod tests {
             assert_eq!(role.provider.name(), "local");
             assert_eq!(role.provider.endpoint(), SIDECAR);
             assert_eq!(role.model, Config::default().model());
+            assert_eq!(role.compact_at, None, "no context_window, no compaction");
         }
+    }
+
+    #[test]
+    fn compact_at_is_the_context_window_scaled_by_the_configured_fraction() {
+        let roles = resolved(
+            r#"
+[compaction]
+fraction = 0.5
+
+[roles.executor]
+provider = "local"
+context_window = 100000
+"#,
+        );
+
+        assert_eq!(roles.executor().compact_at, Some(50_000));
+        assert_eq!(
+            roles.concierge().compact_at,
+            None,
+            "an unconfigured role never compacts"
+        );
     }
 
     #[test]

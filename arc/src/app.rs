@@ -53,6 +53,9 @@ pub enum Command {
         session_id: String,
         disposition: branch_marked::Disposition,
     },
+    CompactSession {
+        session_id: String,
+    },
     Yank(String),
 }
 
@@ -111,6 +114,9 @@ pub enum NetEvent {
         session_id: String,
     },
     SessionForked {
+        session_id: String,
+    },
+    Compacted {
         session_id: String,
     },
 }
@@ -906,6 +912,7 @@ impl App {
                     "jobs" => return Some(self.open_jobs()),
                     "help" => self.help = true,
                     "fork" => return self.fork_selected(),
+                    "compact" => return self.compact_session(),
                     cmd => match cmd.strip_prefix("code ") {
                         Some(project) => return self.open_code(project.trim()),
                         None => self.last_error = Some("E492".to_owned()),
@@ -950,6 +957,14 @@ impl App {
                 Some("fork: select a sent message, not a tool or live block".to_owned());
             None
         }
+    }
+
+    fn compact_session(&mut self) -> Option<Command> {
+        let Some(session_id) = self.session_id.clone() else {
+            self.last_error = Some("compact: no open session".to_owned());
+            return None;
+        };
+        Some(Command::CompactSession { session_id })
     }
 
     fn fork_selected_visual(&mut self) -> Option<Command> {
@@ -1899,6 +1914,10 @@ impl App {
                     self.mode = Mode::Insert;
                 }
                 command
+            }
+            NetEvent::Compacted { session_id } => {
+                self.yank_note = Some("compacted".to_owned());
+                Some(Command::History { session_id })
             }
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
@@ -6862,6 +6881,50 @@ mod tests {
             command,
             Some(Command::CancelTurn {
                 session_id: "s-live".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn colon_compact_emits_compact_session_for_the_open_session() {
+        let mut app = App::new();
+        app.session_id = Some("s-open".to_owned());
+        normal(&mut app, ":compact");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::CompactSession {
+                session_id: "s-open".to_owned()
+            })
+        );
+        assert_eq!(app.last_error, None, ":compact is a command, not E492");
+    }
+
+    #[test]
+    fn colon_compact_with_no_open_session_is_an_error_and_emits_nothing() {
+        let mut app = App::new();
+        normal(&mut app, ":compact");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(command, None);
+        assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn a_compacted_ack_notes_it_and_refetches_history() {
+        let mut app = App::new();
+        app.session_id = Some("s-open".to_owned());
+
+        let command = app.on_net(NetEvent::Compacted {
+            session_id: "s-open".to_owned(),
+        });
+
+        assert_eq!(app.yank_note.as_deref(), Some("compacted"));
+        assert_eq!(
+            command,
+            Some(Command::History {
+                session_id: "s-open".to_owned()
             })
         );
     }

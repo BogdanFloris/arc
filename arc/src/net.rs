@@ -185,6 +185,9 @@ async fn handle(
             session_id,
             disposition,
         } => mark_branch(&mut client, &session_id, disposition, events).await,
+        Command::CompactSession { session_id } => {
+            compact_session(&mut client, &session_id, events).await
+        }
         // main.rs writes the OSC 52 sequence itself; this never reaches the socket
         // and CancelTurn goes to run_control's own connection instead
         Command::CancelTurn { .. } | Command::Yank(_) => Ok(()),
@@ -360,6 +363,26 @@ async fn mark_branch(
 ) -> Result<(), Error> {
     match client.mark_branch(session_id, disposition).await {
         Ok(()) => list(client, events).await,
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn compact_session(
+    client: &mut Client,
+    session_id: &str,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match client.compact_session(session_id).await {
+        Ok(()) => {
+            let _ = events.send(NetEvent::Compacted {
+                session_id: session_id.to_owned(),
+            });
+            Ok(())
+        }
         Err(Error::Server { code, msg }) => {
             let _ = events.send(NetEvent::Failed { code, msg });
             Ok(())
