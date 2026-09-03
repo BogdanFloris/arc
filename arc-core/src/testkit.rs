@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -147,6 +147,18 @@ pub fn engine_with_role(
         Engine::new(Store::new(log, projection), Registry::new(512)),
         runner_with_role(provider, role),
     )
+}
+
+// create_direct_session/create_bound_session require a known project
+pub fn engine_with_role_and_project(
+    provider: &Arc<ScriptedProvider>,
+    dir: &TempDir,
+    role: SessionRole,
+) -> (Engine, Runner) {
+    let (engine, runner) = engine_with_role(provider, dir, role);
+    let mut projects = BTreeMap::new();
+    projects.insert("arc".to_owned(), crate::session::ProjectSpec::default());
+    (engine.with_projects(projects), runner)
 }
 
 pub fn engine_with_tools(

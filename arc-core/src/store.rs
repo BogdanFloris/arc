@@ -36,6 +36,7 @@ pub struct SessionSnapshot {
     pub latest_seq: u64,
     pub memory_index: Vec<MemoryIndexEntry>,
     pub role: i32,
+    pub source: i32,
 }
 
 impl Store {
@@ -102,12 +103,17 @@ impl Store {
             .projection
             .session_role(&first.session_id)?
             .unwrap_or(SessionRole::Unspecified as i32);
+        let source = self
+            .projection
+            .session_source(&first.session_id)?
+            .unwrap_or(Source::Unspecified as i32);
         Ok(Some(SessionSnapshot {
             session_id: first.session_id,
             rows,
             latest_seq: first.latest_seq,
             memory_index,
             role,
+            source,
         }))
     }
 

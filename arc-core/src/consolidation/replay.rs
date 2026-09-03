@@ -160,7 +160,10 @@ async fn run_version(
         let role = projection
             .session_role(&session_id)?
             .unwrap_or(SessionRole::Unspecified as i32);
-        if !super::extracts_user_facts(role) {
+        let source = projection
+            .session_source(&session_id)?
+            .unwrap_or(Source::Unspecified as i32);
+        if !super::extracts_user_facts(source, role) {
             sessions.push(SessionReplay {
                 session_id,
                 operations: Vec::new(),
@@ -173,6 +176,7 @@ async fn run_version(
             latest_seq,
             memory_index: projection.memory_index()?,
             role,
+            source,
         };
         let extractor = ModelExtractor::pinned(
             Arc::clone(provider),

@@ -4,7 +4,7 @@ pub mod replay;
 use std::collections::HashSet;
 use std::future::Future;
 
-use arc_proto::v1::{Role, SessionRole, memory_event};
+use arc_proto::v1::{Role, SessionRole, Source, memory_event};
 
 use crate::projection::MessageRow;
 use crate::session::Engine;
@@ -140,7 +140,7 @@ async fn pass<E: Extractor>(
     title_if_due(engine, extractor, &snapshot).await?;
 
     // the store is not locked during extraction: it can take minutes
-    let events = if extracts_user_facts(snapshot.role) {
+    let events = if extracts_user_facts(snapshot.source, snapshot.role) {
         extractor
             .extract(&snapshot)
             .await
@@ -151,8 +151,9 @@ async fn pass<E: Extractor>(
     } else {
         tracing::info!(
             session_id = %snapshot.session_id,
+            source = source_name(snapshot.source),
             role = role_name(snapshot.role),
-            "session role holds no user facts; skipping extraction"
+            "session source holds no user facts; skipping extraction"
         );
         Vec::new()
     };
@@ -230,17 +231,31 @@ fn is_role(row: &MessageRow, role: Role) -> bool {
     matches!(row, MessageRow::Message { role: r, .. } if *r == role as i32)
 }
 
-/// A work transcript holds no user facts; only concierge and pre-role
-/// (legacy) sessions were TUI conversations worth extracting.
-fn extracts_user_facts(role: i32) -> bool {
-    matches!(
-        SessionRole::try_from(role),
-        Ok(SessionRole::Unspecified | SessionRole::Concierge)
-    )
+/// The gate is presence, not role. A source-less legacy session falls
+/// back to the old role rule.
+fn extracts_user_facts(source: i32, role: i32) -> bool {
+    match Source::try_from(source) {
+        Ok(Source::User) => true,
+        Ok(Source::Model) => false,
+        _ => matches!(
+            SessionRole::try_from(role),
+            Ok(SessionRole::Unspecified | SessionRole::Concierge)
+        ),
+    }
 }
 
 fn role_name(role: i32) -> &'static str {
     SessionRole::try_from(role).map_or("unknown", crate::provider::role_label)
+}
+
+fn source_name(source: i32) -> &'static str {
+    match Source::try_from(source) {
+        Ok(Source::Unspecified) => "unspecified",
+        Ok(Source::Model) => "model",
+        Ok(Source::User) => "user",
+        Ok(Source::System) => "system",
+        Err(_) => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -250,16 +265,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, SessionRole, Source, event,
-        memory_event, memory_record, session_event,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Role,
+        SessionCreated, SessionEvent, SessionRole, Source, event, memory_event, memory_record,
+        session_event,
     };
     use tempfile::TempDir;
 
     use super::{ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, run_pass};
     use crate::projection::Projection;
+    use crate::session::Engine;
     use crate::testkit::{
         ScriptedProvider, TraceCapture, channel, counter_samples, done_reply, engine,
-        engine_with_role, replay_events,
+        engine_with_role, engine_with_role_and_project, replay_events,
     };
 
     const ALL_IDLE: i64 = i64::MAX;
@@ -333,6 +350,46 @@ mod tests {
         async fn title(&self, _session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
             Ok(Some("Job transcript".to_owned()))
         }
+    }
+
+    // the only way to reproduce a session logged with an arbitrary source
+    fn seed_session(engine: &Engine, session_id: &str, role: SessionRole, source: Source) {
+        let ts = Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        engine
+            .with_store_mut(|store| {
+                store.append(
+                    source,
+                    ts,
+                    event::Payload::Session(SessionEvent {
+                        event: Some(session_event::Event::SessionCreated(SessionCreated {
+                            session_id: session_id.to_owned(),
+                            role: role as i32,
+                            ..Default::default()
+                        })),
+                    }),
+                )
+            })
+            .expect("seed SessionCreated");
+        engine
+            .with_store_mut(|store| {
+                store.append(
+                    source,
+                    ts,
+                    event::Payload::Session(SessionEvent {
+                        event: Some(session_event::Event::MessageAppended(MessageAppended {
+                            session_id: session_id.to_owned(),
+                            role: Role::User as i32,
+                            content: "hi".to_owned(),
+                            turn_id: "t-1".to_owned(),
+                            ..Default::default()
+                        })),
+                    }),
+                )
+            })
+            .expect("seed MessageAppended");
     }
 
     fn titled_events(dir: &std::path::Path) -> Vec<arc_proto::v1::SessionTitled> {
@@ -756,13 +813,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_idle_executor_session_is_titled_but_never_extracted() {
+    async fn a_dispatched_executor_session_is_titled_but_never_extracted() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Executor);
+        let (engine, run) = engine_with_role_and_project(&provider, &dir, SessionRole::Executor);
+        // source Model, as dispatch_job records it
+        let session_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("create bound session");
         let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
+        engine
+            .send_message(&run, Some(&session_id), "hi", tx)
             .await
             .expect("send");
 
@@ -778,7 +839,7 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Consolidated {
-                session_id: reply.session_id.clone(),
+                session_id: session_id.clone(),
                 through_seq: 2,
                 records: 0,
                 records_created: 0,
@@ -788,16 +849,83 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "an executor session must never reach the extractor"
+            "a dispatched executor session must never reach the extractor"
         );
 
         let titled = titled_events(dir.path());
         assert_eq!(
             titled.len(),
             1,
-            "an eligible executor session still gets a title"
+            "an eligible dispatched session still gets a title"
         );
-        assert_eq!(titled[0].session_id, reply.session_id);
+        assert_eq!(titled[0].session_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn a_direct_executor_session_extracts() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine_with_role_and_project(&provider, &dir, SessionRole::Executor);
+        // source User, as the :code door records it
+        let session_id = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect("create direct session");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "hi", tx)
+            .await
+            .expect("send");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: vec![created_record("mr-code")],
+        };
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+
+        assert!(
+            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
+            "got: {outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a :code session the user opened must reach the extractor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executor_session_with_unspecified_source_does_not_extract() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _run) = engine_with_role(&provider, &dir, SessionRole::Executor);
+        seed_session(
+            &engine,
+            "s-legacy",
+            SessionRole::Executor,
+            Source::Unspecified,
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: Arc::clone(&calls),
+            records: Vec::new(),
+        };
+        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("pass");
+
+        assert!(
+            matches!(outcome, Outcome::Consolidated { records: 0, .. }),
+            "got: {outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unspecified-source executor session keeps the old role rule"
+        );
     }
 
     #[tokio::test]
@@ -885,14 +1013,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_role_less_legacy_session_still_extracts() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
+        let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Unspecified);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
+        let (engine, _run) = engine_with_role(&provider, &dir, SessionRole::Unspecified);
+        seed_session(
+            &engine,
+            "s-legacy",
+            SessionRole::Unspecified,
+            Source::Unspecified,
+        );
 
         let calls = Arc::new(AtomicUsize::new(0));
         let extractor = CountingExtractor {

@@ -483,6 +483,18 @@ impl Projection {
         Ok(role)
     }
 
+    pub(crate) fn session_source(&self, session_id: &str) -> Result<Option<i32>, Error> {
+        let source = self
+            .conn
+            .query_row(
+                "SELECT source FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(source)
+    }
+
     pub(crate) fn session_started_at(&self, session_id: &str) -> Result<Option<i64>, Error> {
         let started: Option<Option<i64>> = self
             .conn
