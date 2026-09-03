@@ -75,18 +75,38 @@ fn url_from_args() -> Result<Option<String>> {
     }
 }
 
+// a remote daemon's directory means nothing here, so only a loopback host
+// gets a door guessed from where the client was started
+fn is_local(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = match rest.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => rest.split(['/', ':']).next().unwrap_or(""),
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn launch_dir(url: &str) -> Option<std::path::PathBuf> {
+    if !is_local(url) {
+        return None;
+    }
+    std::fs::canonicalize(std::env::current_dir().ok()?).ok()
+}
+
 async fn run(
     mut terminal: ratatui::DefaultTerminal,
     url: String,
     herdr: &mut Reporter,
 ) -> Result<()> {
+    let mut app = App::new();
+    app.set_launch_dir(launch_dir(&url));
+
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (control_commands, control_command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut events) = mpsc::unbounded_channel();
     tokio::spawn(net::run(url.clone(), command_rx, event_tx.clone()));
     tokio::spawn(net::run_control(url, control_command_rx, event_tx));
 
-    let mut app = App::new();
     let _ = commands.send(Command::List);
 
     let mut keys = EventStream::new();
@@ -170,4 +190,36 @@ fn set_cursor_style(mode: Mode) {
     let mut out = std::io::stdout();
     let _ = crossterm::execute!(out, style);
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_hosts_are_local() {
+        assert!(is_local("ws://127.0.0.1:8787"));
+        assert!(is_local("ws://localhost:8787"));
+        assert!(is_local("ws://[::1]:8787"));
+        assert!(is_local(DEFAULT_URL), "the default is a loopback address");
+    }
+
+    #[test]
+    fn a_remote_host_is_not_local() {
+        assert!(!is_local("ws://100.64.0.1:8787"));
+        assert!(!is_local("ws://arc.tailnet-1234.ts.net:8787"));
+    }
+
+    // a remote address never guesses a door: its directory means nothing
+    // to the daemon, whatever the client's own cwd happens to be
+    #[test]
+    fn a_remote_address_yields_no_launch_dir() {
+        assert_eq!(launch_dir("ws://100.64.0.1:8787"), None);
+    }
+
+    #[test]
+    fn a_local_address_yields_the_canonical_cwd() {
+        let expected = std::fs::canonicalize(std::env::current_dir().expect("cwd")).ok();
+        assert_eq!(launch_dir(DEFAULT_URL), expected);
+    }
 }

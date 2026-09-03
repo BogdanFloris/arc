@@ -57,6 +57,7 @@ dependencies = [
  "prost-types",
  "ratatui",
  "serde_json",
+ "tempfile",
  "textwrap",
  "tokio",
  "tokio-tungstenite",

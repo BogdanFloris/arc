@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
@@ -97,6 +98,7 @@ pub enum NetEvent {
     ReviewChanged(u32),
     JobItems(Vec<JobInfo>),
     ProjectItems(Vec<ProjectInfo>),
+    ProjectsSeeded(Vec<ProjectInfo>),
     SessionAppended {
         session_id: String,
     },
@@ -266,6 +268,11 @@ pub struct App {
     pending_code: Option<(SessionRole, String)>,
     pending_first: Option<String>,
     pub review_pending: u32,
+    launch_dir: Option<PathBuf>,
+    seeded_projects: Vec<ProjectInfo>,
+    /// True until the first key reaches `on_key`: gates the launch-directory
+    /// door guess, so a key the user already pressed always wins.
+    untouched: bool,
 }
 
 impl App {
@@ -316,7 +323,16 @@ impl App {
             pending_code: None,
             pending_first: None,
             review_pending: 0,
+            launch_dir: None,
+            seeded_projects: Vec::new(),
+            untouched: true,
         }
+    }
+
+    /// Set once at startup, from the client's own working directory; `None`
+    /// for a remote client, whose directory means nothing to the daemon.
+    pub fn set_launch_dir(&mut self, dir: Option<PathBuf>) {
+        self.launch_dir = dir;
     }
 
     fn push_block(&mut self, block: Block) {
@@ -359,6 +375,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
+        self.untouched = false;
         self.yank_note = None;
         match key.code {
             KeyCode::PageUp if self.picker.is_some() => {
@@ -409,6 +426,7 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) -> Option<Command> {
+        self.untouched = false;
         self.yank_note = None;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let overlay = self.help
@@ -1433,6 +1451,7 @@ impl App {
             .picker
             .as_ref()
             .is_some_and(|picker| picker.show_abandoned);
+        let open_project = self.open_project();
         let order: Vec<&SessionInfo> = self
             .by_recency()
             .into_iter()
@@ -1443,6 +1462,10 @@ impl App {
             })
             .filter(|session| show_all || !is_job_session(session))
             .filter(|session| show_abandoned || !is_abandoned(session))
+            .filter(|session| match open_project {
+                Some(project) if !show_all => session.project == project,
+                _ => true,
+            })
             .collect();
         let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
         if !filtering || self.input.is_empty() {
@@ -1521,6 +1544,22 @@ impl App {
             (Source::User, SessionRole::Executor) => Some(format!("code/{project}")),
             _ => None,
         }
+    }
+
+    /// The project a code door — pending or already open — is bound to.
+    /// `None` for the concierge, where the picker stays unscoped.
+    fn open_project(&self) -> Option<&str> {
+        if self.session_id.is_none() {
+            return match &self.pending_code {
+                Some((SessionRole::Executor, project)) => Some(project.as_str()),
+                _ => None,
+            };
+        }
+        let (role, project, source) = self
+            .session_id
+            .as_deref()
+            .and_then(|id| self.session_meta.get(id))?;
+        (*source == Source::User && *role == SessionRole::Executor).then_some(project.as_str())
     }
 
     fn back_session(&mut self) -> Option<Command> {
@@ -1782,6 +1821,21 @@ impl App {
                 }
                 None
             }
+            NetEvent::ProjectsSeeded(items) => {
+                if self.untouched && self.session_id.is_none() && self.pending_code.is_none() {
+                    let roots = canonical_roots(&items);
+                    let matched = self
+                        .launch_dir
+                        .as_deref()
+                        .and_then(|dir| longest_matching_root(dir, &roots))
+                        .map(str::to_owned);
+                    if let Some(project) = matched {
+                        self.open_code(&project);
+                    }
+                }
+                self.seeded_projects = items;
+                None
+            }
             NetEvent::JobItems(items) => {
                 for job in &items {
                     self.record_session_meta(
@@ -1986,6 +2040,30 @@ pub fn is_job_session(session: &SessionInfo) -> bool {
 
 fn is_abandoned(session: &SessionInfo) -> bool {
     session.disposition == arc_proto::v1::branch_marked::Disposition::Abandoned as i32
+}
+
+/// The seeded projects whose root exists locally and canonicalizes, paired
+/// with that canonical root.
+fn canonical_roots(projects: &[ProjectInfo]) -> Vec<(&str, PathBuf)> {
+    projects
+        .iter()
+        .filter(|project| !project.root.is_empty())
+        .filter_map(|project| {
+            std::fs::canonicalize(&project.root)
+                .ok()
+                .map(|root| (project.name.as_str(), root))
+        })
+        .collect()
+}
+
+/// Longest-prefix match by path component, over already-canonical roots —
+/// a root `/a/b` matches a launch dir under it but not a sibling `/a/b2`.
+fn longest_matching_root<'a>(launch_dir: &Path, roots: &[(&'a str, PathBuf)]) -> Option<&'a str> {
+    roots
+        .iter()
+        .filter(|(_, root)| launch_dir.starts_with(root))
+        .max_by_key(|(_, root)| root.components().count())
+        .map(|(name, _)| *name)
 }
 
 fn short_id(id: &str) -> &str {
@@ -5071,6 +5149,27 @@ mod tests {
         assert_eq!(app.open_door_label(), None, "navigation abandons the door");
     }
 
+    // start_session(None) is the same path a pending door abandons through
+    // (see above); this proves it holds for an already-created code session too
+    #[test]
+    fn ctrl_n_from_an_open_code_session_opens_a_concierge() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![code_session(
+            "s-code", "", "scratch",
+        )]));
+        app.start_session(Some("s-code".to_owned()));
+        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
+
+        app.on_key(ctrl('n'));
+
+        assert_eq!(app.session_id, None);
+        assert_eq!(
+            app.open_door_label(),
+            None,
+            "ctrl-n from an open code session opens the concierge"
+        );
+    }
+
     #[test]
     fn opening_a_session_from_a_sessions_list_shows_its_door_label() {
         let mut app = App::new();
@@ -5091,6 +5190,166 @@ mod tests {
             app.open_door_label(),
             None,
             "a concierge conversation is the default door, unlabelled"
+        );
+    }
+
+    #[test]
+    fn nested_roots_prefer_the_longer_and_reject_a_sibling() {
+        let roots = vec![
+            ("outer", PathBuf::from("/a")),
+            ("inner", PathBuf::from("/a/b")),
+        ];
+        assert_eq!(
+            longest_matching_root(Path::new("/a/b/c"), &roots),
+            Some("inner"),
+            "the deeper root wins over its ancestor"
+        );
+        assert_eq!(
+            longest_matching_root(Path::new("/a/b2"), &[("inner", PathBuf::from("/a/b"))]),
+            None,
+            "a sibling that merely shares a prefix string is not a component match"
+        );
+    }
+
+    #[test]
+    fn a_seeded_root_matching_the_launch_dir_opens_the_pending_code_door() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let launch_dir = root.path().join("docs");
+        std::fs::create_dir(&launch_dir).expect("mkdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+        let canonical_launch = std::fs::canonicalize(&launch_dir).expect("canonicalize");
+
+        let mut app = App::new();
+        app.set_launch_dir(Some(canonical_launch));
+        let command = app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
+            name: "arc".to_owned(),
+            description: String::new(),
+            root: canonical_root.display().to_string(),
+        }]));
+
+        assert_eq!(command, None, "nothing durable until the first message");
+        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+    }
+
+    #[test]
+    fn a_launch_dir_outside_every_root_opens_no_door() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+        let canonical_elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonicalize");
+
+        let mut app = App::new();
+        app.set_launch_dir(Some(canonical_elsewhere));
+        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
+            name: "arc".to_owned(),
+            description: String::new(),
+            root: canonical_root.display().to_string(),
+        }]));
+
+        assert_eq!(app.open_door_label(), None);
+    }
+
+    // a remote client's launch_dir is None (main.rs never sets one), which
+    // takes the same no-door path as a directory outside every root
+    #[test]
+    fn no_launch_dir_opens_no_door_even_with_a_matching_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+
+        let mut app = App::new();
+        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
+            name: "arc".to_owned(),
+            description: String::new(),
+            root: canonical_root.display().to_string(),
+        }]));
+
+        assert_eq!(app.open_door_label(), None);
+    }
+
+    #[test]
+    fn a_seed_arriving_after_the_user_acts_first_opens_no_door() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+        let seed = vec![ProjectInfo {
+            name: "arc".to_owned(),
+            description: String::new(),
+            root: canonical_root.display().to_string(),
+        }];
+
+        let mut typed_first = App::new();
+        typed_first.set_launch_dir(Some(canonical_root.clone()));
+        typed(&mut typed_first, "hello");
+        typed_first.on_net(NetEvent::ProjectsSeeded(seed.clone()));
+        assert_eq!(
+            typed_first.open_door_label(),
+            None,
+            "typing before the seed arrives claims the door"
+        );
+
+        let mut picker_first = App::new();
+        picker_first.set_launch_dir(Some(canonical_root));
+        picker_first.on_key(ctrl('p'));
+        assert!(picker_first.picker.is_some());
+        picker_first.on_net(NetEvent::ProjectsSeeded(seed));
+        assert_eq!(
+            picker_first.open_door_label(),
+            None,
+            "opening the picker before the seed arrives claims the door"
+        );
+    }
+
+    #[test]
+    fn the_picker_scopes_to_the_open_project_until_show_all() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![
+            code_session("s-arc-1", "in arc", "arc"),
+            code_session("s-scratch-1", "in scratch", "scratch"),
+            session("s-concierge"),
+        ]));
+        normal(&mut app, ":code arc");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+
+        app.on_key(ctrl('p'));
+        let scoped: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            scoped,
+            vec!["s-arc-1"],
+            "the default candidate set is scoped to the open project"
+        );
+
+        app.on_key(key(KeyCode::Char('a')));
+        let all: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            all.contains(&"s-scratch-1"),
+            "show-all lifts the project scope"
+        );
+    }
+
+    #[test]
+    fn submitting_after_an_auto_opened_door_creates_a_session_like_code_does() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+
+        let mut app = App::new();
+        app.set_launch_dir(Some(canonical_root.clone()));
+        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
+            name: "arc".to_owned(),
+            description: String::new(),
+            root: canonical_root.display().to_string(),
+        }]));
+        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+
+        typed(&mut app, "hello");
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::CreateSession {
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+            }),
+            "the first message after an auto-opened door is exactly the :code flow"
         );
     }
 

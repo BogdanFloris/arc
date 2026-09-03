@@ -117,6 +117,10 @@ async fn connect(url: &str, events: &mpsc::UnboundedSender<NetEvent>) -> Option<
         let pending = u32::try_from(items.len()).unwrap_or(u32::MAX);
         let _ = events.send(NetEvent::ReviewChanged(pending));
     }
+    // seeds a launch-directory door guess; C still fetches its own fresh list
+    if let Ok(projects) = client.projects().await {
+        let _ = events.send(NetEvent::ProjectsSeeded(projects));
+    }
     Some(client)
 }
 
@@ -428,8 +432,8 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{
-        ClientFrame, JobInfo, JobList, MemoryReviewItems, ServerFrame, SessionList, client_frame,
-        server_frame,
+        ClientFrame, JobInfo, JobList, MemoryReviewItems, ProjectList, ServerFrame, SessionList,
+        client_frame, server_frame,
     };
     use futures::{SinkExt as _, StreamExt as _};
     use prost::Message as _;
@@ -510,6 +514,17 @@ mod tests {
                 server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
             )
             .await;
+            let projects = expect_frame(&mut ws).await;
+            assert!(matches!(
+                projects.msg,
+                Some(client_frame::Msg::ListProjects(_))
+            ));
+            reply(
+                &mut ws,
+                projects.request_id,
+                server_frame::Msg::ProjectList(ProjectList { projects: vec![] }),
+            )
+            .await;
             let list = expect_frame(&mut ws).await;
             assert!(matches!(list.msg, Some(client_frame::Msg::ListSessions(_))));
             reply(
@@ -543,6 +558,17 @@ mod tests {
                 server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
             )
             .await;
+            let projects = expect_frame(&mut ws).await;
+            assert!(matches!(
+                projects.msg,
+                Some(client_frame::Msg::ListProjects(_))
+            ));
+            reply(
+                &mut ws,
+                projects.request_id,
+                server_frame::Msg::ProjectList(ProjectList { projects: vec![] }),
+            )
+            .await;
             let jobs = expect_frame(&mut ws).await;
             assert!(matches!(jobs.msg, Some(client_frame::Msg::ListJobs(_))));
             reply(
@@ -565,6 +591,11 @@ mod tests {
             NetEvent::ReviewChanged(0),
             "connecting seeds the review indicator before the command runs"
         );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::ProjectsSeeded(vec![]),
+            "connecting also seeds the project list, for a launch-directory door guess"
+        );
         assert_eq!(next_event(&mut events).await, NetEvent::Sessions(vec![]));
         assert!(
             matches!(next_event(&mut events).await, NetEvent::Disconnected { .. }),
@@ -576,6 +607,11 @@ mod tests {
             next_event(&mut events).await,
             NetEvent::ReviewChanged(0),
             "the reconnect seeds the indicator again"
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::ProjectsSeeded(vec![]),
+            "the reconnect seeds the project list again too"
         );
         assert_eq!(
             next_event(&mut events).await,

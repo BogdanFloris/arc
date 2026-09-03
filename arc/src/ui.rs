@@ -978,6 +978,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":review           open the review pane",
             ":jobs             open the jobs pane",
             ":code <project>   open a bound executor session, no dispatch",
+            "                  a local launch inside a project's root opens this door on its own",
             ":fork             branch at the visual selection",
             ":help             this popup (j k scroll it)",
         ],
