@@ -36,8 +36,9 @@ impl Dispatch {
             }
         }
         parts.push(
-            "\"none\" lands the job in the standing scratch project; the acknowledgment \
-             names where it went."
+            "\"none\" means this session's own bound project; an unbound caller lands \
+             in the standing scratch project when one is configured, and must \
+             otherwise name a configured project."
                 .to_owned(),
         );
         parts.join(" ")
@@ -45,8 +46,12 @@ impl Dispatch {
 
     // an early-return-on-error reads best here; ToolReply is not on a hot path
     #[allow(clippy::result_large_err)]
-    fn resolve_project(&self, project: &str) -> Result<String, ToolReply> {
+    fn resolve_project(&self, project: &str, ctx: &TurnContext) -> Result<String, ToolReply> {
         if project == "none" {
+            if ctx.grants.is_some() {
+                // bound: the engine resolves "none" to this session's own project
+                return Ok(project.to_owned());
+            }
             return self.scratch.clone().ok_or_else(|| {
                 ToolReply::error(format!(
                     "ERROR: no scratch project is configured. Name one of the configured \
@@ -60,7 +65,8 @@ impl Dispatch {
         }
         Err(ToolReply::error(format!(
             "ERROR: unknown project {project:?}. Use one of the configured projects \
-             ({}), or \"none\" for the scratch project.",
+             ({}), or \"none\" for this session's own project or the standing scratch \
+             project.",
             self.names_joined()
         )))
     }
@@ -138,7 +144,7 @@ impl Tool for Dispatch {
     fn execute(
         &self,
         arguments_json: String,
-        _ctx: TurnContext,
+        ctx: TurnContext,
     ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
         Box::pin(async move {
             let args: DispatchArgs = match serde_json::from_str(&arguments_json) {
@@ -159,7 +165,7 @@ impl Tool for Dispatch {
                     ));
                 }
             };
-            let project = match self.resolve_project(&args.project) {
+            let project = match self.resolve_project(&args.project, &ctx) {
                 Ok(project) => project,
                 Err(reply) => return reply,
             };
@@ -202,7 +208,10 @@ impl Tool for Dispatch {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::Dispatch;
+    use crate::tool::workspace::{Grant, Grants, Mode};
     use crate::tool::{Tool, TurnContext};
     use arc_proto::v1::SessionRole;
 
@@ -214,6 +223,16 @@ mod tests {
                 .collect(),
             scratch.map(str::to_owned),
         )
+    }
+
+    fn ctx_bound(root: &std::path::Path) -> TurnContext {
+        let grants = Grants::new(vec![Grant::new(root, Mode::ReadWrite)]).expect("grants");
+        TurnContext {
+            session_id: String::new(),
+            turn_id: String::new(),
+            grants: Some(Arc::new(grants)),
+            command_prefix: Vec::new(),
+        }
     }
 
     fn args(role: &str, project: &str, brief: &str, intent: &str) -> String {
@@ -286,6 +305,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn none_in_a_bound_session_passes_through_unresolved() {
+        // the tool only validates the value; the engine resolves "none" to
+        // the calling session's own project, since only it knows that
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let tool = dispatch(&[("arc", "")], None);
+
+        let reply = tool
+            .execute(
+                args("archivist", "none", "tidy up notes", "implement"),
+                ctx_bound(dir.path()),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(reply.job_request.expect("a job request").project, "none");
+    }
+
+    #[tokio::test]
     async fn none_resolves_to_scratch_when_one_is_configured() {
         let tool = dispatch(&[("arc", "")], Some("scratch"));
 
@@ -301,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_without_a_configured_scratch_is_an_actionable_error() {
+    async fn none_from_an_unbound_session_without_a_configured_scratch_is_an_actionable_error() {
         let tool = dispatch(&[("arc", "")], None);
 
         let reply = tool
@@ -486,6 +523,14 @@ mod tests {
         assert!(
             description.contains("scratch.") && !description.contains("scratch:"),
             "an empty description contributes just the bare name: {description}"
+        );
+        assert!(
+            description.contains("\"none\" means this session's own bound project"),
+            "{description}"
+        );
+        assert!(
+            description.contains("standing scratch project"),
+            "{description}"
         );
     }
 }

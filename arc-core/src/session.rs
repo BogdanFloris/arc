@@ -506,10 +506,27 @@ impl Engine {
         job_request: crate::tool::JobRequest,
     ) -> (ToolOutcome, String, Option<DispatchedJob>) {
         let role = job_request.role;
-        let project = job_request.project;
         let brief = job_request.brief;
         let budget = job_request.budget;
         let intent = job_request.intent;
+        let project = if job_request.project == "none" {
+            match self.session_project(parent_session) {
+                Ok(Some(name)) if !name.is_empty() => name,
+                _ => {
+                    return (
+                        ToolOutcome::Error,
+                        format!(
+                            "ERROR: this session has no project of its own. Name one of \
+                             the configured projects instead: {}.",
+                            self.projects.keys().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                        None,
+                    );
+                }
+            }
+        } else {
+            job_request.project
+        };
         if !job_request.fresh {
             if let Some(warm) = self.warm_finished_job(parent_session, &project, role, intent) {
                 return (
@@ -5925,6 +5942,112 @@ mod tests {
             .send_message(&executor_run, Some(&child_id), "go", tx)
             .await
             .expect("an executor runner continues the dispatched child");
+    }
+
+    #[tokio::test]
+    async fn a_bound_sessions_none_dispatch_resolves_to_its_own_project() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "none", "fix the bug", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("dispatched"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, _) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let run = runner_with_role(&provider, SessionRole::Executor);
+
+        let parent_id = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect("a bound direct session");
+
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, Some(&parent_id), "start a job", tx)
+            .await
+            .expect("send");
+
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(child) = &events[3] else {
+            panic!("expected the child SessionCreated, got {:?}", events[3]);
+        };
+        assert_eq!(
+            child.project, "arc",
+            "\"none\" resolved to the dispatching session's own project"
+        );
+        assert_eq!(
+            reply.jobs,
+            [DispatchedJob {
+                session_id: child.session_id.clone(),
+                parent_session: parent_id.clone(),
+                role: SessionRole::Executor,
+                project: "arc".to_owned(),
+                brief: "fix the bug".to_owned(),
+                budget: None,
+            }],
+            "identical to a dispatch that named \"arc\" explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_sessions_none_dispatch_is_an_actionable_error_naming_projects() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "dispatch",
+                    &dispatch_args("executor", "none", "fix the bug", "implement"),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "start a job", tx)
+            .await
+            .expect("a bad dispatch fails the call, not the turn");
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 5, "no child session was created");
+        let result = resulted(&events[3]);
+        assert_eq!(result.outcome, ToolOutcome::Error as i32);
+        assert!(result.content.contains("arc"), "{}", result.content);
+        assert!(reply.jobs.is_empty(), "a failed dispatch spawns no job");
     }
 
     #[tokio::test]
