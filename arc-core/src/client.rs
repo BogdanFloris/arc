@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use arc_proto::v1::{
-    CancelJob, CancelTurn, ClientFrame, CreateSession, DropSteers, FetchHistory, ForkSession,
-    JobInfo, ListJobs, ListProjects, ListSessions, MarkBranch, MemoryReviewAccept,
+    CancelJob, CancelTurn, ClientFrame, CompactSession, CreateSession, DropSteers, FetchHistory,
+    ForkSession, JobInfo, ListJobs, ListProjects, ListSessions, MarkBranch, MemoryReviewAccept,
     MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification, ProjectInfo, SendMessage,
     ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe, branch_marked, client_frame,
     server_frame,
@@ -298,6 +298,16 @@ impl Client {
             .send(client_frame::Msg::MarkBranch(MarkBranch {
                 session_id: session_id.to_owned(),
                 disposition: disposition as i32,
+            }))
+            .await?;
+        self.verdict_ack(id).await
+    }
+
+    #[tracing::instrument(name = "client.compact_session", skip_all, fields(session_id))]
+    pub async fn compact_session(&mut self, session_id: &str) -> Result<(), Error> {
+        let id = self
+            .send(client_frame::Msg::CompactSession(CompactSession {
+                session_id: session_id.to_owned(),
             }))
             .await?;
         self.verdict_ack(id).await

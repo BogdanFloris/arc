@@ -6,9 +6,9 @@ use arc_proto::v1::{
     BranchMarked, Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall,
     HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
     MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
-    ProvenanceEntry, Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent,
-    SessionTitled, ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event,
-    memory_record, session_event,
+    ProvenanceEntry, Role, ServerCallRecorded, SessionCompacted, SessionConsolidated,
+    SessionCreated, SessionEvent, SessionTitled, Source, ToolCallIssued, ToolResultRecorded, event,
+    history_entry, memory_event, memory_record, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -24,7 +24,8 @@ use crate::log;
 // 14: memory_fts indexes memory records for ranked search
 // 15: messages gained grounding_json and the server-call kind
 // 16: sessions split dispatched_by out of parent_session and gained disposition
-pub(crate) const SCHEMA_VERSION: u32 = 16;
+// 17: compactions records SessionCompacted, applied by the transcript builder
+pub(crate) const SCHEMA_VERSION: u32 = 17;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -114,6 +115,15 @@ CREATE TABLE IF NOT EXISTS session_grants (
 );
 
 CREATE INDEX IF NOT EXISTS session_grants_by_session ON session_grants (session_id);
+
+CREATE TABLE IF NOT EXISTS compactions (
+    session_id  TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    through_seq INTEGER NOT NULL,
+    summary     TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS compactions_by_session ON compactions (session_id, seq);
 ";
 
 pub(crate) const KIND_MESSAGE: i64 = 0;
@@ -418,8 +428,9 @@ impl Projection {
                 session_event::Event::SessionConsolidated(consolidated) => {
                     mark_consolidated(&tx, event, consolidated)?;
                 }
-                // applied by the compaction row; the schema lands first
-                session_event::Event::SessionCompacted(_) => {}
+                session_event::Event::SessionCompacted(compacted) => {
+                    insert_compaction(&tx, event, compacted)?;
+                }
             },
             event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
                 memory_event::Event::RecordCreated(created) => {
@@ -569,6 +580,22 @@ impl Projection {
 
     pub(crate) fn lineage_messages(&self, session_id: &str) -> Result<Vec<MessageRow>, Error> {
         lineage_messages(&self.conn, session_id)
+    }
+
+    /// Same as [`Self::lineage_messages`], keeping each row's log seq — the
+    /// compaction pass needs it to slice the transcript at `through_seq`.
+    pub(crate) fn lineage_messages_with_seq(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(u64, MessageRow)>, Error> {
+        lineage_rows(&self.conn, session_id)
+    }
+
+    /// Seqs of this session's own user-authored messages (`Role::User`,
+    /// `Source::User`), oldest first — never rows inherited from a fork
+    /// parent. The compaction cutoff is chosen from these alone.
+    pub(crate) fn own_user_message_seqs(&self, session_id: &str) -> Result<Vec<u64>, Error> {
+        own_user_message_seqs(&self.conn, session_id)
     }
 
     /// Which session a seq's row belongs to, and its kind — a fork at an
@@ -1196,14 +1223,102 @@ fn lineage_rows(conn: &Connection, session_id: &str) -> Result<Vec<(u64, Message
 
     let mut rows = Vec::new();
     for (ancestor_id, truncate_at) in chain {
-        rows.extend(
-            messages_with_seq(conn, &ancestor_id)?
-                .into_iter()
-                .filter(|(seq, _)| *seq <= truncate_at),
-        );
+        let ancestor_rows: Vec<(u64, MessageRow)> = messages_with_seq(conn, &ancestor_id)?
+            .into_iter()
+            .filter(|(seq, _)| *seq <= truncate_at)
+            .collect();
+        rows.extend(apply_compaction(
+            conn,
+            &ancestor_id,
+            Some(truncate_at),
+            ancestor_rows,
+        )?);
     }
-    rows.extend(messages_with_seq(conn, session_id)?);
+    let own_rows = messages_with_seq(conn, session_id)?;
+    rows.extend(apply_compaction(conn, session_id, None, own_rows)?);
     Ok(rows)
+}
+
+/// Replaces every row through a session's latest applicable compaction with
+/// one synthetic user-role message holding the summary; rows after it are
+/// untouched. `bound`, when set, is the fork point the caller inherited this
+/// session's rows through — a compaction recorded after that point happened
+/// on a branch the fork never saw, so it does not apply.
+fn apply_compaction(
+    conn: &Connection,
+    session_id: &str,
+    bound: Option<u64>,
+    rows: Vec<(u64, MessageRow)>,
+) -> Result<Vec<(u64, MessageRow)>, Error> {
+    let Some((_, through_seq, summary)) = latest_compaction(conn, session_id, bound)? else {
+        return Ok(rows);
+    };
+    let mut out = Vec::with_capacity(rows.len() + 1);
+    out.push((through_seq, summary_row(summary)));
+    out.extend(rows.into_iter().filter(|(seq, _)| *seq > through_seq));
+    Ok(out)
+}
+
+fn summary_row(summary: String) -> MessageRow {
+    MessageRow::Message {
+        role: Role::User as i32,
+        content: summary,
+        partial: false,
+        turn_id: String::new(),
+        source: Source::Model as i32,
+        input_tokens: 0,
+        output_tokens: 0,
+        elapsed_ms: 0,
+        grounding_json: String::new(),
+    }
+}
+
+/// The latest `SessionCompacted` recorded for `session_id` at or before
+/// `bound` (unbounded when `None`), as `(event_seq, through_seq, summary)`.
+fn latest_compaction(
+    conn: &Connection,
+    session_id: &str,
+    bound: Option<u64>,
+) -> Result<Option<(u64, u64, String)>, Error> {
+    let bound = bound.map(seq_param).transpose()?;
+    let row: Option<(i64, i64, String)> = conn
+        .query_row(
+            "SELECT seq, through_seq, summary FROM compactions
+             WHERE session_id = ?1 AND (?2 IS NULL OR seq <= ?2)
+             ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![session_id, bound],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(seq, through_seq, summary)| {
+        Ok::<_, Error>((
+            u64::try_from(seq).map_err(|_| bad_column(0, "seq out of range"))?,
+            u64::try_from(through_seq).map_err(|_| bad_column(1, "through_seq out of range"))?,
+            summary,
+        ))
+    })
+    .transpose()
+}
+
+fn own_user_message_seqs(conn: &Connection, session_id: &str) -> Result<Vec<u64>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT seq FROM messages
+         WHERE session_id = ?1 AND kind = ?2 AND role = ?3 AND source = ?4
+         ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            session_id,
+            KIND_MESSAGE,
+            Role::User as i32,
+            Source::User as i32
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    rows.map(|seq| -> Result<u64, Error> {
+        u64::try_from(seq?).map_err(|_| bad_column(0, "seq out of range").into())
+    })
+    .collect()
 }
 
 fn session_parent(conn: &Connection, session_id: &str) -> Result<Option<(String, u64)>, Error> {
@@ -1522,6 +1637,23 @@ fn insert_message(
 
 fn empty_as_null(text: &str) -> Option<&str> {
     (!text.is_empty()).then_some(text)
+}
+
+fn insert_compaction(
+    tx: &Transaction<'_>,
+    event: &Event,
+    compacted: &SessionCompacted,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO compactions (session_id, seq, through_seq, summary) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            &compacted.session_id,
+            seq_param(event.seq)?,
+            seq_param(compacted.through_seq)?,
+            &compacted.summary,
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_server_call(
@@ -1968,9 +2100,10 @@ mod tests {
     use arc_proto::v1::{
         BranchMarked, Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
         MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, ServerCallRecorded, SessionConsolidated, SessionCreated, SessionEvent, SessionRole,
-        SessionTitled, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
-        event, history_entry, memory_event, memory_record, session_event,
+        Role, ServerCallRecorded, SessionCompacted, SessionConsolidated, SessionCreated,
+        SessionEvent, SessionRole, SessionTitled, Source, ToolCallIssued, ToolOutcome,
+        ToolResultRecorded, WorkspaceGrant, event, history_entry, memory_event, memory_record,
+        session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::{Connection, OptionalExtension};
@@ -2106,6 +2239,7 @@ mod tests {
 
     fn expected_tables() -> Vec<String> {
         [
+            "compactions",
             "memory_fts",
             "memory_fts_config",
             "memory_fts_content",
@@ -2905,6 +3039,37 @@ mod tests {
         event
     }
 
+    fn session_compacted(seq: u64, session_id: &str, through_seq: u64, summary: &str) -> Event {
+        Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionCompacted(SessionCompacted {
+                    session_id: session_id.to_owned(),
+                    through_seq,
+                    summary: summary.to_owned(),
+                    prompt_version: "v1".to_owned(),
+                    model: "test-model".to_owned(),
+                })),
+            })),
+        }
+    }
+
+    fn summary_row(summary: &str) -> MessageRow {
+        MessageRow::Message {
+            role: Role::User as i32,
+            content: summary.to_owned(),
+            partial: false,
+            turn_id: String::new(),
+            source: Source::Model as i32,
+            input_tokens: 0,
+            output_tokens: 0,
+            elapsed_ms: 0,
+            grounding_json: String::new(),
+        }
+    }
+
     fn message_row(content: &str) -> MessageRow {
         MessageRow::Message {
             role: Role::User as i32,
@@ -3005,6 +3170,119 @@ mod tests {
         // must return rather than loop forever; content is secondary here
         let lineage = super::lineage_messages(&projection.conn, "s-a").expect("lineage");
         assert_eq!(lineage, []);
+    }
+
+    #[test]
+    fn a_compaction_replaces_its_prefix_with_the_summary_and_keeps_the_rest_verbatim() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        projection
+            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
+            .expect("apply");
+        projection.apply(&message_appended(5, "m5")).expect("apply");
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-01").expect("lineage"),
+            [
+                summary_row("Goal\ncatching up"),
+                message_row("m3"),
+                message_row("m5")
+            ]
+        );
+    }
+
+    #[test]
+    fn replaying_a_compacted_log_twice_gives_the_same_transcript() {
+        let mut first = Projection::in_memory().expect("open");
+        first.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            first
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        first
+            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
+            .expect("apply");
+        first.apply(&message_appended(5, "m5")).expect("apply");
+        let once = super::lineage_messages(&first.conn, "s-01").expect("lineage");
+
+        let mut second = Projection::in_memory().expect("open");
+        second.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            second
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        second
+            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
+            .expect("apply");
+        second.apply(&message_appended(5, "m5")).expect("apply");
+        let twice = super::lineage_messages(&second.conn, "s-01").expect("lineage");
+
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_fork_before_the_compaction_event_inherits_the_full_prefix() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        // forked at m2 (seq 2), before the compaction at seq 4
+        projection
+            .apply(&fork_created(3, "s-fork", "s-01", 2))
+            .expect("apply");
+        projection
+            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
+            .expect("apply");
+        projection
+            .apply(&message_appended_for(5, "s-fork", "b1"))
+            .expect("apply");
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
+            ["m1", "m2", "b1"].map(message_row)
+        );
+    }
+
+    #[test]
+    fn a_fork_after_the_compaction_event_inherits_the_summary() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("apply");
+        for seq in 1..=3 {
+            projection
+                .apply(&message_appended(seq, &format!("m{seq}")))
+                .expect("apply");
+        }
+        projection
+            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
+            .expect("apply");
+        projection.apply(&message_appended(5, "m4")).expect("apply");
+        // forked at m4 (seq 5), after the compaction at seq 4
+        projection
+            .apply(&fork_created(6, "s-fork", "s-01", 5))
+            .expect("apply");
+        projection
+            .apply(&message_appended_for(7, "s-fork", "b1"))
+            .expect("apply");
+
+        assert_eq!(
+            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
+            [
+                summary_row("Goal\ncatching up"),
+                message_row("m3"),
+                message_row("m4"),
+                message_row("b1")
+            ]
+        );
     }
 
     fn branch_marked(seq: u64, id: &str, disposition: i32) -> Event {

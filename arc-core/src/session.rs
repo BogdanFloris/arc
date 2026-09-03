@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
     BranchMarked, Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role,
-    ServerCallRecorded, SessionAppended, SessionCreated, SessionEvent, SessionRole, Source,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, branch_marked,
+    ServerCallRecorded, SessionAppended, SessionCompacted, SessionCreated, SessionEvent,
+    SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
+    branch_marked,
 };
 use arc_proto::v1::{event, memory_event, notification, session_event};
 use futures::StreamExt as _;
@@ -53,6 +54,9 @@ pub struct Runner {
     pub thinking: Thinking,
     /// The concierge's identity file, or a job's spawn-built preamble.
     pub system: Option<String>,
+    /// The prompt-token count that triggers compaction (§4.4); `None` for a
+    /// role with no configured `context_window`, which never compacts.
+    pub compact_at: Option<u32>,
 }
 
 // never held across an .await: it fences a single append batch or
@@ -251,6 +255,15 @@ impl Engine {
             }
             None => false,
         }
+    }
+
+    /// Whether a turn is currently driving this session — the same registry
+    /// `cancel_turn` checks, read without sending anything.
+    pub fn turn_is_live(&self, session_id: &str) -> bool {
+        self.cancels
+            .lock()
+            .expect("cancels lock poisoned")
+            .contains_key(session_id)
     }
 
     /// Queues a message into a session's live turn, delivered at its next
@@ -1099,6 +1112,7 @@ impl Engine {
             session_id,
         };
 
+        let mut compacted = false;
         let reply = loop {
             // the last step offers no tools, so the model has to answer
             let last_step = steps >= max_tool_steps(runner.role);
@@ -1110,7 +1124,7 @@ impl Engine {
                 sources,
             );
 
-            let (ending, text, reasoning, calls) = self
+            let (ending, text, reasoning, calls, step_usage) = self
                 .run_completion(
                     runner,
                     session_id,
@@ -1123,6 +1137,10 @@ impl Engine {
                     &mut cancel_rx,
                 )
                 .await?;
+            let over_budget = !compacted
+                && runner.compact_at.is_some_and(|limit| {
+                    step_usage.is_some_and(|usage| usage.input_tokens >= limit)
+                });
 
             match ending {
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
@@ -1165,6 +1183,15 @@ impl Engine {
                         });
                     }
                     self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
+                    if over_budget {
+                        compacted = true;
+                        if self.compact(runner, session_id, turn_id).await? {
+                            let rows = self.with_store(|store| {
+                                store.projection().lineage_messages(session_id)
+                            })?;
+                            transcript = rebuild_transcript(&rows);
+                        }
+                    }
                 }
                 Ending::Done(_) => {
                     let elapsed_ms = elapsed_ms_since(turn_start);
@@ -1186,6 +1213,9 @@ impl Engine {
                     // the turn going instead of ending it unanswered
                     if self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)? {
                         continue;
+                    }
+                    if over_budget {
+                        self.compact(runner, session_id, turn_id).await?;
                     }
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
@@ -1286,11 +1316,12 @@ impl Engine {
         server_calls: &mut ServerCalls,
         grounding: &mut Option<String>,
         cancel_rx: &mut watch::Receiver<bool>,
-    ) -> Result<(Ending, String, String, Vec<ToolCall>), Error> {
+    ) -> Result<(Ending, String, String, Vec<ToolCall>, Option<Usage>), Error> {
         let mut stream = runner.provider.complete(request).await?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();
+        let mut step_usage: Option<Usage> = None;
         let ending = loop {
             let delta = tokio::select! {
                 _ = cancel_rx.changed() => break Ending::Cut { cancelled: true },
@@ -1367,6 +1398,7 @@ impl Engine {
                     let total = total_usage.get_or_insert(Usage::default());
                     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
                     total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+                    step_usage = Some(usage);
                     break Ending::Done(stop);
                 }
                 Some(Err(error)) => break Ending::Failed(error),
@@ -1374,7 +1406,7 @@ impl Engine {
             }
         };
         let (text, reasoning) = split_leaked_thinking(text, reasoning);
-        Ok((ending, text, reasoning, calls))
+        Ok((ending, text, reasoning, calls, step_usage))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1775,6 +1807,188 @@ impl Engine {
         )
     }
 
+    /// Replaces the session's transcript through a cutoff seq with one
+    /// summary the runner's own model writes (§4.4). Returns whether a
+    /// `SessionCompacted` event was appended; `false` covers every reason it
+    /// wasn't — nothing to compact, a provider error, a summary that failed
+    /// validation — and the turn (or the hand-triggered `:compact`) is meant
+    /// to carry on uncompacted in every one of them.
+    #[tracing::instrument(
+        name = "session.compact",
+        skip_all,
+        fields(
+            role = provider::role_label(runner.role),
+            session_id,
+            turn_id = %turn_id,
+            through_seq = tracing::field::Empty,
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        )
+    )]
+    pub async fn compact(
+        &self,
+        runner: &Runner,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<bool, Error> {
+        let span = tracing::Span::current();
+
+        let Some(through_seq) = self.compaction_cutoff(session_id)? else {
+            tracing::info!(session_id, "nothing to compact");
+            span.record("outcome", "nothing_to_compact");
+            return Ok(false);
+        };
+        span.record("through_seq", through_seq);
+
+        let rows =
+            self.with_store(|store| store.projection().lineage_messages_with_seq(session_id))?;
+        let prefix: Vec<MessageRow> = rows
+            .iter()
+            .filter(|(seq, _)| *seq <= through_seq)
+            .map(|(_, row)| row.clone())
+            .collect();
+        if prefix.is_empty() {
+            tracing::info!(session_id, "nothing to compact");
+            span.record("outcome", "nothing_to_compact");
+            return Ok(false);
+        }
+        let users_words: Vec<&str> = rows
+            .iter()
+            .filter(|(seq, _)| *seq <= through_seq)
+            .filter_map(|(_, row)| match row {
+                MessageRow::Message {
+                    role,
+                    content,
+                    source,
+                    ..
+                } if *role == Role::User as i32 && *source == Source::User as i32 => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        let request = CompletionRequest {
+            model: runner.model.clone(),
+            role: runner.role,
+            thinking: runner.thinking,
+            system: Some(COMPACTION_PROMPT_V1.to_owned()),
+            messages: rebuild_transcript(&prefix),
+            tools: Vec::new(),
+            seed: None,
+            web: false,
+        };
+
+        let (model_text, usage) = match self.compaction_completion(runner, request).await {
+            Ok(pair) => pair,
+            Err(reason) => {
+                tracing::warn!(
+                    session_id,
+                    reason = %reason,
+                    "compaction call failed; the turn continues uncompacted"
+                );
+                span.record("outcome", "provider_error");
+                return Ok(false);
+            }
+        };
+        span.record("input_tokens", usage.input_tokens);
+        span.record("output_tokens", usage.output_tokens);
+
+        let summary = render_compaction_summary(&model_text, &users_words);
+        if let Err(reason) = validate_compaction_summary(&summary) {
+            tracing::warn!(
+                session_id,
+                reason,
+                "compaction summary failed validation; nothing appended"
+            );
+            span.record("outcome", "invalid_summary");
+            return Ok(false);
+        }
+
+        self.record(
+            Source::Model,
+            session_event::Event::SessionCompacted(SessionCompacted {
+                session_id: session_id.to_owned(),
+                through_seq,
+                summary,
+                prompt_version: COMPACTION_PROMPT_VERSION.to_owned(),
+                model: runner.model.clone(),
+            }),
+        )?;
+        span.record("outcome", "compacted");
+        Ok(true)
+    }
+
+    /// The seq to compact through: the session's own rows keep its last two
+    /// user-initiated exchanges whole (or its last one, with fewer than
+    /// three), and everything before that is fair game. `None` when there is
+    /// nothing to cut — fewer than one own user message, or that message is
+    /// already the earliest thing in the lineage.
+    fn compaction_cutoff(&self, session_id: &str) -> Result<Option<u64>, Error> {
+        let own_user_seqs =
+            self.with_store(|store| store.projection().own_user_message_seqs(session_id))?;
+        let anchor = if own_user_seqs.len() >= 3 {
+            own_user_seqs[own_user_seqs.len() - 2]
+        } else {
+            match own_user_seqs.last() {
+                Some(seq) => *seq,
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(anchor.saturating_sub(1)))
+    }
+
+    /// A single non-streamed completion for the compaction pass: no tools
+    /// offered, so a tool call back is a provider that ignored the system
+    /// prompt, not a turn to drive.
+    async fn compaction_completion(
+        &self,
+        runner: &Runner,
+        request: CompletionRequest,
+    ) -> Result<(String, Usage), String> {
+        let mut stream = runner
+            .provider
+            .complete(request)
+            .await
+            .map_err(|error| format!("provider refused the request: {error}"))?;
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        let mut finished = false;
+        while let Some(item) = stream.next().await {
+            match item.map_err(|error| format!("stream failed: {error}"))? {
+                CompletionDelta::Text(chunk) => text.push_str(&chunk),
+                CompletionDelta::Reasoning(_)
+                | CompletionDelta::ServerCall { .. }
+                | CompletionDelta::ServerResponse { .. }
+                | CompletionDelta::Grounding(_) => {}
+                CompletionDelta::ToolCall(call) => {
+                    return Err(format!(
+                        "the model called {} with no tools offered",
+                        call.name
+                    ));
+                }
+                CompletionDelta::Done {
+                    usage: step_usage,
+                    stop: Stop::EndTurn,
+                } => {
+                    usage = step_usage;
+                    finished = true;
+                }
+                CompletionDelta::Done {
+                    stop: Stop::ToolCalls,
+                    ..
+                } => {
+                    return Err("the model stopped for tool calls with no tools offered".to_owned());
+                }
+            }
+        }
+        if !finished {
+            return Err("stream cut before the model finished".to_owned());
+        }
+        Ok((text, usage))
+    }
+
     fn open_turn(
         &self,
         runner: &Runner,
@@ -1821,6 +2035,73 @@ impl Engine {
             web: sources.contains(&ToolSource::Web),
         }
     }
+}
+
+pub const COMPACTION_PROMPT_VERSION: &str = "v1";
+
+pub const COMPACTION_PROMPT_V1: &str = r#"You are ARC's compaction pass. A conversation has outgrown its context
+window; your summary replaces everything before it, and the rest of the
+conversation continues verbatim after it. Whatever you leave out is gone.
+
+Read the conversation that follows and answer with a summary under
+exactly these headings, in this order:
+
+Goal
+One or two sentences: what the user is trying to get done.
+
+Done so far
+What has actually been finished, as concrete claims, not narration of
+the conversation.
+
+Open
+What is still unresolved: outstanding questions, next steps, anything
+started but not closed.
+
+Facts to keep
+File paths, commands, decisions, and errors seen — the specifics a
+continuation needs and would otherwise have to rediscover.
+
+Summarize tool output; never quote it verbatim. Do not write a section
+for the user's own words — that is appended separately, exactly as
+written. Start your reply with the "Goal" heading and nothing before it."#;
+
+const COMPACTION_GOAL_HEADING: &str = "Goal";
+
+const USERS_WORDS_HEADING: &str = "User's words";
+
+const MAX_COMPACTION_SUMMARY_BYTES: usize = 32 * 1024;
+
+/// Appends the code-owned `User's words` section: every user-authored
+/// message in the compacted range, verbatim, in the order it was sent. The
+/// model never sees or writes this part (§4.4).
+fn render_compaction_summary(model_text: &str, users_words: &[&str]) -> String {
+    let mut summary = model_text.trim().to_owned();
+    summary.push_str("\n\n");
+    summary.push_str(USERS_WORDS_HEADING);
+    summary.push('\n');
+    if users_words.is_empty() {
+        summary.push_str("(none)\n");
+    } else {
+        for message in users_words {
+            summary.push('\n');
+            summary.push_str(message);
+            summary.push('\n');
+        }
+    }
+    summary
+}
+
+fn validate_compaction_summary(summary: &str) -> Result<(), &'static str> {
+    if summary.trim().is_empty() {
+        return Err("empty");
+    }
+    if !summary.trim_start().starts_with(COMPACTION_GOAL_HEADING) {
+        return Err("missing the Goal heading");
+    }
+    if summary.len() > MAX_COMPACTION_SUMMARY_BYTES {
+        return Err("exceeds the 32 KiB cap");
+    }
+    Ok(())
 }
 
 // frozen at session start so the prefix stays byte-stable across turns
@@ -2122,8 +2403,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, MemoryCounters,
-        ProjectSpec, Runner, branch_marked,
+        COMPACTION_PROMPT_V1, ContinuedJob, DispatchedJob, Engine, EngineEvent, Error,
+        MAX_TOOL_STEPS, MemoryCounters, ProjectSpec, Runner, branch_marked,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -3967,6 +4248,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -3996,6 +4278,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
 
         let (tx, _rx) = channel();
@@ -4209,6 +4492,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -4555,6 +4839,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -5952,6 +6237,7 @@ mod tests {
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
         let child_engine = child_engine.with_projects(projects_with(
@@ -6697,6 +6983,7 @@ mod tests {
             model: "model-b".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -6730,6 +7017,7 @@ mod tests {
             model: "model-b".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -6759,6 +7047,7 @@ mod tests {
             model: "model-a".to_owned(),
             thinking: Thinking::Default,
             system: None,
+            compact_at: None,
         };
         let (tx, _rx) = channel();
 
@@ -7506,6 +7795,222 @@ mod tests {
                 assistant_entry_with_usage("second reply", 3, 5),
             ],
             "the two turns land whole, in order, with nothing interleaved"
+        );
+    }
+
+    fn compacted_event(
+        events: &[session_event::Event],
+    ) -> Option<&arc_proto::v1::SessionCompacted> {
+        events.iter().find_map(|event| match event {
+            session_event::Event::SessionCompacted(compacted) => Some(compacted),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_step_at_the_limit_compacts_and_the_next_request_carries_the_summary() {
+        const LIMIT: u32 = 42;
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("reply1"),
+            done_reply("reply2"),
+            vec![
+                Ok(call("c1", 0, "lookup", "{}")),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: LIMIT,
+                        output_tokens: 5,
+                    },
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            done_reply("Goal\nDone so far\nOpen\nFacts to keep"),
+            done_reply("final answer"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let run = Runner {
+            compact_at: Some(LIMIT),
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("turn 1");
+        let session_id = reply.session_id;
+
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "more", tx)
+            .await
+            .expect("turn 2");
+
+        let (tx, mut rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "third question", tx)
+            .await
+            .expect("turn 3");
+        drain(&mut rx);
+
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            5,
+            "two whole turns, then step, compact, step"
+        );
+        let compaction_request = &requests[3];
+        assert_eq!(
+            compaction_request.system.as_deref(),
+            Some(COMPACTION_PROMPT_V1)
+        );
+        assert!(
+            compaction_request.tools.is_empty(),
+            "compaction never offers tools"
+        );
+
+        let logged = replay_log(dir.path());
+        let compacted = compacted_event(&logged).expect("a SessionCompacted event landed");
+        assert!(
+            compacted.summary.starts_with("Goal"),
+            "{}",
+            compacted.summary
+        );
+        assert!(
+            compacted.summary.contains("hi"),
+            "the user's own words carry over verbatim: {}",
+            compacted.summary
+        );
+
+        let (role, content) = turn(&requests[4].messages[0]);
+        assert_eq!(role, Role::User);
+        assert!(content.starts_with("Goal"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn a_step_under_the_limit_never_compacts() {
+        const LIMIT: u32 = 42;
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("reply1"),
+            done_reply("reply2"),
+            vec![
+                Ok(CompletionDelta::Text("under budget".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: LIMIT - 1,
+                        output_tokens: 5,
+                    },
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
+        let run = Runner {
+            compact_at: Some(LIMIT),
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("turn 1");
+        let session_id = reply.session_id;
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "more", tx)
+            .await
+            .expect("turn 2");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "third question", tx)
+            .await
+            .expect("turn 3");
+
+        assert_eq!(provider.requests().len(), 3, "no compaction call was made");
+        assert!(compacted_event(&replay_log(dir.path())).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_runner_with_no_context_window_never_compacts_however_large_the_usage() {
+        let provider = ScriptedProvider::scripted(vec![vec![
+            Ok(CompletionDelta::Text("no window configured".to_owned())),
+            Ok(CompletionDelta::Done {
+                usage: Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 5,
+                },
+                stop: Stop::EndTurn,
+            }),
+        ]]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
+        let run = Runner {
+            compact_at: None,
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "hello", tx)
+            .await
+            .expect("turn");
+
+        assert_eq!(provider.requests().len(), 1, "no compaction call was made");
+        assert!(compacted_event(&replay_log(dir.path())).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_summary_missing_the_goal_heading_appends_nothing_and_the_turn_finishes_normally() {
+        const LIMIT: u32 = 42;
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("reply1"),
+            done_reply("reply2"),
+            vec![
+                Ok(call("c1", 0, "lookup", "{}")),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: LIMIT,
+                        output_tokens: 5,
+                    },
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            done_reply("not a heading at all"),
+            done_reply("final answer"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let run = Runner {
+            compact_at: Some(LIMIT),
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("turn 1");
+        let session_id = reply.session_id;
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&session_id), "more", tx)
+            .await
+            .expect("turn 2");
+        let (tx, mut rx) = channel();
+        let reply = engine
+            .send_message(&run, Some(&session_id), "third question", tx)
+            .await
+            .expect("the turn finishes normally, uncompacted");
+        drain(&mut rx);
+
+        assert!(!reply.partial);
+        assert!(
+            compacted_event(&replay_log(dir.path())).is_none(),
+            "an invalid summary writes nothing to the log"
         );
     }
 }

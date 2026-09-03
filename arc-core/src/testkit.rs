@@ -129,6 +129,7 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
         model: "test-model".to_owned(),
         thinking: Thinking::Default,
         system: Some("be terse".to_owned()),
+        compact_at: None,
     }
 }
 
