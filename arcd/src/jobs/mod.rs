@@ -6,29 +6,26 @@ mod tests_common;
 mod turn;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_core::provider::role_label;
-use arc_core::session::{ContinuedJob, DispatchedJob, Engine, Runner};
-use arc_proto::v1::{JobInfo, Notification, ProjectInfo, SessionRole};
+use arc_core::session::{
+    ContinuedJob, DispatchedJob, Engine, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
+};
+use arc_proto::v1::{JobInfo, Notification, ProjectInfo, SessionRole, Source};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use handback::{Handback, HandbackCtx, handback_crashed, job_title, record_handback};
+use handback::{Autonomy, handback_crashed, job_title, record_handback};
 use prompt::job_system_prompt;
 use status::{JobState, JobStatuses, notify_job_changed};
-use turn::run_job;
+use turn::{EVENT_BUFFER, Task, run_task};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-pub(super) struct Steer {
-    pub(super) text: String,
-    pub(super) from_user: bool,
-}
 
 /// The root a job works in and the wrapper its commands run under.
 #[derive(Debug, Clone)]
@@ -46,135 +43,97 @@ impl From<PathBuf> for Project {
     }
 }
 
-struct LiveJob {
-    steer_tx: mpsc::UnboundedSender<Steer>,
+/// A session with a task running its turns. The inbox holds messages that
+/// arrived while the task was between turns; a message that arrives while a
+/// turn is actually live goes to the engine instead, which delivers it at
+/// the turn's next step boundary.
+struct LiveSession {
+    inbox: mpsc::UnboundedSender<Inbound>,
     cancel: watch::Sender<bool>,
     drop_tx: mpsc::UnboundedSender<()>,
 }
 
-type LiveMap = Mutex<HashMap<String, LiveJob>>;
+type LiveMap = Mutex<HashMap<String, LiveSession>>;
 type Handles = Mutex<Vec<JoinHandle<()>>>;
 
-pub struct Supervisor {
+/// What a turn's task streams to the connection that started it.
+pub enum TurnEvent {
+    Engine(EngineEvent),
+    Ended(Result<Reply, SessionError>),
+}
+
+pub enum SendOutcome {
+    /// The message started a turn. `events` carries it when the caller
+    /// asked to be attached.
+    Started {
+        session_id: String,
+        events: Option<mpsc::Receiver<TurnEvent>>,
+    },
+    /// The session was already working: the message lands in the running
+    /// turn, or as the task's next turn.
+    Queued { session_id: String },
+}
+
+#[derive(Clone)]
+pub(crate) struct Shared {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
+    concierge: Option<Runner>,
     projects: BTreeMap<String, Project>,
-    handles: Arc<Handles>,
+    identity: Option<String>,
     live: Arc<LiveMap>,
     statuses: Arc<JobStatuses>,
     notifier: Option<broadcast::Sender<Notification>>,
-    handback: Option<Arc<Handback>>,
-    identity: Option<String>,
+    handles: Arc<Handles>,
+    autonomy: Arc<Autonomy>,
+}
+
+pub struct Supervisor {
+    shared: Shared,
     project_list: Vec<ProjectInfo>,
 }
 
 impl Supervisor {
     pub fn new(engine: Arc<Engine>, runners: BTreeMap<SessionRole, Runner>) -> Self {
         Self {
-            engine,
-            runners,
-            projects: BTreeMap::new(),
-            handles: Arc::new(Mutex::new(Vec::new())),
-            live: Arc::new(Mutex::new(HashMap::new())),
-            statuses: Arc::new(JobStatuses::new()),
-            notifier: None,
-            handback: None,
-            identity: None,
+            shared: Shared {
+                engine,
+                runners,
+                concierge: None,
+                projects: BTreeMap::new(),
+                identity: None,
+                live: Arc::new(Mutex::new(HashMap::new())),
+                statuses: Arc::new(JobStatuses::new()),
+                notifier: None,
+                handles: Arc::new(Mutex::new(Vec::new())),
+                autonomy: Arc::new(Autonomy::new()),
+            },
             project_list: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_projects(mut self, projects: BTreeMap<String, Project>) -> Self {
-        self.projects = projects;
+        self.shared.projects = projects;
         self
     }
 
     #[must_use]
     pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
-        self.notifier = Some(notifier);
+        self.shared.notifier = Some(notifier);
         self
     }
 
     #[must_use]
     pub fn with_concierge(mut self, runner: Runner) -> Self {
-        self.handback = Some(Arc::new(Handback::new(runner)));
+        self.shared.concierge = Some(runner);
         self
     }
 
     #[must_use]
     pub fn with_identity(mut self, identity: Option<String>) -> Self {
-        self.identity = identity;
+        self.shared.identity = identity;
         self
-    }
-
-    pub fn spawn(&self, job: DispatchedJob) {
-        spawn_job(
-            job,
-            &self.engine,
-            &self.runners,
-            &self.projects,
-            &self.live,
-            &self.statuses,
-            self.notifier.as_ref(),
-            self.handback.as_ref(),
-            &self.handles,
-        );
-    }
-
-    pub fn reset_autonomy(&self, session_id: &str) {
-        if let Some(handback) = &self.handback {
-            handback.reset_autonomy(session_id);
-        }
-    }
-
-    pub fn list(&self) -> Vec<JobInfo> {
-        let mut jobs = self.statuses.list();
-        for job in &mut jobs {
-            job.title = self.title(&job.session_id);
-        }
-        jobs
-    }
-
-    fn title(&self, session_id: &str) -> String {
-        job_title(&self.engine, session_id)
-    }
-
-    pub fn steer(&self, session_id: &str, text: &str) -> bool {
-        let queued = steer_live(&self.live, session_id, text, true);
-        if queued {
-            if let Some(info) = self.statuses.record_steer_queued(session_id) {
-                notify_job_changed(self.notifier.as_ref(), &self.engine, info);
-            }
-        }
-        queued
-    }
-
-    pub fn cancel(&self, session_id: &str) -> bool {
-        cancel_live(&self.live, session_id)
-    }
-
-    pub fn drop_steers(&self, session_id: &str) -> bool {
-        let live = self.live.lock().expect("live");
-        let Some(job) = live.get(session_id) else {
-            return false;
-        };
-        let _ = job.drop_tx.send(());
-        true
-    }
-
-    pub fn job_runner(&self, role: SessionRole) -> Option<&Runner> {
-        self.runners.get(&role)
-    }
-
-    pub(crate) fn project_root(&self, project: &str) -> Option<&Path> {
-        self.projects
-            .get(project)
-            .map(|project| project.root.as_path())
-    }
-
-    pub(crate) fn identity(&self) -> Option<&str> {
-        self.identity.as_deref()
     }
 
     #[must_use]
@@ -183,41 +142,74 @@ impl Supervisor {
         self
     }
 
+    /// The one way a message reaches a session. A live turn takes it at its
+    /// next step boundary, a task between turns runs it next, and an idle
+    /// session gets a task of its own — for a user message always, for a
+    /// system message until the autonomy cap.
+    pub fn send(
+        &self,
+        session_id: Option<&str>,
+        content: &str,
+        source: Source,
+        attach: bool,
+    ) -> Result<SendOutcome, SessionError> {
+        send_into(&self.shared, session_id, content, source, attach)
+    }
+
+    /// Dispatch and resume, for tests. A turn that dispatches routes its
+    /// own children as it ends; nothing else starts a job.
+    #[cfg(test)]
+    pub fn spawn(&self, job: DispatchedJob) {
+        spawn_job(&self.shared, job);
+    }
+
+    #[cfg(test)]
+    pub fn continue_job(&self, cont: ContinuedJob) {
+        route_continue(&self.shared, cont);
+    }
+
+    pub fn list(&self) -> Vec<JobInfo> {
+        let mut jobs = self.shared.statuses.list();
+        for job in &mut jobs {
+            job.title = job_title(&self.shared.engine, &job.session_id);
+        }
+        jobs
+    }
+
+    pub fn cancel(&self, session_id: &str) -> bool {
+        cancel_live(&self.shared.live, session_id)
+    }
+
+    pub fn drop_steers(&self, session_id: &str) -> bool {
+        let live = self.shared.live.lock().expect("live");
+        let Some(session) = live.get(session_id) else {
+            return false;
+        };
+        let _ = session.drop_tx.send(());
+        true
+    }
+
+    /// What a new session of this role would run under: the role's own
+    /// runner, or the concierge's when the role has none configured.
+    pub(crate) fn role_runner(&self, role: SessionRole) -> Option<Runner> {
+        self.shared
+            .runners
+            .get(&role)
+            .cloned()
+            .or_else(|| self.shared.concierge.clone())
+    }
+
     pub(crate) fn project_list(&self) -> &[ProjectInfo] {
         &self.project_list
     }
 
-    pub fn continue_job(&self, cont: ContinuedJob) {
-        let ctx = HandbackCtx {
-            engine: &self.engine,
-            runners: &self.runners,
-            projects: &self.projects,
-            live: &self.live,
-            statuses: &self.statuses,
-            notifier: self.notifier.as_ref(),
-            handles: &self.handles,
-            handback: self.handback.as_ref(),
-        };
-        route_continue(&ctx, cont);
-    }
-
-    pub async fn repair_restart_handbacks(&self) {
-        let unfinished = match self.engine.unfinished_jobs() {
+    pub fn repair_restart_handbacks(&self) {
+        let unfinished = match self.shared.engine.unfinished_jobs() {
             Ok(unfinished) => unfinished,
             Err(error) => {
                 warn!(%error, "could not scan for unconcluded jobs at startup; skipping restart repair");
                 return;
             }
-        };
-        let ctx = HandbackCtx {
-            engine: &self.engine,
-            runners: &self.runners,
-            projects: &self.projects,
-            live: &self.live,
-            statuses: &self.statuses,
-            notifier: self.notifier.as_ref(),
-            handles: &self.handles,
-            handback: self.handback.as_ref(),
         };
         for job in unfinished {
             info!(
@@ -225,14 +217,20 @@ impl Supervisor {
                 parent_session = %job.parent_session,
                 "handing back a job left unfinished by the last restart"
             );
-            record_handback(&ctx, &job, Some("the daemon restarted")).await;
+            record_handback(&self.shared, &job, Some("the daemon restarted"));
         }
     }
 
     pub async fn shutdown(&self) {
         let draining = async {
             loop {
-                let handles: Vec<_> = self.handles.lock().expect("handles").drain(..).collect();
+                let handles: Vec<_> = self
+                    .shared
+                    .handles
+                    .lock()
+                    .expect("handles")
+                    .drain(..)
+                    .collect();
                 if handles.is_empty() {
                     return;
                 }
@@ -243,37 +241,186 @@ impl Supervisor {
             .await
             .is_err()
         {
-            warn!("shutdown grace expired; abandoning outstanding jobs");
+            warn!("shutdown grace expired; abandoning outstanding tasks");
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_dispatched(ctx: &HandbackCtx<'_>, jobs: Vec<DispatchedJob>) {
+fn send_into(
+    shared: &Shared,
+    session_id: Option<&str>,
+    content: &str,
+    source: Source,
+    attach: bool,
+) -> Result<SendOutcome, SessionError> {
+    if content.trim().is_empty() {
+        return Err(SessionError::EmptyMessage);
+    }
+    // a user message ends whatever chain of system-started turns was running
+    if source == Source::User {
+        if let Some(session_id) = session_id {
+            shared.autonomy.reset(session_id);
+        }
+    }
+
+    let mut live = shared.live.lock().expect("live");
+    if let Some(session_id) = session_id {
+        if let Some(queued) = deliver_live(shared, &live, session_id, content, source) {
+            return Ok(queued);
+        }
+    }
+
+    let (session_id, runner) = if let Some(session_id) = session_id {
+        (session_id.to_owned(), turn_runner(shared, session_id)?)
+    } else {
+        let runner = concierge_runner(shared)?;
+        (shared.engine.create_session(&runner)?, runner)
+    };
+    if !autonomy_allows(shared, &session_id, content, source) {
+        return Ok(SendOutcome::Queued { session_id });
+    }
+
+    let (events, receiver) = if attach {
+        let (events, receiver) = mpsc::channel(EVENT_BUFFER);
+        (Some(events), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let task = Task {
+        job: DispatchedJob {
+            session_id: session_id.clone(),
+            parent_session: String::new(),
+            role: runner.role,
+            project: String::new(),
+            brief: content.to_owned(),
+            budget: None,
+        },
+        dispatched: false,
+        source,
+        attached: events,
+        spent_tokens: 0,
+    };
+    spawn_task(shared, &mut live, runner, task);
+    Ok(SendOutcome::Started {
+        session_id,
+        events: receiver,
+    })
+}
+
+/// Hands a message to the session's live task, if it has one: into the
+/// running turn, or into the task's inbox as its next turn. `None` means
+/// there is no task to take it.
+fn deliver_live(
+    shared: &Shared,
+    live: &HashMap<String, LiveSession>,
+    session_id: &str,
+    content: &str,
+    source: Source,
+) -> Option<SendOutcome> {
+    let session = live.get(session_id)?;
+    if shared.engine.queue_message(session_id, content, source) {
+        return Some(SendOutcome::Queued {
+            session_id: session_id.to_owned(),
+        });
+    }
+    if !autonomy_allows(shared, session_id, content, source) {
+        return Some(SendOutcome::Queued {
+            session_id: session_id.to_owned(),
+        });
+    }
+    let sent = session
+        .inbox
+        .send(Inbound {
+            content: content.to_owned(),
+            source,
+        })
+        .is_ok();
+    if !sent {
+        return None;
+    }
+    if let Some(info) = shared.statuses.record_steer_queued(session_id) {
+        notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+    }
+    Some(SendOutcome::Queued {
+        session_id: session_id.to_owned(),
+    })
+}
+
+/// A handback that would start a turn of its own is capped once a parent
+/// has narrated `MAX_HANDBACK_TURNS` of them with no user message between:
+/// past that it lands in the log and stops there (DESIGN.md §4.1).
+fn autonomy_allows(shared: &Shared, session_id: &str, content: &str, source: Source) -> bool {
+    if source != Source::System || shared.autonomy.claim(session_id) {
+        return true;
+    }
+    warn!(
+        session_id,
+        "consecutive system-started turns hit the autonomy cap; appending without a turn"
+    );
+    if let Err(error) = shared.engine.append_message(session_id, content, source) {
+        warn!(session_id, %error, "could not append the capped message");
+    }
+    false
+}
+
+fn concierge_runner(shared: &Shared) -> Result<Runner, SessionError> {
+    shared
+        .concierge
+        .clone()
+        .ok_or_else(|| SessionError::NoRunner {
+            role: role_label(SessionRole::Concierge).to_owned(),
+        })
+}
+
+/// The runner a session the user (or a handback) writes into runs under,
+/// fixed for the task's lifetime so its prompt prefix stays byte-stable.
+fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError> {
+    let role = match shared.engine.session_role(session_id) {
+        Ok(role) => role.unwrap_or(SessionRole::Unspecified),
+        Err(error) => {
+            warn!(session_id, %error, "could not read the session's role; serving it as a concierge");
+            SessionRole::Unspecified
+        }
+    };
+    let (SessionRole::Executor | SessionRole::Archivist) = role else {
+        return concierge_runner(shared);
+    };
+    let mut runner = match shared.runners.get(&role) {
+        Some(runner) => runner.clone(),
+        None => concierge_runner(shared)?,
+    };
+    if role == SessionRole::Executor {
+        if let Some(prompt) = direct_system_prompt_for(shared, session_id) {
+            runner.system = Some(prompt);
+        }
+    }
+    Ok(runner)
+}
+
+fn direct_system_prompt_for(shared: &Shared, session_id: &str) -> Option<String> {
+    let project = shared.engine.session_project(session_id).ok().flatten()?;
+    let root = &shared.projects.get(&project)?.root;
+    Some(prompt::direct_system_prompt(
+        root,
+        shared.identity.as_deref(),
+    ))
+}
+
+fn spawn_dispatched(shared: &Shared, jobs: Vec<DispatchedJob>) {
     for job in jobs {
-        spawn_job(
-            job,
-            ctx.engine,
-            ctx.runners,
-            ctx.projects,
-            ctx.live,
-            ctx.statuses,
-            ctx.notifier,
-            ctx.handback,
-            ctx.handles,
-        );
+        spawn_job(shared, job);
     }
 }
 
-fn route_continues(ctx: &HandbackCtx<'_>, continues: Vec<ContinuedJob>) {
+fn route_continues(shared: &Shared, continues: Vec<ContinuedJob>) {
     for cont in continues {
-        route_continue(ctx, cont);
+        route_continue(shared, cont);
     }
 }
 
-fn route_cancels(ctx: &HandbackCtx<'_>, cancels: Vec<String>) {
+fn route_cancels(shared: &Shared, cancels: Vec<String>) {
     for session_id in cancels {
-        if !cancel_live(ctx.live, &session_id) {
+        if !cancel_live(&shared.live, &session_id) {
             warn!(session_id, "cancel_job named a job that wasn't live");
         }
     }
@@ -281,45 +428,24 @@ fn route_cancels(ctx: &HandbackCtx<'_>, cancels: Vec<String>) {
 
 fn cancel_live(live: &LiveMap, session_id: &str) -> bool {
     let live = live.lock().expect("live");
-    let Some(job) = live.get(session_id) else {
+    let Some(session) = live.get(session_id) else {
         return false;
     };
-    let _ = job.cancel.send(true);
+    let _ = session.cancel.send(true);
     true
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_job(
-    job: DispatchedJob,
-    engine: &Arc<Engine>,
-    runners: &BTreeMap<SessionRole, Runner>,
-    projects: &BTreeMap<String, Project>,
-    live: &Arc<LiveMap>,
-    statuses: &Arc<JobStatuses>,
-    notifier: Option<&broadcast::Sender<Notification>>,
-    handback: Option<&Arc<Handback>>,
-    handles: &Arc<Handles>,
-) {
-    spawn_job_checked(
-        job, engine, runners, projects, live, statuses, notifier, handback, handles, false, 0,
-    );
+fn spawn_job(shared: &Shared, job: DispatchedJob) {
+    spawn_job_checked(shared, job, false, 0);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_job_checked(
+    shared: &Shared,
     job: DispatchedJob,
-    engine: &Arc<Engine>,
-    runners: &BTreeMap<SessionRole, Runner>,
-    projects: &BTreeMap<String, Project>,
-    live: &Arc<LiveMap>,
-    statuses: &Arc<JobStatuses>,
-    notifier: Option<&broadcast::Sender<Notification>>,
-    handback: Option<&Arc<Handback>>,
-    handles: &Arc<Handles>,
     guard_absent: bool,
     initial_spent_tokens: u64,
 ) -> bool {
-    let Some(mut runner) = runners.get(&job.role).cloned() else {
+    let Some(mut runner) = shared.runners.get(&job.role).cloned() else {
         warn!(
             session_id = %job.session_id,
             role = role_label(job.role),
@@ -327,144 +453,126 @@ fn spawn_job_checked(
         );
         return false;
     };
-    if let Some(project) = projects.get(&job.project) {
+    if let Some(project) = shared.projects.get(&job.project) {
         runner.system = Some(job_system_prompt(&project.root));
     }
-    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (drop_tx, drop_rx) = mpsc::unbounded_channel();
-    {
-        let mut live_guard = live.lock().expect("live");
-        if guard_absent && live_guard.contains_key(&job.session_id) {
-            warn!(
-                session_id = %job.session_id,
-                "continue_job raced with another resume of the same job; skipping"
-            );
-            return false;
-        }
-        live_guard.insert(
-            job.session_id.clone(),
-            LiveJob {
-                steer_tx,
-                cancel: cancel_tx,
-                drop_tx,
-            },
+    let mut live = shared.live.lock().expect("live");
+    if guard_absent && live.contains_key(&job.session_id) {
+        warn!(
+            session_id = %job.session_id,
+            "continue_job raced with another resume of the same job; skipping"
         );
+        return false;
     }
-    let info = statuses.start(&job, initial_spent_tokens);
-    notify_job_changed(notifier, engine, info);
-    let handle = spawn_watched(
+    let info = shared.statuses.start(&job, initial_spent_tokens);
+    notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+    let task = Task {
         job,
-        Arc::clone(engine),
-        runner,
-        steer_rx,
-        cancel_rx,
-        drop_rx,
-        Arc::clone(live),
-        Arc::clone(statuses),
-        notifier.cloned(),
-        runners.clone(),
-        projects.clone(),
-        handback.cloned(),
-        Arc::clone(handles),
-    );
-    let mut handles = handles.lock().expect("handles");
-    // reap finished wrappers so a long-lived daemon's history stays bounded
-    handles.retain(|held| !held.is_finished());
-    handles.push(handle);
+        dispatched: true,
+        source: Source::User,
+        attached: None,
+        spent_tokens: initial_spent_tokens,
+    };
+    spawn_task(shared, &mut live, runner, task);
     true
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_watched(
-    job: DispatchedJob,
-    engine: Arc<Engine>,
+fn spawn_task(
+    shared: &Shared,
+    live: &mut HashMap<String, LiveSession>,
     runner: Runner,
-    steer_rx: mpsc::UnboundedReceiver<Steer>,
+    task: Task,
+) {
+    let (inbox, inbox_rx) = mpsc::unbounded_channel();
+    let (cancel, cancel_rx) = watch::channel(false);
+    let (drop_tx, drop_rx) = mpsc::unbounded_channel();
+    live.insert(
+        task.job.session_id.clone(),
+        LiveSession {
+            inbox,
+            cancel,
+            drop_tx,
+        },
+    );
+    let handle = spawn_watched(shared.clone(), runner, task, inbox_rx, cancel_rx, drop_rx);
+    let mut handles = shared.handles.lock().expect("handles");
+    // reap finished wrappers so a long-lived daemon's history stays bounded
+    handles.retain(|held| !held.is_finished());
+    handles.push(handle);
+}
+
+fn spawn_watched(
+    shared: Shared,
+    runner: Runner,
+    task: Task,
+    inbox_rx: mpsc::UnboundedReceiver<Inbound>,
     cancel_rx: watch::Receiver<bool>,
     drop_rx: mpsc::UnboundedReceiver<()>,
-    live: Arc<LiveMap>,
-    statuses: Arc<JobStatuses>,
-    notifier: Option<broadcast::Sender<Notification>>,
-    runners: BTreeMap<SessionRole, Runner>,
-    projects: BTreeMap<String, Project>,
-    handback: Option<Arc<Handback>>,
-    handles: Arc<Handles>,
 ) -> JoinHandle<()> {
-    let recovery_job = job.clone();
+    let recovery = task.job.clone();
+    let dispatched = task.dispatched;
     let start = Instant::now();
     tokio::spawn(async move {
-        let inner = tokio::spawn(run_job(
-            Arc::clone(&engine),
+        let inner = tokio::spawn(run_task(
+            shared.clone(),
             runner,
-            job,
-            steer_rx,
+            task,
+            inbox_rx,
             cancel_rx,
             drop_rx,
-            Arc::clone(&live),
-            Arc::clone(&statuses),
-            notifier.clone(),
-            runners.clone(),
-            projects.clone(),
-            handback.clone(),
-            Arc::clone(&handles),
         ));
         if let Err(join_error) = inner.await {
             if !join_error.is_panic() {
                 return;
             }
             warn!(
-                session_id = %recovery_job.session_id,
-                "job task panicked; forcing it to failed"
+                session_id = %recovery.session_id,
+                "session task panicked; forcing it to failed"
             );
-            live.lock().expect("live").remove(&recovery_job.session_id);
-            if let Some(info) =
-                statuses.finish(&recovery_job.session_id, JobState::Failed, start.elapsed())
-            {
-                notify_job_changed(notifier.as_ref(), &engine, info);
+            shared
+                .live
+                .lock()
+                .expect("live")
+                .remove(&recovery.session_id);
+            if !dispatched {
+                return;
             }
-            let ctx = HandbackCtx {
-                engine: &engine,
-                runners: &runners,
-                projects: &projects,
-                live: &live,
-                statuses: &statuses,
-                notifier: notifier.as_ref(),
-                handles: &handles,
-                handback: handback.as_ref(),
-            };
-            handback_crashed(&ctx, &recovery_job).await;
+            if let Some(info) =
+                shared
+                    .statuses
+                    .finish(&recovery.session_id, JobState::Failed, start.elapsed())
+            {
+                notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+            }
+            handback_crashed(&shared, &recovery);
         }
     })
 }
 
-fn steer_live(live: &LiveMap, session_id: &str, text: &str, from_user: bool) -> bool {
-    let live = live.lock().expect("live");
-    live.get(session_id).is_some_and(|job| {
-        job.steer_tx
-            .send(Steer {
-                text: text.to_owned(),
-                from_user,
-            })
-            .is_ok()
-    })
-}
-
-fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
-    if steer_live(ctx.live, &cont.session_id, &cont.message, false) {
-        if let Some(info) = ctx.statuses.record_steer_queued(&cont.session_id) {
-            notify_job_changed(ctx.notifier, ctx.engine, info);
+fn route_continue(shared: &Shared, cont: ContinuedJob) {
+    {
+        let live = shared.live.lock().expect("live");
+        if deliver_live(
+            shared,
+            &live,
+            &cont.session_id,
+            &cont.message,
+            Source::Model,
+        )
+        .is_some()
+        {
+            info!(session_id = %cont.session_id, "continue_job queued into the live job");
+            return;
         }
-        info!(session_id = %cont.session_id, "continue_job queued into the live job");
-        return;
     }
     let session_id = cont.session_id.clone();
     // a resume's strip counter seeds from durable usage, not zero (row 6.37)
-    let initial_spent_tokens = ctx.engine.session_usage_tokens(&session_id).unwrap_or_else(|error| {
+    let initial_spent_tokens = shared.engine.session_usage_tokens(&session_id).unwrap_or_else(|error| {
         warn!(session_id, %error, "could not read the job's durable usage; resuming its counter at zero");
         0
     });
     let resumed = spawn_job_checked(
+        shared,
         DispatchedJob {
             session_id: cont.session_id,
             parent_session: cont.parent_session,
@@ -473,14 +581,6 @@ fn route_continue(ctx: &HandbackCtx<'_>, cont: ContinuedJob) {
             brief: cont.message,
             budget: None,
         },
-        ctx.engine,
-        ctx.runners,
-        ctx.projects,
-        ctx.live,
-        ctx.statuses,
-        ctx.notifier,
-        ctx.handback,
-        ctx.handles,
         true,
         initial_spent_tokens,
     );
@@ -511,7 +611,7 @@ mod tests {
     use super::handback::NO_REPLY;
     use super::tests_common::testkit::{
         child_session, child_user_messages, engine_for_project, engine_for_project_notified,
-        executor_runner, job_changed, only_job, parent_session, wait_for_message_count,
+        executor_runner, job_changed, only_job, parent_session, steer, wait_for_message_count,
     };
 
     #[tokio::test]
@@ -660,7 +760,7 @@ mod tests {
 
         let engine = reopened_arc_engine(&dir);
         let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks().await;
+        supervisor.repair_restart_handbacks();
 
         assert_eq!(
             child_user_messages(dir.path(), "s-parent"),
@@ -673,7 +773,7 @@ mod tests {
 
         let engine = reopened_arc_engine(&dir);
         let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks().await;
+        supervisor.repair_restart_handbacks();
 
         assert_eq!(
             child_user_messages(dir.path(), "s-parent").len(),
@@ -698,7 +798,7 @@ mod tests {
 
         let engine = reopened_arc_engine(&dir);
         let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks().await;
+        supervisor.repair_restart_handbacks();
 
         assert_eq!(
             child_user_messages(dir.path(), "s-parent"),
@@ -720,7 +820,7 @@ mod tests {
 
         let engine = reopened_arc_engine(&dir);
         let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks().await;
+        supervisor.repair_restart_handbacks();
 
         assert_eq!(
             child_user_messages(dir.path(), "s-child"),
@@ -730,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_steer_to_a_live_job_is_queued_and_runs_after_the_initial_turn() {
+    async fn a_steer_to_a_live_job_lands_in_the_turn_it_is_already_running() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -767,7 +867,7 @@ mod tests {
 
         wait_for_message_count(dir.path(), &child_id, 1).await;
         assert!(
-            supervisor.steer(&child_id, "also check the linter"),
+            steer(&supervisor, &child_id, "also check the linter"),
             "the job is live"
         );
         notify.notify_one();
@@ -781,12 +881,12 @@ mod tests {
                 (Role::User, "also check the linter".to_owned()),
                 (Role::Assistant, "steer reply".to_owned()),
             ],
-            "the brief turn ran to completion before the steered turn started"
+            "the steer landed at the running turn's next step boundary"
         );
     }
 
     #[tokio::test]
-    async fn two_steers_run_as_two_turns_in_the_order_they_arrived() {
+    async fn two_steers_into_one_live_turn_both_land_in_it_in_order() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -802,8 +902,7 @@ mod tests {
                     stop: Stop::EndTurn,
                 })],
             },
-            Step::Immediate(done_reply("first steer done")),
-            Step::Immediate(done_reply("second steer done")),
+            Step::Immediate(done_reply("both steers done")),
         ]);
 
         let engine = engine_for_project(&dir, &root);
@@ -826,8 +925,8 @@ mod tests {
         });
 
         wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "first steer"));
-        assert!(supervisor.steer(&child_id, "second steer"));
+        assert!(steer(&supervisor, &child_id, "first steer"));
+        assert!(steer(&supervisor, &child_id, "second steer"));
         notify.notify_one();
         supervisor.shutdown().await;
 
@@ -837,10 +936,10 @@ mod tests {
                 (Role::User, "fix the failing test".to_owned()),
                 (Role::Assistant, "on it".to_owned()),
                 (Role::User, "first steer".to_owned()),
-                (Role::Assistant, "first steer done".to_owned()),
                 (Role::User, "second steer".to_owned()),
-                (Role::Assistant, "second steer done".to_owned()),
-            ]
+                (Role::Assistant, "both steers done".to_owned()),
+            ],
+            "both landed at the same step boundary, in the order they arrived"
         );
     }
 
@@ -865,6 +964,8 @@ mod tests {
             ],
             done_reply("parent job done"),
             done_reply("grandchild done"),
+            // the grandchild's report reaches the job that dispatched it
+            done_reply("noted the grandchild"),
         ]);
 
         let mut registry = Registry::new(512);
@@ -1048,7 +1149,7 @@ mod tests {
         supervisor.shutdown().await;
 
         assert!(
-            !supervisor.steer(&child_id, "not live anymore"),
+            !steer(&supervisor, &child_id, "not live anymore"),
             "the job already finished; nothing is left to steer"
         );
 
@@ -1155,24 +1256,24 @@ mod tests {
         let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
         let provider = ScriptedProvider::scripted(vec![]);
         let runners = BTreeMap::from([(SessionRole::Executor, executor_runner(&provider))]);
-        let live: Arc<LiveMap> = Arc::new(Mutex::new(HashMap::new()));
-        let statuses = Arc::new(JobStatuses::new());
-        let handles: Arc<Handles> = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let shared = &supervisor.shared;
 
         // stands in for a first resume already holding this session's slot
-        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (inbox, _inbox_rx) = mpsc::unbounded_channel();
+        let (cancel, _cancel_rx) = watch::channel(false);
         let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
-        live.lock().expect("live").insert(
+        shared.live.lock().expect("live").insert(
             "s-child".to_owned(),
-            LiveJob {
-                steer_tx,
-                cancel: cancel_tx,
+            LiveSession {
+                inbox,
+                cancel,
                 drop_tx,
             },
         );
 
         let spawned = spawn_job_checked(
+            shared,
             DispatchedJob {
                 session_id: "s-child".to_owned(),
                 parent_session: "s-parent".to_owned(),
@@ -1181,29 +1282,21 @@ mod tests {
                 brief: "second resume".to_owned(),
                 budget: None,
             },
-            &engine,
-            &runners,
-            &BTreeMap::new(),
-            &live,
-            &statuses,
-            None,
-            None,
-            &handles,
             true,
             0,
         );
 
         assert!(
             !spawned,
-            "a racing resume must not clobber the first one's steer channel"
+            "a racing resume must not clobber the first one's inbox"
         );
         assert_eq!(
-            live.lock().expect("live").len(),
+            shared.live.lock().expect("live").len(),
             1,
             "still exactly the first resume's entry"
         );
         assert!(
-            handles.lock().expect("handles").is_empty(),
+            shared.handles.lock().expect("handles").is_empty(),
             "no task was spawned for the loser of the race"
         );
     }
@@ -1242,7 +1335,7 @@ mod tests {
             "the watchdog forced the panicked task to failed"
         );
         assert!(
-            !supervisor.steer(&child_id, "too late"),
+            !steer(&supervisor, &child_id, "too late"),
             "the panicking task's live entry was removed"
         );
         assert_eq!(
@@ -1345,7 +1438,7 @@ mod tests {
         });
 
         wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "too late"));
+        assert!(steer(&supervisor, &child_id, "too late"));
         assert!(supervisor.cancel(&child_id));
         supervisor.shutdown().await;
 
@@ -1355,7 +1448,7 @@ mod tests {
             "the queued steer never ran"
         );
         assert!(
-            !supervisor.steer(&child_id, "still too late"),
+            !steer(&supervisor, &child_id, "still too late"),
             "the job already ended"
         );
     }

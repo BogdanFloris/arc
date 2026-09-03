@@ -1,21 +1,20 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use arc_core::footprint::{self, Mark};
 use arc_core::provider::Usage;
-use arc_core::session::{ContinuedJob, DispatchedJob, Engine, EngineEvent, Runner};
-use arc_proto::v1::{Budget, Notification, ReasoningDelta, SessionRole, notification};
-use tokio::sync::{broadcast, mpsc, watch};
+use arc_core::session::{
+    DispatchedJob, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
+};
+use arc_proto::v1::{Budget, Notification, ReasoningDelta, Source, notification};
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::handback::{
-    Handback, HandbackCtx, handback_cancelled, handback_clean, handback_failed,
-    handback_over_budget, handback_user_reply,
+    handback_cancelled, handback_clean, handback_failed, handback_over_budget, handback_user_reply,
 };
-use super::status::{JobState, JobStatuses, notify_job_changed};
-use super::{Handles, LiveMap, Project, Steer, route_cancels, route_continues, spawn_dispatched};
+use super::status::{JobState, notify_job_changed};
+use super::{LiveMap, Shared, TurnEvent, route_cancels, route_continues, spawn_dispatched};
 
 pub(super) const EVENT_BUFFER: usize = 64;
 /// How long a turn may go without an engine event (a delta, reasoning, or
@@ -23,211 +22,272 @@ pub(super) const EVENT_BUFFER: usize = 64;
 /// goes quiet without closing would otherwise hold the job open forever.
 const JOB_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Why a job's turn loop stopped short of a clean finish: both read the
-/// same terminal `JobState::Failed`, so only the handback text tells them
-/// apart (the caller wired to `k` gets a distinct reason from a genuine
-/// provider failure).
+/// A session's work: the message that starts it, and everything the task
+/// needs to run turn after turn until its inbox runs dry.
+pub(super) struct Task {
+    pub(super) job: DispatchedJob,
+    /// A dispatched job: it reports to a parent and rides the job strip.
+    /// A session the user opened does neither.
+    pub(super) dispatched: bool,
+    pub(super) source: Source,
+    /// The connection that sent the first message, if it asked to watch.
+    pub(super) attached: Option<mpsc::Sender<TurnEvent>>,
+    pub(super) spent_tokens: u64,
+}
+
+/// Everything reaching a turn from outside the engine.
+struct Channels<'a> {
+    inbox: &'a mut mpsc::UnboundedReceiver<Inbound>,
+    drop_rx: &'a mut mpsc::UnboundedReceiver<()>,
+    cancel: &'a mut watch::Receiver<bool>,
+    attached: &'a mut Option<mpsc::Sender<TurnEvent>>,
+}
+
+/// Why a turn loop stopped short of a clean finish: both read the same
+/// terminal `JobState::Failed`, so only the handback text tells them apart
+/// (the caller wired to `k` gets a distinct reason from a genuine provider
+/// failure).
 enum EndReason {
     Failed,
     Cancelled,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_job(
-    engine: Arc<Engine>,
+/// One turn per message: the first, then whatever arrived while it ran.
+/// The task ends when its inbox is empty at a turn boundary.
+pub(super) async fn run_task(
+    shared: Shared,
     runner: Runner,
-    job: DispatchedJob,
-    mut steer_rx: mpsc::UnboundedReceiver<Steer>,
+    task: Task,
+    mut inbox_rx: mpsc::UnboundedReceiver<Inbound>,
     mut cancel_rx: watch::Receiver<bool>,
     mut drop_rx: mpsc::UnboundedReceiver<()>,
-    live: Arc<LiveMap>,
-    statuses: Arc<JobStatuses>,
-    notifier: Option<broadcast::Sender<Notification>>,
-    runners: BTreeMap<SessionRole, Runner>,
-    projects: BTreeMap<String, Project>,
-    handback: Option<Arc<Handback>>,
-    handles: Arc<Handles>,
 ) {
+    let Task {
+        job,
+        dispatched,
+        source,
+        mut attached,
+        mut spent_tokens,
+    } = task;
     let session_id = job.session_id.clone();
     let start = Instant::now();
-    let mut spent_tokens: u64 = 0;
-    let ctx = HandbackCtx {
-        engine: &engine,
-        runners: &runners,
-        projects: &projects,
-        live: &live,
-        statuses: &statuses,
-        notifier: notifier.as_ref(),
-        handles: &handles,
-        handback: handback.as_ref(),
+    let mut inbound = Inbound {
+        content: job.brief.clone(),
+        source,
     };
+    let mut first = true;
 
-    let mark = footprint_mark(&ctx, &job).await;
-    match run_turn(
-        &ctx,
-        &runner,
-        &session_id,
-        &job.brief,
-        &mut steer_rx,
-        &mut drop_rx,
-        &mut cancel_rx,
-    )
-    .await
-    {
-        TurnOutcome::Success {
-            usage,
-            jobs,
-            continues,
-            cancels,
-        } => {
-            spent_tokens += usage_tokens(usage);
-            if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
-                notify_job_changed(notifier.as_ref(), &engine, info);
-            }
-            spawn_dispatched(&ctx, jobs);
-            route_continues(&ctx, continues);
-            route_cancels(&ctx, cancels);
-            let footprint = footprint_since(&ctx, &job, mark).await;
-            handback_clean(&ctx, &job, footprint).await;
-        }
-        TurnOutcome::Failure => {
-            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
-            return;
-        }
-        TurnOutcome::Cancelled => {
-            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
-            return;
-        }
-    }
-
-    // every turn hands back as it ends, so a steer queued behind a running
-    // turn can never swallow that turn's report
     loop {
-        drain_dropped_steers(&mut drop_rx, &mut steer_rx, &ctx, &session_id);
-
-        if *cancel_rx.borrow() {
-            end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
-            return;
-        }
-
-        if let Some(breach) = budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed()) {
-            warn_over_budget(&session_id, &breach);
-            finish_now(&live, &mut steer_rx, &statuses, &session_id);
-            if let Some(info) = statuses.finish(&session_id, JobState::OverBudget, start.elapsed())
-            {
-                notify_job_changed(notifier.as_ref(), &engine, info);
-            }
-            handback_over_budget(&ctx, &job, &breach).await;
-            return;
-        }
-
-        let steered = match steer_rx.try_recv() {
-            Ok(steer) => Some(steer),
-            Err(mpsc::error::TryRecvError::Disconnected) => None,
-            Err(mpsc::error::TryRecvError::Empty) => {
-                let mut live = live.lock().expect("live");
-                if let Ok(steer) = steer_rx.try_recv() {
-                    Some(steer)
-                } else {
-                    live.remove(&session_id);
-                    None
-                }
-            }
+        let mark = if dispatched {
+            footprint_mark(&shared, &job).await
+        } else {
+            None
         };
-        let Some(steer) = steered else { break };
-        if let Some(info) = statuses.record_steer_consumed(&session_id) {
-            notify_job_changed(notifier.as_ref(), &engine, info);
-        }
-        let mark = footprint_mark(&ctx, &job).await;
-        match run_turn(
-            &ctx,
-            &runner,
-            &session_id,
-            &steer.text,
-            &mut steer_rx,
-            &mut drop_rx,
-            &mut cancel_rx,
-        )
-        .await
-        {
-            TurnOutcome::Success {
-                usage,
-                jobs,
-                continues,
-                cancels,
-            } => {
-                spent_tokens += usage_tokens(usage);
-                if let Some(info) = statuses.record_tokens(&session_id, spent_tokens) {
-                    notify_job_changed(notifier.as_ref(), &engine, info);
-                }
-                spawn_dispatched(&ctx, jobs);
-                route_continues(&ctx, continues);
-                route_cancels(&ctx, cancels);
-                let footprint = footprint_since(&ctx, &job, mark).await;
-                if steer.from_user {
-                    handback_user_reply(&ctx, &job, footprint).await;
-                } else {
-                    handback_clean(&ctx, &job, footprint).await;
-                }
-            }
-            TurnOutcome::Failure => {
-                end_job(&ctx, &job, &mut steer_rx, start, EndReason::Failed).await;
+        let outcome = {
+            let mut channels = Channels {
+                inbox: &mut inbox_rx,
+                drop_rx: &mut drop_rx,
+                cancel: &mut cancel_rx,
+                attached: &mut attached,
+            };
+            run_turn(
+                &shared,
+                &runner,
+                &session_id,
+                &inbound,
+                dispatched,
+                &mut channels,
+            )
+            .await
+        };
+        let mut reply = match outcome {
+            TurnOutcome::Success(reply) => reply,
+            TurnOutcome::Failure(error) => {
+                end_task(
+                    &shared,
+                    &job,
+                    dispatched,
+                    &mut inbox_rx,
+                    start,
+                    &EndReason::Failed,
+                );
+                end_attached(&mut attached, error.map(Err)).await;
                 return;
             }
             TurnOutcome::Cancelled => {
-                end_job(&ctx, &job, &mut steer_rx, start, EndReason::Cancelled).await;
+                end_task(
+                    &shared,
+                    &job,
+                    dispatched,
+                    &mut inbox_rx,
+                    start,
+                    &EndReason::Cancelled,
+                );
+                end_attached(&mut attached, Some(Err(SessionError::Cancelled))).await;
                 return;
             }
+        };
+
+        spent_tokens += usage_tokens(reply.usage);
+        if dispatched {
+            if let Some(info) = shared.statuses.record_tokens(&session_id, spent_tokens) {
+                notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+            }
         }
+        spawn_dispatched(&shared, std::mem::take(&mut reply.jobs));
+        route_continues(&shared, std::mem::take(&mut reply.continues));
+        route_cancels(&shared, std::mem::take(&mut reply.cancels));
+
+        drain_dropped(&mut drop_rx, &mut inbox_rx, &shared, &session_id);
+        let cancelled = *cancel_rx.borrow();
+        // before any stop is acted on: the turn that crossed a budget still
+        // reports what it did
+        if dispatched {
+            let footprint = footprint_since(&shared, &job, mark).await;
+            if !first && inbound.source == Source::User {
+                handback_user_reply(&shared, &job, footprint.as_deref());
+            } else {
+                handback_clean(&shared, &job, footprint.as_deref());
+            }
+        }
+        let breach = if dispatched && !cancelled {
+            budget_breach(job.budget.as_ref(), spent_tokens, start.elapsed())
+        } else {
+            None
+        };
+        // the task's fate is settled before the connection hears the turn
+        // ended: a message sent the instant the answer lands finds either
+        // this task's inbox or no task at all, never one on its way out
+        let next = if cancelled || breach.is_some() {
+            None
+        } else {
+            next_inbound(&shared.live, &mut inbox_rx, &session_id)
+        };
+        end_attached(&mut attached, Some(Ok(reply))).await;
+
+        if cancelled {
+            end_task(
+                &shared,
+                &job,
+                dispatched,
+                &mut inbox_rx,
+                start,
+                &EndReason::Cancelled,
+            );
+            return;
+        }
+        if let Some(breach) = breach {
+            warn_over_budget(&session_id, &breach);
+            finish_now(&shared, &mut inbox_rx, &session_id);
+            if let Some(info) =
+                shared
+                    .statuses
+                    .finish(&session_id, JobState::OverBudget, start.elapsed())
+            {
+                notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+            }
+            handback_over_budget(&shared, &job, &breach);
+            return;
+        }
+
+        let Some(next) = next else {
+            break;
+        };
+        if dispatched {
+            if let Some(info) = shared.statuses.record_steer_consumed(&session_id) {
+                notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+            }
+        }
+        inbound = next;
+        first = false;
     }
 
-    if let Some(info) = statuses.finish(&session_id, JobState::Finished, start.elapsed()) {
-        notify_job_changed(notifier.as_ref(), &engine, info);
+    if dispatched {
+        if let Some(info) = shared
+            .statuses
+            .finish(&session_id, JobState::Finished, start.elapsed())
+        {
+            notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
+        }
     }
 }
 
-async fn footprint_mark(ctx: &HandbackCtx<'_>, job: &DispatchedJob) -> Option<Mark> {
-    let project = ctx.projects.get(&job.project)?;
+/// The next message, or `None` once the inbox is empty and the session has
+/// left the live map. The recheck under the lock is what keeps a message
+/// from slipping in between the last look and the removal.
+fn next_inbound(
+    live: &LiveMap,
+    inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
+    session_id: &str,
+) -> Option<Inbound> {
+    match inbox_rx.try_recv() {
+        Ok(inbound) => Some(inbound),
+        Err(mpsc::error::TryRecvError::Disconnected) => None,
+        Err(mpsc::error::TryRecvError::Empty) => {
+            let mut live = live.lock().expect("live");
+            if let Ok(inbound) = inbox_rx.try_recv() {
+                return Some(inbound);
+            }
+            live.remove(session_id);
+            None
+        }
+    }
+}
+
+async fn end_attached(
+    attached: &mut Option<mpsc::Sender<TurnEvent>>,
+    ended: Option<Result<Reply, SessionError>>,
+) {
+    let Some(events) = attached.take() else {
+        return;
+    };
+    if let Some(ended) = ended {
+        let _ = events.send(TurnEvent::Ended(ended)).await;
+    }
+}
+
+async fn footprint_mark(shared: &Shared, job: &DispatchedJob) -> Option<Mark> {
+    let project = shared.projects.get(&job.project)?;
     footprint::mark(&project.root, &project.command_prefix).await
 }
 
 async fn footprint_since(
-    ctx: &HandbackCtx<'_>,
+    shared: &Shared,
     job: &DispatchedJob,
     mark: Option<Mark>,
 ) -> Option<String> {
-    let project = ctx.projects.get(&job.project)?;
+    let project = shared.projects.get(&job.project)?;
     footprint::since(&mark?, &project.root, &project.command_prefix).await
 }
 
-async fn end_job(
-    ctx: &HandbackCtx<'_>,
+fn end_task(
+    shared: &Shared,
     job: &DispatchedJob,
-    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
+    dispatched: bool,
+    inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
     start: Instant,
-    reason: EndReason,
+    reason: &EndReason,
 ) {
-    finish_now(ctx.live, steer_rx, ctx.statuses, &job.session_id);
-    if let Some(info) = ctx
+    finish_now(shared, inbox_rx, &job.session_id);
+    if !dispatched {
+        return;
+    }
+    if let Some(info) = shared
         .statuses
         .finish(&job.session_id, JobState::Failed, start.elapsed())
     {
-        notify_job_changed(ctx.notifier, ctx.engine, info);
+        notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
     }
     match reason {
-        EndReason::Failed => handback_failed(ctx, job).await,
-        EndReason::Cancelled => handback_cancelled(ctx, job).await,
+        EndReason::Failed => handback_failed(shared, job),
+        EndReason::Cancelled => handback_cancelled(shared, job),
     }
 }
 
 enum TurnOutcome {
-    Success {
-        usage: Option<Usage>,
-        jobs: Vec<DispatchedJob>,
-        continues: Vec<ContinuedJob>,
-        cancels: Vec<String>,
-    },
-    Failure,
+    Success(Reply),
+    /// `None` for a turn that went silent: there is no error to report.
+    Failure(Option<SessionError>),
     Cancelled,
 }
 
@@ -277,36 +337,35 @@ fn warn_over_budget(session_id: &str, breach: &BudgetBreach) {
     }
 }
 
-fn handle_job_event(
-    event: &EngineEvent,
-    pending_tool_calls: &mut u32,
-    deadline: &mut Instant,
-    ctx: &HandbackCtx<'_>,
-    session_id: &str,
-) {
+fn track_tool_calls(event: &EngineEvent, pending_tool_calls: &mut u32) {
+    match event {
+        EngineEvent::ToolCallStarted { .. } => *pending_tool_calls += 1,
+        EngineEvent::ToolCallEnded { .. } => {
+            *pending_tool_calls = pending_tool_calls.saturating_sub(1);
+        }
+        _ => {}
+    }
+}
+
+fn handle_job_event(event: &EngineEvent, shared: &Shared, session_id: &str) {
     match event {
         EngineEvent::ToolCallStarted {
             name,
             arguments_json,
             ..
         } => {
-            *pending_tool_calls += 1;
-            if let Some(info) = ctx
+            if let Some(info) = shared
                 .statuses
                 .record_tool_step(session_id, name, arguments_json)
             {
-                notify_job_changed(ctx.notifier, ctx.engine, info);
+                notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
             }
-        }
-        EngineEvent::ToolCallEnded { .. } => {
-            *pending_tool_calls = pending_tool_calls.saturating_sub(1);
-            ctx.statuses.touch_engine(session_id);
         }
         // no socket initiated this turn, so the broadcast is the only path
         // a watching client has to the model's thinking
         EngineEvent::Reasoning(text) => {
-            ctx.statuses.touch_engine(session_id);
-            if let Some(notifier) = ctx.notifier {
+            shared.statuses.touch_engine(session_id);
+            if let Some(notifier) = shared.notifier.as_ref() {
                 let _ = notifier.send(Notification {
                     event: Some(notification::Event::JobReasoning(ReasoningDelta {
                         session_id: session_id.to_owned(),
@@ -315,40 +374,64 @@ fn handle_job_event(
                 });
             }
         }
-        _ => ctx.statuses.touch_engine(session_id),
+        _ => shared.statuses.touch_engine(session_id),
     }
-    debug!(session_id = %session_id, ?event, "job event");
+}
+
+async fn handle_event(
+    event: EngineEvent,
+    shared: &Shared,
+    session_id: &str,
+    dispatched: bool,
+    pending_tool_calls: &mut u32,
+    deadline: &mut Instant,
+    attached: &mut Option<mpsc::Sender<TurnEvent>>,
+) {
+    track_tool_calls(&event, pending_tool_calls);
+    if dispatched {
+        handle_job_event(&event, shared, session_id);
+    }
+    debug!(session_id, ?event, "turn event");
     *deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
+    let Some(events) = attached.as_ref() else {
+        return;
+    };
+    if events.send(TurnEvent::Engine(event)).await.is_err() {
+        info!(session_id, "the connection watching this turn went away");
+        *attached = None;
+    }
 }
 
 enum RawOutcome {
-    Sent(Result<arc_core::session::Reply, arc_core::session::Error>),
+    Sent(Result<Reply, SessionError>),
     SilentTimeout,
     Cancelled,
 }
 
 /// Runs one turn to completion, failing it if the engine goes quiet for
-/// `JOB_SILENCE_TIMEOUT` with no events, or if `cancel_rx` fires. A pending
+/// `JOB_SILENCE_TIMEOUT` with no events, or if `cancel` fires. A pending
 /// tool call suspends the timeout instead of tripping it: bash alone is
 /// allowed to run silent for up to its own 600s cap, so a tool call in
 /// flight is activity, not stall. A cancel drops `send` mid-await — the
 /// same shape a crash leaves — instead of waiting the turn out. A
 /// `DropSteers` request lands here too, so it empties the queue without
 /// waiting for a long turn to finish first.
-#[allow(clippy::too_many_arguments)]
 async fn run_turn(
-    ctx: &HandbackCtx<'_>,
+    shared: &Shared,
     runner: &Runner,
     session_id: &str,
-    text: &str,
-    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
-    drop_rx: &mut mpsc::UnboundedReceiver<()>,
-    cancel_rx: &mut watch::Receiver<bool>,
+    inbound: &Inbound,
+    dispatched: bool,
+    channels: &mut Channels<'_>,
 ) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
-    let send = ctx
-        .engine
-        .send_message(runner, Some(session_id), text, events);
+    let send = shared.engine.send_message_from(
+        runner,
+        Some(session_id),
+        &inbound.content,
+        inbound.source,
+        events,
+    );
     tokio::pin!(send);
 
     let mut deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
@@ -364,7 +447,7 @@ async fn run_turn(
                 // the engine can complete a fully-scripted turn with events
                 // still buffered; drain them so fast tools count as steps
                 while let Ok(event) = rx.try_recv() {
-                    handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
+                    handle_event(event, shared, session_id, dispatched, &mut pending_tool_calls, &mut deadline, channels.attached).await;
                 }
                 break RawOutcome::Sent(result);
             }
@@ -372,15 +455,15 @@ async fn run_turn(
                 // send_message drops its sender exactly as it returns, so a
                 // `None` here means `send` is already ready on the next poll
                 let Some(event) = event else { continue };
-                handle_job_event(&event, &mut pending_tool_calls, &mut deadline, ctx, session_id);
+                handle_event(event, shared, session_id, dispatched, &mut pending_tool_calls, &mut deadline, channels.attached).await;
             }
-            () = tokio::time::sleep_until(deadline), if pending_tool_calls == 0 => break RawOutcome::SilentTimeout,
-            changed = cancel_rx.changed(), if cancel_live => match changed {
+            () = tokio::time::sleep_until(deadline), if dispatched && pending_tool_calls == 0 => break RawOutcome::SilentTimeout,
+            changed = channels.cancel.changed(), if cancel_live => match changed {
                 Ok(()) => break RawOutcome::Cancelled,
                 Err(_) => cancel_live = false,
             },
-            dropped = drop_rx.recv(), if drop_live => match dropped {
-                Some(()) => drop_queued_steers(steer_rx, ctx, session_id),
+            dropped = channels.drop_rx.recv(), if drop_live => match dropped {
+                Some(()) => drop_queued(channels.inbox, shared, session_id),
                 None => drop_live = false,
             },
         }
@@ -392,18 +475,13 @@ async fn run_turn(
                 session_id = %session_id,
                 input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
                 output_tokens = reply.usage.map_or(0, |usage| usage.output_tokens),
-                "job turn completed"
+                "turn completed"
             );
-            TurnOutcome::Success {
-                usage: reply.usage,
-                jobs: reply.jobs,
-                continues: reply.continues,
-                cancels: reply.cancels,
-            }
+            TurnOutcome::Success(reply)
         }
         RawOutcome::Sent(Err(error)) => {
-            warn!(session_id = %session_id, %error, "job turn failed");
-            TurnOutcome::Failure
+            warn!(session_id = %session_id, %error, "turn failed");
+            TurnOutcome::Failure(Some(error))
         }
         // dropping `send` here abandons the turn mid-flight, the same shape
         // as a crash: any durable but unresolved tool call is left for the
@@ -414,36 +492,32 @@ async fn run_turn(
                 timeout_secs = JOB_SILENCE_TIMEOUT.as_secs(),
                 "job turn silent past the timeout; failing it"
             );
-            TurnOutcome::Failure
+            TurnOutcome::Failure(None)
         }
         RawOutcome::Cancelled => {
-            info!(session_id = %session_id, "job turn cancelled by the user");
+            info!(session_id = %session_id, "turn cancelled by the user");
             TurnOutcome::Cancelled
         }
     }
 }
 
-fn drop_queued_steers(
-    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
-    ctx: &HandbackCtx<'_>,
-    session_id: &str,
-) {
+fn drop_queued(inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>, shared: &Shared, session_id: &str) {
     let mut dropped = 0_usize;
-    while steer_rx.try_recv().is_ok() {
+    while inbox_rx.try_recv().is_ok() {
         dropped += 1;
     }
     if dropped > 0 {
-        warn!(session_id, dropped, "dropping queued steers on request");
+        warn!(session_id, dropped, "dropping queued messages on request");
     }
-    if let Some(info) = ctx.statuses.drop_queued(session_id) {
-        notify_job_changed(ctx.notifier, ctx.engine, info);
+    if let Some(info) = shared.statuses.drop_queued(session_id) {
+        notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
     }
 }
 
-fn drain_dropped_steers(
+fn drain_dropped(
     drop_rx: &mut mpsc::UnboundedReceiver<()>,
-    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
-    ctx: &HandbackCtx<'_>,
+    inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
+    shared: &Shared,
     session_id: &str,
 ) {
     let mut requested = false;
@@ -451,26 +525,21 @@ fn drain_dropped_steers(
         requested = true;
     }
     if requested {
-        drop_queued_steers(steer_rx, ctx, session_id);
+        drop_queued(inbox_rx, shared, session_id);
     }
 }
 
-fn finish_now(
-    live: &LiveMap,
-    steer_rx: &mut mpsc::UnboundedReceiver<Steer>,
-    statuses: &JobStatuses,
-    session_id: &str,
-) {
-    live.lock().expect("live").remove(session_id);
+fn finish_now(shared: &Shared, inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>, session_id: &str) {
+    shared.live.lock().expect("live").remove(session_id);
     let mut dropped = 0_usize;
-    while steer_rx.try_recv().is_ok() {
+    while inbox_rx.try_recv().is_ok() {
         dropped += 1;
     }
-    statuses.drop_queued(session_id);
+    shared.statuses.drop_queued(session_id);
     if dropped > 0 {
         warn!(
             session_id,
-            dropped, "dropping queued steers as the job finishes"
+            dropped, "dropping queued messages as the session's task ends"
         );
     }
 }
@@ -478,25 +547,27 @@ fn finish_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use arc_core::log::Log;
     use arc_core::projection::Projection;
     use arc_core::provider::{CompletionDelta, Error as ProviderError, Stop};
-    use arc_core::session::ProjectSpec;
+    use arc_core::session::{Engine, ProjectSpec};
     use arc_core::store::Store;
     use arc_core::testkit::{ScriptedProvider, Step, call, done_reply, runner, tool_stop, usage};
     use arc_core::tool::Registry;
     use arc_core::tool::ToolSource;
     use arc_core::tool::workspace::{Grant, Mode};
-    use arc_proto::v1::{Role, job_info};
+    use arc_proto::v1::{Role, SessionRole, job_info};
     use tempfile::TempDir;
+    use tokio::sync::broadcast;
 
     use crate::jobs::Supervisor;
     use crate::jobs::handback::NO_REPLY;
     use crate::jobs::tests_common::testkit::{
         GatedTool, child_session, child_user_messages, engine_for_project, executor_runner,
-        only_job, parent_session, wait_for_message_count, wait_for_tool_call_issued,
+        only_job, parent_session, steer, wait_for_message_count, wait_for_tool_call_issued,
     };
 
     #[tokio::test]
@@ -578,14 +649,14 @@ mod tests {
             budget: None,
         });
 
-        // queued while the failing turn is still gated open
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "too late"));
+        // queued before the failing turn is live, so it waits for a turn
+        // of its own — one the job never reaches
+        assert!(steer(&supervisor, &child_id, "too late"));
         notify.notify_one();
         supervisor.shutdown().await;
 
         assert!(
-            !supervisor.steer(&child_id, "later still"),
+            !steer(&supervisor, &child_id, "later still"),
             "a failed job removed its live entry; nothing is left to read a steer"
         );
         assert_eq!(
@@ -633,16 +704,15 @@ mod tests {
             }),
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
         assert!(
-            supervisor.steer(&child_id, "too late"),
+            steer(&supervisor, &child_id, "too late"),
             "the job is still live when queued"
         );
         notify.notify_one();
         supervisor.shutdown().await;
 
         assert!(
-            !supervisor.steer(&child_id, "later still"),
+            !steer(&supervisor, &child_id, "later still"),
             "the over-budget job removed its live entry"
         );
         assert_eq!(
@@ -694,8 +764,7 @@ mod tests {
             }),
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "also check the linter"));
+        assert!(steer(&supervisor, &child_id, "also check the linter"));
         notify.notify_one();
         supervisor.shutdown().await;
 
@@ -751,11 +820,13 @@ mod tests {
             }),
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
         assert!(
-            supervisor.steer(&child_id, "too late"),
+            steer(&supervisor, &child_id, "too late"),
             "the job is still live when queued"
         );
+        // the task's own clock starts when it first runs, so let the brief
+        // turn reach the gate before moving the paused clock past the budget
+        wait_for_message_count(dir.path(), &child_id, 1).await;
         // the job task is gated on a Notify, not a timer, so advancing the
         // paused clock here only changes what its Instant::elapsed() later
         // reports, it does not let the task run ahead
@@ -764,7 +835,7 @@ mod tests {
         supervisor.shutdown().await;
 
         assert!(
-            !supervisor.steer(&child_id, "later still"),
+            !steer(&supervisor, &child_id, "later still"),
             "the over-budget job removed its live entry"
         );
         assert_eq!(
@@ -820,14 +891,13 @@ mod tests {
             }),
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "first steer"));
-        assert!(supervisor.steer(&child_id, "second steer"));
+        assert!(steer(&supervisor, &child_id, "first steer"));
+        assert!(steer(&supervisor, &child_id, "second steer"));
         notify.notify_one();
         supervisor.shutdown().await;
 
         assert!(
-            !supervisor.steer(&child_id, "third steer"),
+            !steer(&supervisor, &child_id, "third steer"),
             "the over-budget job removed its live entry"
         );
         assert_eq!(

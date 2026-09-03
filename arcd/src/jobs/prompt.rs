@@ -46,9 +46,9 @@ pub(super) fn job_system_prompt(root: &Path) -> String {
     with_agents_md(root, job_preamble(root))
 }
 
-/// Re-derived per turn like `sources` (row 9.1) — byte-stable while the
-/// inputs are unchanged, since caching depends on the prefix staying
-/// stable turn to turn.
+/// Built once when a session's task starts, like a job's, so the prefix
+/// the prompt cache matches on stays byte-stable for every turn the task
+/// runs.
 pub(crate) fn direct_system_prompt(root: &Path, identity: Option<&str>) -> String {
     let preamble = match identity {
         Some(identity) => format!("{}\n\n{}", direct_preamble(root), identity.trim_end()),
@@ -71,7 +71,7 @@ mod tests {
 
     use crate::jobs::Supervisor;
     use crate::jobs::tests_common::testkit::{
-        child_session, engine_for_project, executor_runner, wait_for_message_count,
+        child_session, engine_for_project, executor_runner, steer, wait_for_message_count,
     };
 
     #[tokio::test]
@@ -256,8 +256,10 @@ mod tests {
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
+        // queued before the brief turn is live, so it runs as a second
+        // turn: two turns is what makes the prompt comparison meaningful
+        assert!(steer(&supervisor, &child_id, "also check the linter"));
         wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "also check the linter"));
         notify.notify_one();
         supervisor.shutdown().await;
 

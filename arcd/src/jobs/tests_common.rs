@@ -14,7 +14,9 @@ use arc_core::store::Store;
 use arc_core::testkit::{ScriptedProvider, replay_log, runner};
 use arc_core::tool::workspace::{Grant, Mode};
 use arc_core::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
-use arc_proto::v1::{JobInfo, Notification, Role, SessionRole, notification};
+use arc_proto::v1::{JobInfo, Notification, Role, SessionRole, Source, notification};
+
+use crate::jobs::Supervisor;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
@@ -179,6 +181,23 @@ pub(crate) mod testkit {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for a tool call in session {session_id}");
+    }
+
+    /// Steers a job the way the TUI does, and reports whether there was a
+    /// task to take it — which is what the tests here actually assert.
+    pub(crate) fn steer(supervisor: &Supervisor, session_id: &str, text: &str) -> bool {
+        let live = supervisor
+            .shared
+            .live
+            .lock()
+            .expect("live")
+            .contains_key(session_id);
+        if live {
+            supervisor
+                .send(Some(session_id), text, Source::User, false)
+                .expect("send into a live session");
+        }
+        live
     }
 
     pub(crate) fn only_job(listed: Vec<JobInfo>) -> JobInfo {

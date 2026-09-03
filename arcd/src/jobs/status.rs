@@ -302,7 +302,7 @@ mod tests {
     use crate::jobs::Supervisor;
     use crate::jobs::tests_common::testkit::{
         GatedTool, child_session, child_user_messages, engine_for_project,
-        engine_for_project_notified, executor_runner, job_changed, only_job,
+        engine_for_project_notified, executor_runner, job_changed, only_job, steer,
         wait_for_message_count,
     };
 
@@ -350,8 +350,9 @@ mod tests {
             budget: None,
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "also check the linter"));
+        // no wait: the steer lands before the first turn is live, so it
+        // runs as the task's next turn instead of joining this one
+        assert!(steer(&supervisor, &child_id, "also check the linter"));
         first_gate.notify_one();
         // the steer is now its own gated turn: the brief turn's reply plus
         // the steer's own user message have both landed, so its usage is
@@ -1010,8 +1011,9 @@ mod tests {
             budget: None,
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "also check the linter"));
+        // no wait: the steer lands before the first turn is live, so it
+        // waits for a turn of its own and the count can see it
+        assert!(steer(&supervisor, &child_id, "also check the linter"));
         assert_eq!(
             only_job(supervisor.list()).queued_steers,
             1,
@@ -1062,9 +1064,8 @@ mod tests {
             budget: None,
         });
 
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.steer(&child_id, "first"));
-        assert!(supervisor.steer(&child_id, "second"));
+        assert!(steer(&supervisor, &child_id, "first"));
+        assert!(steer(&supervisor, &child_id, "second"));
         let mut job = job_changed(&mut notifications).await;
         while job.queued_steers != 2 {
             job = job_changed(&mut notifications).await;

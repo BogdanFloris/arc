@@ -250,12 +250,11 @@ impl Daemon {
                 .with_project_list(project_list),
         );
         // after orphan repair (already done in `start`), before serving
-        supervisor.repair_restart_handbacks().await;
+        supervisor.repair_restart_handbacks();
 
         server::serve(
             listener,
             self.engine,
-            self.roles.concierge().clone(),
             self.reads,
             Arc::clone(&supervisor),
             self.notifier,

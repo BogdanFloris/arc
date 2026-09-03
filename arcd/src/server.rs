@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use arc_core::projection::{Reader, ReviewItem, SessionSummary};
 use arc_core::provider::role_label;
-use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply, Runner};
+use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
     ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MarkBranch,
     MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ProjectList,
     ReasoningDelta, ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionList, SessionRole, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked,
+    SessionList, SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked,
     client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
@@ -25,18 +25,15 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
-use crate::jobs::Supervisor;
+use crate::jobs::{SendOutcome, Supervisor, TurnEvent};
 
 type Socket = WebSocketStream<TcpStream>;
-
-const EVENT_BUFFER: usize = 64;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn serve(
     listener: TcpListener,
     engine: Arc<Engine>,
-    runner: Runner,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
     notifier: broadcast::Sender<Notification>,
@@ -57,7 +54,6 @@ pub async fn serve(
                         stream,
                         peer,
                         Arc::clone(&engine),
-                        runner.clone(),
                         Arc::clone(&reads),
                         Arc::clone(&supervisor),
                         notifier.clone(),
@@ -99,7 +95,6 @@ async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
     engine: Arc<Engine>,
-    runner: Runner,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
     notifier: broadcast::Sender<Notification>,
@@ -130,7 +125,6 @@ async fn connection(
                             if request(
                                 &mut ws,
                                 &engine,
-                                &runner,
                                 &reads,
                                 &supervisor,
                                 &notifier,
@@ -224,7 +218,6 @@ async fn push_notification(
 async fn request(
     ws: &mut Socket,
     engine: &Engine,
-    runner: &Runner,
     reads: &Reader,
     supervisor: &Supervisor,
     notifier: &broadcast::Sender<Notification>,
@@ -233,7 +226,7 @@ async fn request(
 ) -> ControlFlow<()> {
     match frame.msg {
         Some(client_frame::Msg::SendMessage(send)) => {
-            send_message(ws, engine, runner, supervisor, frame.request_id, send).await
+            send_message(ws, supervisor, frame.request_id, send).await
         }
         Some(client_frame::Msg::ListSessions(_)) => {
             list_sessions(ws, reads, frame.request_id).await
@@ -261,7 +254,7 @@ async fn request(
             drop_steers(ws, supervisor, frame.request_id, &drop.session_id).await
         }
         Some(client_frame::Msg::CreateSession(create)) => {
-            create_session(ws, engine, runner, frame.request_id, create).await
+            create_session(ws, engine, supervisor, frame.request_id, create).await
         }
         Some(client_frame::Msg::ForkSession(fork)) => {
             fork_session(ws, engine, frame.request_id, fork).await
@@ -303,106 +296,41 @@ async fn request(
 
 async fn send_message(
     ws: &mut Socket,
-    engine: &Engine,
-    runner: &Runner,
     supervisor: &Supervisor,
     request_id: u64,
     send: SendMessage,
 ) -> ControlFlow<()> {
-    // a user message ends whatever chain of handback turns was running
-    if !send.session_id.is_empty() {
-        supervisor.reset_autonomy(&send.session_id);
-    }
-
-    if !send.session_id.is_empty() && supervisor.steer(&send.session_id, &send.content) {
-        return flow(send_steered(ws, request_id, &send.session_id).await);
-    }
-
-    let served_by = turn_runner(engine, supervisor, runner, &send.session_id);
-
-    let (events, rx) = mpsc::channel(EVENT_BUFFER);
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
-    // forward has to run alongside the engine or the event channel fills
-    let (result, connected) = tokio::join!(
-        engine.send_message(&served_by, session_id, &send.content, events),
-        forward(ws, request_id, send.session_id.clone(), rx),
-    );
-
-    if !connected {
-        return ControlFlow::Break(());
-    }
-
-    let msg = match result {
-        Ok(reply) => {
-            let msg = stream_end(&reply);
-            for job in reply.jobs {
-                supervisor.spawn(job);
-            }
-            for cont in reply.continues {
-                supervisor.continue_job(cont);
-            }
-            for id in reply.cancels {
-                if !supervisor.cancel(&id) {
-                    warn!(session_id = %id, "cancel_job named a job that wasn't live");
-                }
-            }
-            msg
+    match supervisor.send(session_id, &send.content, Source::User, true) {
+        Ok(SendOutcome::Started { session_id, events }) => {
+            let Some(events) = events else {
+                return flow(
+                    send_frame(
+                        ws,
+                        request_id,
+                        error_frame("internal", "the turn started unattached"),
+                    )
+                    .await,
+                );
+            };
+            forward(ws, request_id, session_id, events).await
+        }
+        Ok(SendOutcome::Queued { session_id }) => {
+            flow(send_queued(ws, request_id, &session_id).await)
         }
         Err(error) => {
             warn!(%error, code = error_code(&error), "request failed");
-            error_frame(error_code(&error), &error)
+            flow(send_frame(ws, request_id, error_frame(error_code(&error), &error)).await)
         }
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-fn turn_runner(
-    engine: &Engine,
-    supervisor: &Supervisor,
-    concierge: &Runner,
-    session_id: &str,
-) -> Runner {
-    if session_id.is_empty() {
-        return concierge.clone();
-    }
-    match engine.session_role(session_id) {
-        Ok(Some(role @ (SessionRole::Executor | SessionRole::Archivist))) => {
-            let mut served_by = supervisor
-                .job_runner(role)
-                .cloned()
-                .unwrap_or_else(|| concierge.clone());
-            if role == SessionRole::Executor {
-                if let Some(prompt) = direct_system_prompt_for(engine, supervisor, session_id) {
-                    served_by.system = Some(prompt);
-                }
-            }
-            served_by
-        }
-        _ => concierge.clone(),
     }
 }
 
-fn direct_system_prompt_for(
-    engine: &Engine,
-    supervisor: &Supervisor,
-    session_id: &str,
-) -> Option<String> {
-    let project = engine.session_project(session_id).ok().flatten()?;
-    if project.is_empty() {
-        return None;
-    }
-    let root = supervisor.project_root(&project)?;
-    Some(crate::jobs::prompt::direct_system_prompt(
-        root,
-        supervisor.identity(),
-    ))
-}
-
-/// A steered message never reaches the engine on this connection: its turn
-/// runs inside the job task, and its output lands in the child's log, not
-/// this stream. The client just gets an accepted, empty-usage stream end.
-async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> bool {
+/// A message into a session already working never streams on this
+/// connection: its answer belongs to the turn that took it, and reaches
+/// every client through the session's notifications. The sender gets an
+/// accepted and an empty stream end marked queued.
+async fn send_queued(ws: &mut Socket, request_id: u64, session_id: &str) -> bool {
     let accepted = server_frame::Msg::MessageAccepted(MessageAccepted {
         session_id: session_id.to_owned(),
     });
@@ -421,13 +349,28 @@ async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> boo
     send_frame(ws, request_id, end).await
 }
 
+/// The turn's own events, streamed to the connection that started it. The
+/// turn goes on without this connection if it drops: the task owns it.
 async fn forward(
     ws: &mut Socket,
     request_id: u64,
     mut session_id: String,
-    mut rx: mpsc::Receiver<EngineEvent>,
-) -> bool {
+    mut rx: mpsc::Receiver<TurnEvent>,
+) -> ControlFlow<()> {
     while let Some(event) = rx.recv().await {
+        let event = match event {
+            TurnEvent::Engine(event) => event,
+            TurnEvent::Ended(ended) => {
+                let msg = match ended {
+                    Ok(reply) => stream_end(&reply),
+                    Err(error) => {
+                        warn!(%error, code = error_code(&error), "turn failed");
+                        error_frame(error_code(&error), &error)
+                    }
+                };
+                return flow(send_frame(ws, request_id, msg).await);
+            }
+        };
         let msg = match event {
             EngineEvent::Accepted { session_id: id } => {
                 session_id.clone_from(&id);
@@ -463,10 +406,18 @@ async fn forward(
             }
         };
         if !send_frame(ws, request_id, msg).await {
-            return false;
+            return ControlFlow::Break(());
         }
     }
-    true
+    // the task ended without a verdict: only a panicked turn gets here
+    flow(
+        send_frame(
+            ws,
+            request_id,
+            error_frame("internal", "the turn ended without a reply"),
+        )
+        .await,
+    )
 }
 
 async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> ControlFlow<()> {
@@ -555,20 +506,12 @@ async fn drop_steers(
 async fn create_session(
     ws: &mut Socket,
     engine: &Engine,
-    runner: &Runner,
+    supervisor: &Supervisor,
     request_id: u64,
     create: CreateSession,
 ) -> ControlFlow<()> {
     let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
-    let msg = if role == SessionRole::Executor {
-        match engine.create_direct_session(runner, &create.project, role) {
-            Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
-            Err(error) => {
-                warn!(%error, code = error_code(&error), "create_session failed");
-                error_frame(error_code(&error), &error)
-            }
-        }
-    } else {
+    let msg = if role != SessionRole::Executor {
         error_frame(
             "unsupported_role",
             format!(
@@ -576,6 +519,16 @@ async fn create_session(
                 role_label(role)
             ),
         )
+    } else if let Some(runner) = supervisor.role_runner(role) {
+        match engine.create_direct_session(&runner, &create.project, role) {
+            Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
+            Err(error) => {
+                warn!(%error, code = error_code(&error), "create_session failed");
+                error_frame(error_code(&error), &error)
+            }
+        }
+    } else {
+        error_frame("no_runner", "no runner is configured for the executor role")
     };
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -777,6 +730,7 @@ fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
 fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
+        SessionError::NoRunner { .. } => "no_runner",
         SessionError::EmptyReply => "empty_reply",
         SessionError::Cancelled => "cancelled",
         SessionError::RoleMismatch { .. } => "role_mismatch",
@@ -863,7 +817,7 @@ mod tests {
         HistoryToolCall, HistoryToolResult, ListJobs, ListProjects, ListSessions, MemoryEvent,
         MemoryRecord, MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete,
         MemoryReviewList, Notification, ProjectInfo, Role, SessionCreated, SessionEvent,
-        SessionRole, Source, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
+        SessionRole, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
         notification, session_event,
     };
     use futures::stream;
@@ -875,6 +829,7 @@ mod tests {
     use super::*;
     use arc_core::provider::{Provider, Thinking};
     use arc_core::session::ProjectSpec;
+    use arc_core::session::Runner;
     use arc_core::testkit::{Canned, ScriptedProvider, Step, done_reply, replay_log, usage};
 
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -1112,6 +1067,7 @@ mod tests {
                     // mirrors daemon.rs: identity rides the supervisor for
                     // direct executor turns, never for dispatched jobs
                     .with_identity(Some(TEST_IDENTITY.to_owned()))
+                    .with_concierge(runner)
                     .with_project_list(project_list),
             );
 
@@ -1121,7 +1077,6 @@ mod tests {
             let server = tokio::spawn(serve(
                 listener,
                 engine,
-                runner,
                 reads,
                 Arc::clone(&supervisor),
                 notifier,
@@ -1164,7 +1119,8 @@ mod tests {
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
                 Supervisor::new(Arc::clone(&engine), BTreeMap::new())
-                    .with_notifier(notifier.clone()),
+                    .with_notifier(notifier.clone())
+                    .with_concierge(runner),
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1173,7 +1129,6 @@ mod tests {
             let server = tokio::spawn(serve(
                 listener,
                 engine,
-                runner,
                 reads,
                 Arc::clone(&supervisor),
                 notifier,
@@ -1274,6 +1229,20 @@ mod tests {
     }
 
     use arc_proto::v1::history_entry;
+
+    fn last_assistant_content(events: &[session_event::Event], session_id: &str) -> Option<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m)
+                    if m.session_id == session_id && m.role == Role::Assistant as i32 =>
+                {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .next_back()
+    }
 
     fn said(answer: &SessionHistory) -> Vec<(Role, &str)> {
         answer
@@ -1376,6 +1345,145 @@ mod tests {
         assert_eq!(end.output_tokens, usage().output_tokens);
         assert!(!end.partial);
         assert!(!end.step_capped, "the turn finished on its own");
+        assert!(!end.queued, "this connection streamed the turn it started");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_into_a_live_turn_is_queued_and_answered_inside_it() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("first".to_owned()))],
+                notify: Arc::clone(&gate),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(vec![
+                Ok(CompletionDelta::Text(" and second".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ]),
+        ]) as Arc<dyn Provider>;
+
+        let mut harness =
+            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let session_id = match next_frame(&mut ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        wait_for_child_message_count(&harness, &session_id, 1).await;
+
+        let mut second_ws = harness.connect().await;
+        send(&mut second_ws, 2, say(&session_id, "and another thing")).await;
+        match next_frame(&mut second_ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, session_id),
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        }
+        let queued = ended(next_frame(&mut second_ws).await.msg.expect("a message"));
+        assert!(
+            queued.queued,
+            "the sender is told its message joined a turn already running"
+        );
+        assert_eq!((queued.input_tokens, queued.output_tokens), (0, 0));
+
+        gate.notify_one();
+
+        let mut text = String::new();
+        let closing = loop {
+            let frame = next_frame(&mut ws).await;
+            assert_eq!(frame.request_id, 1, "one stream, one request");
+            match frame.msg {
+                Some(server_frame::Msg::Delta(delta)) => text.push_str(&delta.text),
+                Some(closing) => break closing,
+                None => panic!("a server frame with no message"),
+            }
+        };
+        assert_eq!(
+            text, "first and second",
+            "the answer to the queued message streams in the turn that took it"
+        );
+        assert!(!ended(closing).queued);
+
+        let messages: Vec<_> = harness
+            .logged_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                session_event::Event::MessageAppended(m) if m.session_id == session_id => {
+                    Some((Role::try_from(m.role).expect("a known role"), m.content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                (Role::User, "hello".to_owned()),
+                (Role::Assistant, "first".to_owned()),
+                (Role::User, "and another thing".to_owned()),
+                (Role::Assistant, " and second".to_owned()),
+            ],
+            "the queued message landed at the turn's next step boundary"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_mid_turn_never_stops_the_turn() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
+            notify: Arc::clone(&gate),
+            after: vec![
+                Ok(CompletionDelta::Text(" and done".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        }]) as Arc<dyn Provider>;
+
+        let mut harness =
+            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, say("", "hello")).await;
+        let session_id = match next_frame(&mut ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
+            other => panic!("expected MessageAccepted, got {other:?}"),
+        };
+        wait_for_child_message_count(&harness, &session_id, 1).await;
+
+        drop(ws);
+        gate.notify_one();
+        wait_for_child_message_count(&harness, &session_id, 2).await;
+
+        let reply = harness
+            .logged_events()
+            .into_iter()
+            .find_map(|event| match event {
+                session_event::Event::MessageAppended(m)
+                    if m.session_id == session_id && m.role == Role::Assistant as i32 =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            })
+            .expect("the turn finished without its connection");
+        assert_eq!(reply.content, "working and done");
+        assert!(
+            !reply.partial,
+            "the turn ran to a whole reply, not a cut one"
+        );
 
         harness.stop().await;
     }
@@ -2142,6 +2250,14 @@ mod tests {
                     stop: Stop::EndTurn,
                 }),
             ],
+            // the handback turn the finished job starts on this parent
+            vec![
+                Ok(CompletionDelta::Text("noted".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
         ]));
         let executor_script = Script::Canned(VecDeque::from([vec![
             Ok(CompletionDelta::Text("on it".to_owned())),
@@ -2209,17 +2325,18 @@ mod tests {
         assert_eq!(child_messages[1].role, Role::Assistant as i32);
         assert_eq!(child_messages[1].content, "on it");
 
-        let parent_messages: Vec<_> = events
+        let handback = events
             .iter()
             .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.session_id == parent_id => Some(m),
+                session_event::Event::MessageAppended(m)
+                    if m.session_id == parent_id && m.role == Role::User as i32 =>
+                {
+                    Some(m)
+                }
                 _ => None,
             })
-            .collect();
-        let handback = parent_messages
-            .last()
+            .next_back()
             .expect("the handback landed in the parent's history");
-        assert_eq!(handback.role, Role::User as i32);
         assert_eq!(
             handback.content,
             format!(
@@ -2227,6 +2344,11 @@ mod tests {
                 child.session_id
             ),
             "the handback names the child and carries its final reply"
+        );
+        assert_eq!(
+            last_assistant_content(&events, &parent_id),
+            Some("noted".to_owned()),
+            "and the parent read it on a turn of its own"
         );
 
         harness.stop().await;
@@ -2358,6 +2480,14 @@ mod tests {
                     stop: Stop::EndTurn,
                 }),
             ],
+            // the handback turn the finished job starts on this parent
+            vec![
+                Ok(CompletionDelta::Text("noted".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                }),
+            ],
         ]))
     }
 
@@ -2428,7 +2558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_steer_to_a_live_job_is_accepted_and_processed_after_the_initial_turn() {
+    async fn a_steer_to_a_live_job_is_accepted_and_lands_in_the_turn_it_is_running() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
 
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -2505,12 +2635,12 @@ mod tests {
                 (Role::User, "also check the linter".to_owned()),
                 (Role::Assistant, "steer reply".to_owned()),
             ],
-            "the brief turn ran to completion before the steered turn started"
+            "the steer landed in the turn already running"
         );
         assert_eq!(
             harness.provider.requests().len(),
-            2,
-            "the steer never reached the engine: the concierge ran only its own two turns"
+            3,
+            "the steer never reached the concierge: its own turn, then the handback turn"
         );
 
         harness.stop().await;
@@ -2570,7 +2700,9 @@ mod tests {
             .logged_events()
             .into_iter()
             .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.session_id == parent_id => {
+                session_event::Event::MessageAppended(m)
+                    if m.session_id == parent_id && m.role == Role::User as i32 =>
+                {
                     Some(m.content)
                 }
                 _ => None,
@@ -2701,7 +2833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_steers_on_a_live_job_with_queued_steers_is_accepted() {
+    async fn drop_steers_on_a_live_job_is_accepted_and_leaves_its_turn_alone() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
 
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -2728,11 +2860,6 @@ mod tests {
 
         let child_id = dispatched_child_id(&harness);
         wait_for_child_message_count(&harness, &child_id, 1).await;
-
-        let mut steer_ws = harness.connect().await;
-        send(&mut steer_ws, 2, say(&child_id, "also check the linter")).await;
-        next_frame(&mut steer_ws).await; // MessageAccepted
-        next_frame(&mut steer_ws).await; // StreamEnd
 
         let mut drop_ws = harness.connect().await;
         send(
@@ -2766,7 +2893,7 @@ mod tests {
         assert_eq!(
             child_messages,
             ["fix the failing test".to_owned(), "working".to_owned()],
-            "the dropped steer never ran"
+            "the drop left the running turn alone"
         );
 
         harness.stop().await;
@@ -3420,17 +3547,21 @@ mod tests {
         let (notifier, _receiver) = broadcast::channel(256);
 
         let concierge_gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
-            before: vec![Ok(CompletionDelta::Text("part one ".to_owned()))],
-            notify: Arc::clone(&concierge_gate),
-            after: vec![
-                Ok(CompletionDelta::Text("part two".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        }]) as Arc<dyn Provider>;
+        let concierge_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("part one ".to_owned()))],
+                notify: Arc::clone(&concierge_gate),
+                after: vec![
+                    Ok(CompletionDelta::Text("part two".to_owned())),
+                    Ok(CompletionDelta::Done {
+                        usage: usage(),
+                        stop: Stop::EndTurn,
+                    }),
+                ],
+            },
+            // the job's handback starts a turn on its own parent session
+            Step::Immediate(done_reply("noted")),
+        ]) as Arc<dyn Provider>;
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("job done")]);
 
         let engine = Arc::new(
@@ -3467,7 +3598,8 @@ mod tests {
                 Arc::clone(&engine),
                 BTreeMap::from([(SessionRole::Executor, executor_runner)]),
             )
-            .with_notifier(notifier.clone()),
+            .with_notifier(notifier.clone())
+            .with_concierge(concierge_runner),
         );
 
         let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -3477,7 +3609,6 @@ mod tests {
         let server = tokio::spawn(serve(
             listener,
             Arc::clone(&engine),
-            concierge_runner,
             reads,
             Arc::clone(&supervisor),
             notifier,
