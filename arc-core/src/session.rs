@@ -174,7 +174,7 @@ pub enum Error {
 
     #[error(
         "session {session_id} was recorded on {pinned}; the {role} now runs {serving}. \
-         Dispatch a fresh job instead."
+         Fork it to continue under {serving}, or dispatch a fresh job."
     )]
     ModelMismatch {
         session_id: String,
@@ -483,9 +483,16 @@ impl Engine {
             .ok_or_else(|| Error::UnknownSession {
                 session_id: parent_id.to_owned(),
             })?;
-        let (provider, model) = self
-            .with_store(|store| store.projection().session_identity(parent_id))?
-            .unwrap_or_default();
+        // a fork is the door past the pin: it runs under the role's model today
+        let (provider, model) = match self
+            .role_identities
+            .get(&SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified))
+        {
+            Some(current) => current.clone(),
+            None => self
+                .with_store(|store| store.projection().session_identity(parent_id))?
+                .unwrap_or_default(),
+        };
         let project = self
             .with_store(|store| store.projection().session_project(parent_id))?
             .unwrap_or_default();
@@ -5751,7 +5758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_session_copies_the_parents_recorded_identity_grants_and_role() {
+    async fn fork_session_records_the_roles_current_identity_and_copies_grants_and_role() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -5814,8 +5821,8 @@ mod tests {
         assert_eq!(created.project, "arc");
         assert_eq!(
             (created.provider.as_str(), created.model.as_str()),
-            ("codex-legacy", "gpt-5-legacy"),
-            "the parent's recorded identity, not the reconfigured one"
+            ("codex-new", "gpt-6-new"),
+            "the role's current identity, so the fork runs under today's model"
         );
         assert_eq!(
             created.grants,
