@@ -86,6 +86,7 @@ pub enum NetEvent {
     ToolEnded {
         call_id: String,
         outcome: i32,
+        content: String,
     },
     End {
         partial: bool,
@@ -208,6 +209,8 @@ pub enum Block {
         name: String,
         args: String,
         outcome: Option<&'static str>,
+        content: String,
+        open: bool,
     },
     Cost {
         input_tokens: u32,
@@ -476,7 +479,7 @@ impl App {
             KeyCode::Char('d') if self.picker.is_some() => self.page_picker_selection(false),
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
-            KeyCode::Char('o') => self.toggle_thought(),
+            KeyCode::Char('o') => self.toggle_open_blocks(),
             KeyCode::Char('t') if self.status != Status::Streaming => {
                 return self.back_session();
             }
@@ -1738,15 +1741,27 @@ impl App {
                     name,
                     args: tool_summary(&arguments_json),
                     outcome: None,
+                    content: String::new(),
+                    open: false,
                 });
                 None
             }
-            NetEvent::ToolEnded { call_id, outcome } => {
+            NetEvent::ToolEnded {
+                call_id,
+                outcome,
+                content,
+            } => {
                 let ended = self.transcript.iter_mut().rev().find(
                     |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
                 );
-                if let Some(Block::Tool { outcome: o, .. }) = ended {
+                if let Some(Block::Tool {
+                    outcome: o,
+                    content: c,
+                    ..
+                }) = ended
+                {
                     *o = Some(outcome_label(outcome));
+                    *c = content;
                 }
                 None
             }
@@ -1963,16 +1978,22 @@ impl App {
         since.map_or(0, |since| since.elapsed().as_secs()).max(1)
     }
 
-    fn toggle_thought(&mut self) {
+    // one "show the work" toggle for everything that hides output by
+    // default: thoughts, handbacks, and tool results together
+    fn toggle_open_blocks(&mut self) {
         let any_open = self.transcript.iter().any(|block| {
             matches!(
                 block,
-                Block::Thought { open: true, .. } | Block::Handback { open: true, .. }
+                Block::Thought { open: true, .. }
+                    | Block::Handback { open: true, .. }
+                    | Block::Tool { open: true, .. }
             )
         });
         for block in &mut self.transcript {
             match block {
-                Block::Thought { open, .. } | Block::Handback { open, .. } => {
+                Block::Thought { open, .. }
+                | Block::Handback { open, .. }
+                | Block::Tool { open, .. } => {
                     *open = !any_open;
                 }
                 _ => {}
@@ -2267,6 +2288,8 @@ fn history_blocks(
                     name: call.name,
                     args: tool_summary(&call.arguments_json),
                     outcome: None,
+                    content: String::new(),
+                    open: false,
                 });
                 seqs.push(Some(seq));
             }
@@ -2274,8 +2297,12 @@ fn history_blocks(
                 let ended = blocks.iter_mut().rev().find(
                     |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
                 );
-                if let Some(Block::Tool { outcome, .. }) = ended {
+                if let Some(Block::Tool {
+                    outcome, content, ..
+                }) = ended
+                {
                     *outcome = Some(outcome_label(result.outcome));
+                    *content = result.content;
                 }
             }
             // provider-side, arrives resolved; styled like a finished tool line
@@ -2285,6 +2312,8 @@ fn history_blocks(
                     name: call.name,
                     args: tool_summary(&call.arguments_json),
                     outcome: Some("web"),
+                    content: call.response_json,
+                    open: false,
                 });
                 seqs.push(Some(seq));
             }
@@ -2474,6 +2503,14 @@ mod tests {
             call_id: call_id.to_owned(),
             name: name.to_owned(),
             arguments_json: String::new(),
+        }
+    }
+
+    fn ended(call_id: &str, outcome: i32, content: &str) -> NetEvent {
+        NetEvent::ToolEnded {
+            call_id: call_id.to_owned(),
+            outcome,
+            content: content.to_owned(),
         }
     }
 
@@ -2813,10 +2850,7 @@ mod tests {
         app.on_net(started("a", "alpha"));
         app.on_net(started("b", "beta"));
 
-        app.on_net(NetEvent::ToolEnded {
-            call_id: "b".to_owned(),
-            outcome: ToolOutcome::Ok as i32,
-        });
+        app.on_net(ended("b", ToolOutcome::Ok as i32, "found it"));
         assert_eq!(
             app.transcript,
             [
@@ -2832,26 +2866,28 @@ mod tests {
                     name: "alpha".to_owned(),
                     args: String::new(),
                     outcome: None,
+                    content: String::new(),
+                    open: false,
                 },
                 Block::Tool {
                     call_id: "b".to_owned(),
                     name: "beta".to_owned(),
                     args: String::new(),
                     outcome: Some("ok"),
+                    content: "found it".to_owned(),
+                    open: false,
                 },
             ]
         );
 
-        app.on_net(NetEvent::ToolEnded {
-            call_id: "a".to_owned(),
-            outcome: ToolOutcome::Error as i32,
-        });
+        app.on_net(ended("a", ToolOutcome::Error as i32, "boom"));
         assert!(matches!(
             &app.transcript[2],
             Block::Tool {
                 outcome: Some("error"),
+                content,
                 ..
-            }
+            } if content == "boom"
         ));
     }
 
@@ -2876,6 +2912,8 @@ mod tests {
                 name: "bash".to_owned(),
                 args: "cargo test".to_owned(),
                 outcome: None,
+                content: String::new(),
+                open: false,
             })
         );
     }
@@ -2906,6 +2944,8 @@ mod tests {
                 name: "read".to_owned(),
                 args: "src/main.rs".to_owned(),
                 outcome: Some("unknown"),
+                content: String::new(),
+                open: false,
             }]
         );
     }
@@ -3078,6 +3118,8 @@ mod tests {
                 name: "bash".to_owned(),
                 args: String::new(),
                 outcome: Some("ok"),
+                content: String::new(),
+                open: false,
             },
             Block::Arc {
                 text: "two".to_owned(),
@@ -3472,10 +3514,7 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         app.on_net(started("t", "get_time"));
-        app.on_net(NetEvent::ToolEnded {
-            call_id: "t".to_owned(),
-            outcome: 42,
-        });
+        app.on_net(ended("t", 42, "who knows"));
 
         assert_eq!(
             app.transcript,
@@ -3486,6 +3525,8 @@ mod tests {
                     name: "get_time".to_owned(),
                     args: String::new(),
                     outcome: Some("unknown"),
+                    content: "who knows".to_owned(),
+                    open: false,
                 },
             ]
         );
@@ -4401,10 +4442,7 @@ mod tests {
             session_id: "s-1".to_owned(),
         });
         live.on_net(started("t1", "lookup"));
-        live.on_net(NetEvent::ToolEnded {
-            call_id: "t1".to_owned(),
-            outcome: ToolOutcome::Ok as i32,
-        });
+        live.on_net(ended("t1", ToolOutcome::Ok as i32, "found it"));
         live.on_net(NetEvent::Delta("answer".to_owned()));
         live.on_net(end(false));
 
@@ -4415,7 +4453,15 @@ mod tests {
             entries: vec![
                 prose_entry(Role::User as i32, "hi", false),
                 call_entry("t1", "lookup"),
-                result_entry("t1", ToolOutcome::Ok as i32),
+                HistoryEntry {
+                    entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
+                        call_id: "t1".to_owned(),
+                        outcome: ToolOutcome::Ok as i32,
+                        truncated: false,
+                        content: "found it".to_owned(),
+                    })),
+                    seq: 0,
+                },
                 prose_entry(Role::Assistant as i32, "answer", false),
             ],
             parent_session: String::new(),
@@ -4424,6 +4470,13 @@ mod tests {
         });
 
         assert_eq!(reopened.transcript, live.transcript);
+        assert!(
+            matches!(
+                &live.transcript[1],
+                Block::Tool { content, .. } if content == "found it"
+            ),
+            "the live path filled the tool result's content"
+        );
     }
 
     #[test]
@@ -4450,12 +4503,16 @@ mod tests {
                     name: "alpha".to_owned(),
                     args: String::new(),
                     outcome: Some("unknown"),
+                    content: String::new(),
+                    open: false,
                 },
                 Block::Tool {
                     call_id: "b".to_owned(),
                     name: "beta".to_owned(),
                     args: String::new(),
                     outcome: Some("unknown"),
+                    content: String::new(),
+                    open: false,
                 },
             ]
         );
@@ -6067,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_opens_thoughts_and_handbacks_together() {
+    fn ctrl_o_opens_thoughts_handbacks_and_tool_results_together() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -6076,6 +6133,8 @@ mod tests {
         });
         app.on_net(NetEvent::Reasoning("checking the failing case".to_owned()));
         app.on_net(NetEvent::Delta("done".to_owned()));
+        app.on_net(started("t1", "lookup"));
+        app.on_net(ended("t1", ToolOutcome::Ok as i32, "found it"));
         app.transcript.push(
             prose_block(handback_message(&format!(
                 "Job {JOB_ID} finished.\nall green"
@@ -6089,7 +6148,11 @@ mod tests {
             "ctrl-o opens the thought"
         );
         assert!(
-            matches!(&app.transcript[3], Block::Handback { open: true, .. }),
+            matches!(&app.transcript[3], Block::Tool { open: true, .. }),
+            "and the tool result"
+        );
+        assert!(
+            matches!(&app.transcript[4], Block::Handback { open: true, .. }),
             "and the handback with it"
         );
 
@@ -6100,6 +6163,10 @@ mod tests {
         ));
         assert!(matches!(
             &app.transcript[3],
+            Block::Tool { open: false, .. }
+        ));
+        assert!(matches!(
+            &app.transcript[4],
             Block::Handback { open: false, .. }
         ));
     }
@@ -6245,6 +6312,8 @@ mod tests {
             name: "bash".to_owned(),
             args: "ls".to_owned(),
             outcome: Some("ok"),
+            content: "total 0".to_owned(),
+            open: false,
         });
         app.transcript.push(Block::Cost {
             input_tokens: 10,
@@ -6737,6 +6806,8 @@ mod tests {
                 name: "bash".to_owned(),
                 args: "secret.sh".to_owned(),
                 outcome: Some("ok"),
+                content: "secret output".to_owned(),
+                open: true,
             },
             Block::Cost {
                 input_tokens: 1,

@@ -593,6 +593,7 @@ mod tests {
                 EngineEvent::ToolCallEnded {
                     call_id: "c1".to_owned(),
                     outcome: ToolOutcome::Ok,
+                    content: "found it".to_owned(),
                 },
                 EngineEvent::Delta("final text".to_owned()),
             ]

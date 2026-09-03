@@ -44,6 +44,7 @@ pub enum TurnEvent {
     ToolCallEnded {
         call_id: String,
         outcome: i32,
+        content: String,
     },
     End {
         input_tokens: u32,
@@ -433,6 +434,7 @@ impl Turn<'_> {
             server_frame::Msg::ToolCallEnded(ended) => TurnEvent::ToolCallEnded {
                 call_id: ended.call_id,
                 outcome: ended.outcome,
+                content: ended.content,
             },
             server_frame::Msg::StreamEnd(end) => {
                 self.done = true;
@@ -1000,7 +1002,7 @@ mod tests {
                 session_id: "s-1".to_owned(),
                 call_id: "call-aa".to_owned(),
                 outcome: ToolOutcome::Ok as i32,
-                content: String::new(),
+                content: "3 memories found".to_owned(),
             })),
             echo(delta("s-1", "hello")),
             echo(stream_end("s-1", false)),
@@ -1031,6 +1033,7 @@ mod tests {
                 TurnEvent::ToolCallEnded {
                     call_id: "call-aa".to_owned(),
                     outcome: ToolOutcome::Ok as i32,
+                    content: "3 memories found".to_owned(),
                 },
                 TurnEvent::Delta("hello".to_owned()),
                 TurnEvent::End {

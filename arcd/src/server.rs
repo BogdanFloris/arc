@@ -394,14 +394,16 @@ async fn forward(
                 name,
                 arguments_json,
             }),
-            EngineEvent::ToolCallEnded { call_id, outcome } => {
-                server_frame::Msg::ToolCallEnded(ToolCallEnded {
-                    session_id: session_id.clone(),
-                    call_id,
-                    outcome: outcome as i32,
-                    content: String::new(),
-                })
-            }
+            EngineEvent::ToolCallEnded {
+                call_id,
+                outcome,
+                content,
+            } => server_frame::Msg::ToolCallEnded(ToolCallEnded {
+                session_id: session_id.clone(),
+                call_id,
+                outcome: outcome as i32,
+                content,
+            }),
         };
         if !send_frame(ws, request_id, msg).await {
             return ControlFlow::Break(());
@@ -1871,7 +1873,7 @@ mod tests {
                     session_id: session_id.clone(),
                     call_id: "t1".to_owned(),
                     outcome: ToolOutcome::Ok as i32,
-                    content: String::new(),
+                    content: "found it".to_owned(),
                 }),
                 server_frame::Msg::Delta(Delta {
                     session_id: session_id.clone(),

@@ -455,7 +455,15 @@ fn map_turn_event(event: TurnEvent) -> NetEvent {
             name,
             arguments_json,
         },
-        TurnEvent::ToolCallEnded { call_id, outcome } => NetEvent::ToolEnded { call_id, outcome },
+        TurnEvent::ToolCallEnded {
+            call_id,
+            outcome,
+            content,
+        } => NetEvent::ToolEnded {
+            call_id,
+            outcome,
+            content,
+        },
         TurnEvent::End {
             input_tokens,
             output_tokens,

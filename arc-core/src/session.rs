@@ -106,6 +106,7 @@ pub enum EngineEvent {
     ToolCallEnded {
         call_id: String,
         outcome: ToolOutcome,
+        content: String,
     },
 }
 
@@ -1363,7 +1364,7 @@ impl Engine {
                                 turn_id: turn_id.to_owned(),
                                 name: call_name,
                                 arguments_json: call_payload,
-                                response_json: payload_json,
+                                response_json: payload_json.clone(),
                                 provider_roundtrip: Vec::new(),
                             }),
                         )?;
@@ -1372,6 +1373,7 @@ impl Engine {
                             .send(EngineEvent::ToolCallEnded {
                                 call_id,
                                 outcome: ToolOutcome::Ok,
+                                content: payload_json,
                             })
                             .await;
                     } else {
@@ -1561,6 +1563,7 @@ impl Engine {
                 .send(EngineEvent::ToolCallEnded {
                     call_id: call.id.clone(),
                     outcome,
+                    content: content.clone(),
                 })
                 .await;
             results.push((call.id.clone(), content));
@@ -1588,6 +1591,7 @@ impl Engine {
                     .send(EngineEvent::ToolCallEnded {
                         call_id: call.id.clone(),
                         outcome: ToolOutcome::Error,
+                        content: content.clone(),
                     })
                     .await;
                 results.push((call.id.clone(), content));
@@ -3399,6 +3403,7 @@ mod tests {
                 EngineEvent::ToolCallEnded {
                     call_id: "srv1".to_owned(),
                     outcome: ToolOutcome::Ok,
+                    content: "found it".to_owned(),
                 },
                 EngineEvent::Delta("answer".to_owned()),
             ]
@@ -3465,6 +3470,7 @@ mod tests {
                 EngineEvent::ToolCallEnded {
                     call_id: "web-0".to_owned(),
                     outcome: ToolOutcome::Ok,
+                    content: r#"{"results":["arc 3.5"]}"#.to_owned(),
                 },
                 EngineEvent::Delta("arc shipped 3.5".to_owned()),
             ]
@@ -3936,6 +3942,7 @@ mod tests {
         assert!(drain(&mut rx).contains(&EngineEvent::ToolCallEnded {
             call_id: "x".to_owned(),
             outcome: ToolOutcome::Error,
+            content: "ERROR: nope".to_owned(),
         }));
     }
 

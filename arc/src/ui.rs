@@ -239,6 +239,8 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                 name,
                 args,
                 outcome,
+                content,
+                open,
                 ..
             } => {
                 let state = outcome.unwrap_or("...");
@@ -248,6 +250,9 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                     format!("{name} {args} · {state}")
                 };
                 out.push(Line::styled(elide(&text, width), theme::DIM));
+                if *open && !content.is_empty() {
+                    push_capped(&mut out, content, width, theme::DIM);
+                }
             }
             Block::Sources(sources) => {
                 for (title, uri) in sources {
@@ -297,6 +302,23 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: S
         for line in textwrap::wrap(paragraph, options.clone()) {
             out.push(Line::styled(line.into_owned(), style));
         }
+    }
+}
+
+// the tool already capped the text at its own output limit; this caps the
+// screen space an open result can take, independent of that
+const TOOL_CONTENT_CAP: usize = 40;
+
+fn push_capped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let mut wrapped = Vec::new();
+    push_wrapped(&mut wrapped, text, width, style);
+    if wrapped.len() > TOOL_CONTENT_CAP {
+        let cut = wrapped.len() - TOOL_CONTENT_CAP;
+        wrapped.truncate(TOOL_CONTENT_CAP);
+        out.extend(wrapped);
+        out.push(Line::styled(format!("… {cut} more lines"), theme::DIM));
+    } else {
+        out.extend(wrapped);
     }
 }
 
@@ -1286,6 +1308,100 @@ mod tests {
             reversed("needle", &buffer),
             vec!["needle here"],
             "exactly the match renders reversed"
+        );
+    }
+
+    fn tool_block(open: bool, content: &str) -> Block {
+        Block::Tool {
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            args: "cargo test".to_owned(),
+            outcome: Some("ok"),
+            content: content.to_owned(),
+            open,
+        }
+    }
+
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_collapsed_and_an_open_tool_block_render_side_by_side() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app.transcript.push(Block::You("run the tests".to_owned()));
+        app.transcript
+            .push(tool_block(false, "cargo test\n... 42 passed"));
+        app.transcript
+            .push(Block::You("what failed earlier?".to_owned()));
+        app.transcript.push(tool_block(
+            true,
+            "bash -lc 'cargo test tool_result'\nrunning 3 tests\ntest a ... ok",
+        ));
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("bash cargo test · ok"), "both headers render");
+        assert!(
+            !text.contains("42 passed"),
+            "the collapsed block's content stays hidden"
+        );
+        assert!(
+            text.contains("running 3 tests") && text.contains("test a ... ok"),
+            "the open block's content renders wrapped beneath its header"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_tool_block_renders_as_one_line() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app.transcript.push(Block::You("run the tests".to_owned()));
+        app.transcript
+            .push(tool_block(false, "running 42 tests\nall green\n"));
+
+        let buffer = rendered(&mut app);
+        let text = plain_text(&buffer);
+        assert!(text.contains("bash cargo test · ok"), "the header renders");
+        assert!(
+            !text.contains("running 42 tests") && !text.contains("all green"),
+            "collapsed content stays off screen"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_collapsed_tool_block_and_its_content_appears() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        app.transcript.push(Block::You("run the tests".to_owned()));
+        app.transcript
+            .push(tool_block(false, "running 42 tests\nall green"));
+
+        app.on_key(ctrl('o'));
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.contains("running 42 tests") && text.contains("all green"),
+            "ctrl-o opened it, the same gesture that opens a thought"
+        );
+    }
+
+    #[test]
+    fn a_long_open_tool_result_is_capped_at_forty_lines_with_a_marker() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        let content = (1..=45)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.transcript.push(tool_block(true, &content));
+
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("line 40"), "the cap keeps the first 40");
+        assert!(!text.contains("line 41"), "the rest is cut");
+        assert!(
+            text.contains("5 more lines"),
+            "the marker names how many were cut, got: {text}"
         );
     }
 
