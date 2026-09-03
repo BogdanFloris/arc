@@ -72,7 +72,18 @@ pub struct Engine {
     // deregisters on every exit, so a session appears here only while its
     // turn is actually running
     cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
+    // same lifecycle as `cancels`: a per-turn inbox drained at step
+    // boundaries, so a message sent mid-turn lands without a new turn
+    inboxes: StdMutex<HashMap<String, mpsc::UnboundedSender<Inbound>>>,
     notifier: Option<broadcast::Sender<Notification>>,
+}
+
+/// A message queued into a session with a live turn, delivered at the
+/// turn's next step boundary rather than starting a turn of its own.
+#[derive(Debug, Clone)]
+pub struct Inbound {
+    pub content: String,
+    pub source: Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +214,7 @@ impl Engine {
             expert_enabled: false,
             turns: StdMutex::new(HashMap::new()),
             cancels: StdMutex::new(HashMap::new()),
+            inboxes: StdMutex::new(HashMap::new()),
             notifier: None,
         }
     }
@@ -234,6 +246,22 @@ impl Engine {
                 let _ = tx.send(true);
                 true
             }
+            None => false,
+        }
+    }
+
+    /// Queues a message into a session's live turn, delivered at its next
+    /// step boundary. Returns whether a turn was live and accepted it; a
+    /// caller sees `false` when it must start a turn itself instead.
+    pub fn queue_message(&self, session_id: &str, content: &str, source: Source) -> bool {
+        let inboxes = self.inboxes.lock().expect("inboxes lock poisoned");
+        match inboxes.get(session_id) {
+            Some(tx) => tx
+                .send(Inbound {
+                    content: content.to_owned(),
+                    source,
+                })
+                .is_ok(),
             None => false,
         }
     }
@@ -835,6 +863,40 @@ impl Engine {
         content: &str,
         events: mpsc::Sender<EngineEvent>,
     ) -> Result<Reply, Error> {
+        self.send_message_from(runner, session_id, content, Source::User, events)
+            .await
+    }
+
+    #[tracing::instrument(
+        level = "info",
+        name = "session.send_message",
+        skip_all,
+        fields(
+            model = %runner.model,
+            role = provider::role_label(runner.role),
+            thinking = runner.thinking.label(),
+            session_id = tracing::field::Empty,
+            new_session = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            assistant_seq = tracing::field::Empty,
+            tool_steps = tracing::field::Empty,
+            counter.memory_searches = tracing::field::Empty,
+            counter.memory_search_hits = tracing::field::Empty,
+            counter.memory_reads_from_search = tracing::field::Empty,
+            counter.records_created = tracing::field::Empty,
+            counter.records_superseded = tracing::field::Empty,
+            server_calls = tracing::field::Empty,
+            grounded = tracing::field::Empty,
+        )
+    )]
+    pub async fn send_message_from(
+        &self,
+        runner: &Runner,
+        session_id: Option<&str>,
+        content: &str,
+        source: Source,
+        events: mpsc::Sender<EngineEvent>,
+    ) -> Result<Reply, Error> {
         if content.trim().is_empty() {
             return Err(Error::EmptyMessage);
         }
@@ -877,7 +939,7 @@ impl Engine {
             )?;
         }
         self.record(
-            Source::User,
+            source,
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.clone(),
                 role: Role::User as i32,
@@ -985,10 +1047,16 @@ impl Engine {
             .lock()
             .expect("cancels lock poisoned")
             .insert(session_id.to_owned(), cancel_tx);
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Inbound>();
+        self.inboxes
+            .lock()
+            .expect("inboxes lock poisoned")
+            .insert(session_id.to_owned(), inbox_tx);
         // the drop guard is the honest shape: every exit from this loop,
-        // including a `?` early return, must deregister the same entry
-        let _cancel_guard = CancelGuard {
+        // including a `?` early return, must deregister both entries
+        let _turn_guard = TurnRegistration {
             cancels: &self.cancels,
+            inboxes: &self.inboxes,
             session_id,
         };
 
@@ -1057,6 +1125,7 @@ impl Engine {
                             cancels: cancel_requests,
                         });
                     }
+                    self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
                 }
                 Ending::Done(_) => {
                     let elapsed_ms = elapsed_ms_since(turn_start);
@@ -1069,6 +1138,16 @@ impl Engine {
                         elapsed_ms,
                         grounding.clone().unwrap_or_default(),
                     )?;
+                    transcript.push(Message::Text {
+                        role: Role::Assistant,
+                        content: text,
+                        reasoning: None,
+                    });
+                    // a message that lands right as the model stops keeps
+                    // the turn going instead of ending it unanswered
+                    if self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)? {
+                        continue;
+                    }
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
                     break Ok(Reply {
@@ -1592,6 +1671,43 @@ impl Engine {
         Ok(seq)
     }
 
+    // arrival order: a message sent while the turn is between steps lands
+    // in the transcript exactly where it was queued
+    fn drain_inbox(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
+        transcript: &mut Vec<Message>,
+    ) -> Result<bool, Error> {
+        let mut delivered = false;
+        while let Ok(inbound) = inbox_rx.try_recv() {
+            self.record(
+                inbound.source,
+                session_event::Event::MessageAppended(MessageAppended {
+                    session_id: session_id.to_owned(),
+                    role: Role::User as i32,
+                    content: inbound.content.clone(),
+                    partial: false,
+                    turn_id: turn_id.to_owned(),
+                    ..Default::default()
+                }),
+            )?;
+            transcript.push(Message::Text {
+                role: Role::User,
+                content: inbound.content,
+                reasoning: None,
+            });
+            tracing::info!(
+                session_id,
+                source = ?inbound.source,
+                "delivered a queued message at a turn step boundary"
+            );
+            delivered = true;
+        }
+        Ok(delivered)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn append_reply(
         &self,
@@ -1935,16 +2051,21 @@ enum Ending {
     Failed(provider::Error),
 }
 
-struct CancelGuard<'a> {
+struct TurnRegistration<'a> {
     cancels: &'a StdMutex<HashMap<String, watch::Sender<bool>>>,
+    inboxes: &'a StdMutex<HashMap<String, mpsc::UnboundedSender<Inbound>>>,
     session_id: &'a str,
 }
 
-impl Drop for CancelGuard<'_> {
+impl Drop for TurnRegistration<'_> {
     fn drop(&mut self) {
         self.cancels
             .lock()
             .expect("cancels lock poisoned")
+            .remove(self.session_id);
+        self.inboxes
+            .lock()
+            .expect("inboxes lock poisoned")
             .remove(self.session_id);
     }
 }
@@ -2490,6 +2611,195 @@ mod tests {
         assert!(
             !engine.cancel_turn(&reply.session_id),
             "the turn already ended; a second cancel finds nothing registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_message_on_an_idle_session_returns_false_and_appends_nothing() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _run) = engine(&provider, &dir);
+
+        assert!(!engine.queue_message("s-never-existed", "hi", Source::User));
+        assert!(replay_log(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_message_is_refused_once_the_turn_has_ended() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("all done")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert!(
+            !engine.queue_message(&reply.session_id, "late", Source::User),
+            "the turn ended; the inbox is deregistered"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_from_records_the_first_message_with_the_given_source() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi there")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message_from(&run, None, "hi", Source::System, tx)
+            .await
+            .expect("send");
+
+        let logged = replay_log(dir.path());
+        let user = appended(&logged[1]);
+        assert_eq!(user.content, "hi");
+        assert_eq!(replay_events(dir.path())[1].source, Source::System as i32);
+        assert!(!reply.session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_during_a_tool_step_lands_after_the_result_and_before_the_reply() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "slow", "{}")), Ok(tool_stop())],
+            done_reply("final reply"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(Gated {
+            name: "slow",
+            notify: Arc::clone(&gate),
+        }));
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = Arc::new(engine);
+
+        let (tx, mut rx) = channel();
+        let handle = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let run = run.clone();
+            async move { engine.send_message(&run, None, "go", tx).await }
+        });
+
+        let session_id = loop {
+            if let EngineEvent::Accepted { session_id } =
+                rx.recv().await.expect("events channel stays open")
+            {
+                break session_id;
+            }
+        };
+        loop {
+            if let EngineEvent::ToolCallStarted { .. } =
+                rx.recv().await.expect("events channel stays open")
+            {
+                break;
+            }
+        }
+
+        assert!(
+            engine.queue_message(&session_id, "queued mid-tool", Source::System),
+            "the turn is live"
+        );
+        gate.notify_one();
+
+        let reply = handle.await.expect("task").expect("a clean reply");
+        assert!(!reply.partial);
+
+        let events = replay_log(dir.path());
+        let issued_call = issued(&events[2]);
+        assert_eq!(issued_call.call_id, "c1");
+        let result = resulted(&events[3]);
+        assert_eq!(result.call_id, "c1");
+        let injected = appended(&events[4]);
+        assert_eq!(injected.content, "queued mid-tool");
+        let raw_events = replay_events(dir.path());
+        assert_eq!(raw_events[4].source, Source::System as i32);
+        let final_reply = appended(&events[5]);
+        assert_eq!(final_reply.content, "final reply");
+        assert_eq!(events.len(), 6);
+
+        let requests = provider.requests();
+        assert_eq!(
+            requests[1].messages.last(),
+            Some(&Message::Text {
+                role: Role::User,
+                content: "queued mid-tool".to_owned(),
+                reasoning: None,
+            }),
+            "the next completion request ends with the injected message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_as_the_model_stops_continues_the_turn_for_a_second_completion() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("stopped".to_owned()))],
+                notify: Arc::clone(&gate),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("second reply")),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Arc::new(engine);
+
+        let (tx, mut rx) = channel();
+        let handle = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let run = run.clone();
+            async move { engine.send_message(&run, None, "go", tx).await }
+        });
+
+        let session_id = loop {
+            if let EngineEvent::Accepted { session_id } =
+                rx.recv().await.expect("events channel stays open")
+            {
+                break session_id;
+            }
+        };
+        loop {
+            if let EngineEvent::Delta(text) = rx.recv().await.expect("events channel stays open") {
+                assert_eq!(text, "stopped");
+                break;
+            }
+        }
+
+        assert!(
+            engine.queue_message(&session_id, "queued at the finish", Source::User),
+            "the turn is live"
+        );
+        gate.notify_one();
+
+        let reply = handle.await.expect("task").expect("a clean reply");
+        assert!(!reply.partial);
+
+        let events = replay_log(dir.path());
+        assert_eq!(events.len(), 5);
+        let first_reply = appended(&events[2]);
+        assert_eq!(first_reply.content, "stopped");
+        let injected = appended(&events[3]);
+        assert_eq!(injected.content, "queued at the finish");
+        let second_reply = appended(&events[4]);
+        assert_eq!(second_reply.content, "second reply");
+        assert_eq!(reply.seq, 4, "the reply points at the second completion");
+
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the queued message forced a second completion"
+        );
+
+        assert!(
+            !engine.queue_message(&session_id, "too late", Source::User),
+            "the turn ended; the inbox is deregistered"
         );
     }
 
