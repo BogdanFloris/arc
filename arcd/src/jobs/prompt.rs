@@ -20,7 +20,11 @@ fn direct_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working interactively with \
          the user in {}. Four workspace tools are available: read, write, edit, \
-         bash. Be concise. Show file paths clearly.",
+         bash. Be concise. Show file paths clearly.\n\n\
+         When you dispatch, end your reply; the handback arrives on its own. \
+         Briefs are self-contained: the child sees nothing of this session. \
+         Check a handback against the workspace with your own tools before \
+         repeating it.",
         root.display()
     )
 }
@@ -175,6 +179,33 @@ mod tests {
         let identity = system.find("You are ARC.").expect("identity");
         let agents = system.find("Use jj, not git.").expect("AGENTS.md");
         assert!(preamble < identity && identity < agents, "{system}");
+    }
+
+    #[test]
+    fn only_the_direct_prompt_carries_dispatch_doctrine() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let direct = direct_system_prompt(&root, None);
+        let job = job_system_prompt(&root);
+
+        assert!(
+            direct.contains("When you dispatch, end your reply; the handback arrives on its own."),
+            "{direct}"
+        );
+        assert!(
+            direct.contains("Briefs are self-contained: the child sees nothing of this session."),
+            "{direct}"
+        );
+        assert!(
+            direct.contains(
+                "Check a handback against the workspace with your own tools before \
+                 repeating it."
+            ),
+            "{direct}"
+        );
+        assert!(!job.contains("When you dispatch"), "{job}");
     }
 
     #[test]
