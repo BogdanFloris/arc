@@ -8,7 +8,7 @@ Write and speak in plain English. Say only what the reader needs. Lead with the 
 
 ## Current phase
 
-Phase 3.5 is the tree. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. Session forking, rewind, and tree navigation land now, developed through ARC itself — that week of use is Phase 3's carried exit criterion. History is never rewritten: a fork is a new branch, a rewind is a fork at an earlier point (invariant 1). Do not build later-phase features. If work points toward voice, devices, or a sandboxed worker, add only the interface needed now.
+Phase 3.7 is the direct door. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. The executor becomes the session the user develops in: one turn runner for every session, messages landing mid-turn, tool results on screen, compaction as a log event, memory gated on presence. History is never rewritten: a fork is a new branch, a rewind is a fork at an earlier point, and compaction is an event the transcript builder honours, never a rewrite (invariant 1). Do not build later-phase features. If work points toward voice, devices, or a sandboxed worker, add only the interface needed now.
 
 ## Workspace
 

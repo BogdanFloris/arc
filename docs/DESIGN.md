@@ -10,7 +10,7 @@
 
 ARC is a personal AI assistant. An always-on Rust daemon (`arcd`) serves a thin TUI client over WebSocket. ARC has durable memory, a stable identity, and swappable LLM providers. Voice, mobile, and device support are later work.
 
-Conversation stays short and responsive. ARC sends longer work, such as writing a program or flashing a board, to jobs with their own models and tools. Coding is the first job type, not a special case.
+Where the user opens ARC decides the door. Opened inside a configured project, ARC is the coding session itself: the user talks to the model that reads and edits the code. Opened anywhere else, ARC is the conversation: short, unbound, with memory, and the shape voice will use. Either door sends work it should not wait for, such as a twenty-minute refactor or flashing a board, to jobs with their own models and tools. Coding is the first job type, not a special case. Amended 2026-09-03: the earlier text made the conversation the only door and routed every line of code through a relay that could not read it. The evidence is in `TASKS-phase3-6.md`.
 
 Priorities, in order:
 
@@ -196,6 +196,8 @@ This gives a job the same archive, replay, fork, and rewind behaviour as any oth
 
 The reason to separate them at all is size. A conversational turn is small; writing a driver is twenty minutes and a hundred thousand tokens. Run that in the conversation and the context the user talks to drowns in tool output.
 
+That argument holds for the unbound conversation and for work the user walks away from. It does not hold for the session the user sits in front of. A development session is the executor itself, bound to the project with identity loaded, and it dispatches only for work that should run beside it or after the user leaves. Decided 2026-09-03: Phase 3.6 spent seven of its thirteen rows repairing what a relay that cannot read the code lost, cut, or invented between the user and the job.
+
 Rules:
 
 - **The conversation never blocks.** Dispatch returns a job id immediately and the user keeps talking.
@@ -204,11 +206,11 @@ Rules:
 - **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
 - **A job has a budget**, declared at dispatch and enforced by arcd. A loop that cannot terminate must not be able to drain a month's allowance. Suspended while daily use calibrates, 2026-08-26: the dispatch tool no longer asks the model for budgets — token arithmetic was noise to the concierge, and the provider subscription's own cap is the ceiling that matters during testing. The enforcement machinery stays, dormant, for when real spend data says what budgets should be.
 
-**A job runs as a supervised task in `arcd`.** It uses the same `Store` and appends the same events. This keeps the conversation responsive without adding process coordination. It is not a security boundary: workspace tools still run as the user. Move jobs to a separate worker only when a real sandbox design is ready.
+**Every session's turn runs as a supervised task in `arcd`**, interactive sessions and jobs alike. Decided 2026-09-03; until then only jobs did, and a conversational turn ran on the connection that started it. A connection subscribes to a session's events and can drop and return without the turn noticing. A message into a live session is queued and delivered at the next step boundary, whether it comes from the user, from a parent's steer, or from a child's handback. A system-sourced message into an idle session starts a turn; a user's message always does. That one rule is the steer, the handback turn, and the mid-turn "no, use GPIO 4" together. A job is then a session whose parent receives a summary and a footprint when its turn ends, not a second runner. This is not a security boundary: workspace tools still run as the user. Move jobs to a separate worker only when a real sandbox design is ready.
 
 **Dispatch is a normal tool call; the handback is a separate message.** The model calls dispatch, ARC appends `ToolCallIssued`, creates the child durably, and records an immediate `ToolResultRecorded` acknowledging the job and naming the child session. When the job finishes, its summary arrives in the parent as a `MessageAppended` with `Event.source = SYSTEM`, carrying the child's session id.
 
-**The handback turn.** A summary landing in a concierge parent is read, not just filed: the daemon drives one model turn over the parent, with no user message appended, so the concierge reacts — verifies, reports in a sentence or two, and dispatches again when the result demands it. Chains of work run this way with the user informed at every hop rather than consulted; the concierge stops and asks when it genuinely needs input, which ends the chain because nothing else triggers a turn. A backstop of fifty consecutive handback turns without a user message exists to bound a pathological loop, not to govern normal use. Handbacks arriving while a handback turn is pending collapse into one turn over the accumulated state. §3.1's rule that arcd does not re-drive the model is about crash recovery — a restarted daemon must not resume a turn the user walked away from — and was never meant to keep the daemon from reading its own mail.
+**The handback turn.** With every session on one runner this is the general rule above, stated for the case that motivated it. A summary landing in a concierge parent is read, not just filed: the daemon drives one model turn over the parent, with no user message appended, so the concierge reacts — verifies, reports in a sentence or two, and dispatches again when the result demands it. Chains of work run this way with the user informed at every hop rather than consulted; the concierge stops and asks when it genuinely needs input, which ends the chain because nothing else triggers a turn. A backstop of fifty consecutive handback turns without a user message exists to bound a pathological loop, not to govern normal use. Handbacks arriving while a handback turn is pending collapse into one turn over the accumulated state. §3.1's rule that arcd does not re-drive the model is about crash recovery — a restarted daemon must not resume a turn the user walked away from — and was never meant to keep the daemon from reading its own mail.
 
 An earlier draft made the summary the dispatch call's own delayed `ToolResultRecorded`. That shape cannot be built honestly: while the job runs, the parent's transcript holds a call with no result, and providers reject such a history — so the transcript builder would have to show the model a synthetic "still running" line that was never logged, breaking the rule that what the model sees is durable. The immediate ack keeps every transcript valid at every moment, and the system-sourced summary message is durable, ordered, and visible to the model on the next turn exactly as logged. The unfinished-call recovery rule still covers a crash between `ToolCallIssued` and the ack: unknown, not failed.
 
@@ -262,6 +264,19 @@ The cost is a pin. A concierge whose web access comes from its provider is tied 
 
 **Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
 
+### 4.4 Compaction
+
+A long session outgrows its window. The answer is an event, not an in-memory convenience. Decided 2026-09-03, resolving the open question in section 12; the first `:code` sessions that run all day forced it.
+
+- **`SessionCompacted`** records the seq the summary covers through, the summary text, the prompt version that wrote it, and the model. On replay the transcript builder shows the model the summary in place of everything through that seq, then the rest verbatim. A rebuild reproduces the same transcript without calling a model, which is what invariants 1 and 2 require. Nothing leaves the log; the archive and the TUI still hold every message.
+- **The trigger is measured.** Providers report prompt tokens on every step, and the last step's count is the live context size. Each role's config names its `context_window`, and compaction runs when a step's prompt tokens cross a fraction of it. Session totals are the wrong number: they sum every step.
+- **The session's own model writes the summary.** It holds the context and its cache is warm. The span carries a compaction label. The output is validated before it is appended; a summary that does not parse writes nothing and the turn continues uncompacted.
+- **User messages are never paraphrased.** The summary carries them verbatim, and the last few turns stay whole. Tool output goes first.
+- **The tree is unaffected.** A fork before the event inherits the full prefix; a fork after inherits the summary.
+- **`:compact`** appends the same event by hand.
+
+The cache miss after a compaction is inherent and paid once.
+
 **The shell tool settles the open redaction question.** `bash` is the first tool that can read its own environment. arcd runs workspace tools with a scrubbed environment: no keys and no tokens. A result cannot contain credentials the process never received. Secret protection depends on what the tool can access, not on a regex applied afterwards.
 
 ## 5. Memory
@@ -285,7 +300,7 @@ This is close to what `AGENTS.md` already asks of contributors, and deliberately
 
 Identity loads wherever the user is present: the concierge, and a direct executor session — the `:code` door and any follow-up sent into a finished job's own session (row 9.1). Dispatched jobs still get none; a job has no voice and no personality preamble, and paying for one on the bulk of the token spend is waste. The distinction is presence, not role.
 
-Operational doctrine is not identity and does not live in the file. The concierge's rules for running jobs — dispatch-then-stop, when to continue versus dispatch, handbacks are claims — are a constant in code, appended after the identity file in the concierge's system prompt: each line is coupled to the tool surface and must change in lockstep with it, at code cadence, not human cadence.
+Operational doctrine is not identity and does not live in the file. The concierge's rules for running jobs — dispatch-then-stop, when to continue versus dispatch, handbacks are claims — are a constant in code, appended after the identity file in the concierge's system prompt: each line is coupled to the tool surface and must change in lockstep with it, at code cadence, not human cadence. A direct session that dispatches carries a shorter set: dispatch then stop, briefs are self-contained, check a handback with your own tools before repeating it. Most of the concierge's lines exist because it cannot read the code; a session that can needs none of them.
 
 ### 5.2 Distilled tier
 
@@ -327,6 +342,8 @@ Storage is the easy half. Deciding what to remember is the hard half. v1 keeps i
 2. **End-of-session extraction.** When a session goes idle, a cheap model pass extracts durable facts, merges them into existing records, and resolves contradictions by superseding. Runs async on the daemon.
 
 **Gates around the extractor** (decided 2026-08-28; the evidence is in TASKS section 8). Extraction is role-gated: the pass mines concierge sessions only — job sessions are titled and marked consolidated, never asked for user facts, because a work transcript holds none and a model asked anyway writes a task log. The extractor's input states what is already known: the identity file renders into it as context that must never be re-extracted, and recalled memory — memory and archive tool results in the transcript — is elided, so injected content is never learned again. And dedup is code, not prompt: between parse and append, an exact-normalized match against ACTIVE records dies as a no-op, and near matches go to one forced-choice model call — reasoning first, then duplicate-of/supersedes/neither over integer indices into the shown neighbors — validated and applied by code. Asking the model to check the index is not trusted; that was measured to fail.
+
+The gate is presence, not role. Amended 2026-09-03: a session the user opened, at either door, is mined; a session a model dispatched is titled and never asked for user facts. The recorded creation source says which. `memory_write` follows the same rule and is held wherever the user is present, so a correction given inside a `:code` session lands the same as one given in conversation.
 
 Every decision emits Perfetto spans, so tuning happens against traces, not guesses. The failure modes to watch are hoarding noise and remembering nothing useful. Rules get complexity only once real usage shows which one bites.
 
@@ -426,7 +443,7 @@ Tool-calling and system-prompt differences are normalized in `arc-core`, never l
 
 Protobuf over WebSocket (`wire.proto`), served by `arcd` on localhost. Remote access is Tailscale reaching the same socket. ARC does not implement its own tunnel, TLS termination, or auth beyond a local token in v1.
 
-The protocol serves the TUI in Phase 3: send a message, receive streamed deltas and tool-call events, and query sessions and history. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state. Job status can be queried or refreshed by the TUI. Images, modality hints, unsolicited notifications, and additional transports arrive with the clients that require them.
+The protocol serves the TUI in Phase 3: send a message, receive streamed deltas and tool-call events, and query sessions and history. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state. The door is the client's choice: a local client started inside a configured project's root opens a bound executor session there, pending until the first message; started anywhere else, or from a remote client whose directory means nothing to the daemon, it opens the conversation. Each door stays reachable from the other. Job status can be queried or refreshed by the TUI. Images, modality hints, unsolicited notifications, and additional transports arrive with the clients that require them.
 
 Clients:
 
@@ -478,6 +495,10 @@ Each phase ends in something used daily. No phase starts until the previous one 
 
 **Phase 3.5 — Tree.** Session forking with §4's branch semantics, rewind, and tree navigation in the TUI. Split out of Phase 3 and kept immediately after it because rewind is a development feature: recovering from a bad edit path without re-prompting from scratch is what makes a cheap `executor` model affordable. Exit criterion: branching gets used naturally.
 
+**Phase 3.6 — Quiet week.** *Done 2026-09-03.* No planned rows; thirteen found. Seven were the concierge losing, cutting, or inventing what passed between the user and a job, and the verdict was that a split built for voice is the wrong default at a keyboard. Record in `TASKS-phase3-6.md`.
+
+**Phase 3.7 — Direct door.** The executor becomes the development session: one turn runner for every session, messages landing mid-turn, tool results on screen, compaction as an event, the door chosen by where the client opened, memory gated on presence. Exit criterion: a week of development in `:code` sessions, with the concierge used for talk and for away-from-keyboard dispatch only, and compaction having fired on real work without a visible loss.
+
 **Phase 4 — Voice + remote.** `arc-voice` per §7 — wake word, local ASR, text on the wire, local TTS — the daemon reached from a phone over Tailscale (the mobile client can start as the TUI over SSH), and rustic backup automated. Exit criteria: a restore drill rather than a backup existing, and voice degrading to the local provider when the network is gone.
 
 **Phase 5 — Devices.** The first device MCP server (ESP32 pan-tilt) as a source in §4.3's registry, device-tool safety conventions designed against the first real actuator, then the arm. A wake-word room satellite, if one appears, is a §7 *client* and not a device — same board, different integration path, and conflating them would put a special case in the device layer. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
@@ -488,7 +509,7 @@ Deferred on purpose. Decide when the phase forces it.
 
 - **Consolidation triggering:** idle timeout vs explicit session close vs continuous. The v1 placeholder is a configurable idle timeout, so the pass has something to hang on. Traces judge it. (Phase 2.)
 - ~~**Model routing.**~~ **Decided.** Configuration assigns static roles; there is no runtime difficulty classifier, and every trace span records its role. Two questions remain: whether roles need task-specific labels (for example, consolidation and titling may need different timeouts and concurrency), and whether the concierge can dispatch reliably enough or needs a stronger model just for dispatch. Phase 3 traces should answer both.
-- **Compaction and the log.** A long job (§4.1) will exceed any context window, and summarising its own history is a durable decision that changes what the model sees. Replay must reproduce it, so it cannot be an in-memory convenience. Likely a new kind inside `SessionEvent`, recording what was compacted and the prompt version that did it — the same shape as `SessionConsolidated` in §5.4. Decide when the first job hits the limit, not before. (Phase 3.)
+- ~~**Compaction and the log.**~~ **Decided 2026-09-03**, as section 4.4: a `SessionCompacted` event the transcript builder honours on replay, triggered by measured prompt tokens against a configured window. What remains open is the fraction and the summary prompt, which the first real compactions tune.
 - **Voice stage placement.** With the concierge hosted, the GPU is free during a voice turn — the sidecar is asleep and consolidation only runs on idle sessions. The Phase 4 plan's "whisper on CPU so the GPU stays free" constraint may no longer apply, which would allow a larger ASR model or GPU-side TTS for faster first audio. Measure in Phase 4 rather than inheriting the assumption. (Phase 4.)
 - **Identity edits in the log.** Revisit if hand-editing becomes a bottleneck.
 - **Embeddings model for sqlite-vec,** local or API. (Phase 4/5.)
