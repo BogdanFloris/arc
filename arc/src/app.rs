@@ -4135,6 +4135,7 @@ mod tests {
                 call_id: call_id.to_owned(),
                 outcome,
                 truncated: false,
+                content: String::new(),
             })),
             seq: 0,
         }
@@ -4968,10 +4969,12 @@ mod tests {
             ProjectInfo {
                 name: "arc".to_owned(),
                 description: "ARC's own repo".to_owned(),
+                root: String::new(),
             },
             ProjectInfo {
                 name: "scratch".to_owned(),
                 description: String::new(),
+                root: String::new(),
             },
         ]));
         app.on_key(key(KeyCode::Char('j')));

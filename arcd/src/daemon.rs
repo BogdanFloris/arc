@@ -238,6 +238,7 @@ impl Daemon {
             .map(|(name, project)| arc_proto::v1::ProjectInfo {
                 name: name.clone(),
                 description: project.description.clone(),
+                root: project.root.display().to_string(),
             })
             .collect();
         let supervisor = Arc::new(

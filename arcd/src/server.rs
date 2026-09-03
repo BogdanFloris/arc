@@ -281,6 +281,18 @@ async fn request(
             });
             ControlFlow::Continue(())
         }
+        // served by the compaction row; the schema lands first
+        Some(client_frame::Msg::CompactSession(compact)) => flow(
+            send_frame(
+                ws,
+                frame.request_id,
+                error_frame(
+                    "unsupported",
+                    format!("compaction is not served yet ({})", compact.session_id),
+                ),
+            )
+            .await,
+        ),
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
@@ -404,6 +416,7 @@ async fn send_steered(ws: &mut Socket, request_id: u64, session_id: &str) -> boo
         partial: false,
         step_capped: false,
         grounding_json: String::new(),
+        queued: true,
     });
     send_frame(ws, request_id, end).await
 }
@@ -445,6 +458,7 @@ async fn forward(
                     session_id: session_id.clone(),
                     call_id,
                     outcome: outcome as i32,
+                    content: String::new(),
                 })
             }
         };
@@ -708,6 +722,7 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
         partial: reply.partial,
         step_capped: reply.step_capped,
         grounding_json: reply.grounding_json.clone(),
+        queued: false,
     })
 }
 
@@ -788,6 +803,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
         Some(client_frame::Msg::ListProjects(_)) => "list_projects",
         Some(client_frame::Msg::Subscribe(_)) => "subscribe",
+        Some(client_frame::Msg::CompactSession(_)) => "compact_session",
         Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
         Some(client_frame::Msg::DropSteers(_)) => "drop_steers",
         Some(client_frame::Msg::CreateSession(_)) => "create_session",
@@ -1067,6 +1083,7 @@ mod tests {
                 .map(|name| ProjectInfo {
                     name: name.clone(),
                     description: format!("about {name}"),
+                    root: String::new(),
                 })
                 .collect();
             let engine = Arc::new(
@@ -1705,6 +1722,7 @@ mod tests {
                     session_id: session_id.clone(),
                     call_id: "t1".to_owned(),
                     outcome: ToolOutcome::Ok as i32,
+                    content: String::new(),
                 }),
                 server_frame::Msg::Delta(Delta {
                     session_id: session_id.clone(),
@@ -1847,6 +1865,7 @@ mod tests {
                         call_id: "t1".to_owned(),
                         outcome: ToolOutcome::Ok as i32,
                         truncated: false,
+                        content: "found it".to_owned(),
                     })),
                     seq: 3,
                 },
@@ -3214,6 +3233,7 @@ mod tests {
             vec![ProjectInfo {
                 name: "arc".to_owned(),
                 description: "about arc".to_owned(),
+                root: String::new(),
             }]
         );
 

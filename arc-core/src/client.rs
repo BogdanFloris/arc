@@ -526,6 +526,7 @@ mod tests {
             partial,
             step_capped: false,
             grounding_json: String::new(),
+            queued: false,
         })
     }
 
@@ -940,6 +941,7 @@ mod tests {
                 session_id: "s-1".to_owned(),
                 call_id: "call-aa".to_owned(),
                 outcome: ToolOutcome::Ok as i32,
+                content: String::new(),
             })),
             echo(delta("s-1", "hello")),
             echo(stream_end("s-1", false)),

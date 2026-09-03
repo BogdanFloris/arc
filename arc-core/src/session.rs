@@ -1718,6 +1718,7 @@ fn session_id_of(event: &session_event::Event) -> &str {
         session_event::Event::BranchMarked(e) => &e.session_id,
         session_event::Event::SessionConsolidated(e) => &e.session_id,
         session_event::Event::SessionTitled(e) => &e.session_id,
+        session_event::Event::SessionCompacted(e) => &e.session_id,
     }
 }
 
@@ -3210,6 +3211,7 @@ mod tests {
                         call_id: "c1".to_owned(),
                         outcome: 42,
                         truncated: true,
+                        content: "what the model saw".to_owned(),
                     })),
                     seq: 0,
                 },

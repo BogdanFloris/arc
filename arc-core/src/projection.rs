@@ -418,6 +418,8 @@ impl Projection {
                 session_event::Event::SessionConsolidated(consolidated) => {
                     mark_consolidated(&tx, event, consolidated)?;
                 }
+                // applied by the compaction row; the schema lands first
+                session_event::Event::SessionCompacted(_) => {}
             },
             event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
                 memory_event::Event::RecordCreated(created) => {
@@ -1331,11 +1333,13 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             call_id,
             outcome,
             truncated,
+            content,
             ..
         } => history_entry::Entry::ToolResult(HistoryToolResult {
             call_id,
             outcome,
             truncated,
+            content,
         }),
         MessageRow::ServerCall {
             name,
@@ -1365,6 +1369,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::BranchMarked(_) => "branch_marked",
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
             session_event::Event::SessionTitled(_) => "session_titled",
+            session_event::Event::SessionCompacted(_) => "session_compacted",
         },
         event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
             memory_event::Event::RecordCreated(_) => "memory_record_created",

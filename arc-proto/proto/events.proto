@@ -129,6 +129,16 @@ message SessionConsolidated {
   string prompt_version = 3;
 }
 
+// The transcript builder shows `summary` in place of every row through
+// `through_seq`; replay reproduces the same transcript without a model.
+message SessionCompacted {
+  string session_id = 1;
+  uint64 through_seq = 2;
+  string summary = 3;
+  string prompt_version = 4;
+  string model = 5;
+}
+
 message SessionEvent {
   oneof event {
     SessionCreated session_created = 1;
@@ -139,6 +149,7 @@ message SessionEvent {
     SessionTitled session_titled = 7;
     ServerCallRecorded server_call_recorded = 8;
     BranchMarked branch_marked = 9;
+    SessionCompacted session_compacted = 10;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
 }

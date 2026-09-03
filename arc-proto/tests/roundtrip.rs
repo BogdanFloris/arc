@@ -366,6 +366,7 @@ fn server_frame_arms_round_trip() {
                         call_id: "call-aa".to_string(),
                         outcome: ToolOutcome::Ok as i32,
                         truncated: true,
+                        content: String::new(),
                     })),
                     seq: 3,
                 },
@@ -385,11 +386,25 @@ fn server_frame_arms_round_trip() {
             partial: true,
             step_capped: true,
             grounding_json: r#"{"webSearchQueries":["arc"]}"#.to_string(),
+            queued: false,
         }),
         server_frame::Msg::Error(Error {
             code: "provider_unavailable".to_string(),
             msg: "upstream returned 503".to_string(),
         }),
+    ];
+
+    for arm in arms {
+        round_trip(&ServerFrame {
+            request_id: 7,
+            msg: Some(arm),
+        });
+    }
+}
+
+#[test]
+fn server_frame_stream_arms_round_trip() {
+    let arms = [
         server_frame::Msg::ReasoningDelta(ReasoningDelta {
             session_id: "s-01".to_string(),
             text: "let me look that up ".to_string(),
@@ -405,6 +420,7 @@ fn server_frame_arms_round_trip() {
             session_id: "s-01".to_string(),
             call_id: "call-aa".to_string(),
             outcome: ToolOutcome::Error as i32,
+            content: String::new(),
         }),
     ];
 

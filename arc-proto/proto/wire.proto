@@ -68,7 +68,15 @@ message ClientFrame {
     MarkBranch mark_branch = 23;
     CancelTurn cancel_turn = 24;
     ListProjects list_projects = 25;
+    CompactSession compact_session = 26;
   }
+}
+
+// Appends a SessionCompacted by hand (the TUI's :compact). Refused while
+// the session has a live turn; the reply is the same ack CreateSession
+// answers with.
+message CompactSession {
+  string session_id = 1;
 }
 
 // Cancels the caller's own in-flight turn (row 2.5): a graceful cut, not the
@@ -94,6 +102,8 @@ message ProjectInfo {
   string name = 1;
   // one line grounding what the project is, from its config
   string description = 2;
+  // the project's root, so a local client can match its own directory
+  string root = 3;
 }
 
 message ProjectList {
@@ -221,6 +231,8 @@ message ToolCallEnded {
   string call_id = 2;
   ToolOutcome outcome = 3;
   reserved 4;
+  // the result as the tool capped it, for the client to show on request
+  string content = 5;
 }
 
 message StreamEnd {
@@ -234,6 +246,9 @@ message StreamEnd {
   // grounding metadata for the reply just streamed, so a live turn can
   // render citations without a refetch; empty when ungrounded
   string grounding_json = 6;
+  // the message was queued into a turn already running in this session;
+  // its answer arrives in that turn's stream, not this one
+  bool queued = 7;
 }
 
 message Error {
@@ -276,6 +291,7 @@ message HistoryToolResult {
   string call_id = 1;
   ToolOutcome outcome = 2;
   bool truncated = 3;
+  string content = 4;
 }
 
 message HistoryEntry {
