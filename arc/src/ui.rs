@@ -364,12 +364,6 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(note) = &app.yank_note {
         words.push(Span::styled(format!(" {note}"), theme::DIM));
     }
-    if !app.queued.is_empty() {
-        words.push(Span::styled(
-            format!(" +{} queued", app.queued.len()),
-            theme::DIM,
-        ));
-    }
     if !words.is_empty() {
         words.push(Span::styled(" --", theme::DIM));
     }
@@ -447,15 +441,9 @@ fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>
 // measured before the layout: the input row has to grow with its wrapped text
 fn input_height(app: &App, frame: Rect) -> u16 {
     let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
-    let steering = app
-        .jobs
-        .as_ref()
-        .is_some_and(|jobs| jobs.steering.is_some());
     let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
     let (prefix, text): (&str, &str) = if app.mode == Mode::Cmd {
         (":", &app.cmd)
-    } else if steering {
-        ("s> ", &app.input)
     } else if filtering || app.searching {
         ("/", &app.input)
     } else {
@@ -470,15 +458,9 @@ fn input_height(app: &App, frame: Rect) -> u16 {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let steering = app
-        .jobs
-        .as_ref()
-        .is_some_and(|jobs| jobs.steering.is_some());
     let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
-    } else if steering {
-        ("s> ", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else if filtering || app.searching {
         ("/", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
@@ -523,7 +505,6 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 
     if app.mode == Mode::Cmd
-        || steering
         || filtering
         || app.searching
         || (app.picker.is_none()
@@ -1014,7 +995,6 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               move selection",
             "r                 refresh the list",
             "enter             open the selected job's session",
-            "s                 steer the selected job",
             "x                 cancel the selected job (if running)",
             "d                 drop its queued steers (if any)",
             "q esc             close",

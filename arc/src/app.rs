@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -19,6 +19,10 @@ pub enum Command {
     },
     Send {
         session_id: Option<String>,
+        content: String,
+    },
+    SendLive {
+        session_id: String,
         content: String,
     },
     ReviewList {
@@ -89,6 +93,10 @@ pub enum NetEvent {
         output_tokens: u32,
         step_capped: bool,
         grounding_json: String,
+        /// The message that started this stream was queued into a turn
+        /// already running in this session; its real reply streams on
+        /// whichever request accepted that turn, not this one.
+        queued: bool,
     },
     Failed {
         code: String,
@@ -161,7 +169,6 @@ pub struct Jobs {
     pub items: Vec<JobInfo>,
     pub selected: usize,
     pub loaded: bool,
-    pub steering: Option<String>,
     pub confirmation: Option<String>,
 }
 
@@ -250,7 +257,14 @@ pub struct App {
     pub status: Status,
     pub last_error: Option<String>,
     pub yank_note: Option<String>,
-    pub queued: VecDeque<String>,
+    /// Count of turns this client is inside; `Status::Streaming` iff > 0.
+    /// `Accepted` increments, `StreamEnd`/error decrements, `Disconnected`
+    /// resets — two sockets can each hold one at once.
+    live_streams: u32,
+    /// A message typed while streaming but before the session id is known
+    /// (the first message of a brand-new session): sent as `Send` once an
+    /// `Accepted` names the session, the way `pending_first` already works.
+    pending_live: Option<String>,
     thinking_since: Option<Instant>,
     turn_started: Option<Instant>,
     streamed_chars: usize,
@@ -259,11 +273,9 @@ pub struct App {
     pub ambient: Vec<JobInfo>,
     strip_since: Instant,
     refetch_in_flight: bool,
-    steer_stash: Option<String>,
     previous_session: Option<String>,
     picker_filter_stash: Option<String>,
     search_stash: Option<String>,
-    steer_turn_pending: bool,
     visual_anchor: usize,
     visual_point: bool,
     visual_boundary: usize,
@@ -305,7 +317,8 @@ impl App {
             status: Status::Idle,
             last_error: None,
             yank_note: None,
-            queued: VecDeque::new(),
+            live_streams: 0,
+            pending_live: None,
             thinking_since: None,
             turn_started: None,
             streamed_chars: 0,
@@ -314,11 +327,9 @@ impl App {
             ambient: Vec::new(),
             strip_since: Instant::now(),
             refetch_in_flight: false,
-            steer_stash: None,
             previous_session: None,
             picker_filter_stash: None,
             search_stash: None,
-            steer_turn_pending: false,
             visual_anchor: 0,
             visual_point: false,
             visual_boundary: 0,
@@ -1121,16 +1132,12 @@ impl App {
             items: Vec::new(),
             selected: 0,
             loaded: false,
-            steering: None,
             confirmation: None,
         });
         Command::ListJobs
     }
 
     fn on_jobs_key(&mut self, code: KeyCode) -> Option<Command> {
-        if self.jobs.as_ref().expect("jobs is open").steering.is_some() {
-            return self.on_steer_key(code);
-        }
         let jobs = self.jobs.as_mut().expect("jobs is open");
         jobs.confirmation = None;
         let last = jobs.items.len().saturating_sub(1);
@@ -1143,11 +1150,6 @@ impl App {
                 let session_id = self.selected_job();
                 self.jobs = None;
                 return self.start_session(session_id);
-            }
-            KeyCode::Char('s') => {
-                if let Some(session_id) = self.selected_job() {
-                    self.start_steer(session_id);
-                }
             }
             KeyCode::Char('x') => return self.cancel_selected_job(),
             KeyCode::Char('d') => return self.drop_selected_steers(),
@@ -1184,44 +1186,6 @@ impl App {
         jobs.items
             .get(jobs.selected)
             .map(|job| job.session_id.clone())
-    }
-
-    fn start_steer(&mut self, session_id: String) {
-        self.steer_stash = Some(std::mem::take(&mut self.input));
-        self.cursor = 0;
-        self.jobs.as_mut().expect("jobs is open").steering = Some(session_id);
-    }
-
-    fn on_steer_key(&mut self, code: KeyCode) -> Option<Command> {
-        match code {
-            KeyCode::Esc => self.cancel_steer(),
-            KeyCode::Enter => return self.submit_steer(),
-            _ => self.edit_input(code),
-        }
-        None
-    }
-
-    fn cancel_steer(&mut self) {
-        self.jobs.as_mut().expect("jobs is open").steering = None;
-        self.input = self.steer_stash.take().unwrap_or_default();
-        self.cursor = self.input.len();
-    }
-
-    fn submit_steer(&mut self) -> Option<Command> {
-        let content = self.input.trim().to_owned();
-        if content.is_empty() {
-            return None;
-        }
-        let jobs = self.jobs.as_mut().expect("jobs is open");
-        let session_id = jobs.steering.take()?;
-        jobs.confirmation = Some(format!("steered {}", short_id(&session_id)));
-        self.input = self.steer_stash.take().unwrap_or_default();
-        self.cursor = self.input.len();
-        self.steer_turn_pending = true;
-        Some(Command::Send {
-            session_id: Some(session_id),
-            content,
-        })
     }
 
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
@@ -1610,7 +1574,15 @@ impl App {
         self.scroll_back = 0;
         self.push_block(Block::You(content.clone()));
         if self.status == Status::Streaming {
-            self.queued.push_back(content);
+            if let Some(session_id) = self.session_id.clone() {
+                return Some(Command::SendLive {
+                    session_id,
+                    content,
+                });
+            }
+            // the first message of a brand-new session: no session id to
+            // steer into yet, so hold it for the accept that names one
+            self.pending_live = Some(content);
             return None;
         }
         if self.session_id.is_none() {
@@ -1708,15 +1680,23 @@ impl App {
                 None
             }
             NetEvent::Accepted { session_id } => {
-                if self.steer_turn_pending {
-                    return None;
-                }
+                // the first live stream gets a fresh reply block; a second
+                // one accepted into an already-streaming session is just a
+                // queuing handshake, its answer is the first stream's
+                let first_stream = self.live_streams == 0;
+                self.live_streams += 1;
+                self.status = Status::Streaming;
                 let created = self.session_id.is_none();
                 self.session_id = Some(session_id);
-                self.push_block(Block::Arc {
-                    text: String::new(),
-                    partial: false,
-                });
+                if first_stream {
+                    self.push_block(Block::Arc {
+                        text: String::new(),
+                        partial: false,
+                    });
+                }
+                if let Some(live) = self.pending_live.take() {
+                    return Some(self.send(live));
+                }
                 created.then_some(Command::List)
             }
             NetEvent::Delta(text) => {
@@ -1776,9 +1756,13 @@ impl App {
                 output_tokens,
                 step_capped,
                 grounding_json,
+                queued,
             } => {
-                if self.steer_turn_pending {
-                    self.steer_turn_pending = false;
+                self.live_streams = self.live_streams.saturating_sub(1);
+                if queued {
+                    // a queuing handshake, not a finished turn: the real
+                    // reply is still streaming on whichever request holds it
+                    self.turn_over();
                     return None;
                 }
                 self.finalize_thinking();
@@ -1802,10 +1786,11 @@ impl App {
                 if !sources.is_empty() {
                     self.push_block(Block::Sources(sources));
                 }
-                self.turn_over(Status::Idle)
+                self.turn_over();
+                None
             }
             NetEvent::Failed { code, msg } => {
-                self.steer_turn_pending = false;
+                self.live_streams = self.live_streams.saturating_sub(1);
                 self.pending_first = None;
                 self.pending_rewind_text = None;
                 self.finalize_thinking();
@@ -1813,7 +1798,8 @@ impl App {
                 self.turn_started = None;
                 self.last_error = Some(code.clone());
                 self.push_block(Block::Fault { code, msg });
-                self.turn_over(Status::Idle)
+                self.turn_over();
+                None
             }
             NetEvent::ReviewItems(items) => {
                 if let Some(review) = self.review.as_mut() {
@@ -1921,20 +1907,24 @@ impl App {
             }
             NetEvent::Disconnected { reason } => {
                 self.turn_started = None;
+                self.live_streams = 0;
                 self.last_error = Some("disconnected".to_owned());
                 self.push_block(Block::Fault {
                     code: "disconnected".to_owned(),
                     msg: reason,
                 });
-                self.turn_over(Status::Disconnected)
+                self.status = Status::Disconnected;
+                None
             }
         }
     }
 
-    fn turn_over(&mut self, status: Status) -> Option<Command> {
-        self.status = status;
-        let next = self.queued.pop_front()?;
-        Some(self.send(next))
+    fn turn_over(&mut self) {
+        self.status = if self.live_streams > 0 {
+            Status::Streaming
+        } else {
+            Status::Idle
+        };
     }
 
     fn stream_thought(&mut self, text: String) {
@@ -2464,6 +2454,18 @@ mod tests {
             output_tokens: 0,
             step_capped: false,
             grounding_json: String::new(),
+            queued: false,
+        }
+    }
+
+    fn queued_end() -> NetEvent {
+        NetEvent::End {
+            partial: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            step_capped: false,
+            grounding_json: String::new(),
+            queued: true,
         }
     }
 
@@ -2959,6 +2961,7 @@ mod tests {
             output_tokens: 0,
             step_capped: false,
             grounding_json: GROUNDING.to_owned(),
+            queued: false,
         });
         assert!(
             matches!(
@@ -3272,6 +3275,7 @@ mod tests {
             output_tokens: 140,
             step_capped: false,
             grounding_json: String::new(),
+            queued: false,
         });
 
         assert!(matches!(
@@ -3319,6 +3323,7 @@ mod tests {
             output_tokens: 0,
             step_capped: true,
             grounding_json: String::new(),
+            queued: false,
         });
 
         assert_eq!(app.transcript.last(), Some(&Block::StepCapped));
@@ -3514,7 +3519,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_while_streaming_queues_and_the_end_flushes() {
+    fn typing_while_streaming_sends_live_and_pushes_the_you_block() {
         let mut app = App::new();
         typed(&mut app, "one");
         app.on_key(key(KeyCode::Enter));
@@ -3523,28 +3528,64 @@ mod tests {
         });
 
         typed(&mut app, "two");
-        assert_eq!(app.on_key(key(KeyCode::Enter)), None, "queued, not sent");
-        assert_eq!(app.queued.len(), 1);
+        let command = app.on_key(key(KeyCode::Enter));
 
-        let next = app.on_net(end(false));
         assert_eq!(
-            next,
+            command,
+            Some(Command::SendLive {
+                session_id: "s-1".to_owned(),
+                content: "two".to_owned()
+            }),
+            "a message typed mid-turn goes to the live turn, not a local queue"
+        );
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("one".to_owned()),
+                Block::Arc {
+                    text: String::new(),
+                    partial: false
+                },
+                Block::You("two".to_owned()),
+            ],
+            "the You block lands immediately, not after the turn ends"
+        );
+        assert_eq!(app.status, Status::Streaming);
+    }
+
+    #[test]
+    fn a_message_typed_before_the_first_accept_sends_once_the_session_is_named() {
+        let mut app = App::new();
+        typed(&mut app, "one");
+        app.on_key(key(KeyCode::Enter));
+
+        // the first message is in flight; no session id exists yet to steer into
+        typed(&mut app, "two");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            None,
+            "held until a session id is known, like pending_first"
+        );
+
+        let flushed = app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+
+        assert_eq!(
+            flushed,
             Some(Command::Send {
                 session_id: Some("s-1".to_owned()),
                 content: "two".to_owned()
             }),
-            "the queued message goes to the session the first turn named"
+            "sent as soon as the accept names the session"
         );
         assert_eq!(app.status, Status::Streaming);
-        assert!(app.queued.is_empty());
     }
 
     #[test]
-    fn disconnecting_faults_the_transcript_and_retries_the_queue() {
+    fn disconnecting_faults_the_transcript_with_no_retry() {
         let mut app = App::new();
         typed(&mut app, "one");
-        app.on_key(key(KeyCode::Enter));
-        typed(&mut app, "two");
         app.on_key(key(KeyCode::Enter));
 
         let retry = app.on_net(NetEvent::Disconnected {
@@ -3555,18 +3596,12 @@ mod tests {
             app.transcript.last(),
             Some(Block::Fault { code, .. }) if code == "disconnected"
         ));
-        assert_eq!(
-            retry,
-            Some(Command::Send {
-                session_id: None,
-                content: "two".to_owned()
-            }),
-            "the queued message drives the reconnect attempt"
-        );
+        assert_eq!(retry, None, "there is no local queue left to retry");
+        assert_eq!(app.status, Status::Disconnected);
     }
 
     #[test]
-    fn disconnecting_sets_the_status_and_it_persists_with_no_queue() {
+    fn disconnecting_sets_the_status_and_it_persists() {
         let mut app = App::new();
         app.on_net(NetEvent::Disconnected {
             reason: "the daemon closed the connection".to_owned(),
@@ -4721,19 +4756,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_does_nothing_while_steering() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(app.jobs.as_ref().expect("open").steering.is_some());
-
-        assert_eq!(app.on_key(ctrl('j')), None);
-
-        assert_eq!(app.input, "", "ctrl-j did not touch the steer input");
-    }
-
-    #[test]
     fn colon_help_opens_the_popup_and_q_closes_it() {
         let mut app = App::new();
         normal(&mut app, ":help");
@@ -5511,89 +5533,18 @@ mod tests {
     }
 
     #[test]
-    fn s_enters_the_steer_substate_and_typed_chars_land_in_the_input() {
+    fn s_is_no_longer_a_jobs_key() {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.input = "draft reply".to_owned();
-        app.cursor = app.input.len();
 
-        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None);
-        assert_eq!(app.input, "", "the conversation draft is stashed away");
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None, "not a jobs key");
         assert_eq!(
-            app.jobs.as_ref().expect("open").steering.as_deref(),
-            Some("s-a")
+            app.input, "",
+            "the steer prompt is gone, nothing captures it"
         );
-
-        typed(&mut app, "stop and check the tests");
-        assert_eq!(app.input, "stop and check the tests");
-        assert!(app.jobs.is_some(), "the popup stays open while steering");
-    }
-
-    #[test]
-    fn esc_cancels_steering_and_restores_the_stashed_input() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.input = "draft reply".to_owned();
-        app.cursor = app.input.len();
-        app.on_key(key(KeyCode::Char('s')));
-        typed(&mut app, "abandoned");
-
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-
-        assert_eq!(app.input, "draft reply", "the stash comes back");
-        assert_eq!(app.cursor, app.input.len());
-        assert!(
-            app.jobs.as_ref().expect("open").steering.is_none(),
-            "back to browsing the list"
-        );
-    }
-
-    #[test]
-    fn submitting_a_steer_sends_to_the_jobs_session_not_the_open_one() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
-        app.session_id = Some("s-open".to_owned());
-        app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Char('s')));
-        typed(&mut app, "pause and summarize");
-
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            command,
-            Some(Command::Send {
-                session_id: Some("s-b".to_owned()),
-                content: "pause and summarize".to_owned()
-            })
-        );
-        assert_eq!(
-            app.session_id.as_deref(),
-            Some("s-open"),
-            "the open conversation never moved"
-        );
+        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
         assert!(app.jobs.is_some(), "the popup stays open");
-        assert!(app.jobs.as_ref().expect("open").steering.is_none());
-    }
-
-    #[test]
-    fn the_confirmation_line_appears_after_submit_and_clears_on_the_next_key() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.on_key(key(KeyCode::Char('s')));
-        typed(&mut app, "go on");
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            app.jobs.as_ref().expect("open").confirmation.as_deref(),
-            Some("steered s-a")
-        );
-
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
     }
 
     #[test]
@@ -5682,25 +5633,49 @@ mod tests {
     }
 
     #[test]
-    fn a_steer_accepted_and_end_do_not_touch_the_open_conversation() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.session_id = Some("s-open".to_owned());
-        app.transcript.push(Block::You("earlier".to_owned()));
-        app.on_key(key(KeyCode::Char('s')));
-        typed(&mut app, "go on");
+    fn a_queued_stream_end_decrements_without_a_cost_block_or_touching_the_reply() {
+        let mut app = App::new();
+        typed(&mut app, "one");
         app.on_key(key(KeyCode::Enter));
-
         app.on_net(NetEvent::Accepted {
-            session_id: "s-a".to_owned(),
+            session_id: "s-1".to_owned(),
         });
-        let next = app.on_net(end(false));
+        app.on_net(NetEvent::Delta("still going".to_owned()));
+
+        typed(&mut app, "two");
+        let command = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            command,
+            Some(Command::SendLive {
+                session_id: "s-1".to_owned(),
+                content: "two".to_owned()
+            })
+        );
+
+        // the control channel's own accept-then-queued-end handshake for "two"
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+        let next = app.on_net(queued_end());
 
         assert_eq!(next, None);
-        assert_eq!(app.session_id.as_deref(), Some("s-open"));
-        assert_eq!(app.transcript, [Block::You("earlier".to_owned())]);
-        assert_eq!(app.status, Status::Idle);
+        assert_eq!(
+            app.status,
+            Status::Streaming,
+            "the main turn for \"one\" is still live"
+        );
+        assert_eq!(
+            app.transcript,
+            [
+                Block::You("one".to_owned()),
+                Block::Arc {
+                    text: "still going".to_owned(),
+                    partial: false
+                },
+                Block::You("two".to_owned()),
+            ],
+            "no Cost block, and the reply-in-progress is untouched"
+        );
     }
 
     #[test]

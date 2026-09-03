@@ -137,7 +137,7 @@ async fn run(
 
         match command {
             Some(Command::Yank(text)) => yank(&text),
-            Some(command @ Command::CancelTurn { .. }) => {
+            Some(command @ (Command::CancelTurn { .. } | Command::SendLive { .. })) => {
                 control_commands.send(command).expect("control task alive");
             }
             Some(command) => commands.send(command).expect("connection task alive"),

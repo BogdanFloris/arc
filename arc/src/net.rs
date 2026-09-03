@@ -1,4 +1,4 @@
-use arc_core::client::{Client, Error, TurnEvent};
+use arc_core::client::{Client, Error, Turn, TurnEvent};
 use arc_proto::v1::{Notification, notification};
 use tokio::sync::mpsc;
 
@@ -55,9 +55,10 @@ pub async fn run(
     }
 }
 
-/// A second connection, for `CancelTurn` alone: the main task in `run` is
-/// busy inside `send()` for the whole streaming turn Esc needs to interrupt,
-/// so a cancel needs a socket of its own. Connects lazily, on first use.
+/// A second connection, for `CancelTurn` and `SendLive`: the main task in
+/// `run` is busy inside `send()` for the whole streaming turn, so a message
+/// or a cancel that has to interrupt it needs a socket of its own. Connects
+/// lazily, on first use.
 pub async fn run_control(
     url: String,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -65,9 +66,6 @@ pub async fn run_control(
 ) {
     let mut client: Option<Client> = None;
     while let Some(command) = commands.recv().await {
-        let Command::CancelTurn { session_id } = command else {
-            continue;
-        };
         let mut connected = match client.take() {
             Some(connected) => connected,
             None => match Client::connect(&url).await {
@@ -80,7 +78,21 @@ pub async fn run_control(
                 }
             },
         };
-        match connected.cancel_turn(&session_id).await {
+        let result = match command {
+            Command::CancelTurn { session_id } => connected.cancel_turn(&session_id).await,
+            Command::SendLive {
+                session_id,
+                content,
+            } => match connected.send_message(Some(&session_id), &content).await {
+                Ok(turn) => drive_turn(turn, &events).await,
+                Err(error) => Err(error),
+            },
+            _ => {
+                client = Some(connected);
+                continue;
+            }
+        };
+        match result {
             Ok(()) => client = Some(connected),
             Err(Error::Server { code, msg }) => {
                 let _ = events.send(NetEvent::Failed { code, msg });
@@ -188,9 +200,9 @@ async fn handle(
         Command::CompactSession { session_id } => {
             compact_session(&mut client, &session_id, events).await
         }
-        // main.rs writes the OSC 52 sequence itself; this never reaches the socket
-        // and CancelTurn goes to run_control's own connection instead
-        Command::CancelTurn { .. } | Command::Yank(_) => Ok(()),
+        // main.rs writes the OSC 52 sequence itself; this never reaches the
+        // socket, and CancelTurn/SendLive go to run_control's own connection
+        Command::CancelTurn { .. } | Command::SendLive { .. } | Command::Yank(_) => Ok(()),
     };
     match result {
         Ok(()) => Some(client),
@@ -411,43 +423,56 @@ async fn send(
     content: &str,
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
-    let mut turn = client.send_message(session_id, content).await?;
+    let turn = client.send_message(session_id, content).await?;
+    drive_turn(turn, events).await
+}
+
+/// Drives a turn to completion, mapping each event to the app. Shared by the
+/// main socket's `send()` and the control socket's `SendLive`, so a message
+/// landing in an already-live turn is handled the same way either arrives.
+async fn drive_turn(
+    mut turn: Turn<'_>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
     while let Some(event) = turn.next().await? {
-        let event = match event {
-            TurnEvent::Accepted { session_id } => NetEvent::Accepted { session_id },
-            TurnEvent::Delta(text) => NetEvent::Delta(text),
-            TurnEvent::Reasoning(text) => NetEvent::Reasoning(text),
-            TurnEvent::ToolCallStarted {
-                call_id,
-                name,
-                arguments_json,
-                ..
-            } => NetEvent::ToolStarted {
-                call_id,
-                name,
-                arguments_json,
-            },
-            TurnEvent::ToolCallEnded { call_id, outcome } => {
-                NetEvent::ToolEnded { call_id, outcome }
-            }
-            TurnEvent::End {
-                input_tokens,
-                output_tokens,
-                partial,
-                step_capped,
-                grounding_json,
-            } => NetEvent::End {
-                partial,
-                input_tokens,
-                output_tokens,
-                step_capped,
-                grounding_json,
-            },
-            TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
-        };
-        let _ = events.send(event);
+        let _ = events.send(map_turn_event(event));
     }
     Ok(())
+}
+
+fn map_turn_event(event: TurnEvent) -> NetEvent {
+    match event {
+        TurnEvent::Accepted { session_id } => NetEvent::Accepted { session_id },
+        TurnEvent::Delta(text) => NetEvent::Delta(text),
+        TurnEvent::Reasoning(text) => NetEvent::Reasoning(text),
+        TurnEvent::ToolCallStarted {
+            call_id,
+            name,
+            arguments_json,
+            ..
+        } => NetEvent::ToolStarted {
+            call_id,
+            name,
+            arguments_json,
+        },
+        TurnEvent::ToolCallEnded { call_id, outcome } => NetEvent::ToolEnded { call_id, outcome },
+        TurnEvent::End {
+            input_tokens,
+            output_tokens,
+            partial,
+            step_capped,
+            grounding_json,
+            queued,
+        } => NetEvent::End {
+            partial,
+            input_tokens,
+            output_tokens,
+            step_capped,
+            grounding_json,
+            queued,
+        },
+        TurnEvent::Failed { code, msg } => NetEvent::Failed { code, msg },
+    }
 }
 
 #[cfg(test)]
@@ -455,8 +480,8 @@ mod tests {
     use std::time::Duration;
 
     use arc_proto::v1::{
-        ClientFrame, JobInfo, JobList, MemoryReviewItems, ProjectList, ServerFrame, SessionList,
-        client_frame, server_frame,
+        ClientFrame, Delta, JobInfo, JobList, MemoryReviewItems, MessageAccepted, ProjectList,
+        ServerFrame, SessionList, StreamEnd, client_frame, server_frame,
     };
     use futures::{SinkExt as _, StreamExt as _};
     use prost::Message as _;
@@ -693,6 +718,165 @@ mod tests {
                 code: "no_turn".to_owned(),
                 msg: "no turn is running on session s-idle".to_owned(),
             }
+        );
+
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("server finishes within PATIENCE")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn a_send_live_queued_into_a_running_turn_emits_only_accepted_and_a_queued_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("local addr"));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let frame = expect_frame(&mut ws).await;
+            assert!(
+                matches!(
+                    &frame.msg,
+                    Some(client_frame::Msg::SendMessage(m)) if m.session_id == "s-1"
+                ),
+                "got: {:?}",
+                frame.msg
+            );
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::MessageAccepted(MessageAccepted {
+                    session_id: "s-1".to_owned(),
+                }),
+            )
+            .await;
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::StreamEnd(StreamEnd {
+                    session_id: "s-1".to_owned(),
+                    queued: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        });
+
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        tokio::spawn(run_control(url, command_rx, event_tx));
+
+        commands
+            .send(Command::SendLive {
+                session_id: "s-1".to_owned(),
+                content: "no, use GPIO 4".to_owned(),
+            })
+            .expect("control task alive");
+
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::Accepted {
+                session_id: "s-1".to_owned()
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::End {
+                partial: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                step_capped: false,
+                grounding_json: String::new(),
+                queued: true,
+            },
+            "the real reply streams on whichever request holds the live turn"
+        );
+
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("server finishes within PATIENCE")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn a_send_live_that_lands_a_fresh_turn_streams_it_like_the_main_socket_would() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("local addr"));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let frame = expect_frame(&mut ws).await;
+            assert!(matches!(
+                &frame.msg,
+                Some(client_frame::Msg::SendMessage(m)) if m.session_id == "s-1"
+            ));
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::MessageAccepted(MessageAccepted {
+                    session_id: "s-1".to_owned(),
+                }),
+            )
+            .await;
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::Delta(Delta {
+                    session_id: "s-1".to_owned(),
+                    text: "on it".to_owned(),
+                }),
+            )
+            .await;
+            reply(
+                &mut ws,
+                frame.request_id,
+                server_frame::Msg::StreamEnd(StreamEnd {
+                    session_id: "s-1".to_owned(),
+                    queued: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        });
+
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        tokio::spawn(run_control(url, command_rx, event_tx));
+
+        commands
+            .send(Command::SendLive {
+                session_id: "s-1".to_owned(),
+                content: "one more thing".to_owned(),
+            })
+            .expect("control task alive");
+
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::Accepted {
+                session_id: "s-1".to_owned()
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::Delta("on it".to_owned())
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::End {
+                partial: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                step_capped: false,
+                grounding_json: String::new(),
+                queued: false,
+            },
+            "the previous turn had just ended, so this one runs and streams for real"
         );
 
         tokio::time::timeout(PATIENCE, server)

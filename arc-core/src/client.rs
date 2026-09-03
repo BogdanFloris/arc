@@ -51,6 +51,10 @@ pub enum TurnEvent {
         partial: bool,
         step_capped: bool,
         grounding_json: String,
+        /// This send was queued into a turn already running in this
+        /// session; its reply streams on whichever request accepted that
+        /// turn, not this one.
+        queued: bool,
     },
     Failed {
         code: String,
@@ -438,6 +442,7 @@ impl Turn<'_> {
                     partial: end.partial,
                     step_capped: end.step_capped,
                     grounding_json: end.grounding_json,
+                    queued: end.queued,
                 }
             }
             server_frame::Msg::Error(error) => {
@@ -884,6 +889,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_queued_stream_end_carries_the_flag() {
+        let (url, handle) = server(vec![vec![
+            echo(accepted("s-1")),
+            echo(server_frame::Msg::StreamEnd(StreamEnd {
+                session_id: "s-1".to_owned(),
+                input_tokens: 0,
+                output_tokens: 0,
+                partial: false,
+                step_capped: false,
+                grounding_json: String::new(),
+                queued: true,
+            })),
+        ]])
+        .await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        let mut turn = client
+            .send_message(Some("s-1"), "steer")
+            .await
+            .expect("send");
+        assert_eq!(
+            turn.next().await.expect("accepted"),
+            Some(TurnEvent::Accepted {
+                session_id: "s-1".to_owned()
+            })
+        );
+        assert_eq!(
+            turn.next().await.expect("end"),
+            Some(TurnEvent::End {
+                input_tokens: 0,
+                output_tokens: 0,
+                partial: false,
+                step_capped: false,
+                grounding_json: String::new(),
+                queued: true,
+            }),
+            "the message landed in a turn already running; its reply streams elsewhere"
+        );
+
+        received(handle).await;
+    }
+
+    #[tokio::test]
     async fn a_turn_yields_accepted_deltas_and_end() {
         let (url, handle) = server(vec![vec![
             echo(accepted("s-1")),
@@ -918,6 +966,7 @@ mod tests {
                 partial: false,
                 step_capped: false,
                 grounding_json: String::new(),
+                queued: false,
             })
         );
         assert_eq!(turn.next().await.expect("closed"), None, "the turn is over");
@@ -990,6 +1039,7 @@ mod tests {
                     partial: false,
                     step_capped: false,
                     grounding_json: String::new(),
+                    queued: false,
                 },
             ]
         );
