@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use arc_proto::v1::{
     CancelJob, CancelTurn, ClientFrame, CompactSession, CreateSession, DropSteers, FetchHistory,
-    ForkSession, JobInfo, ListJobs, ListProjects, ListSessions, MarkBranch, MemoryReviewAccept,
-    MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, Notification, ProjectInfo, SendMessage,
-    ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe, branch_marked, client_frame,
-    server_frame,
+    ForkSession, JobInfo, ListJobs, ListModels, ListProjects, ListSessions, MarkBranch,
+    MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, ModelChoice,
+    Notification, ProjectInfo, SelectModel, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionRole, Subscribe, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -216,6 +216,40 @@ impl Client {
                 msg: error.msg,
             }),
             other => Err(unexpected("ProjectList", &other)),
+        }
+    }
+
+    #[tracing::instrument(name = "client.models", skip_all)]
+    pub async fn models(&mut self) -> Result<Vec<ModelChoice>, Error> {
+        let id = self
+            .send(client_frame::Msg::ListModels(ListModels {}))
+            .await?;
+        self.model_list(id).await
+    }
+
+    #[tracing::instrument(name = "client.select_model", skip_all, fields(choice))]
+    pub async fn select_model(
+        &mut self,
+        role: SessionRole,
+        choice: &str,
+    ) -> Result<Vec<ModelChoice>, Error> {
+        let id = self
+            .send(client_frame::Msg::SelectModel(SelectModel {
+                role: role as i32,
+                choice: choice.to_owned(),
+            }))
+            .await?;
+        self.model_list(id).await
+    }
+
+    async fn model_list(&mut self, id: u64) -> Result<Vec<ModelChoice>, Error> {
+        match self.answer(id).await? {
+            server_frame::Msg::ModelList(list) => Ok(list.choices),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("ModelList", &other)),
         }
     }
 
@@ -459,6 +493,7 @@ impl Turn<'_> {
             | server_frame::Msg::MemoryReviewItems(_)
             | server_frame::Msg::JobList(_)
             | server_frame::Msg::ProjectList(_)
+            | server_frame::Msg::ModelList(_)
             | server_frame::Msg::Notification(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
@@ -481,6 +516,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
         server_frame::Msg::JobList(_) => "JobList",
         server_frame::Msg::ProjectList(_) => "ProjectList",
+        server_frame::Msg::ModelList(_) => "ModelList",
         server_frame::Msg::Notification(_) => "Notification",
     };
     Error::Protocol(format!("expected {wanted}, got {got}"))

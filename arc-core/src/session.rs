@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    BranchMarked, Budget, MemoryEvent, MessageAppended, Notification, ReviewChanged, Role,
-    ServerCallRecorded, SessionAppended, SessionCompacted, SessionCreated, SessionEvent,
-    SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant,
-    branch_marked,
+    BranchMarked, Budget, MemoryEvent, MessageAppended, ModelChoice as WireModelChoice, ModelList,
+    Notification, ReviewChanged, Role, RoleEvent, RoleModelSelected, ServerCallRecorded,
+    SessionAppended, SessionCompacted, SessionCreated, SessionEvent, SessionRole, Source,
+    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, branch_marked,
 };
-use arc_proto::v1::{event, memory_event, notification, session_event};
+use arc_proto::v1::{event, memory_event, notification, role_event, session_event};
 use futures::StreamExt as _;
 
 use tokio::sync::broadcast;
@@ -61,11 +61,21 @@ pub struct Runner {
 
 // never held across an .await: it fences a single append batch or
 // projection read, so concurrent turns interleave everywhere else
+/// One entry of a role's configured menu; the log records which is chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub thinking: Thinking,
+}
+
 pub struct Engine {
     store: StdMutex<Store>,
     registry: Registry,
     projects: BTreeMap<String, ProjectSpec>,
-    role_identities: BTreeMap<SessionRole, (String, String)>,
+    // per role, in config order: the first is the default when nothing is selected
+    role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
     // `[roles.counsel]` presence, not per-project config (§6.2): concierge and
     // executor hold `consult_expert` when true; archivist never does
     expert_enabled: bool,
@@ -192,6 +202,9 @@ pub enum Error {
     #[error("project {project} is not configured")]
     UnknownProject { project: String },
 
+    #[error("`{choice}` is not one of the {role} role's model choices")]
+    UnknownChoice { role: String, choice: String },
+
     #[error("project {project}: could not resolve its granted roots: {source}")]
     Grants {
         project: String,
@@ -218,7 +231,7 @@ impl Engine {
             store: StdMutex::new(store),
             registry,
             projects: BTreeMap::new(),
-            role_identities: BTreeMap::new(),
+            role_choices: BTreeMap::new(),
             expert_enabled: false,
             turns: StdMutex::new(HashMap::new()),
             cancels: StdMutex::new(HashMap::new()),
@@ -299,12 +312,109 @@ impl Engine {
     }
 
     #[must_use]
-    pub fn with_role_identities(
+    pub fn with_role_choices(
         mut self,
+        role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
+    ) -> Self {
+        self.role_choices = role_choices;
+        self
+    }
+
+    /// A one-entry menu per role, named by its model: what a runner with no
+    /// configured choices amounts to.
+    #[must_use]
+    pub fn with_role_identities(
+        self,
         role_identities: BTreeMap<SessionRole, (String, String)>,
     ) -> Self {
-        self.role_identities = role_identities;
-        self
+        self.with_role_choices(
+            role_identities
+                .into_iter()
+                .map(|(role, (provider, model))| {
+                    (
+                        role,
+                        vec![ModelChoice {
+                            name: model.clone(),
+                            provider,
+                            model,
+                            thinking: Thinking::Default,
+                        }],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The name of the role's current choice: the recorded selection when it
+    /// is still on the menu, else the first choice. `None` for a role with no
+    /// menu.
+    pub fn selected_choice(&self, role: SessionRole) -> Result<Option<String>, Error> {
+        Ok(self.current_choice(role)?.map(|choice| choice.name))
+    }
+
+    fn current_choice(&self, role: SessionRole) -> Result<Option<ModelChoice>, Error> {
+        let Some(choices) = self.role_choices.get(&role) else {
+            return Ok(None);
+        };
+        let selected = self.with_store(|store| store.projection().role_selection(role))?;
+        Ok(selected
+            .and_then(|name| choices.iter().find(|choice| choice.name == name))
+            .or_else(|| choices.first())
+            .cloned())
+    }
+
+    fn role_identity(&self, role: SessionRole) -> Result<Option<(String, String)>, Error> {
+        Ok(self
+            .current_choice(role)?
+            .map(|choice| (choice.provider, choice.model)))
+    }
+
+    /// Every role's menu with its current pick marked, in wire shape.
+    pub fn model_list(&self) -> Result<ModelList, Error> {
+        let mut choices = Vec::new();
+        for (role, menu) in &self.role_choices {
+            let selected = self.selected_choice(*role)?;
+            for choice in menu {
+                choices.push(WireModelChoice {
+                    role: *role as i32,
+                    name: choice.name.clone(),
+                    provider: choice.provider.clone(),
+                    model: choice.model.clone(),
+                    thinking: choice.thinking.label().to_owned(),
+                    selected: selected.as_deref() == Some(choice.name.as_str()),
+                });
+            }
+        }
+        Ok(ModelList { choices })
+    }
+
+    /// Records the user's pick for a role. Open sessions keep their model
+    /// (invariant 9); new sessions and forks take this one.
+    #[tracing::instrument(name = "engine.select_model", skip_all, fields(role = provider::role_label(role), choice))]
+    pub fn select_model(&self, role: SessionRole, choice: &str) -> Result<(), Error> {
+        let on_menu = self
+            .role_choices
+            .get(&role)
+            .is_some_and(|menu| menu.iter().any(|entry| entry.name == choice));
+        if !on_menu {
+            return Err(Error::UnknownChoice {
+                role: provider::role_label(role).to_owned(),
+                choice: choice.to_owned(),
+            });
+        }
+        let payload = event::Payload::Role(RoleEvent {
+            event: Some(role_event::Event::ModelSelected(RoleModelSelected {
+                role: role as i32,
+                choice: choice.to_owned(),
+            })),
+        });
+        self.with_store_mut(|store| store.append(Source::User, Some(now_ts()), payload))?;
+        if let Some(notifier) = &self.notifier {
+            let _ = notifier.send(Notification {
+                event: Some(notification::Event::ModelsChanged(self.model_list()?)),
+            });
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -422,9 +532,7 @@ impl Engine {
         let session_id = uuid::Uuid::new_v4().to_string();
         tracing::Span::current().record("session_id", session_id.as_str());
         let (provider, model) = self
-            .role_identities
-            .get(&role)
-            .cloned()
+            .role_identity(role)?
             .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
         self.record(
             source,
@@ -485,10 +593,9 @@ impl Engine {
             })?;
         // a fork is the door past the pin: it runs under the role's model today
         let (provider, model) = match self
-            .role_identities
-            .get(&SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified))
+            .role_identity(SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified))?
         {
-            Some(current) => current.clone(),
+            Some(current) => current,
             None => self
                 .with_store(|store| store.projection().session_identity(parent_id))?
                 .unwrap_or_default(),
@@ -1649,9 +1756,9 @@ impl Engine {
             return None;
         }
         let current = self
-            .role_identities
-            .get(&role)
-            .cloned()
+            .role_identity(role)
+            .ok()
+            .flatten()
             .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
         if recorded == current {
             return None;
@@ -5446,6 +5553,85 @@ mod tests {
                     read_write: false,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn selecting_a_model_is_logged_and_new_sessions_record_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let choice = |name: &str, model: &str| super::ModelChoice {
+            name: name.to_owned(),
+            provider: "codex".to_owned(),
+            model: model.to_owned(),
+            thinking: Thinking::Default,
+        };
+
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        engine = engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin, ToolSource::Workspace],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_choices(BTreeMap::from([(
+                SessionRole::Executor,
+                vec![choice("sol", "gpt-5.6-sol"), choice("astra", "gpt-6-astra")],
+            )]));
+
+        assert_eq!(
+            engine
+                .selected_choice(SessionRole::Executor)
+                .expect("query")
+                .as_deref(),
+            Some("sol"),
+            "nothing selected: the first choice is the default"
+        );
+        let err = engine
+            .select_model(SessionRole::Executor, "luna")
+            .expect_err("not on the menu");
+        assert!(matches!(err, Error::UnknownChoice { .. }), "{err}");
+
+        engine
+            .select_model(SessionRole::Executor, "astra")
+            .expect("select");
+
+        let list = engine.model_list().expect("list");
+        let picked: Vec<(&str, bool)> = list
+            .choices
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.selected))
+            .collect();
+        assert_eq!(picked, [("sol", false), ("astra", true)]);
+
+        let session_id = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("create a bound session");
+        let events = replay_log(dir.path());
+        let session_event::Event::SessionCreated(created) = &events[0] else {
+            panic!("expected SessionCreated first, got {:?}", events[0]);
+        };
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(
+            (created.provider.as_str(), created.model.as_str()),
+            ("codex", "gpt-6-astra"),
+            "the new session runs under the selected choice"
+        );
+
+        let (reopened, _) = reopened_engine(&provider, &dir, Registry::new(512));
+        let reopened = reopened.with_role_choices(BTreeMap::from([(
+            SessionRole::Executor,
+            vec![choice("sol", "gpt-5.6-sol")],
+        )]));
+        assert_eq!(
+            reopened
+                .selected_choice(SessionRole::Executor)
+                .expect("query")
+                .as_deref(),
+            Some("sol"),
+            "a selection no longer on the menu falls back to the default"
         );
     }
 

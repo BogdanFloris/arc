@@ -6,9 +6,10 @@ use arc_proto::v1::{
     BranchMarked, Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall,
     HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
     MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
-    ProvenanceEntry, Role, ServerCallRecorded, SessionCompacted, SessionConsolidated,
-    SessionCreated, SessionEvent, SessionTitled, Source, ToolCallIssued, ToolResultRecorded, event,
-    history_entry, memory_event, memory_record, session_event,
+    ProvenanceEntry, Role, RoleEvent, RoleModelSelected, ServerCallRecorded, SessionCompacted,
+    SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled, Source,
+    ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event, memory_record,
+    role_event, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -25,7 +26,8 @@ use crate::log;
 // 15: messages gained grounding_json and the server-call kind
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
-pub(crate) const SCHEMA_VERSION: u32 = 17;
+// 18: role_selections records RoleModelSelected, one row per role
+pub(crate) const SCHEMA_VERSION: u32 = 18;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -124,6 +126,12 @@ CREATE TABLE IF NOT EXISTS compactions (
 );
 
 CREATE INDEX IF NOT EXISTS compactions_by_session ON compactions (session_id, seq);
+
+CREATE TABLE IF NOT EXISTS role_selections (
+    role   INTEGER PRIMARY KEY,
+    choice TEXT    NOT NULL,
+    seq    INTEGER NOT NULL
+);
 ";
 
 pub(crate) const KIND_MESSAGE: i64 = 0;
@@ -457,6 +465,13 @@ impl Projection {
                 seq = event.seq,
                 "memory event of an unknown kind; skipping its rows"
             ),
+            event::Payload::Role(RoleEvent {
+                event: Some(role_event::Event::ModelSelected(selected)),
+            }) => select_role_model(&tx, event, selected)?,
+            event::Payload::Role(_) => tracing::warn!(
+                seq = event.seq,
+                "role event of an unknown kind; skipping its rows"
+            ),
         }
         set_last_seq(&tx, event.seq)?;
         tx.commit()?;
@@ -516,6 +531,10 @@ impl Projection {
             )
             .optional()?;
         Ok(started.flatten())
+    }
+
+    pub(crate) fn role_selection(&self, role: SessionRole) -> Result<Option<String>, Error> {
+        role_selection(&self.conn, role)
     }
 
     pub(crate) fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
@@ -872,6 +891,10 @@ impl Reader {
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         sessions(&self.conn())
+    }
+
+    pub fn role_selection(&self, role: SessionRole) -> Result<Option<String>, Error> {
+        role_selection(&self.conn(), role)
     }
 
     // the user rewinding must see the inherited history, so a branch's view
@@ -1505,8 +1528,40 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             memory_event::Event::RecordDeleted(_) => "memory_record_deleted",
             memory_event::Event::RecordReviewed(_) => "memory_record_reviewed",
         },
-        event::Payload::Session(_) | event::Payload::Memory(_) => "unknown",
+        event::Payload::Role(RoleEvent {
+            event: Some(role_event::Event::ModelSelected(_)),
+        }) => "role_model_selected",
+        event::Payload::Session(_) | event::Payload::Memory(_) | event::Payload::Role(_) => {
+            "unknown"
+        }
     }
+}
+
+fn select_role_model(
+    tx: &Transaction<'_>,
+    event: &Event,
+    selected: &RoleModelSelected,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO role_selections (role, choice, seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT(role) DO UPDATE SET choice = excluded.choice, seq = excluded.seq",
+        (
+            selected.role,
+            &selected.choice,
+            i64::try_from(event.seq).unwrap_or(i64::MAX),
+        ),
+    )?;
+    Ok(())
+}
+
+fn role_selection(conn: &Connection, role: SessionRole) -> Result<Option<String>, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT choice FROM role_selections WHERE role = ?1",
+            [role as i32],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 pub(crate) fn bad_json_column(index: usize, source: &serde_json::Error) -> rusqlite::Error {
@@ -2254,6 +2309,7 @@ mod tests {
             "messages_fts_docsize",
             "messages_fts_idx",
             "projection_meta",
+            "role_selections",
             "session_grants",
             "sessions",
         ]
@@ -2269,6 +2325,49 @@ mod tests {
                 row.get(0)
             })
             .expect("count")
+    }
+
+    #[test]
+    fn a_role_model_selection_replays_and_the_latest_wins() {
+        let mut projection = Projection::in_memory().expect("in-memory projection");
+        let select = |seq: u64, choice: &str| Event {
+            seq,
+            ts: None,
+            source: Source::User as i32,
+            payload: Some(event::Payload::Role(arc_proto::v1::RoleEvent {
+                event: Some(arc_proto::v1::role_event::Event::ModelSelected(
+                    arc_proto::v1::RoleModelSelected {
+                        role: SessionRole::Executor as i32,
+                        choice: choice.to_owned(),
+                    },
+                )),
+            })),
+        };
+
+        assert_eq!(
+            projection
+                .role_selection(SessionRole::Executor)
+                .expect("query"),
+            None
+        );
+        projection.apply(&select(1, "sol")).expect("apply");
+        projection.apply(&select(2, "astra")).expect("apply");
+
+        assert_eq!(
+            projection
+                .role_selection(SessionRole::Executor)
+                .expect("query")
+                .as_deref(),
+            Some("astra")
+        );
+        assert_eq!(
+            projection
+                .role_selection(SessionRole::Concierge)
+                .expect("query"),
+            None,
+            "a selection is per role"
+        );
+        assert_eq!(projection.last_seq().expect("seq"), Some(2));
     }
 
     #[test]

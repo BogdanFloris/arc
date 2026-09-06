@@ -308,18 +308,18 @@ pub fn replay_events(dir: &std::path::Path) -> Vec<arc_proto::v1::Event> {
         .collect()
 }
 
+/// The log's session events in order; memory and role events are skipped.
 pub fn replay_log(dir: &std::path::Path) -> Vec<session_event::Event> {
     let segments = discover_segments(dir).expect("discover");
     LogReader::new(segments)
-        .map(|result| {
+        .filter_map(|result| {
             let event = result.expect("replay");
             match event.payload.expect("payload") {
                 arc_proto::v1::event::Payload::Session(session) => {
-                    session.event.expect("session event")
+                    Some(session.event.expect("session event"))
                 }
-                other @ arc_proto::v1::event::Payload::Memory(_) => {
-                    panic!("expected a session event, got {other:?}")
-                }
+                arc_proto::v1::event::Payload::Memory(_)
+                | arc_proto::v1::event::Payload::Role(_) => None,
             }
         })
         .collect()
