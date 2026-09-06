@@ -227,6 +227,20 @@ message MemoryEvent {
   }
 }
 
+// Config declares what a role may run (`[models]` presets and a role's
+// `choices`); this records which one is chosen. The latest wins on replay.
+message RoleModelSelected {
+  SessionRole role = 1;
+  // a preset name from the role's choices
+  string choice = 2;
+}
+
+message RoleEvent {
+  oneof event {
+    RoleModelSelected model_selected = 1;
+  }
+}
+
 message Event {
   uint64 seq = 1;
   google.protobuf.Timestamp ts = 2;
@@ -234,6 +248,7 @@ message Event {
   oneof payload {
     SessionEvent session = 10;
     MemoryEvent memory = 11;
+    RoleEvent role = 13;
   }
   reserved 12;  // IdentityEvent, if identity ever stops being a file
 }

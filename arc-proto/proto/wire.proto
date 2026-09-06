@@ -69,7 +69,33 @@ message ClientFrame {
     CancelTurn cancel_turn = 24;
     ListProjects list_projects = 25;
     CompactSession compact_session = 26;
+    SelectModel select_model = 27;
+    ListModels list_models = 28;
   }
+}
+
+// Appends a RoleModelSelected for `role`; `choice` must be one of the role's
+// configured choices. Answered with the new ModelList.
+message SelectModel {
+  SessionRole role = 1;
+  string choice = 2;
+}
+
+message ListModels {}
+
+message ModelChoice {
+  SessionRole role = 1;
+  // the preset name, what SelectModel takes
+  string name = 2;
+  string provider = 3;
+  string model = 4;
+  string thinking = 5;
+  // the role's current pick: the recorded selection, else the first choice
+  bool selected = 6;
+}
+
+message ModelList {
+  repeated ModelChoice choices = 1;
 }
 
 // Appends a SessionCompacted by hand (the TUI's :compact). Refused while
@@ -150,6 +176,8 @@ message Notification {
     ReviewChanged review_changed = 3;
     // a job session's model is thinking; ephemeral, never in the log
     ReasoningDelta job_reasoning = 4;
+    // a role's model selection changed; the full menu with the new pick
+    ModelList models_changed = 5;
   }
 }
 
@@ -354,5 +382,6 @@ message ServerFrame {
     JobList job_list = 20;
     Notification notification = 21;
     ProjectList project_list = 22;
+    ModelList model_list = 23;
   }
 }
