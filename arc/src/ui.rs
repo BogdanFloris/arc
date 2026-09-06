@@ -8,7 +8,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Panel, Borders, Clear, Paragraph};
 
-use crate::app::{App, Block, Mode, Status, format_tokens};
+use crate::app::{App, Block, Mode, Overlay, Status, format_tokens};
 use crate::{markdown, theme};
 
 const MARGIN: u16 = 2;
@@ -59,26 +59,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, inset(body), app);
     draw_rule(frame, rule, app);
     draw_input(frame, inset(input), app);
-    if let Some(picker) = &app.picker {
-        draw_picker(frame, frame.area(), app, picker);
-    }
-    if let Some(review) = &app.review {
-        draw_review(frame, frame.area(), review);
-    }
-    if let Some(jobs) = &app.jobs {
-        draw_jobs(frame, frame.area(), jobs);
-    }
-    if let Some(projects) = &app.projects {
-        draw_projects(frame, frame.area(), projects);
-    }
-    if let Some(models) = &app.models {
-        draw_models(frame, frame.area(), models);
-    }
-    if app.help {
-        draw_help(frame, app, frame.area());
-    }
-    if app.inspection.is_some() {
-        draw_inspection(frame, app, frame.area());
+    match &app.overlay {
+        Overlay::Picker(picker) => draw_picker(frame, frame.area(), app, picker),
+        Overlay::Review(review) => draw_review(frame, frame.area(), review),
+        Overlay::Jobs(jobs) => draw_jobs(frame, frame.area(), jobs),
+        Overlay::Projects(projects) => draw_projects(frame, frame.area(), projects),
+        Overlay::Models(models) => draw_models(frame, frame.area(), models),
+        Overlay::Help { .. } => draw_help(frame, app, frame.area()),
+        Overlay::Inspection(_) => draw_inspection(frame, app, frame.area()),
+        Overlay::None => {}
     }
 }
 
@@ -198,7 +187,7 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
     let mut bounds = Vec::with_capacity(app.transcript.len());
     let last = app.transcript.len().saturating_sub(1);
     let mut previous: Option<&Block> = None;
-    for (i, block) in app.transcript.iter().enumerate() {
+    for (i, block) in app.transcript.iter().map(|entry| &entry.block).enumerate() {
         let grouped = activity(block) && previous.is_some_and(activity);
         if !(out.is_empty() || grouped) {
             out.push(Line::default());
@@ -378,7 +367,7 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
         .filter(|s| !s.title.is_empty())
         .map(|s| s.title.as_str())
         .or_else(|| {
-            app.transcript.iter().find_map(|block| match block {
+            app.transcript.iter().find_map(|entry| match &entry.block {
                 Block::You(text) => text.lines().next(),
                 _ => None,
             })
@@ -404,8 +393,14 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_inspection(frame: &mut Frame, app: &mut App, full: Rect) {
-    let inspection = app.inspection.as_mut().expect("inspection");
-    let Some(block) = app.transcript.get(inspection.block) else {
+    let Overlay::Inspection(inspection) = &mut app.overlay else {
+        return;
+    };
+    let Some(block) = app
+        .transcript
+        .get(inspection.block)
+        .map(|entry| &entry.block)
+    else {
         return;
     };
     let (title, content) = match block {
@@ -630,7 +625,7 @@ fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>
 // measured before the layout: the input row has to grow with its wrapped text
 fn input_height(app: &App, frame: Rect) -> u16 {
     let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
-    let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
+    let filtering = app.picker().is_some_and(|picker| picker.filtering);
     let (prefix, text): (&str, &str) = if app.mode == Mode::Cmd {
         (":", &app.cmd)
     } else if filtering || app.searching {
@@ -647,22 +642,16 @@ fn input_height(app: &App, frame: Rect) -> u16 {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let filtering = app.picker.as_ref().is_some_and(|picker| picker.filtering);
+    let filtering = app.picker().is_some_and(|picker| picker.filtering);
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
     } else if filtering || app.searching {
         ("/", theme::ACCENT, &app.input, theme::PLAIN, app.cursor)
     } else {
-        let style = if app.picker.is_some()
-            || app.review.is_some()
-            || app.jobs.is_some()
-            || app.projects.is_some()
-            || app.models.is_some()
-            || app.help
-        {
-            theme::DIM
-        } else {
+        let style = if app.overlay == Overlay::None {
             theme::PLAIN
+        } else {
+            theme::DIM
         };
         ("> ", theme::ACCENT, &app.input, style, app.cursor)
     };
@@ -694,17 +683,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 
-    if app.mode == Mode::Cmd
-        || filtering
-        || app.searching
-        || (app.picker.is_none()
-            && app.review.is_none()
-            && app.jobs.is_none()
-            && app.projects.is_none()
-            && app.models.is_none()
-            && !app.help
-            && app.inspection.is_none())
-    {
+    if app.mode == Mode::Cmd || filtering || app.searching || app.overlay == Overlay::None {
         let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
         let row = u16::try_from(cursor_row.saturating_sub(start)).unwrap_or(u16::MAX);
         frame.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
@@ -1350,8 +1329,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, full: Rect) {
     let visible = area.height as usize;
     // write the clamp back, like the transcript does with scroll_back —
     // otherwise every extra j is debt that k has to repay
-    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(visible));
-    let top = app.help_scroll;
+    let Overlay::Help { scroll } = &mut app.overlay else {
+        return;
+    };
+    *scroll = (*scroll).min(lines.len().saturating_sub(visible));
+    let top = *scroll;
     let more_below = lines.len() > top + visible;
     let mut lines: Vec<Line> = lines.into_iter().skip(top).take(visible).collect();
     if more_below {
@@ -1513,6 +1495,7 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 
 #[cfg(test)]
 mod tests {
+    use crate::app::{Entry, Overlay};
     use arc_proto::v1::{JobInfo, ModelChoice, SessionInfo, SessionRole, job_info};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
@@ -1534,7 +1517,7 @@ mod tests {
             thinking: "medium".to_owned(),
             selected,
         };
-        app.models = Some(Models {
+        app.overlay = Overlay::Models(Models {
             items: vec![
                 choice(SessionRole::Concierge, "astra", "gpt-6-astra", true),
                 choice(SessionRole::Executor, "sol", "gpt-5.6-sol", true),
@@ -1588,7 +1571,7 @@ mod tests {
         info.model = "pinned-model".to_owned();
         app.on_net(NetEvent::Sessions(vec![info]));
         app.session_id = Some("s-code".to_owned());
-        app.transcript = vec![
+        app.set_blocks(vec![
             Block::You("Fix session picker navigation".to_owned()),
             Block::Tool {
                 call_id: "t1".to_owned(),
@@ -1601,7 +1584,7 @@ mod tests {
                     .join("\n"),
                 open: false,
             },
-        ];
+        ]);
         app.on_key(key(KeyCode::Esc));
         let text = plain_text(&rendered(&mut app));
         assert!(text.contains("Session picker keyboard navigation"));
@@ -1618,7 +1601,7 @@ mod tests {
         let narrow = plain_text(&rendered_at(&mut app, 40, 12));
         assert!(narrow.contains("output line 80"));
         app.on_key(key(KeyCode::Char('q')));
-        assert!(app.inspection.is_none());
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]
@@ -1635,6 +1618,7 @@ mod tests {
                 content: "detail\n".repeat(12),
                 open: false,
             })
+            .map(Entry::from)
             .collect();
         app.scroll_back = 20;
         rendered(&mut app);
@@ -1648,7 +1632,7 @@ mod tests {
         assert_eq!(
             app.transcript
                 .iter()
-                .filter(|block| matches!(block, Block::Tool { open: true, .. }))
+                .filter(|entry| matches!(&entry.block, Block::Tool { open: true, .. }))
                 .count(),
             1
         );
@@ -1715,7 +1699,7 @@ mod tests {
             "newer message",
             "needle again",
         ] {
-            app.transcript.push(Block::You(text.to_owned()));
+            app.push_block(Block::You(text.to_owned()));
         }
         app
     }
@@ -1724,7 +1708,7 @@ mod tests {
     fn a_confirmed_search_scrolls_to_and_highlights_exactly_one_block() {
         let mut app = conversation();
         for i in 0..60 {
-            app.transcript.push(Block::You(format!("filler {i}")));
+            app.push_block(Block::You(format!("filler {i}")));
         }
         app.scroll_back = 0; // parked at the bottom, the match sits far above
         search(&mut app, "needle here");
@@ -1758,12 +1742,10 @@ mod tests {
     fn a_collapsed_and_an_open_tool_block_render_side_by_side() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
-        app.transcript.push(Block::You("run the tests".to_owned()));
-        app.transcript
-            .push(tool_block(false, "cargo test\n... 42 passed"));
-        app.transcript
-            .push(Block::You("what failed earlier?".to_owned()));
-        app.transcript.push(tool_block(
+        app.push_block(Block::You("run the tests".to_owned()));
+        app.push_block(tool_block(false, "cargo test\n... 42 passed"));
+        app.push_block(Block::You("what failed earlier?".to_owned()));
+        app.push_block(tool_block(
             true,
             "bash -lc 'cargo test tool_result'\nrunning 3 tests\ntest a ... ok",
         ));
@@ -1784,9 +1766,8 @@ mod tests {
     fn a_collapsed_tool_block_renders_as_one_line() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
-        app.transcript.push(Block::You("run the tests".to_owned()));
-        app.transcript
-            .push(tool_block(false, "running 42 tests\nall green\n"));
+        app.push_block(Block::You("run the tests".to_owned()));
+        app.push_block(tool_block(false, "running 42 tests\nall green\n"));
 
         let buffer = rendered(&mut app);
         let text = plain_text(&buffer);
@@ -1801,9 +1782,8 @@ mod tests {
     fn ctrl_o_opens_the_collapsed_tool_block_and_its_content_appears() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
-        app.transcript.push(Block::You("run the tests".to_owned()));
-        app.transcript
-            .push(tool_block(false, "running 42 tests\nall green"));
+        app.push_block(Block::You("run the tests".to_owned()));
+        app.push_block(tool_block(false, "running 42 tests\nall green"));
 
         app.on_key(ctrl('o'));
 
@@ -1822,7 +1802,7 @@ mod tests {
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.transcript.push(tool_block(true, &content));
+        app.push_block(tool_block(true, &content));
 
         let text = plain_text(&rendered(&mut app));
         assert!(text.contains("line 40"), "the cap keeps the first 40");
@@ -1865,7 +1845,7 @@ mod tests {
     #[test]
     fn the_review_detail_names_the_record_a_supersede_replaced() {
         let mut app = App::new();
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: vec![crate::app::ReviewEntry {
                 id: "mr-new".to_owned(),
                 kind: 4,
@@ -1888,7 +1868,7 @@ mod tests {
     #[test]
     fn the_review_picker_shows_an_action_footer_and_arms_delete_there() {
         let mut app = App::new();
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: vec![crate::app::ReviewEntry {
                 id: "mr-new".to_owned(),
                 kind: 4,
@@ -1913,7 +1893,7 @@ mod tests {
             "unarmed shows no delete warning"
         );
 
-        app.review.as_mut().expect("open").pending_delete = true;
+        app.review_mut().expect("open").pending_delete = true;
         let text = plain_text(&rendered(&mut app));
         assert!(
             text.contains("dd deletes the selected record"),
@@ -1928,7 +1908,7 @@ mod tests {
             .map(|i| format!("body line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: vec![crate::app::ReviewEntry {
                 id: "mr-new".to_owned(),
                 kind: 4,
@@ -1978,7 +1958,7 @@ mod tests {
             .map(|i| format!("body line {i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: vec![
                 review_entry("mr-short", "tiny body"),
                 review_entry("mr-deep", &deep),
@@ -1989,7 +1969,7 @@ mod tests {
         });
 
         let short = footer_row(&plain_text(&rendered(&mut app)));
-        app.review.as_mut().expect("open").selected = 1;
+        app.review_mut().expect("open").selected = 1;
         let deep = footer_row(&plain_text(&rendered(&mut app)));
 
         assert_eq!(
@@ -2001,7 +1981,7 @@ mod tests {
     #[test]
     fn the_review_footer_is_separated_from_the_detail_by_a_rule() {
         let mut app = App::new();
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: vec![review_entry("mr-1", "body text")],
             selected: 0,
             loaded: true,
@@ -2026,7 +2006,7 @@ mod tests {
     #[test]
     fn the_empty_review_pane_still_shows_the_close_footer() {
         let mut app = App::new();
-        app.review = Some(crate::app::Review {
+        app.overlay = Overlay::Review(crate::app::Review {
             items: Vec::new(),
             selected: 0,
             loaded: true,

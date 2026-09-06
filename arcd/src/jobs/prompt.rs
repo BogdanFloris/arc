@@ -7,8 +7,7 @@ use crate::identity;
 fn job_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working non-interactively \
-         in {}. Four workspace tools are available: read, write, edit, bash. Be \
-         concise. Show file paths clearly. Comments only where AGENTS.md allows \
+         in {}. Be concise. Show file paths clearly. Comments only where AGENTS.md allows \
          one. When a brief asks for commits and holds several tasks, commit each \
          task on its own. When you are done, your final message is the job's \
          report.",
@@ -19,8 +18,7 @@ fn job_preamble(root: &Path) -> String {
 fn direct_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working interactively with \
-         the user in {}. Four workspace tools are available: read, write, edit, \
-         bash. Be concise. Show file paths clearly.\n\n\
+         the user in {}. Be concise. Show file paths clearly.\n\n\
          When you hand off the whole task, end your reply; the handback arrives on its own. \
          When you delegate part of a task, continue independent work. Do not edit \
          the same files as a running child. \

@@ -255,11 +255,35 @@ pub struct Inspection {
     pub scroll: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    Help {
+        scroll: usize,
+    },
+    Picker(Picker),
+    Review(Review),
+    Jobs(Jobs),
+    Projects(Projects),
+    Models(Models),
+    Inspection(Inspection),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub block: Block,
+    pub seq: Option<u64>,
+}
+
+impl From<Block> for Entry {
+    fn from(block: Block) -> Self {
+        Self { block, seq: None }
+    }
+}
+
 pub struct App {
-    pub transcript: Vec<Block>,
-    /// Parallel to `transcript`: the history seq a block came from, `None`
-    /// for one built live — forking reads from history only.
-    seqs: Vec<Option<u64>>,
+    pub transcript: Vec<Entry>,
     pub input: String,
     pub cursor: usize,
     pub mode: Mode,
@@ -267,14 +291,8 @@ pub struct App {
     pending: Option<char>,
     pub session_id: Option<String>,
     pub sessions: Vec<SessionInfo>,
-    pub picker: Option<Picker>,
     pub picker_tree: bool,
-    pub review: Option<Review>,
-    pub jobs: Option<Jobs>,
-    pub projects: Option<Projects>,
-    pub models: Option<Models>,
-    pub help: bool,
-    pub inspection: Option<Inspection>,
+    pub overlay: Overlay,
     pub viewport_anchor: Option<(usize, usize)>,
     pub restore_anchor: bool,
     pub visible_blocks: Vec<usize>,
@@ -282,7 +300,6 @@ pub struct App {
     code_return: Option<(Option<String>, String)>,
     chat_draft: String,
     code_draft: String,
-    pub help_scroll: usize,
     pub search: Option<Search>,
     pub searching: bool,
     pub status: Status,
@@ -325,10 +342,70 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
+    pub fn block_contents(&self) -> Vec<Block> {
+        self.transcript
+            .iter()
+            .map(|entry| entry.block.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn set_blocks(&mut self, blocks: Vec<Block>) {
+        self.transcript = blocks.into_iter().map(Entry::from).collect();
+    }
+
+    pub fn picker(&self) -> Option<&Picker> {
+        match &self.overlay {
+            Overlay::Picker(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match &mut self.overlay {
+            Overlay::Picker(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn review(&self) -> Option<&Review> {
+        match &self.overlay {
+            Overlay::Review(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn review_mut(&mut self) -> Option<&mut Review> {
+        match &mut self.overlay {
+            Overlay::Review(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn jobs(&self) -> Option<&Jobs> {
+        match &self.overlay {
+            Overlay::Jobs(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn jobs_mut(&mut self) -> Option<&mut Jobs> {
+        match &mut self.overlay {
+            Overlay::Jobs(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn projects_mut(&mut self) -> Option<&mut Projects> {
+        match &mut self.overlay {
+            Overlay::Projects(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn models_mut(&mut self) -> Option<&mut Models> {
+        match &mut self.overlay {
+            Overlay::Models(value) => Some(value),
+            _ => None,
+        }
+    }
     pub fn new() -> Self {
         Self {
             transcript: Vec::new(),
-            seqs: Vec::new(),
             input: String::new(),
             cursor: 0,
             mode: Mode::Insert,
@@ -336,14 +413,8 @@ impl App {
             pending: None,
             session_id: None,
             sessions: Vec::new(),
-            picker: None,
             picker_tree: false,
-            review: None,
-            jobs: None,
-            projects: None,
-            models: None,
-            help: false,
-            inspection: None,
+            overlay: Overlay::None,
             viewport_anchor: None,
             restore_anchor: false,
             visible_blocks: Vec::new(),
@@ -351,7 +422,6 @@ impl App {
             code_return: None,
             chat_draft: String::new(),
             code_draft: String::new(),
-            help_scroll: 0,
             search: None,
             searching: false,
             status: Status::Idle,
@@ -392,70 +462,60 @@ impl App {
         self.launch_dir = dir;
     }
 
-    fn push_block(&mut self, block: Block) {
-        self.transcript.push(block);
-        self.seqs.push(None);
+    pub(super) fn push_block(&mut self, block: Block) {
+        self.transcript.push(block.into());
     }
 
     fn pop_block(&mut self) -> Option<Block> {
-        self.seqs.pop();
-        self.transcript.pop()
+        self.transcript.pop().map(|entry| entry.block)
     }
 
     pub fn on_scroll(&mut self, up: bool, lines: usize) {
-        if let Some(inspection) = self.inspection.as_mut() {
-            inspection.scroll = if up {
-                inspection.scroll.saturating_sub(lines)
+        let move_row = |selected: &mut usize, len: usize| {
+            *selected = if up {
+                selected.saturating_sub(1)
             } else {
-                inspection.scroll.saturating_add(lines)
+                (*selected + 1).min(len.saturating_sub(1))
             };
-            return;
-        }
-        if self.help {
-            self.help_scroll = if up {
-                self.help_scroll.saturating_sub(lines)
-            } else {
-                self.help_scroll.saturating_add(lines)
-            };
-            return;
-        }
-        if let Some(review) = self.review.as_mut() {
-            review.pending_delete = false;
-            review.selected = if up {
-                review.selected.saturating_sub(1)
-            } else {
-                (review.selected + 1).min(review.items.len().saturating_sub(1))
-            };
-            return;
-        }
-        if let Some(jobs) = self.jobs.as_mut() {
-            jobs.selected = if up {
-                jobs.selected.saturating_sub(1)
-            } else {
-                (jobs.selected + 1).min(jobs.items.len().saturating_sub(1))
-            };
-            return;
-        }
-        if self.picker.is_some() {
-            self.move_picker_selection(up);
-            return;
-        }
-        self.scroll_back = if up {
-            self.scroll_back.saturating_add(lines)
-        } else {
-            self.scroll_back.saturating_sub(lines)
         };
+        match &mut self.overlay {
+            Overlay::Help { scroll } | Overlay::Inspection(Inspection { scroll, .. }) => {
+                *scroll = if up {
+                    scroll.saturating_sub(lines)
+                } else {
+                    scroll.saturating_add(lines)
+                };
+            }
+            Overlay::Review(review) => {
+                review.pending_delete = false;
+                move_row(&mut review.selected, review.items.len());
+            }
+            Overlay::Jobs(jobs) => {
+                jobs.confirmation = None;
+                move_row(&mut jobs.selected, jobs.items.len());
+            }
+            Overlay::Projects(projects) => move_row(&mut projects.selected, projects.items.len()),
+            Overlay::Models(models) => move_row(&mut models.selected, models.items.len()),
+            Overlay::Picker(_) => self.move_picker_selection(up),
+            Overlay::None => {
+                self.scroll_back = if up {
+                    self.scroll_back.saturating_add(lines)
+                } else {
+                    self.scroll_back.saturating_sub(lines)
+                };
+            }
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
         self.untouched = false;
         self.yank_note = None;
         match key.code {
-            KeyCode::PageUp if self.picker.is_some() => {
+            KeyCode::PageUp if self.picker().is_some() => {
                 self.page_picker_selection(true);
                 return None;
             }
-            KeyCode::PageDown if self.picker.is_some() => {
+            KeyCode::PageDown if self.picker().is_some() => {
                 self.page_picker_selection(false);
                 return None;
             }
@@ -472,26 +532,40 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.on_control(key.code);
         }
-        if self.inspection.is_some() {
-            return self.on_inspection_key(key.code);
+        if self.overlay != Overlay::None && !self.picker().is_some_and(|picker| picker.filtering) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.overlay = Overlay::None;
+                    return None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.on_scroll(true, 1);
+                    return None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.on_scroll(false, 1);
+                    return None;
+                }
+                _ => {}
+            }
         }
-        if self.help {
-            return self.on_help_key(key.code);
+        if let Overlay::Help { scroll } | Overlay::Inspection(Inspection { scroll, .. }) =
+            &mut self.overlay
+        {
+            match key.code {
+                KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => *scroll = usize::MAX,
+                _ => {}
+            }
+            return None;
         }
-        if self.review.is_some() {
-            return self.on_review_key(key.code);
-        }
-        if self.jobs.is_some() {
-            return self.on_jobs_key(key.code);
-        }
-        if self.projects.is_some() {
-            return self.on_projects_key(key.code);
-        }
-        if self.models.is_some() {
-            return self.on_models_key(key.code);
-        }
-        if self.picker.is_some() {
-            return self.on_picker_key(key.code);
+        match self.overlay {
+            Overlay::Review(_) => return self.on_review_key(key.code),
+            Overlay::Jobs(_) => return self.on_jobs_key(key.code),
+            Overlay::Projects(_) => return self.on_projects_key(key.code),
+            Overlay::Models(_) => return self.on_models_key(key.code),
+            Overlay::Picker(_) => return self.on_picker_key(key.code),
+            Overlay::None | Overlay::Help { .. } | Overlay::Inspection(_) => {}
         }
         if self.searching {
             return self.on_search_key(key.code);
@@ -508,14 +582,7 @@ impl App {
         self.untouched = false;
         self.yank_note = None;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let overlay = self.help
-            || self.inspection.is_some()
-            || self.models.is_some()
-            || self.review.is_some()
-            || self.jobs.is_some()
-            || self.projects.is_some()
-            || self.picker.is_some();
-        if overlay {
+        if self.overlay != Overlay::None {
             return None;
         }
         let first_line = || text.lines().next().unwrap_or_default().to_owned();
@@ -534,13 +601,16 @@ impl App {
     }
 
     fn on_control(&mut self, code: KeyCode) -> Option<Command> {
-        if self.inspection.is_some() && !matches!(code, KeyCode::Char('c' | 'u' | 'd')) {
+        if self.overlay != Overlay::None
+            && !matches!(code, KeyCode::Char('c' | 'u' | 'd'))
+            && !(self.picker().is_some() && matches!(code, KeyCode::Char('n' | 'p')))
+        {
             return None;
         }
         match code {
             KeyCode::Char('c') => self.quit = true,
-            KeyCode::Char('u') if self.picker.is_some() => self.page_picker_selection(true),
-            KeyCode::Char('d') if self.picker.is_some() => self.page_picker_selection(false),
+            KeyCode::Char('u') if self.picker().is_some() => self.page_picker_selection(true),
+            KeyCode::Char('d') if self.picker().is_some() => self.page_picker_selection(false),
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
             KeyCode::Char('o') => self.toggle_current_block(),
@@ -549,13 +619,13 @@ impl App {
             }
             KeyCode::Char('n') if self.searching => self.search_live_step(true),
             KeyCode::Char('p') if self.searching => self.search_live_step(false),
-            KeyCode::Char('n') if self.picker.is_some() => self.move_picker_selection(false),
-            KeyCode::Char('p') if self.picker.is_some() => self.move_picker_selection(true),
+            KeyCode::Char('n') if self.picker().is_some() => self.move_picker_selection(false),
+            KeyCode::Char('p') if self.picker().is_some() => self.move_picker_selection(true),
             KeyCode::Char('p') => return self.open_picker(),
             KeyCode::Char('n') if self.status != Status::Streaming => {
                 return self.start_session(None);
             }
-            KeyCode::Char('j') if self.mode == Mode::Insert && self.picker.is_none() => {
+            KeyCode::Char('j') if self.mode == Mode::Insert && self.picker().is_none() => {
                 self.insert_newline();
             }
             _ => {}
@@ -658,7 +728,7 @@ impl App {
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('s') => return self.open_picker(),
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => self.overlay = Overlay::Help { scroll: 0 },
             KeyCode::Char('J') => return Some(self.open_jobs()),
             KeyCode::Char('Q') => return Some(self.open_review()),
             KeyCode::Char('M') => return Some(self.open_models()),
@@ -684,10 +754,14 @@ impl App {
     }
 
     fn yank_last_reply(&mut self) -> Option<Command> {
-        let reply = self.transcript.iter().rev().find_map(|block| match block {
-            Block::Arc { text, .. } => Some(text.clone()),
-            _ => None,
-        });
+        let reply = self
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.block {
+                Block::Arc { text, .. } => Some(text.clone()),
+                _ => None,
+            });
         if let Some(text) = reply {
             self.yank_note = Some("yanked".to_owned());
             Some(Command::Yank(text))
@@ -718,7 +792,7 @@ impl App {
         let Some(last_you) = self
             .transcript
             .iter()
-            .rposition(|b| matches!(b, Block::You(_)))
+            .rposition(|b| matches!(b.block, Block::You(_)))
         else {
             return;
         };
@@ -767,7 +841,7 @@ impl App {
                 return;
             }
             at = next;
-            if self.is_visual_stop(&self.transcript[at]) {
+            if self.is_visual_stop(&self.transcript[at].block) {
                 self.visual_boundary = at;
                 self.follow_point();
                 return;
@@ -777,9 +851,13 @@ impl App {
 
     fn jump_point(&mut self, to_end: bool) {
         let found = if to_end {
-            self.transcript.iter().rposition(|b| self.is_visual_stop(b))
+            self.transcript
+                .iter()
+                .rposition(|entry| self.is_visual_stop(&entry.block))
         } else {
-            self.transcript.iter().position(|b| self.is_visual_stop(b))
+            self.transcript
+                .iter()
+                .position(|entry| self.is_visual_stop(&entry.block))
         };
         if let Some(at) = found {
             self.visual_boundary = at;
@@ -959,6 +1037,7 @@ impl App {
         let needle = query.to_lowercase();
         self.transcript
             .iter()
+            .map(|entry| &entry.block)
             .enumerate()
             .rev()
             .filter(|(_, block)| {
@@ -1011,7 +1090,7 @@ impl App {
                     "code" => return self.code_picker(),
                     "mode" => return self.switch_door(),
                     "tools" => self.inspect_current_block(),
-                    "help" => self.help = true,
+                    "help" => self.overlay = Overlay::Help { scroll: 0 },
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
                     cmd => match cmd.strip_prefix("code ") {
@@ -1057,10 +1136,13 @@ impl App {
             return None;
         };
         let is_message = matches!(
-            self.transcript.get(index),
+            self.transcript.get(index).map(|entry| &entry.block),
             Some(Block::You(_) | Block::Arc { .. })
         );
-        if let (true, Some(fork_point)) = (is_message, self.seqs.get(index).copied().flatten()) {
+        if let (true, Some(fork_point)) = (
+            is_message,
+            self.transcript.get(index).and_then(|entry| entry.seq),
+        ) {
             Some(Command::ForkSession {
                 session_id,
                 fork_point,
@@ -1089,7 +1171,7 @@ impl App {
     fn rewind_fork(&mut self) -> Option<Command> {
         let index = self.visual_boundary;
         self.mode = Mode::Normal;
-        let Some(Block::You(text)) = self.transcript.get(index) else {
+        let Some(Block::You(text)) = self.transcript.get(index).map(|entry| &entry.block) else {
             self.last_error = Some("rewind: no message selected".to_owned());
             return None;
         };
@@ -1100,8 +1182,10 @@ impl App {
         };
         let preceding = self.transcript[..index]
             .iter()
-            .rposition(|block| matches!(block, Block::You(_) | Block::Arc { .. }));
-        let Some(fork_point) = preceding.and_then(|at| self.seqs.get(at).copied().flatten()) else {
+            .rposition(|entry| matches!(entry.block, Block::You(_) | Block::Arc { .. }));
+        let Some(fork_point) =
+            preceding.and_then(|at| self.transcript.get(at).and_then(|entry| entry.seq))
+        else {
             self.last_error = Some("rewind: no earlier message to fork before".to_owned());
             return None;
         };
@@ -1113,7 +1197,7 @@ impl App {
     }
 
     fn open_review(&mut self) -> Command {
-        self.review = Some(Review {
+        self.overlay = Overlay::Review(Review {
             items: Vec::new(),
             selected: 0,
             loaded: false,
@@ -1128,18 +1212,8 @@ impl App {
         if code == KeyCode::Char('r') {
             return Some(self.open_review());
         }
-        let review = self.review.as_mut().expect("review is open");
-        let last = review.items.len().saturating_sub(1);
+        let review = self.review_mut().expect("review is open");
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.review = None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                review.selected = review.selected.saturating_sub(1);
-                review.pending_delete = false;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                review.selected = (review.selected + 1).min(last);
-                review.pending_delete = false;
-            }
             KeyCode::Char('a') => {
                 review.pending_delete = false;
                 return Self::take_verdict(review)
@@ -1158,7 +1232,7 @@ impl App {
                     self.input = format!("fix memory {}: {} — ", entry.id, entry.title);
                     self.cursor = self.input.len();
                     self.mode = Mode::Insert;
-                    self.review = None;
+                    self.overlay = Overlay::None;
                 }
             }
             _ => review.pending_delete = false,
@@ -1173,25 +1247,6 @@ impl App {
         let entry = review.items.remove(review.selected);
         review.selected = review.selected.min(review.items.len().saturating_sub(1));
         Some(entry.id)
-    }
-
-    fn on_help_key(&mut self, code: KeyCode) -> Option<Command> {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.help = false;
-                self.help_scroll = 0;
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.help_scroll = self.help_scroll.saturating_add(1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.help_scroll = self.help_scroll.saturating_sub(1);
-            }
-            KeyCode::Char('G') => self.help_scroll = usize::MAX,
-            KeyCode::Char('g') => self.help_scroll = 0,
-            _ => {}
-        }
-        None
     }
 
     fn can_switch_door(&mut self) -> bool {
@@ -1261,22 +1316,27 @@ impl App {
             return self
                 .transcript
                 .get(at)
-                .filter(|block| foldable(block))
+                .filter(|entry| foldable(&entry.block))
                 .map(|_| at);
         }
         let mut visible: Vec<usize> = self
             .visible_blocks
             .iter()
             .copied()
-            .filter(|&at| self.transcript.get(at).is_some_and(foldable))
+            .filter(|&at| {
+                self.transcript
+                    .get(at)
+                    .is_some_and(|entry| foldable(&entry.block))
+            })
             .collect();
         if self.scroll_back == 0 {
             visible.reverse();
         }
-        visible
-            .first()
-            .copied()
-            .or_else(|| self.transcript.iter().rposition(foldable))
+        visible.first().copied().or_else(|| {
+            self.transcript
+                .iter()
+                .rposition(|entry| foldable(&entry.block))
+        })
     }
 
     fn toggle_current_block(&mut self) {
@@ -1284,7 +1344,7 @@ impl App {
             return;
         };
         self.restore_anchor = true;
-        match &mut self.transcript[at] {
+        match &mut self.transcript[at].block {
             Block::Tool { open, .. }
             | Block::Thought { open, .. }
             | Block::Handback { open, .. } => *open = !*open,
@@ -1294,30 +1354,14 @@ impl App {
 
     fn inspect_current_block(&mut self) {
         if let Some(block) = self.current_foldable() {
-            self.inspection = Some(Inspection { block, scroll: 0 });
+            self.overlay = Overlay::Inspection(Inspection { block, scroll: 0 });
         } else {
             self.last_error = Some("No tool result or thought to inspect".to_owned());
         }
     }
 
-    fn on_inspection_key(&mut self, code: KeyCode) -> Option<Command> {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.inspection = None,
-            KeyCode::Char('j') | KeyCode::Down => self.on_scroll(false, 1),
-            KeyCode::Char('k') | KeyCode::Up => self.on_scroll(true, 1),
-            KeyCode::Char('g') | KeyCode::Home => {
-                self.inspection.as_mut().expect("inspection").scroll = 0;
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                self.inspection.as_mut().expect("inspection").scroll = usize::MAX;
-            }
-            _ => {}
-        }
-        None
-    }
-
     fn open_projects(&mut self) -> Command {
-        self.projects = Some(Projects {
+        self.overlay = Overlay::Projects(Projects {
             items: Vec::new(),
             selected: 0,
             loaded: false,
@@ -1326,7 +1370,7 @@ impl App {
     }
 
     fn open_models(&mut self) -> Command {
-        self.models = Some(Models {
+        self.overlay = Overlay::Models(Models {
             items: Vec::new(),
             selected: 0,
             loaded: false,
@@ -1335,61 +1379,31 @@ impl App {
     }
 
     fn on_models_key(&mut self, code: KeyCode) -> Option<Command> {
-        let models = self.models.as_mut().expect("models is open");
-        let last = models.items.len().saturating_sub(1);
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.models = None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                models.selected = models.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                models.selected = (models.selected + 1).min(last);
-            }
-            KeyCode::Enter => {
-                let chosen = models.items.get(models.selected).map(|choice| {
-                    (
-                        SessionRole::try_from(choice.role).unwrap_or(SessionRole::Unspecified),
-                        choice.name.clone(),
-                    )
-                });
-                if let Some((role, choice)) = chosen {
-                    self.models = None;
-                    return Some(Command::SelectModel { role, choice });
-                }
-            }
-            _ => {}
+        if code != KeyCode::Enter {
+            return None;
         }
-        None
+        let models = self.models_mut()?;
+        let choice = models.items.get(models.selected)?;
+        let command = Command::SelectModel {
+            role: SessionRole::try_from(choice.role).unwrap_or(SessionRole::Unspecified),
+            choice: choice.name.clone(),
+        };
+        self.overlay = Overlay::None;
+        Some(command)
     }
 
     fn on_projects_key(&mut self, code: KeyCode) -> Option<Command> {
-        let projects = self.projects.as_mut().expect("projects is open");
-        let last = projects.items.len().saturating_sub(1);
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.projects = None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                projects.selected = projects.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                projects.selected = (projects.selected + 1).min(last);
-            }
-            KeyCode::Enter => {
-                let chosen = projects
-                    .items
-                    .get(projects.selected)
-                    .map(|p| p.name.clone());
-                if let Some(name) = chosen {
-                    self.projects = None;
-                    return self.open_code(&name);
-                }
-            }
-            _ => {}
+        if code != KeyCode::Enter {
+            return None;
         }
-        None
+        let projects = self.projects_mut()?;
+        let name = projects.items.get(projects.selected)?.name.clone();
+        self.overlay = Overlay::None;
+        self.open_code(&name)
     }
 
     fn open_jobs(&mut self) -> Command {
-        self.jobs = Some(Jobs {
+        self.overlay = Overlay::Jobs(Jobs {
             items: Vec::new(),
             selected: 0,
             loaded: false,
@@ -1399,17 +1413,13 @@ impl App {
     }
 
     fn on_jobs_key(&mut self, code: KeyCode) -> Option<Command> {
-        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let jobs = self.jobs_mut().expect("jobs is open");
         jobs.confirmation = None;
-        let last = jobs.items.len().saturating_sub(1);
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.jobs = None,
-            KeyCode::Up | KeyCode::Char('k') => jobs.selected = jobs.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => jobs.selected = (jobs.selected + 1).min(last),
             KeyCode::Char('r') => return Some(Command::ListJobs),
             KeyCode::Enter => {
                 let session_id = self.selected_job();
-                self.jobs = None;
+                self.overlay = Overlay::None;
                 return self.start_session(session_id);
             }
             KeyCode::Char('x') => return self.cancel_selected_job(),
@@ -1420,7 +1430,7 @@ impl App {
     }
 
     fn cancel_selected_job(&mut self) -> Option<Command> {
-        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let jobs = self.jobs_mut().expect("jobs is open");
         let job = jobs.items.get(jobs.selected)?;
         if !is_running(job) {
             jobs.confirmation = Some("not running".to_owned());
@@ -1432,7 +1442,7 @@ impl App {
     }
 
     fn drop_selected_steers(&mut self) -> Option<Command> {
-        let jobs = self.jobs.as_mut().expect("jobs is open");
+        let jobs = self.jobs_mut().expect("jobs is open");
         let job = jobs.items.get(jobs.selected)?;
         if !is_running(job) || job.queued_steers == 0 {
             return None;
@@ -1443,21 +1453,18 @@ impl App {
     }
 
     fn selected_job(&self) -> Option<String> {
-        let jobs = self.jobs.as_ref()?;
+        let jobs = self.jobs()?;
         jobs.items
             .get(jobs.selected)
             .map(|job| job.session_id.clone())
     }
 
     fn on_picker_key(&mut self, code: KeyCode) -> Option<Command> {
-        if self.picker.as_ref().expect("picker is open").filtering {
+        if self.picker().expect("picker is open").filtering {
             return self.on_picker_filter_key(code);
         }
-        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let selected = self.picker().expect("picker is open").selected;
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
-            KeyCode::Up | KeyCode::Char('k') => self.move_picker_selection(true),
-            KeyCode::Down | KeyCode::Char('j') => self.move_picker_selection(false),
             KeyCode::Tab => self.toggle_picker_tree(),
             KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
@@ -1470,7 +1477,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let chosen = self.picker_session(selected).map(|s| s.id.clone());
-                self.picker = None;
+                self.overlay = Overlay::None;
                 return self.start_session(chosen);
             }
             _ => {}
@@ -1505,7 +1512,7 @@ impl App {
                 self.edit_input(code);
                 let selected =
                     usize::from(!self.input.is_empty() && !self.picker_rows().is_empty());
-                self.picker.as_mut().expect("picker").selected = selected;
+                self.picker_mut().expect("picker").selected = selected;
                 self.clamp_picker_selection();
             }
         }
@@ -1513,7 +1520,7 @@ impl App {
     }
 
     fn toggle_picker_show_abandoned(&mut self) {
-        if let Some(picker) = self.picker.as_mut() {
+        if let Some(picker) = self.picker_mut() {
             picker.show_abandoned = !picker.show_abandoned;
             picker.selected = 0;
         }
@@ -1521,23 +1528,22 @@ impl App {
 
     fn toggle_picker_tree(&mut self) {
         let selected_id = self
-            .picker
-            .as_ref()
+            .picker()
             .and_then(|picker| picker.selected.checked_sub(1))
             .and_then(|i| self.picker_rows().get(i).map(|s| s.id.clone()));
-        let picker = self.picker.as_mut().expect("picker is open");
+        let picker = self.picker_mut().expect("picker is open");
         picker.tree = !picker.tree;
         self.picker_tree = picker.tree;
         let position =
             selected_id.and_then(|id| self.picker_rows().iter().position(|s| s.id == id));
-        self.picker.as_mut().expect("picker is open").selected = match position {
+        self.picker_mut().expect("picker is open").selected = match position {
             Some(row) => row + 1,
             None => 0,
         };
     }
 
     fn toggle_picker_show_all(&mut self) {
-        let picker = self.picker.as_mut().expect("picker is open");
+        let picker = self.picker_mut().expect("picker is open");
         picker.show_all = !picker.show_all;
         picker.selected = 0;
     }
@@ -1545,29 +1551,29 @@ impl App {
     fn start_picker_filter(&mut self) {
         self.picker_filter_stash = Some(std::mem::take(&mut self.input));
         self.cursor = 0;
-        self.picker.as_mut().expect("picker is open").filtering = true;
+        self.picker_mut().expect("picker is open").filtering = true;
     }
 
     fn cancel_picker_filter(&mut self) {
-        self.picker.as_mut().expect("picker is open").filtering = false;
+        self.picker_mut().expect("picker is open").filtering = false;
         self.input = self.picker_filter_stash.take().unwrap_or_default();
         self.cursor = self.input.len();
         self.clamp_picker_selection();
     }
 
     fn open_filtered_session(&mut self) -> Option<Command> {
-        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let selected = self.picker().expect("picker is open").selected;
         let chosen = self.picker_session(selected).map(|s| s.id.clone());
-        self.picker = None;
+        self.overlay = Overlay::None;
         self.input = self.picker_filter_stash.take().unwrap_or_default();
         self.cursor = self.input.len();
         self.start_session(chosen)
     }
 
     fn move_picker_selection(&mut self, up: bool) {
-        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let selected = self.picker().expect("picker is open").selected;
         let last = self.picker_rows().len();
-        self.picker.as_mut().expect("picker is open").selected = if up {
+        self.picker_mut().expect("picker is open").selected = if up {
             selected.saturating_sub(1)
         } else {
             (selected + 1).min(last)
@@ -1575,10 +1581,10 @@ impl App {
     }
 
     fn page_picker_selection(&mut self, up: bool) {
-        let selected = self.picker.as_ref().expect("picker is open").selected;
+        let selected = self.picker().expect("picker is open").selected;
         let last = self.picker_rows().len();
         let step = PAGE.min(last.max(1));
-        self.picker.as_mut().expect("picker is open").selected = if up {
+        self.picker_mut().expect("picker is open").selected = if up {
             selected.saturating_sub(step)
         } else {
             (selected + step).min(last)
@@ -1587,14 +1593,14 @@ impl App {
 
     fn clamp_picker_selection(&mut self) {
         let last = self.picker_rows().len();
-        let picker = self.picker.as_mut().expect("picker is open");
+        let picker = self.picker_mut().expect("picker is open");
         picker.selected = picker.selected.min(last);
     }
 
     // refreshes on every open: a branch forked seconds ago must be in the tree
     fn open_picker(&mut self) -> Option<Command> {
-        if self.status != Status::Streaming && self.review.is_none() && self.jobs.is_none() {
-            self.picker = Some(Picker {
+        if self.status != Status::Streaming && self.review().is_none() && self.jobs().is_none() {
+            self.overlay = Overlay::Picker(Picker {
                 selected: 0,
                 filtering: false,
                 show_all: false,
@@ -1612,7 +1618,7 @@ impl App {
     }
 
     pub fn picker_rows(&self) -> Vec<&SessionInfo> {
-        if self.picker.as_ref().is_some_and(|picker| picker.tree) {
+        if self.picker().is_some_and(|picker| picker.tree) {
             self.picker_tree_rows()
                 .into_iter()
                 .map(|(session, _)| session)
@@ -1689,11 +1695,8 @@ impl App {
     }
 
     fn picker_candidates(&self) -> Vec<&SessionInfo> {
-        let show_all = self.picker.as_ref().is_some_and(|picker| picker.show_all);
-        let show_abandoned = self
-            .picker
-            .as_ref()
-            .is_some_and(|picker| picker.show_abandoned);
+        let show_all = self.picker().is_some_and(|picker| picker.show_all);
+        let show_abandoned = self.picker().is_some_and(|picker| picker.show_abandoned);
         let open_project = self.open_project();
         let order: Vec<&SessionInfo> = self
             .by_recency()
@@ -1710,7 +1713,7 @@ impl App {
                 _ => true,
             })
             .collect();
-        let filtering = self.picker.as_ref().is_some_and(|picker| picker.filtering);
+        let filtering = self.picker().is_some_and(|picker| picker.filtering);
         if !filtering || self.input.is_empty() {
             return order;
         }
@@ -1823,11 +1826,10 @@ impl App {
         }
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
-        self.seqs.clear();
         self.viewport_anchor = None;
         self.restore_anchor = false;
         self.visible_blocks.clear();
-        self.inspection = None;
+        self.overlay = Overlay::None;
         self.scroll_back = 0;
         self.search = None;
         self.last_error = None;
@@ -1900,7 +1902,7 @@ impl App {
                     );
                 }
                 self.sessions = sessions;
-                if self.picker.is_some() {
+                if self.picker().is_some() {
                     self.clamp_picker_selection();
                 }
                 None
@@ -1913,11 +1915,13 @@ impl App {
                 branches,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    let (rebuilt, rebuilt_seqs) =
-                        history_blocks(entries, &parent_session, fork_point, &branches);
+                    let rebuilt = history_blocks(entries, &parent_session, fork_point, &branches);
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
-                        && rebuilt.starts_with(&self.transcript);
+                        && rebuilt
+                            .iter()
+                            .zip(&self.transcript)
+                            .all(|(a, b)| a.block == b.block);
                     let kept_search =
                         appended_only
                             .then_some(self.search.as_ref())
@@ -1929,7 +1933,6 @@ impl App {
                                 )
                             });
                     self.transcript = rebuilt;
-                    self.seqs = rebuilt_seqs;
                     self.scroll_back = 0;
                     self.refetch_in_flight = false;
                     self.search = kept_search.and_then(|(query, selected_block)| {
@@ -1975,7 +1978,9 @@ impl App {
             NetEvent::Delta(text) => {
                 self.finalize_thinking();
                 self.streamed_chars += text.chars().count();
-                if let Some(Block::Arc { text: reply, .. }) = self.transcript.last_mut() {
+                if let Some(Block::Arc { text: reply, .. }) =
+                    self.transcript.last_mut().map(|entry| &mut entry.block)
+                {
                     reply.push_str(&text);
                 } else {
                     self.push_block(Block::Arc {
@@ -2021,9 +2026,14 @@ impl App {
                 outcome,
                 content,
             } => {
-                let ended = self.transcript.iter_mut().rev().find(
-                    |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
-                );
+                let ended = self
+                    .transcript
+                    .iter_mut()
+                    .map(|entry| &mut entry.block)
+                    .rev()
+                    .find(
+                        |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
+                    );
                 if let Some(Block::Tool {
                     outcome: o,
                     content: c,
@@ -2051,7 +2061,9 @@ impl App {
                     return None;
                 }
                 self.finalize_thinking();
-                if let Some(Block::Arc { partial: p, .. }) = self.transcript.last_mut() {
+                if let Some(Block::Arc { partial: p, .. }) =
+                    self.transcript.last_mut().map(|entry| &mut entry.block)
+                {
                     *p = partial;
                 }
                 let elapsed = self.turn_started.take().map(|since| since.elapsed());
@@ -2087,7 +2099,7 @@ impl App {
                 None
             }
             NetEvent::ReviewItems(items) => {
-                if let Some(review) = self.review.as_mut() {
+                if let Some(review) = self.review_mut() {
                     review.items = items;
                     review.selected = 0;
                     review.loaded = true;
@@ -2100,7 +2112,7 @@ impl App {
                 None
             }
             NetEvent::ProjectItems(items) => {
-                if let Some(projects) = self.projects.as_mut() {
+                if let Some(projects) = self.projects_mut() {
                     projects.selected = 0;
                     projects.items = items;
                     projects.loaded = true;
@@ -2108,7 +2120,7 @@ impl App {
                 None
             }
             NetEvent::ModelItems(items) => {
-                if let Some(models) = self.models.as_mut() {
+                if let Some(models) = self.models_mut() {
                     // land on the executor's pick: the one most often changed
                     models.selected = items
                         .iter()
@@ -2144,7 +2156,7 @@ impl App {
                         Source::Model as i32,
                     );
                 }
-                if let Some(jobs) = self.jobs.as_mut() {
+                if let Some(jobs) = self.jobs_mut() {
                     jobs.items = items;
                     jobs.selected = 0;
                     jobs.loaded = true;
@@ -2170,7 +2182,7 @@ impl App {
                     .retain(|existing| existing.session_id != job.session_id);
                 self.ambient.push(job.clone());
                 self.strip_since = Instant::now();
-                if let Some(jobs) = self.jobs.as_mut() {
+                if let Some(jobs) = self.jobs_mut() {
                     if let Some(row) = jobs
                         .items
                         .iter_mut()
@@ -2231,7 +2243,7 @@ impl App {
             seconds,
             done: false,
             ..
-        }) = self.transcript.last_mut()
+        }) = self.transcript.last_mut().map(|entry| &mut entry.block)
         {
             thinking.push_str(&text);
             *seconds = Self::thought_seconds(self.thinking_since);
@@ -2249,7 +2261,9 @@ impl App {
 
     fn finalize_thinking(&mut self) {
         let since = self.thinking_since.take();
-        if let Some(Block::Thought { seconds, done, .. }) = self.transcript.last_mut() {
+        if let Some(Block::Thought { seconds, done, .. }) =
+            self.transcript.last_mut().map(|entry| &mut entry.block)
+        {
             if !*done {
                 *done = true;
                 *seconds = Self::thought_seconds(since);
@@ -2265,15 +2279,19 @@ impl App {
     // default: thoughts, handbacks, and tool results together
     fn toggle_open_blocks(&mut self) {
         self.restore_anchor = true;
-        let any_open = self.transcript.iter().any(|block| {
-            matches!(
-                block,
-                Block::Thought { open: true, .. }
-                    | Block::Handback { open: true, .. }
-                    | Block::Tool { open: true, .. }
-            )
-        });
-        for block in &mut self.transcript {
+        let any_open = self
+            .transcript
+            .iter()
+            .map(|entry| &entry.block)
+            .any(|block| {
+                matches!(
+                    block,
+                    Block::Thought { open: true, .. }
+                        | Block::Handback { open: true, .. }
+                        | Block::Tool { open: true, .. }
+                )
+            });
+        for block in self.transcript.iter_mut().map(|entry| &mut entry.block) {
             match block {
                 Block::Thought { open, .. }
                 | Block::Handback { open, .. }
@@ -2286,7 +2304,8 @@ impl App {
     }
 
     fn pop_empty_reply(&mut self) {
-        if matches!(self.transcript.last(), Some(Block::Arc { text, .. }) if text.is_empty()) {
+        if matches!(self.transcript.last().map(|entry| &entry.block), Some(Block::Arc { text, .. }) if text.is_empty())
+        {
             self.pop_block();
             // a shrunk transcript can dangle a selection
             if self.mode == Mode::Visual {
@@ -2420,8 +2439,11 @@ fn is_uuid_like(text: &str) -> bool {
     (32..=36).contains(&text.len()) && text.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-fn format_yank(blocks: &[Block]) -> Option<String> {
-    let parts: Vec<String> = blocks.iter().filter_map(block_yank_text).collect();
+fn format_yank(blocks: &[Entry]) -> Option<String> {
+    let parts: Vec<String> = blocks
+        .iter()
+        .filter_map(|entry| block_yank_text(&entry.block))
+        .collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -2544,17 +2566,13 @@ fn prose_block(message: HistoryMessage) -> Option<Block> {
     }
 }
 
-// the parallel Vec carries each block's history seq, `None` for a block with
-// no row of its own (a derived Sources/Cost line, or a ToolResult that only
-// mutates its call's block); forking reads only the paired vector's `Some`s
 fn history_blocks(
     entries: Vec<HistoryEntry>,
     parent_session: &str,
     fork_point: u64,
     branches: &[(u64, String)],
-) -> (Vec<Block>, Vec<Option<u64>>) {
+) -> Vec<Entry> {
     let mut blocks = Vec::new();
-    let mut seqs = Vec::new();
     for entry in entries {
         let seq = entry.seq;
         let was_len = blocks.len();
@@ -2566,35 +2584,37 @@ fn history_blocks(
                 let sources = grounding_sources(&message.grounding_json);
                 if let Some(block) = prose_block(message) {
                     let is_arc = matches!(block, Block::Arc { .. });
-                    blocks.push(block);
-                    seqs.push(Some(seq));
+                    blocks.push(Entry {
+                        block,
+                        seq: Some(seq),
+                    });
                     if is_arc && !sources.is_empty() {
-                        blocks.push(Block::Sources(sources));
-                        seqs.push(None);
+                        blocks.push(Entry::from(Block::Sources(sources)));
                     }
                     if is_arc && (input_tokens != 0 || output_tokens != 0) {
-                        blocks.push(Block::Cost {
+                        blocks.push(Entry::from(Block::Cost {
                             input_tokens,
                             output_tokens,
                             seconds: elapsed_ms as f32 / 1000.0,
-                        });
-                        seqs.push(None);
+                        }));
                     }
                 }
             }
             Some(history_entry::Entry::ToolCall(call)) => {
-                blocks.push(Block::Tool {
-                    call_id: call.call_id,
-                    name: call.name,
-                    args: call.arguments_json,
-                    outcome: None,
-                    content: String::new(),
-                    open: false,
+                blocks.push(Entry {
+                    block: Block::Tool {
+                        call_id: call.call_id,
+                        name: call.name,
+                        args: call.arguments_json,
+                        outcome: None,
+                        content: String::new(),
+                        open: false,
+                    },
+                    seq: Some(seq),
                 });
-                seqs.push(Some(seq));
             }
             Some(history_entry::Entry::ToolResult(result)) => {
-                let ended = blocks.iter_mut().rev().find(
+                let ended = blocks.iter_mut().map(|entry| &mut entry.block).rev().find(
                     |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
                 );
                 if let Some(Block::Tool {
@@ -2607,29 +2627,30 @@ fn history_blocks(
             }
             // provider-side, arrives resolved; styled like a finished tool line
             Some(history_entry::Entry::ServerCall(call)) => {
-                blocks.push(Block::Tool {
-                    call_id: String::new(),
-                    name: call.name,
-                    args: call.arguments_json,
-                    outcome: Some("web"),
-                    content: call.response_json,
-                    open: false,
+                blocks.push(Entry {
+                    block: Block::Tool {
+                        call_id: String::new(),
+                        name: call.name,
+                        args: call.arguments_json,
+                        outcome: Some("web"),
+                        content: call.response_json,
+                        open: false,
+                    },
+                    seq: Some(seq),
                 });
-                seqs.push(Some(seq));
             }
             None => {}
         }
         // the door out: a fork leaving from this entry gets its signpost
         if blocks.len() > was_len {
             for (_, label) in branches.iter().filter(|(at, _)| *at == seq) {
-                blocks.push(Block::Note(format!(
+                blocks.push(Entry::from(Block::Note(format!(
                     "a branch continues from here: {label}"
-                )));
-                seqs.push(None);
+                ))));
             }
         }
     }
-    for block in &mut blocks {
+    for block in blocks.iter_mut().map(|entry| &mut entry.block) {
         if let Block::Tool {
             outcome: outcome @ None,
             ..
@@ -2639,24 +2660,24 @@ fn history_blocks(
         }
     }
     if !parent_session.is_empty() {
-        if let Some(cut) = seqs
+        if let Some(cut) = blocks
             .iter()
-            .rposition(|seq| seq.is_some_and(|s| s <= fork_point))
+            .rposition(|entry| entry.seq.is_some_and(|s| s <= fork_point))
         {
             let mut at = cut + 1;
-            while at < blocks.len() && seqs[at].is_none() {
+            while at < blocks.len() && blocks[at].seq.is_none() {
                 at += 1;
             }
             let head = &parent_session[..parent_session.len().min(8)];
-            blocks.insert(at, Block::Note(format!("branched from {head} here")));
-            seqs.insert(at, None);
+            blocks.insert(at, Block::Note(format!("branched from {head} here")).into());
         }
     }
-    (blocks, seqs)
+    blocks
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::app::Overlay;
     use arc_proto::v1::{HistoryToolCall, HistoryToolResult};
 
     use super::*;
@@ -2795,9 +2816,46 @@ mod tests {
     }
 
     #[test]
+    fn model_overlay_keeps_controls_and_scrolling_out_of_the_transcript() {
+        let mut app = App::new();
+        app.input = "draft".to_owned();
+        app.cursor = app.input.len();
+        app.open_models();
+        let overlay = app.overlay.clone();
+        for code in ['p', 'n', 'j', 'o', 't'] {
+            assert_eq!(app.on_key(ctrl(code)), None);
+            assert_eq!(app.overlay, overlay);
+        }
+        app.on_scroll(true, PAGE);
+        assert_eq!(app.scroll_back, 0);
+        assert_eq!(app.input, "draft");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn project_overlay_scrolls_its_selection() {
+        let mut app = App::new();
+        app.open_projects();
+        app.on_net(NetEvent::ProjectItems(vec![
+            ProjectInfo {
+                name: "one".to_owned(),
+                ..ProjectInfo::default()
+            },
+            ProjectInfo {
+                name: "two".to_owned(),
+                ..ProjectInfo::default()
+            },
+        ]));
+        app.on_scroll(false, 1);
+        assert_eq!(app.projects_mut().expect("projects").selected, 1);
+        assert_eq!(app.scroll_back, 0);
+    }
+
+    #[test]
     fn a_paste_over_an_overlay_is_ignored() {
         let mut app = App::new();
-        app.help = true;
+        app.overlay = Overlay::Help { scroll: 0 };
         assert_eq!(app.on_paste("x"), None);
         assert_eq!(app.input, "");
     }
@@ -2863,7 +2921,7 @@ mod tests {
     }
 
     fn picker_selected(app: &App) -> Option<usize> {
-        app.picker.as_ref().map(|picker| picker.selected)
+        app.picker().map(|picker| picker.selected)
     }
 
     fn end(partial: bool) -> NetEvent {
@@ -2918,7 +2976,7 @@ mod tests {
                 content: "hello".to_owned()
             })
         );
-        assert_eq!(app.transcript, [Block::You("hello".to_owned())]);
+        assert_eq!(app.block_contents(), [Block::You("hello".to_owned())]);
         assert_eq!(app.input, "");
         assert_eq!(app.status, Status::Streaming);
     }
@@ -2928,7 +2986,7 @@ mod tests {
         let mut app = App::new();
         typed(&mut app, "   ");
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.transcript, []);
+        assert_eq!(app.block_contents(), []);
     }
 
     #[test]
@@ -2953,7 +3011,7 @@ mod tests {
         assert_eq!(app.session_id.as_deref(), Some("s-1"));
         assert_eq!(app.status, Status::Idle);
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Arc {
@@ -2989,7 +3047,7 @@ mod tests {
         app.on_net(end(true));
 
         assert!(matches!(
-            app.transcript.last(),
+            app.transcript.last().map(|entry| &entry.block),
             Some(Block::Arc { partial: true, .. })
         ));
     }
@@ -3006,7 +3064,7 @@ mod tests {
         app.on_net(NetEvent::Reasoning("let me ".to_owned()));
         app.on_net(NetEvent::Reasoning("think".to_owned()));
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Thought {
@@ -3032,7 +3090,7 @@ mod tests {
 
         app.on_net(NetEvent::Delta("hello".to_owned()));
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Thought {
@@ -3062,7 +3120,7 @@ mod tests {
         app.on_net(end(true));
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Thought {
@@ -3090,14 +3148,14 @@ mod tests {
 
         assert_eq!(app.on_key(ctrl('o')), None, "insert mode opens it");
         assert!(matches!(
-            app.transcript[1],
+            app.transcript[1].block,
             Block::Thought { open: true, .. }
         ));
 
         app.on_key(key(KeyCode::Esc));
         app.on_key(ctrl('o'));
         assert!(
-            matches!(app.transcript[1], Block::Thought { open: false, .. }),
+            matches!(app.transcript[1].block, Block::Thought { open: false, .. }),
             "normal mode closes it again"
         );
     }
@@ -3115,7 +3173,7 @@ mod tests {
         app.on_key(ctrl('o'));
         assert!(
             matches!(
-                app.transcript.last(),
+                app.transcript.last().map(|entry| &entry.block),
                 Some(Block::Thought {
                     done: false,
                     open: true,
@@ -3128,7 +3186,7 @@ mod tests {
         app.on_net(NetEvent::Delta("hello".to_owned()));
         assert!(
             matches!(
-                app.transcript[1],
+                app.transcript[1].block,
                 Block::Thought {
                     done: true,
                     open: true,
@@ -3146,7 +3204,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
 
         assert_eq!(app.on_key(ctrl('o')), None);
-        assert_eq!(app.transcript, [Block::You("hi".to_owned())]);
+        assert_eq!(app.block_contents(), [Block::You("hi".to_owned())]);
     }
 
     #[test]
@@ -3164,7 +3222,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Thought {
@@ -3182,7 +3240,7 @@ mod tests {
 
         app.on_key(ctrl('o'));
         assert!(matches!(
-            app.transcript[1],
+            app.transcript[1].block,
             Block::Thought { open: true, .. }
         ));
     }
@@ -3212,19 +3270,22 @@ mod tests {
         app.on_key(key(KeyCode::Char('O')));
         for at in [1, 4] {
             assert!(
-                matches!(&app.transcript[at], Block::Thought { open: true, .. }),
+                matches!(&app.transcript[at].block, Block::Thought { open: true, .. }),
                 "both traces open together"
             );
         }
 
-        if let Block::Thought { open, .. } = &mut app.transcript[1] {
+        if let Block::Thought { open, .. } = &mut app.transcript[1].block {
             *open = false;
         }
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('O')));
         for at in [1, 4] {
             assert!(
-                matches!(&app.transcript[at], Block::Thought { open: false, .. }),
+                matches!(
+                    &app.transcript[at].block,
+                    Block::Thought { open: false, .. }
+                ),
                 "any open means the toggle closes all"
             );
         }
@@ -3244,7 +3305,7 @@ mod tests {
 
         app.on_net(ended("b", ToolOutcome::Ok as i32, "found it"));
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Thought {
@@ -3274,7 +3335,7 @@ mod tests {
 
         app.on_net(ended("a", ToolOutcome::Error as i32, "boom"));
         assert!(matches!(
-            &app.transcript[2],
+            &app.transcript[2].block,
             Block::Tool {
                 outcome: Some("error"),
                 content,
@@ -3298,7 +3359,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript.last(),
+            app.transcript.last().map(|entry| &entry.block),
             Some(&Block::Tool {
                 call_id: "t1".to_owned(),
                 name: "bash".to_owned(),
@@ -3330,7 +3391,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::Tool {
                 call_id: "t1".to_owned(),
                 name: "read".to_owned(),
@@ -3416,11 +3477,11 @@ mod tests {
         });
         assert!(
             matches!(
-                app.transcript.last(),
+                app.transcript.last().map(|entry| &entry.block),
                 Some(Block::Sources(sources)) if sources.len() == 2
             ),
             "citations sit under the answer, got {:?}",
-            app.transcript.last()
+            app.transcript.last().map(|entry| &entry.block)
         );
 
         typed(&mut app, "and plainly?");
@@ -3428,7 +3489,10 @@ mod tests {
         app.on_net(NetEvent::Delta("no web involved".to_owned()));
         app.on_net(end(false));
         assert!(
-            !matches!(app.transcript.last(), Some(Block::Sources(_))),
+            !matches!(
+                app.transcript.last().map(|entry| &entry.block),
+                Some(Block::Sources(_))
+            ),
             "an ungrounded turn adds nothing"
         );
     }
@@ -3448,7 +3512,8 @@ mod tests {
             })),
             seq: 0,
         }];
-        let (blocks, _seqs) = history_blocks(entries, "", 0, &[]);
+        let entries = history_blocks(entries, "", 0, &[]);
+        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
         assert!(
             matches!(
                 blocks.as_slice(),
@@ -3465,7 +3530,9 @@ mod tests {
             prose_entry_at(2, Role::Assistant as i32, "inherited answer", false),
             prose_entry_at(3, Role::User as i32, "own question", false),
         ];
-        let (blocks, seqs) = history_blocks(entries, "s-parent-uuid", 2, &[]);
+        let entries = history_blocks(entries, "s-parent-uuid", 2, &[]);
+        let seqs: Vec<_> = entries.iter().map(|entry| entry.seq).collect();
+        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
 
         assert_eq!(
             blocks,
@@ -3486,7 +3553,8 @@ mod tests {
     #[test]
     fn a_parentless_session_gets_no_marker() {
         let entries = vec![prose_entry_at(1, Role::User as i32, "hi", false)];
-        let (blocks, _seqs) = history_blocks(entries, "", 0, &[]);
+        let entries = history_blocks(entries, "", 0, &[]);
+        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
 
         assert!(
             !blocks.iter().any(|b| matches!(b, Block::Note(_))),
@@ -3497,14 +3565,14 @@ mod tests {
     #[test]
     fn point_visual_lights_exactly_one_block_and_walks_both_ways() {
         let mut app = App::new();
-        app.transcript = vec![
+        app.set_blocks(vec![
             Block::You("one".to_owned()),
             Block::Arc {
                 text: "two".to_owned(),
                 partial: false,
             },
             Block::You("three".to_owned()),
-        ];
+        ]);
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('v')));
         assert_eq!(app.visual_range(), Some((2, 2)), "starts at the last block");
@@ -3522,7 +3590,7 @@ mod tests {
     #[test]
     fn point_visual_selects_tools_between_messages() {
         let mut app = App::new();
-        app.transcript = vec![
+        app.set_blocks(vec![
             Block::You("one".to_owned()),
             Block::Tool {
                 call_id: "t1".to_owned(),
@@ -3536,7 +3604,7 @@ mod tests {
                 text: "two".to_owned(),
                 partial: false,
             },
-        ];
+        ]);
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('v')));
         assert_eq!(app.visual_range(), Some((1, 1)), "starts on the tool");
@@ -3569,14 +3637,14 @@ mod tests {
     #[test]
     fn range_visual_still_extends_upward_from_its_anchor() {
         let mut app = App::new();
-        app.transcript = vec![
+        app.set_blocks(vec![
             Block::You("one".to_owned()),
             Block::Arc {
                 text: "two".to_owned(),
                 partial: false,
             },
             Block::You("three".to_owned()),
-        ];
+        ]);
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('V')));
         app.on_key(key(KeyCode::Char('k')));
@@ -3587,16 +3655,16 @@ mod tests {
     fn help_scrolling_moves_and_close_resets_it() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
-        app.help = true;
+        app.overlay = Overlay::Help { scroll: 0 };
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.help_scroll, 2);
+        assert_eq!(app.overlay, Overlay::Help { scroll: 2 });
         app.on_key(key(KeyCode::Char('g')));
-        assert_eq!(app.help_scroll, 0);
+        assert_eq!(app.overlay, Overlay::Help { scroll: 0 });
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Char('q')));
-        assert!(!app.help);
-        assert_eq!(app.help_scroll, 0, "closing forgets the scroll");
+        assert!(!matches!(app.overlay, Overlay::Help { .. }));
+        assert_eq!(app.overlay, Overlay::None, "closing forgets the scroll");
     }
 
     #[test]
@@ -3658,7 +3726,8 @@ mod tests {
             },
         ];
         let branches = vec![(4, "an alternate take".to_owned())];
-        let (blocks, _seqs) = history_blocks(entries, "", 0, &branches);
+        let entries = history_blocks(entries, "", 0, &branches);
+        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
         assert!(
             matches!(
                 &blocks[..],
@@ -3678,7 +3747,7 @@ mod tests {
             Some(Command::List),
             "a branch forked seconds ago must appear without a restart"
         );
-        assert!(app.picker.is_some());
+        assert!(app.picker().is_some());
     }
 
     #[test]
@@ -3724,7 +3793,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.transcript.last(),
+            app.transcript.last().map(|entry| &entry.block),
             Some(Block::Cost {
                 input_tokens: 2345,
                 output_tokens: 140,
@@ -3747,7 +3816,7 @@ mod tests {
         assert!(
             !app.transcript
                 .iter()
-                .any(|block| matches!(block, Block::Cost { .. })),
+                .any(|entry| matches!(&entry.block, Block::Cost { .. })),
             "a steer ack carries zeroed usage"
         );
     }
@@ -3771,7 +3840,10 @@ mod tests {
             queued: false,
         });
 
-        assert_eq!(app.transcript.last(), Some(&Block::StepCapped));
+        assert_eq!(
+            app.transcript.last().map(|entry| &entry.block),
+            Some(&Block::StepCapped)
+        );
     }
 
     #[test]
@@ -3789,7 +3861,7 @@ mod tests {
         assert!(
             !app.transcript
                 .iter()
-                .any(|block| matches!(block, Block::StepCapped))
+                .any(|entry| matches!(&entry.block, Block::StepCapped))
         );
     }
 
@@ -3835,7 +3907,7 @@ mod tests {
         });
         assert!(
             matches!(
-                app.transcript.as_slice(),
+                app.block_contents().as_slice(),
                 [Block::Thought { text, done: false, .. }] if text == "weighing options"
             ),
             "one open thought block accumulates the deltas, got {:?}",
@@ -3898,7 +3970,7 @@ mod tests {
         assert!(
             !app.transcript
                 .iter()
-                .any(|block| matches!(block, Block::Cost { .. }))
+                .any(|entry| matches!(&entry.block, Block::Cost { .. }))
         );
     }
 
@@ -3920,7 +3992,7 @@ mod tests {
         app.on_net(ended("t", 42, "who knows"));
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Tool {
@@ -3949,7 +4021,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Fault {
@@ -3983,7 +4055,7 @@ mod tests {
             "a message typed mid-turn goes to the live turn, not a local queue"
         );
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("one".to_owned()),
                 Block::Arc {
@@ -4037,7 +4109,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.transcript.last(),
+            app.transcript.last().map(|entry| &entry.block),
             Some(Block::Fault { code, .. }) if code == "disconnected"
         ));
         assert_eq!(retry, None, "there is no local queue left to retry");
@@ -4255,7 +4327,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('j')));
         let fetch = app.on_key(key(KeyCode::Enter));
 
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
         assert_eq!(app.session_id.as_deref(), Some("new"));
         assert_eq!(
             fetch,
@@ -4265,7 +4337,7 @@ mod tests {
             "opening a session asks for its transcript"
         );
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::Note("loading".to_owned())],
             "until the answer lands, the wait is visible"
         );
@@ -4346,10 +4418,10 @@ mod tests {
         ]));
         normal(&mut app, "s");
 
-        assert!(!app.picker.as_ref().expect("open").tree, "flat by default");
+        assert!(!app.picker().expect("open").tree, "flat by default");
 
         app.on_key(key(KeyCode::Tab));
-        let picker = app.picker.as_ref().expect("still open");
+        let picker = app.picker().expect("still open");
         assert!(picker.tree);
         assert_eq!(
             picker.selected, 0,
@@ -4357,7 +4429,7 @@ mod tests {
         );
 
         app.on_key(key(KeyCode::Tab));
-        assert!(!app.picker.as_ref().expect("still open").tree);
+        assert!(!app.picker().expect("still open").tree);
     }
 
     #[test]
@@ -4381,7 +4453,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Tab));
 
-        let picker = app.picker.as_ref().expect("still open");
+        let picker = app.picker().expect("still open");
         assert!(picker.tree, "Tab switched to tree");
         assert_eq!(
             picker.selected, 2,
@@ -4399,7 +4471,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Tab));
         assert_eq!(
-            app.picker_session(app.picker.as_ref().expect("open").selected)
+            app.picker_session(app.picker().expect("open").selected)
                 .map(|s| s.id.as_str()),
             Some("s-branch"),
             "flipping back keeps the highlight too"
@@ -4420,13 +4492,13 @@ mod tests {
         app.on_key(key(KeyCode::Char('/')));
         typed(&mut app, "parser");
 
-        let picker = app.picker.as_ref().expect("open");
+        let picker = app.picker().expect("open");
         assert!(picker.filtering, "the filter prompt is active");
         assert!(!picker.tree, "still flat under the filter");
 
         app.on_key(key(KeyCode::Tab));
 
-        let picker = app.picker.as_ref().expect("still open");
+        let picker = app.picker().expect("still open");
         assert!(picker.filtering, "Tab inside the prompt keeps filtering");
         assert!(picker.tree, "and switches the view");
         assert_eq!(
@@ -4439,7 +4511,7 @@ mod tests {
         );
 
         app.on_key(key(KeyCode::Esc));
-        let picker = app.picker.as_ref().expect("still open");
+        let picker = app.picker().expect("still open");
         assert!(!picker.filtering);
         assert!(picker.tree, "closing the prompt keeps the tree mode");
     }
@@ -4456,12 +4528,12 @@ mod tests {
         for _ in 0..2 {
             app.on_key(key(KeyCode::Char('j')));
         }
-        assert_eq!(app.picker.as_ref().expect("open").selected, 2);
+        assert_eq!(app.picker().expect("open").selected, 2);
 
         app.on_net(NetEvent::Sessions(vec![session_with("s-1", "one", "hi")]));
 
         assert_eq!(
-            app.picker.as_ref().expect("still open").selected,
+            app.picker().expect("still open").selected,
             1,
             "a shrinking refresh clamps to the new last row"
         );
@@ -4499,31 +4571,31 @@ mod tests {
             .collect();
         app.on_net(NetEvent::Sessions(sessions));
         normal(&mut app, "s");
-        assert_eq!(app.picker.as_ref().expect("open").selected, 0);
+        assert_eq!(app.picker().expect("open").selected, 0);
 
         app.on_key(key(KeyCode::PageDown));
         assert_eq!(
-            app.picker.as_ref().expect("open").selected,
+            app.picker().expect("open").selected,
             PAGE,
             "PageDown steps by a page"
         );
 
         app.on_key(key(KeyCode::PageDown));
-        assert_eq!(app.picker.as_ref().expect("open").selected, PAGE * 2);
+        assert_eq!(app.picker().expect("open").selected, PAGE * 2);
 
         app.on_key(key(KeyCode::PageUp));
-        assert_eq!(app.picker.as_ref().expect("open").selected, PAGE);
+        assert_eq!(app.picker().expect("open").selected, PAGE);
 
         app.on_key(ctrl('d'));
         assert_eq!(
-            app.picker.as_ref().expect("open").selected,
+            app.picker().expect("open").selected,
             PAGE * 2,
             "ctrl-d pages too"
         );
 
         app.on_key(ctrl('u'));
         app.on_key(ctrl('u'));
-        assert_eq!(app.picker.as_ref().expect("open").selected, 0);
+        assert_eq!(app.picker().expect("open").selected, 0);
         assert_eq!(
             app.scroll_back, 0,
             "paging keys over a picker move the picker, not the transcript"
@@ -4538,14 +4610,14 @@ mod tests {
         )]));
         normal(&mut app, "s");
         app.on_key(key(KeyCode::Tab));
-        assert!(app.picker.as_ref().expect("open").tree);
+        assert!(app.picker().expect("open").tree);
 
         app.on_key(key(KeyCode::Esc));
-        assert!(app.picker.is_none());
+        assert!(app.picker().is_none());
 
         app.on_key(key(KeyCode::Char('s')));
         assert!(
-            app.picker.as_ref().expect("reopened").tree,
+            app.picker().expect("reopened").tree,
             "the reopened picker comes back in tree mode"
         );
     }
@@ -4743,7 +4815,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("what is a walking skeleton?".to_owned()),
                 Block::Arc {
@@ -4780,7 +4852,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("hi".to_owned()),
                 Block::Arc {
@@ -4811,7 +4883,7 @@ mod tests {
         assert!(
             !app.transcript
                 .iter()
-                .any(|block| matches!(block, Block::Cost { .. })),
+                .any(|entry| matches!(&entry.block, Block::Cost { .. })),
             "zero usage renders no cost line"
         );
     }
@@ -4835,7 +4907,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::System("a handback note".to_owned())],
             "a system row never grows a cost line, even carrying stray usage"
         );
@@ -4877,10 +4949,10 @@ mod tests {
             branches: Vec::new(),
         });
 
-        assert_eq!(reopened.transcript, live.transcript);
+        assert_eq!(reopened.block_contents(), live.block_contents());
         assert!(
             matches!(
-                &live.transcript[1],
+                &live.transcript[1].block,
                 Block::Tool { content, .. } if content == "found it"
             ),
             "the live path filled the tool result's content"
@@ -4904,7 +4976,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::Tool {
                     call_id: "a".to_owned(),
@@ -4930,7 +5002,7 @@ mod tests {
     fn history_for_a_session_already_left_is_dropped() {
         let mut app = App::new();
         app.session_id = Some("second".to_owned());
-        app.transcript = vec![Block::Note("loading".to_owned())];
+        app.set_blocks(vec![Block::Note("loading".to_owned())]);
 
         app.on_net(NetEvent::History {
             session_id: "first".to_owned(),
@@ -4941,7 +5013,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::Note("loading".to_owned())],
             "the transcript we are actually waiting on is untouched"
         );
@@ -4951,13 +5023,13 @@ mod tests {
     fn the_picker_row_zero_starts_a_new_session() {
         let mut app = App::new();
         app.session_id = Some("s-1".to_owned());
-        app.transcript.push(Block::You("old".to_owned()));
+        app.push_block(Block::You("old".to_owned()));
 
         app.on_key(ctrl('p'));
         app.on_key(key(KeyCode::Enter));
 
         assert_eq!(app.session_id, None);
-        assert_eq!(app.transcript, []);
+        assert_eq!(app.block_contents(), []);
     }
 
     #[test]
@@ -4966,9 +5038,9 @@ mod tests {
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
         app.on_key(ctrl('p'));
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
         normal(&mut app, "s");
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
     }
 
     #[test]
@@ -4996,7 +5068,7 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         let command = app.on_key(key(KeyCode::Enter));
 
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
         assert_eq!(app.session_id.as_deref(), Some("keep-b"));
         assert_eq!(
             command,
@@ -5025,7 +5097,7 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);
 
         assert!(
-            !app.picker.as_ref().expect("picker still open").filtering,
+            !app.picker().expect("picker still open").filtering,
             "esc exits filtering, not the picker"
         );
         assert_eq!(app.picker_rows().len(), 2, "the full list is back");
@@ -5227,12 +5299,12 @@ mod tests {
         let command = app.on_key(key(KeyCode::Enter));
 
         assert_eq!(command, None);
-        assert!(app.help);
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":help is a command, not E492");
 
         assert_eq!(app.on_key(key(KeyCode::Char('q'))), None);
-        assert!(!app.help);
+        assert!(!matches!(app.overlay, Overlay::Help { .. }));
     }
 
     #[test]
@@ -5243,10 +5315,13 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Char('z'))), None);
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert!(app.help, "still open");
+        assert!(matches!(app.overlay, Overlay::Help { .. }), "still open");
 
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        assert!(!app.help, "esc closes it too");
+        assert!(
+            !matches!(app.overlay, Overlay::Help { .. }),
+            "esc closes it too"
+        );
     }
 
     #[test]
@@ -5290,7 +5365,7 @@ mod tests {
             (since_micros - expected).abs() < 60 * 1_000_000,
             "the window reaches a week back, got {since_micros}"
         );
-        let review = app.review.as_ref().expect("the pane is open");
+        let review = app.review().expect("the pane is open");
         assert!(!review.loaded, "nothing has been answered yet");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":review is a command, not E492");
@@ -5299,15 +5374,15 @@ mod tests {
     #[test]
     fn review_items_land_in_the_open_pane_and_nowhere_after_it_closed() {
         let mut app = reviewing(vec![entry("mr-1", "one")]);
-        let review = app.review.as_ref().expect("open");
+        let review = app.review().expect("open");
         assert!(review.loaded);
         assert_eq!(review.items, [entry("mr-1", "one")]);
         assert_eq!(review.selected, 0);
 
         app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.review, None);
+        assert_eq!(app.review(), None);
         app.on_net(NetEvent::ReviewItems(vec![entry("mr-2", "two")]));
-        assert_eq!(app.review, None);
+        assert_eq!(app.review(), None);
     }
 
     #[test]
@@ -5342,17 +5417,17 @@ mod tests {
         let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
 
         app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.review.as_ref().expect("open").selected, 1);
+        assert_eq!(app.review().expect("open").selected, 1);
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(
-            app.review.as_ref().expect("open").selected,
+            app.review().expect("open").selected,
             1,
             "j stops at the last row"
         );
         app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        assert_eq!(app.review().expect("open").selected, 0);
         app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        assert_eq!(app.review().expect("open").selected, 0);
     }
 
     #[test]
@@ -5368,7 +5443,7 @@ mod tests {
                 record_id: "mr-2".to_owned()
             })
         );
-        let review = app.review.as_ref().expect("still open");
+        let review = app.review().expect("still open");
         assert_eq!(review.items, [entry("mr-1", "one")]);
         assert_eq!(review.selected, 0, "the selection is clamped to the list");
     }
@@ -5382,10 +5457,10 @@ mod tests {
             None,
             "the first d arms"
         );
-        assert!(app.review.as_ref().expect("open").pending_delete);
+        assert!(app.review().expect("open").pending_delete);
 
         app.on_key(key(KeyCode::Char('j')));
-        assert!(!app.review.as_ref().expect("open").pending_delete);
+        assert!(!app.review().expect("open").pending_delete);
         assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);
 
         let command = app.on_key(key(KeyCode::Char('d')));
@@ -5395,7 +5470,7 @@ mod tests {
                 record_id: "mr-2".to_owned()
             })
         );
-        let review = app.review.as_ref().expect("still open");
+        let review = app.review().expect("still open");
         assert_eq!(review.items, [entry("mr-1", "one")]);
         assert!(!review.pending_delete);
     }
@@ -5409,7 +5484,7 @@ mod tests {
         let Some(Command::ReviewList { .. }) = command else {
             panic!("expected a fresh ReviewList, got {command:?}");
         };
-        let review = app.review.as_ref().expect("the pane stays open");
+        let review = app.review().expect("the pane stays open");
         assert!(!review.loaded, "the list resets to loading");
         assert!(review.items.is_empty(), "old items are dropped");
         assert!(!review.pending_delete, "refresh disarms a pending dd");
@@ -5425,7 +5500,7 @@ mod tests {
             "fix sends nothing"
         );
 
-        assert_eq!(app.review, None, "the pane closed");
+        assert_eq!(app.review(), None, "the pane closed");
         assert_eq!(app.input, "fix memory mr-1: Old address — ");
         assert_eq!(app.cursor, app.input.len(), "ready to finish the sentence");
         assert_eq!(app.mode, Mode::Insert);
@@ -5443,10 +5518,10 @@ mod tests {
             "nothing to delete"
         );
         assert_eq!(app.on_key(key(KeyCode::Char('f'))), None);
-        assert!(app.review.is_some(), "an empty pane still shows its line");
+        assert!(app.review().is_some(), "an empty pane still shows its line");
 
         app.on_key(key(KeyCode::Char('q')));
-        assert_eq!(app.review, None);
+        assert_eq!(app.review(), None);
         assert!(!app.quit, "q closed the pane, not the app");
     }
 
@@ -5454,7 +5529,7 @@ mod tests {
     fn the_picker_does_not_open_under_the_review_pane() {
         let mut app = reviewing(vec![entry("mr-1", "one")]);
         app.on_key(ctrl('p'));
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
     }
 
     #[test]
@@ -5463,12 +5538,12 @@ mod tests {
 
         app.on_scroll(false, PAGE);
         assert_eq!(
-            app.review.as_ref().expect("open").selected,
+            app.review().expect("open").selected,
             1,
             "one row per gesture, not one page"
         );
         app.on_scroll(true, PAGE);
-        assert_eq!(app.review.as_ref().expect("open").selected, 0);
+        assert_eq!(app.review().expect("open").selected, 0);
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
@@ -5506,7 +5581,7 @@ mod tests {
         let command = app.on_key(key(KeyCode::Enter));
 
         assert_eq!(command, Some(Command::ListJobs));
-        let jobs = app.jobs.as_ref().expect("the pane is open");
+        let jobs = app.jobs().expect("the pane is open");
         assert!(!jobs.loaded, "nothing has been answered yet");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.last_error, None, ":jobs is a command, not E492");
@@ -5518,7 +5593,7 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Char('?'))), None);
 
-        assert!(app.help);
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
     }
 
     #[test]
@@ -5528,7 +5603,7 @@ mod tests {
         let command = app.on_key(key(KeyCode::Char('J')));
 
         assert_eq!(command, Some(Command::ListJobs));
-        assert!(app.jobs.is_some());
+        assert!(app.jobs().is_some());
     }
 
     #[test]
@@ -5538,7 +5613,7 @@ mod tests {
         let command = app.on_key(key(KeyCode::Char('Q')));
 
         assert!(matches!(command, Some(Command::ReviewList { .. })));
-        assert!(app.review.is_some());
+        assert!(app.review().is_some());
     }
 
     fn choice(role: SessionRole, name: &str, selected: bool) -> ModelChoice {
@@ -5558,7 +5633,7 @@ mod tests {
 
         let command = app.on_key(key(KeyCode::Char('M')));
         assert_eq!(command, Some(Command::ListModels));
-        assert!(!app.models.as_ref().expect("picker is open").loaded);
+        assert!(!app.models_mut().expect("picker is open").loaded);
 
         app.on_net(NetEvent::ModelItems(vec![
             choice(SessionRole::Concierge, "astra", true),
@@ -5566,7 +5641,7 @@ mod tests {
             choice(SessionRole::Executor, "glm-flash", false),
         ]));
         assert_eq!(
-            app.models.as_ref().unwrap().selected,
+            app.models_mut().unwrap().selected,
             1,
             "the cursor lands on the executor's current pick"
         );
@@ -5581,11 +5656,11 @@ mod tests {
                 choice: "glm-flash".to_owned(),
             })
         );
-        assert_eq!(app.models, None, "enter closes the picker");
+        assert_eq!(app.models_mut(), None, "enter closes the picker");
 
         app.on_key(key(KeyCode::Char('M')));
         app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.models, None);
+        assert_eq!(app.models_mut(), None);
     }
 
     #[test]
@@ -5595,7 +5670,7 @@ mod tests {
         typed(&mut app, "model");
         let command = app.on_key(key(KeyCode::Enter));
         assert_eq!(command, Some(Command::ListModels));
-        assert!(app.models.is_some());
+        assert!(app.models_mut().is_some());
     }
 
     #[test]
@@ -5604,7 +5679,7 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         let command = app.on_key(key(KeyCode::Char('C')));
         assert_eq!(command, Some(Command::ListProjects));
-        assert!(!app.projects.as_ref().expect("picker is open").loaded);
+        assert!(!app.projects_mut().expect("picker is open").loaded);
 
         app.on_net(NetEvent::ProjectItems(vec![
             ProjectInfo {
@@ -5622,7 +5697,7 @@ mod tests {
         let command = app.on_key(key(KeyCode::Enter));
 
         assert_eq!(command, None, "nothing durable for an unsent pick");
-        assert_eq!(app.projects, None, "enter closes the picker");
+        assert_eq!(app.projects_mut(), None, "enter closes the picker");
         assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
 
         app.on_key(key(KeyCode::Char('i')));
@@ -5646,11 +5721,11 @@ mod tests {
 
         let command = app.on_key(key(KeyCode::Enter));
         assert_eq!(command, None, "enter on a loading list picks nothing");
-        assert!(app.projects.is_some(), "the picker stays open");
+        assert!(app.projects_mut().is_some(), "the picker stays open");
         assert_eq!(app.open_door_label(), None);
 
         app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.projects, None);
+        assert_eq!(app.projects_mut(), None);
     }
 
     #[test]
@@ -5852,7 +5927,7 @@ mod tests {
         let mut picker_first = App::new();
         picker_first.set_launch_dir(Some(canonical_root));
         picker_first.on_key(ctrl('p'));
-        assert!(picker_first.picker.is_some());
+        assert!(picker_first.picker().is_some());
         picker_first.on_net(NetEvent::ProjectsSeeded(seed));
         assert_eq!(
             picker_first.open_door_label(),
@@ -5967,15 +6042,15 @@ mod tests {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-1", State::Running)]);
-        let jobs = app.jobs.as_ref().expect("open");
+        let jobs = app.jobs().expect("open");
         assert!(jobs.loaded);
         assert_eq!(jobs.items, [job("s-1", State::Running)]);
         assert_eq!(jobs.selected, 0);
 
         app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.jobs, None);
+        assert_eq!(app.jobs(), None);
         app.on_net(NetEvent::JobItems(vec![job("s-2", State::Finished)]));
-        assert_eq!(app.jobs, None);
+        assert_eq!(app.jobs(), None);
     }
 
     #[test]
@@ -5991,7 +6066,7 @@ mod tests {
         app.on_net(NetEvent::JobItems(vec![mine.clone(), unrelated.clone()]));
 
         assert_eq!(
-            app.jobs.as_ref().expect("open").items,
+            app.jobs().expect("open").items,
             [mine, unrelated],
             "the popup is unscoped: only the ambient strip filters by parent_session"
         );
@@ -6007,17 +6082,17 @@ mod tests {
         ]);
 
         app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+        assert_eq!(app.jobs().expect("open").selected, 1);
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(
-            app.jobs.as_ref().expect("open").selected,
+            app.jobs().expect("open").selected,
             1,
             "j stops at the last row"
         );
         app.on_key(key(KeyCode::Up));
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+        assert_eq!(app.jobs().expect("open").selected, 0);
         app.on_key(key(KeyCode::Up));
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+        assert_eq!(app.jobs().expect("open").selected, 0);
     }
 
     #[test]
@@ -6029,7 +6104,10 @@ mod tests {
         let command = app.on_key(key(KeyCode::Char('r')));
 
         assert_eq!(command, Some(Command::ListJobs));
-        assert!(app.jobs.is_some(), "the pane stays open while it refreshes");
+        assert!(
+            app.jobs().is_some(),
+            "the pane stays open while it refreshes"
+        );
     }
 
     #[test]
@@ -6041,7 +6119,7 @@ mod tests {
 
         let fetch = app.on_key(key(KeyCode::Enter));
 
-        assert_eq!(app.jobs, None, "the popup closes");
+        assert_eq!(app.jobs(), None, "the popup closes");
         assert_eq!(app.session_id.as_deref(), Some("s-b"));
         assert_eq!(
             fetch,
@@ -6050,7 +6128,7 @@ mod tests {
             }),
             "the same open path a picker row takes"
         );
-        assert_eq!(app.transcript, [Block::Note("loading".to_owned())]);
+        assert_eq!(app.block_contents(), [Block::Note("loading".to_owned())]);
     }
 
     #[test]
@@ -6064,8 +6142,8 @@ mod tests {
             app.input, "",
             "the steer prompt is gone, nothing captures it"
         );
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
-        assert!(app.jobs.is_some(), "the popup stays open");
+        assert_eq!(app.jobs().expect("open").selected, 0);
+        assert!(app.jobs().is_some(), "the popup stays open");
     }
 
     #[test]
@@ -6083,10 +6161,10 @@ mod tests {
             })
         );
         assert_eq!(
-            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            app.jobs().expect("open").confirmation.as_deref(),
             Some("cancelled s-a")
         );
-        assert!(app.jobs.is_some(), "the popup stays open");
+        assert!(app.jobs().is_some(), "the popup stays open");
     }
 
     #[test]
@@ -6099,7 +6177,7 @@ mod tests {
 
         assert_eq!(command, None, "nothing to cancel on a finished job");
         assert_eq!(
-            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            app.jobs().expect("open").confirmation.as_deref(),
             Some("not running")
         );
     }
@@ -6110,13 +6188,13 @@ mod tests {
 
         let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
         app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+        assert_eq!(app.jobs().expect("open").selected, 1);
 
         let command = app.on_key(key(KeyCode::Char('k')));
 
         assert_eq!(command, None, "k navigates, it does not cancel");
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
-        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
+        assert_eq!(app.jobs().expect("open").selected, 0);
+        assert_eq!(app.jobs().expect("open").confirmation, None);
     }
 
     #[test]
@@ -6136,7 +6214,7 @@ mod tests {
             })
         );
         assert_eq!(
-            app.jobs.as_ref().expect("open").confirmation.as_deref(),
+            app.jobs().expect("open").confirmation.as_deref(),
             Some("dropped 2")
         );
     }
@@ -6150,7 +6228,7 @@ mod tests {
         let command = app.on_key(key(KeyCode::Char('d')));
 
         assert_eq!(command, None);
-        assert_eq!(app.jobs.as_ref().expect("open").confirmation, None);
+        assert_eq!(app.jobs().expect("open").confirmation, None);
     }
 
     #[test]
@@ -6186,7 +6264,7 @@ mod tests {
             "the main turn for \"one\" is still live"
         );
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::You("one".to_owned()),
                 Block::Arc {
@@ -6202,10 +6280,10 @@ mod tests {
     #[test]
     fn q_closes_the_jobs_pane_and_an_empty_pane_still_shows_its_line() {
         let mut app = jobsview(Vec::new());
-        assert!(app.jobs.is_some(), "an empty pane still shows its line");
+        assert!(app.jobs().is_some(), "an empty pane still shows its line");
 
         app.on_key(key(KeyCode::Char('q')));
-        assert_eq!(app.jobs, None);
+        assert_eq!(app.jobs(), None);
         assert!(!app.quit, "q closed the pane, not the app");
     }
 
@@ -6215,7 +6293,7 @@ mod tests {
 
         let mut app = jobsview(vec![job("s-1", State::Running)]);
         app.on_key(ctrl('p'));
-        assert_eq!(app.picker, None);
+        assert_eq!(app.picker(), None);
     }
 
     #[test]
@@ -6229,12 +6307,12 @@ mod tests {
 
         app.on_scroll(false, PAGE);
         assert_eq!(
-            app.jobs.as_ref().expect("open").selected,
+            app.jobs().expect("open").selected,
             1,
             "one row per gesture, not one page"
         );
         app.on_scroll(true, PAGE);
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 0);
+        assert_eq!(app.jobs().expect("open").selected, 0);
         assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
@@ -6374,13 +6452,13 @@ mod tests {
 
         let mut app = jobsview(vec![job("s-1", State::Running), job("s-2", State::Running)]);
         app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs.as_ref().expect("open").selected, 1);
+        assert_eq!(app.jobs().expect("open").selected, 1);
 
         let mut updated = job("s-2", State::Finished);
         updated.spent_tokens = 42;
         app.on_net(NetEvent::JobChanged(updated.clone()));
 
-        let jobs = app.jobs.as_ref().expect("open");
+        let jobs = app.jobs().expect("open");
         assert_eq!(
             jobs.items,
             [job("s-1", State::Running), updated],
@@ -6397,7 +6475,7 @@ mod tests {
         app.on_net(NetEvent::JobChanged(job("s-2", State::Running)));
 
         assert_eq!(
-            app.jobs.as_ref().expect("open").items,
+            app.jobs().expect("open").items,
             [job("s-1", State::Running)],
             "the popup only shows what it fetched"
         );
@@ -6454,7 +6532,7 @@ mod tests {
             session_id: "s-2".to_owned(),
         });
         assert_eq!(command, None);
-        assert_eq!(app.transcript, [], "nothing else moved either");
+        assert_eq!(app.block_contents(), [], "nothing else moved either");
     }
 
     #[test]
@@ -6526,7 +6604,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::Handback {
                 subject: format!("Job {JOB_ID} finished."),
                 body: "fixed the flaky test".to_owned(),
@@ -6551,7 +6629,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [Block::Handback {
                 subject: format!("Job {JOB_ID} stopped: token budget exhausted (500/400)."),
                 body: "partial work".to_owned(),
@@ -6577,7 +6655,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.transcript,
+            app.block_contents(),
             [
                 Block::System("consolidation wrote three memories.".to_owned()),
                 Block::System("Job finished.\nno id in the header".to_owned()),
@@ -6599,7 +6677,7 @@ mod tests {
         app.on_net(NetEvent::Delta("done".to_owned()));
         app.on_net(started("t1", "lookup"));
         app.on_net(ended("t1", ToolOutcome::Ok as i32, "found it"));
-        app.transcript.push(
+        app.push_block(
             prose_block(handback_message(&format!(
                 "Job {JOB_ID} finished.\nall green"
             )))
@@ -6609,30 +6687,30 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('O')));
         assert!(
-            matches!(&app.transcript[1], Block::Thought { open: true, .. }),
+            matches!(&app.transcript[1].block, Block::Thought { open: true, .. }),
             "ctrl-o opens the thought"
         );
         assert!(
-            matches!(&app.transcript[3], Block::Tool { open: true, .. }),
+            matches!(&app.transcript[3].block, Block::Tool { open: true, .. }),
             "and the tool result"
         );
         assert!(
-            matches!(&app.transcript[4], Block::Handback { open: true, .. }),
+            matches!(&app.transcript[4].block, Block::Handback { open: true, .. }),
             "and the handback with it"
         );
 
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('O')));
         assert!(matches!(
-            &app.transcript[1],
+            &app.transcript[1].block,
             Block::Thought { open: false, .. }
         ));
         assert!(matches!(
-            &app.transcript[3],
+            &app.transcript[3].block,
             Block::Tool { open: false, .. }
         ));
         assert!(matches!(
-            &app.transcript[4],
+            &app.transcript[4].block,
             Block::Handback { open: false, .. }
         ));
     }
@@ -6679,8 +6757,8 @@ mod tests {
     #[test]
     fn y_yanks_the_last_reply() {
         let mut app = App::new();
-        app.transcript.push(Block::You("hi".to_owned()));
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::You("hi".to_owned()));
+        app.push_block(Block::Arc {
             text: "hello there".to_owned(),
             partial: false,
         });
@@ -6695,7 +6773,7 @@ mod tests {
     #[test]
     fn y_yanks_a_partial_reply_too() {
         let mut app = App::new();
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::Arc {
             text: "cut off mid".to_owned(),
             partial: true,
         });
@@ -6709,7 +6787,7 @@ mod tests {
     #[test]
     fn y_with_no_reply_yet_is_a_no_op_with_a_footer_note() {
         let mut app = App::new();
-        app.transcript.push(Block::You("hi".to_owned()));
+        app.push_block(Block::You("hi".to_owned()));
         app.on_key(key(KeyCode::Esc));
 
         let command = app.on_key(key(KeyCode::Char('y')));
@@ -6721,7 +6799,7 @@ mod tests {
     #[test]
     fn y_is_ignored_while_streaming() {
         let mut app = App::new();
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::Arc {
             text: "hello".to_owned(),
             partial: false,
         });
@@ -6739,7 +6817,7 @@ mod tests {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::Arc {
             text: "hello".to_owned(),
             partial: false,
         });
@@ -6753,7 +6831,7 @@ mod tests {
     #[test]
     fn the_yank_note_clears_on_the_next_key() {
         let mut app = App::new();
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::Arc {
             text: "hello".to_owned(),
             partial: false,
         });
@@ -6768,12 +6846,12 @@ mod tests {
 
     fn conversation() -> App {
         let mut app = App::new();
-        app.transcript.push(Block::You("first question".to_owned()));
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::You("first question".to_owned()));
+        app.push_block(Block::Arc {
             text: "first answer".to_owned(),
             partial: false,
         });
-        app.transcript.push(Block::Tool {
+        app.push_block(Block::Tool {
             call_id: "t1".to_owned(),
             name: "bash".to_owned(),
             args: "ls".to_owned(),
@@ -6781,14 +6859,13 @@ mod tests {
             content: "total 0".to_owned(),
             open: false,
         });
-        app.transcript.push(Block::Cost {
+        app.push_block(Block::Cost {
             input_tokens: 10,
             output_tokens: 20,
             seconds: 1.0,
         });
-        app.transcript
-            .push(Block::You("second question".to_owned()));
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::You("second question".to_owned()));
+        app.push_block(Block::Arc {
             text: "second answer".to_owned(),
             partial: false,
         });
@@ -6959,7 +7036,7 @@ mod tests {
         use arc_proto::v1::job_info::State;
 
         let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.transcript.push(Block::Arc {
+        app.push_block(Block::Arc {
             text: "hello".to_owned(),
             partial: false,
         });
@@ -7224,7 +7301,7 @@ mod tests {
     fn n_and_n_walk_older_and_newer_and_stop_at_the_ends() {
         let mut app = normal_app();
         for i in 0..3 {
-            app.transcript.push(Block::You(format!("needle {i}")));
+            app.push_block(Block::You(format!("needle {i}")));
         }
         search(&mut app, "needle");
         assert_eq!(app.search_block(), Some(2), "1 is the newest");
@@ -7260,7 +7337,7 @@ mod tests {
     #[test]
     fn chrome_never_matches() {
         let mut app = normal_app();
-        app.transcript = vec![
+        app.set_blocks(vec![
             Block::Thought {
                 text: "secret trace words".to_owned(),
                 seconds: 3,
@@ -7292,7 +7369,7 @@ mod tests {
                 open: true,
             },
             Block::You("plain words".to_owned()),
-        ];
+        ]);
         search(&mut app, "secret");
 
         assert!(app.search.is_none());
@@ -7360,13 +7437,13 @@ mod tests {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![session("a"), session("b")]));
         app.on_key(ctrl('p'));
-        let before = app.picker.as_ref().expect("open").selected;
+        let before = app.picker().expect("open").selected;
         app.on_key(ctrl('n'));
-        assert!(app.picker.is_some(), "ctrl-n stays in the picker");
-        assert_eq!(app.picker.as_ref().expect("open").selected, before + 1);
+        assert!(app.picker().is_some(), "ctrl-n stays in the picker");
+        assert_eq!(app.picker().expect("open").selected, before + 1);
         app.on_key(ctrl('p'));
-        assert!(app.picker.is_some(), "ctrl-p navigates, not reopens");
-        assert_eq!(app.picker.as_ref().expect("open").selected, before);
+        assert!(app.picker().is_some(), "ctrl-p navigates, not reopens");
+        assert_eq!(app.picker().expect("open").selected, before);
     }
 
     #[test]
@@ -7569,7 +7646,7 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('/')));
         assert!(
-            app.picker.as_ref().expect("picker is open").filtering,
+            app.picker().expect("picker is open").filtering,
             "the picker filter, not the search prompt"
         );
         assert!(!app.searching);

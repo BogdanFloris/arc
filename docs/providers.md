@@ -30,11 +30,31 @@ These roles are stable. The next section records the current model for each one.
 | **concierge** | Conversation, recall, job dispatch. Identity file + record index. | Latency, voice, vision, judgment. Volume is small. |
 | **executor** | Job execution. Almost all tokens. | Cost per completed task. Nothing else comes close. |
 | **counsel** | Plans, reviews, and unsticking. Read-only, bounded. | Capability. Called a few times per job, not per turn. |
-| **archivist** | Consolidation, extraction, offline fallback for the concierge. | Free and resident. Latency-insensitive. |
+| **archivist** | Consolidation, extraction, and titling. | Extraction quality and cost; latency-insensitive. |
 
 ---
 
-## 3. Current stack
+## 3. Current configuration
+
+The live configuration is `~/.config/arc/arc.toml`. Model selections recorded
+in the log override each role's first choice for new sessions.
+
+As configured on 2026-09-06:
+
+| Role | Default preset | Access |
+| --- | --- | --- |
+| concierge | astra | Codex |
+| executor | sol | Codex |
+| counsel | fable | Claude CLI, read-only |
+| archivist | deepseek-flash | OpenCode Go |
+
+The llama.cpp settings remain available, but no configured role uses them.
+The daemon therefore does not start the sidecar.
+
+### Earlier stack and measurements
+
+The following records the earlier local-archivist setup and its measurements.
+It is historical evidence, not the current model configuration.
 
 | Role | Filled by | Access | Est. monthly |
 | --- | --- | --- | --- |
@@ -46,7 +66,7 @@ These roles are stable. The next section records the current model for each one.
 | **reserve** | Prepaid Zen credit for Go spillover | — | ~$10 |
 | | | | **~$50** |
 
-### Why the concierge does not use Go
+### Why the earlier concierge used Gemini
 
 Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not offer Claude or Gemini. The concierge uses a separate key for three reasons:
 
@@ -122,7 +142,7 @@ The relevant operating rules.
 
 Everything else on the plan has 0-day retention today. DeepSeek's zero-retention agreement has an expiry date; see the review triggers below.
 
-**ChatGPT plan through Codex — built 2026-09-06, not yet in the stack.** `provider = "codex"` on any role. Auth is the Codex CLI's own OAuth client through the device-code flow (`arcd login codex`, headless-friendly, prints a code to enter at `auth.openai.com/codex/device`); the credential is a JSON file under `data/secrets/` named by the role's `key`, refreshed in place before it expires, and the daemon needs a restart after a fresh login. The wire is the Responses API at `https://chatgpt.com/backend-api/codex/responses` with `store: false`, so the encrypted reasoning item is carried on each tool call's roundtrip bytes and replayed ahead of the calls, which is what keeps the model's chain of thought across a tool step. `thinking` maps to `reasoning.effort` with `low` as the floor; `default` sends nothing. A `usage_limit_reached` failure surfaces as a rate limit with the reset time. Plan metering is OpenAI's rolling 5-hour and weekly windows, not dollars, so its place in the stack is decided by a measured week, not by this file. Model ids are the Codex CLI's (`gpt-5.5` and its siblings; 272k context). Config:
+**ChatGPT plan through Codex — in use since 2026-09-06.** `provider = "codex"` on any role. Auth is the Codex CLI's own OAuth client through the device-code flow (`arcd login codex`, headless-friendly, prints a code to enter at `auth.openai.com/codex/device`); the credential is a JSON file under `data/secrets/` named by the role's `key`, refreshed in place before it expires, and the daemon needs a restart after a fresh login. The wire is the Responses API at `https://chatgpt.com/backend-api/codex/responses` with `store: false`, so the encrypted reasoning item is carried on each tool call's roundtrip bytes and replayed ahead of the calls, which is what keeps the model's chain of thought across a tool step. `thinking` maps to `reasoning.effort` with `low` as the floor; `default` sends nothing. A `usage_limit_reached` failure surfaces as a rate limit with the reset time. Plan metering is OpenAI's rolling 5-hour and weekly windows, not dollars, so its place in the stack is decided by a measured week, not by this file. Model ids are the Codex CLI's (`gpt-5.5` and its siblings; 272k context). Config:
 
 ```toml
 [roles.executor]
