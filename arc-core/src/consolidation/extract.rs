@@ -431,6 +431,7 @@ impl ModelExtractor {
             tools: Vec::new(),
             seed: Some(seed),
             web: false,
+            cache_key: None,
         };
         let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
             Ok(Ok(text)) => text,
@@ -487,6 +488,7 @@ impl Extractor for ModelExtractor {
             tools: Vec::new(),
             seed: Some(seed),
             web: false,
+            cache_key: None,
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
@@ -540,6 +542,7 @@ impl Extractor for ModelExtractor {
                     .unwrap_or_else(|| session_seed(&session.session_id)),
             ),
             web: false,
+            cache_key: None,
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await

@@ -30,6 +30,10 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
 
     pub web: bool,
+
+    /// A stable id for the conversation the request belongs to, for providers
+    /// that route prompt-cache lookups by key. The session id in practice.
+    pub cache_key: Option<String>,
 }
 
 #[derive(
@@ -319,6 +323,7 @@ mod tests {
             seed: None,
             thinking: Thinking::Default,
             web: false,
+            cache_key: None,
         }
     }
 

@@ -1126,6 +1126,7 @@ impl Engine {
             let last_step = steps >= max_tool_steps(runner.role);
             let request = self.completion_request(
                 runner,
+                session_id,
                 system.clone(),
                 transcript.clone(),
                 last_step,
@@ -1889,6 +1890,7 @@ impl Engine {
             tools: Vec::new(),
             seed: None,
             web: false,
+            cache_key: Some(session_id.to_owned()),
         };
 
         let (model_text, usage) = match self.compaction_completion(runner, request).await {
@@ -2026,6 +2028,7 @@ impl Engine {
     fn completion_request(
         &self,
         runner: &Runner,
+        session_id: &str,
         system: Option<String>,
         messages: Vec<Message>,
         last_step: bool,
@@ -2044,6 +2047,7 @@ impl Engine {
             },
             seed: None,
             web: sources.contains(&ToolSource::Web),
+            cache_key: Some(session_id.to_owned()),
         }
     }
 }

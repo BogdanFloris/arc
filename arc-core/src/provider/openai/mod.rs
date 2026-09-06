@@ -320,6 +320,7 @@ mod tests {
             seed: None,
             thinking: Thinking::Default,
             web: false,
+            cache_key: None,
         }
     }
 

@@ -146,6 +146,8 @@ struct Payload<'a> {
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<Reasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -248,6 +250,7 @@ impl<'a> Payload<'a> {
                 effort,
                 summary: "auto",
             }),
+            prompt_cache_key: request.cache_key.as_deref(),
         })
     }
 }
@@ -355,6 +358,7 @@ mod tests {
             seed: None,
             thinking: Thinking::Default,
             web: false,
+            cache_key: None,
         }
     }
 
@@ -493,6 +497,19 @@ mod tests {
             None,
             "default thinking sends no reasoning: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_cache_key_goes_out_as_prompt_cache_key_and_none_sends_nothing() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
+        assert_eq!(body(&requests).get("prompt_cache_key"), None);
+
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.cache_key = Some("session-7".to_owned());
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, req).await;
+        assert_eq!(body(&requests)["prompt_cache_key"], "session-7");
     }
 
     #[tokio::test]

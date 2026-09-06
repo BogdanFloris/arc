@@ -385,6 +385,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             web: false,
+            cache_key: None,
         }
     }
 
