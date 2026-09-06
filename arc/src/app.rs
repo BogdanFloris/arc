@@ -2161,27 +2161,36 @@ fn block_yank_text(block: &Block) -> Option<String> {
 // `project` would beat `question`; known payload keys are tried first
 const SUMMARY_KEYS: &[&str] = &["question", "command", "query", "brief", "path", "id"];
 
+// two provider shapes, verbatim: Gemini's groundingChunks[].web and the
+// Responses API's url_citation annotations
 fn grounding_sources(grounding_json: &str) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(grounding_json) else {
         return Vec::new();
     };
-    let Some(chunks) = value.get("groundingChunks").and_then(|c| c.as_array()) else {
-        return Vec::new();
+    let titled = |source: &serde_json::Value, uri_key: &str| {
+        let uri = source.get(uri_key)?.as_str()?.to_owned();
+        let title = source
+            .get("title")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(&uri)
+            .to_owned();
+        Some((title, uri))
     };
-    chunks
-        .iter()
-        .filter_map(|chunk| {
-            let web = chunk.get("web")?;
-            let uri = web.get("uri")?.as_str()?.to_owned();
-            let title = web
-                .get("title")
-                .and_then(|t| t.as_str())
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or(&uri)
-                .to_owned();
-            Some((title, uri))
-        })
-        .collect()
+    if let Some(chunks) = value.get("groundingChunks").and_then(|c| c.as_array()) {
+        return chunks
+            .iter()
+            .filter_map(|chunk| titled(chunk.get("web")?, "uri"))
+            .collect();
+    }
+    if let Some(annotations) = value.get("annotations").and_then(|a| a.as_array()) {
+        return annotations
+            .iter()
+            .filter(|a| a.get("type").and_then(|t| t.as_str()) == Some("url_citation"))
+            .filter_map(|a| titled(a, "url"))
+            .collect();
+    }
+    Vec::new()
 }
 
 fn tool_summary(arguments_json: &str) -> String {
@@ -2983,6 +2992,25 @@ mod tests {
         assert_eq!(
             grounding_sources("not json"),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn grounding_sources_read_responses_url_citations_too() {
+        let grounding = r#"{"annotations":[
+            {"type":"url_citation","url":"https://a.example/x","title":"A","start_index":0,"end_index":5},
+            {"type":"url_citation","url":"https://b.example/y","title":"  "},
+            {"type":"file_citation","file_id":"f1"}]}"#;
+        assert_eq!(
+            grounding_sources(grounding),
+            [
+                ("A".to_owned(), "https://a.example/x".to_owned()),
+                (
+                    "https://b.example/y".to_owned(),
+                    "https://b.example/y".to_owned()
+                ),
+            ],
+            "a blank title falls back to the url; other annotation kinds are skipped"
         );
     }
 

@@ -14,7 +14,11 @@ pub(super) struct Parser {
     finished: Vec<ToolCall>,
 
     reasoning: Option<Vec<u8>>,
+
+    citations: Vec<serde_json::Value>,
 }
+
+const WEB_SEARCH: &str = "web_search";
 
 impl FrameParser for Parser {
     const PROVIDER: &'static str = "codex";
@@ -32,16 +36,23 @@ impl FrameParser for Parser {
                 let item = event
                     .item
                     .ok_or_else(|| malformed("output_item.added", payload))?;
-                if item.kind() == "function_call" {
-                    let index = event.output_index.unwrap_or_default();
-                    self.building.insert(
-                        index,
-                        Building {
-                            call_id: item.field("call_id"),
-                            name: item.field("name"),
-                            arguments: item.field("arguments"),
-                        },
-                    );
+                match item.kind() {
+                    "function_call" => {
+                        let index = event.output_index.unwrap_or_default();
+                        self.building.insert(
+                            index,
+                            Building {
+                                call_id: item.field("call_id"),
+                                name: item.field("name"),
+                                arguments: item.field("arguments"),
+                            },
+                        );
+                    }
+                    "web_search_call" => items.push(CompletionDelta::ServerCall {
+                        name: WEB_SEARCH.to_owned(),
+                        payload_json: item.0.to_string(),
+                    }),
+                    _ => {}
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -95,6 +106,27 @@ impl FrameParser for Parser {
                     "reasoning" if item.0.get("encrypted_content").is_some() => {
                         self.reasoning = Some(item.0.to_string().into_bytes());
                     }
+                    "web_search_call" => items.push(CompletionDelta::ServerResponse {
+                        name: WEB_SEARCH.to_owned(),
+                        payload_json: item.0.to_string(),
+                    }),
+                    "message" => {
+                        let parts = item.0["content"].as_array().cloned().unwrap_or_default();
+                        for annotation in parts
+                            .iter()
+                            .filter_map(|part| part["annotations"].as_array())
+                            .flatten()
+                            .filter(|it| it["type"] == "url_citation")
+                        {
+                            if !self
+                                .citations
+                                .iter()
+                                .any(|seen| seen["url"] == annotation["url"])
+                            {
+                                self.citations.push(annotation.clone());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -139,8 +171,15 @@ impl FrameParser for Parser {
                 } else {
                     Stop::ToolCalls
                 };
+                if !self.citations.is_empty() {
+                    let citations = std::mem::take(&mut self.citations);
+                    items.push(CompletionDelta::Grounding(
+                        serde_json::json!({ "annotations": citations }).to_string(),
+                    ));
+                }
+                items.extend(calls);
                 return Ok(Deltas {
-                    items: calls,
+                    items,
                     usage,
                     finished: Some(stop),
                 });
@@ -437,6 +476,71 @@ mod tests {
                 },
                 stop: Stop::ToolCalls,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_web_search_arrives_as_a_server_call_its_response_and_grounding() {
+        let events = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"}}),
+            json!({"type": "response.web_search_call.searching", "output_index": 0, "item_id": "ws_1"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "web_search_call", "id": "ws_1", "status": "completed",
+                            "action": {"type": "search", "query": "arc daemon"}}}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": []}}),
+            json!({"type": "response.output_text.delta", "output_index": 1, "delta": "It is a daemon."}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+            "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": [{
+                "type": "output_text", "text": "It is a daemon.",
+                "annotations": [
+                    {"type": "url_citation", "url": "https://a.example/x", "title": "A", "start_index": 0, "end_index": 5},
+                    {"type": "url_citation", "url": "https://a.example/x", "title": "A again", "start_index": 6, "end_index": 9},
+                    {"type": "url_citation", "url": "https://b.example/y", "title": "B", "start_index": 10, "end_index": 14},
+                ]}]}}),
+            completed(30, 8, 0),
+        ];
+
+        let seen = ok(vec![sse(&events)]).await;
+
+        let [
+            CompletionDelta::ServerCall {
+                name: call_name,
+                payload_json: call,
+            },
+            CompletionDelta::ServerResponse {
+                name: response_name,
+                payload_json: response,
+            },
+            CompletionDelta::Text(text),
+            CompletionDelta::Grounding(grounding),
+            CompletionDelta::Done {
+                stop: Stop::EndTurn,
+                ..
+            },
+        ] = seen.as_slice()
+        else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            (call_name.as_str(), response_name.as_str()),
+            ("web_search", "web_search")
+        );
+        assert!(call.contains("in_progress"), "{call}");
+        assert!(response.contains("arc daemon"), "{response}");
+        assert_eq!(text, "It is a daemon.");
+        let grounding: Value = serde_json::from_str(grounding).expect("json");
+        let urls: Vec<&str> = grounding["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            urls,
+            ["https://a.example/x", "https://b.example/y"],
+            "deduplicated by url"
         );
     }
 

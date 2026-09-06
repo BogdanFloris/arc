@@ -206,13 +206,21 @@ struct OutputText<'a> {
 }
 
 #[derive(Serialize)]
-struct WireTool<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a serde_json::Value,
-    strict: bool,
+#[serde(untagged)]
+enum WireTool<'a> {
+    Function {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: &'a str,
+        description: &'a str,
+        parameters: &'a serde_json::Value,
+        strict: bool,
+    },
+
+    Hosted {
+        #[serde(rename = "type")]
+        kind: &'static str,
+    },
 }
 
 impl<'a> Payload<'a> {
@@ -221,7 +229,21 @@ impl<'a> Payload<'a> {
         for message in &request.messages {
             items(message, &mut input)?;
         }
-        let has_tools = !request.tools.is_empty();
+        let mut tools: Vec<WireTool> = request
+            .tools
+            .iter()
+            .map(|tool: &ToolDefinition| WireTool::Function {
+                kind: "function",
+                name: &tool.name,
+                description: &tool.description,
+                parameters: &tool.parameters,
+                strict: false,
+            })
+            .collect();
+        if request.web {
+            tools.push(WireTool::Hosted { kind: "web_search" });
+        }
+        let has_tools = !tools.is_empty();
         Ok(Self {
             model: &request.model,
             instructions: request
@@ -233,17 +255,7 @@ impl<'a> Payload<'a> {
             store: false,
             stream: true,
             include: ["reasoning.encrypted_content"],
-            tools: request
-                .tools
-                .iter()
-                .map(|tool: &ToolDefinition| WireTool {
-                    kind: "function",
-                    name: &tool.name,
-                    description: &tool.description,
-                    parameters: &tool.parameters,
-                    strict: false,
-                })
-                .collect(),
+            tools,
             tool_choice: has_tools.then_some("auto"),
             parallel_tool_calls: has_tools.then_some(true),
             reasoning: effort(request.thinking).map(|effort| Reasoning {
@@ -566,6 +578,19 @@ mod tests {
         );
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], true);
+    }
+
+    #[tokio::test]
+    async fn a_web_request_offers_the_hosted_search_tool() {
+        let mut req = request(None, &[(Role::User, "what happened today?")]);
+        req.web = true;
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body = body(&requests);
+        assert_eq!(body["tools"], json!([{"type": "web_search"}]));
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[tokio::test]
