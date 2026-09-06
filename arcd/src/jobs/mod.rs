@@ -1079,6 +1079,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_child_finishes_while_its_parent_is_busy_and_steering_survives() {
+        let dispatch_args = serde_json::json!({
+            "role": "executor",
+            "project": "arc",
+            "brief": "grandchild work",
+            "intent": "implement",
+        })
+        .to_string();
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let executor_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Immediate(vec![
+                Ok(call("g1", 0, "dispatch", &dispatch_args)),
+                Ok(tool_stop()),
+            ]),
+            Step::Gated {
+                before: vec![Ok(CompletionDelta::Text("independent work".to_owned()))],
+                notify: Arc::clone(&notify),
+                after: vec![Ok(CompletionDelta::Done {
+                    usage: usage(),
+                    stop: Stop::EndTurn,
+                })],
+            },
+            Step::Immediate(done_reply("grandchild done")),
+            Step::Immediate(done_reply("checked report and correction")),
+        ]);
+
+        let mut registry = Registry::new(512);
+        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
+            vec![("arc".to_owned(), String::new())],
+            None,
+        )));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(
+            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
+                "arc".to_owned(),
+                ProjectSpec {
+                    sources: vec![ToolSource::Builtin],
+                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                    command_prefix: Vec::new(),
+                },
+            )])),
+        );
+
+        let child = engine
+            .create_bound_session(
+                &runner(&executor_provider),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("create the child durably");
+
+        let runners =
+            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+
+        let _stream = supervisor
+            .send(
+                Some(&child),
+                "do the work; delegate the rest",
+                Source::User,
+                false,
+            )
+            .expect("start direct turn");
+        for _ in 0..400 {
+            if supervisor
+                .list()
+                .iter()
+                .any(|job| job.session_id != child && job.state == job_info::State::Finished as i32)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(supervisor.list().iter().any(|job| job.session_id != child
+            && job.state == job_info::State::Finished as i32),
+            "the child must finish before the parent is released");
+        assert!(matches!(
+            supervisor
+                .send(Some(&child), "keep the API", Source::User, false)
+                .expect("steer"),
+            SendOutcome::Queued { .. }
+        ));
+        notify.notify_one();
+        supervisor.shutdown().await;
+        let requests = executor_provider.requests();
+        assert_eq!(requests.len(), 4, "no duplicate child or parent turn");
+        let final_context = format!("{:?}", requests[3].messages);
+        assert!(final_context.contains("grandchild done"));
+        assert!(final_context.contains("keep the API"));
+
+        let events = replay_log(dir.path());
+        let grandchild = events
+            .iter()
+            .find_map(|event| match event {
+                arc_proto::v1::session_event::Event::SessionCreated(created)
+                    if created.role == SessionRole::Executor as i32
+                        && created.session_id != child =>
+                {
+                    Some(created.session_id.clone())
+                }
+                _ => None,
+            })
+            .expect("the job's own dispatch created a grandchild durably");
+
+        let ran: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                arc_proto::v1::session_event::Event::MessageAppended(m)
+                    if m.session_id == grandchild =>
+                {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ran,
+            ["grandchild work", "grandchild done"],
+            "the grandchild actually ran, not just existed"
+        );
+    }
+
+    #[tokio::test]
     async fn continue_job_on_a_live_job_queues_into_its_steer_channel_instead_of_resuming() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");

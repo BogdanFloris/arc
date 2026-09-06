@@ -134,9 +134,9 @@ pub(super) async fn run_task(
                 notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
             }
         }
-        spawn_dispatched(&shared, std::mem::take(&mut reply.jobs));
-        route_continues(&shared, std::mem::take(&mut reply.continues));
-        route_cancels(&shared, std::mem::take(&mut reply.cancels));
+        reply.jobs.clear();
+        reply.continues.clear();
+        reply.cancels.clear();
 
         drain_dropped(&mut drop_rx, &mut inbox_rx, &shared, &session_id);
         let cancelled = *cancel_rx.borrow();
@@ -387,6 +387,17 @@ async fn handle_event(
     deadline: &mut Instant,
     attached: &mut Option<mpsc::Sender<TurnEvent>>,
 ) {
+    if let EngineEvent::JobsReady {
+        jobs,
+        continues,
+        cancels,
+    } = event
+    {
+        spawn_dispatched(shared, jobs);
+        route_continues(shared, continues);
+        route_cancels(shared, cancels);
+        return;
+    }
     track_tool_calls(&event, pending_tool_calls);
     if dispatched {
         handle_job_event(&event, shared, session_id);

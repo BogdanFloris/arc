@@ -374,6 +374,7 @@ async fn forward(
             }
         };
         let msg = match event {
+            EngineEvent::JobsReady { .. } => continue,
             EngineEvent::Accepted { session_id: id } => {
                 session_id.clone_from(&id);
                 server_frame::Msg::MessageAccepted(MessageAccepted { session_id: id })

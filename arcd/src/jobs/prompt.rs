@@ -21,7 +21,9 @@ fn direct_preamble(root: &Path) -> String {
         "You are a coding agent inside ARC's harness, working interactively with \
          the user in {}. Four workspace tools are available: read, write, edit, \
          bash. Be concise. Show file paths clearly.\n\n\
-         When you dispatch, end your reply; the handback arrives on its own. \
+         When you hand off the whole task, end your reply; the handback arrives on its own. \
+         When you delegate part of a task, continue independent work. Do not edit \
+         the same files as a running child. \
          Briefs are self-contained: the child sees nothing of this session. \
          Check a handback against the workspace with your own tools before \
          repeating it.",
@@ -191,7 +193,9 @@ mod tests {
         let job = job_system_prompt(&root);
 
         assert!(
-            direct.contains("When you dispatch, end your reply; the handback arrives on its own."),
+            direct.contains(
+                "When you hand off the whole task, end your reply; the handback arrives on its own."
+            ),
             "{direct}"
         );
         assert!(

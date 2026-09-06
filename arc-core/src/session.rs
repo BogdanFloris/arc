@@ -102,6 +102,11 @@ pub struct Inbound {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
+    JobsReady {
+        jobs: Vec<DispatchedJob>,
+        continues: Vec<ContinuedJob>,
+        cancels: Vec<String>,
+    },
     Accepted {
         session_id: String,
     },
@@ -1649,6 +1654,7 @@ impl Engine {
                 memory.observe_event(&memory_event);
                 self.record_memory(Source::Model, memory_event)?;
             }
+            let ready_from = (jobs.len(), continues.len(), cancels.len());
             let (outcome, content) = if let Some(job_request) = job_request {
                 let (outcome, content, job) = self.dispatch_job(runner, session_id, job_request);
                 if let Some(job) = job {
@@ -1694,6 +1700,15 @@ impl Engine {
                     content: content.clone(),
                 })
                 .await;
+            if ready_from != (jobs.len(), continues.len(), cancels.len()) {
+                let _ = events
+                    .send(EngineEvent::JobsReady {
+                        jobs: jobs[ready_from.0..].to_vec(),
+                        continues: continues[ready_from.1..].to_vec(),
+                        cancels: cancels[ready_from.2..].to_vec(),
+                    })
+                    .await;
+            }
             results.push((call.id.clone(), content));
         }
 

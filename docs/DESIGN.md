@@ -200,7 +200,7 @@ That argument holds for the unbound conversation and for work the user walks awa
 
 Rules:
 
-- **The conversation never blocks.** Dispatch returns a job id immediately and the user keeps talking.
+- **The conversation never blocks.** Dispatch returns a job id immediately and the user keeps talking. The supervisor starts the child once the dispatch tool result is durable, without waiting for the parent turn to end. Continue and cancel requests take effect at the same boundary.
 - **Jobs accept messages while running.** Steering — "no, use GPIO 4" — is a message to the child, not a restart of the parent. Without it the only correction is a rewind, which throws the work away.
 - **Handback is a summary, not a transcript.** The child's full history stays in the archive; the parent receives a short report and the child's session id. The same split as §5.2 against §5.3, for the same reason: the index stays small so the body can be large.
 - **A job is pinned to one provider for its lifetime.** Prompt caches are model-scoped and prefix-matched, and cache reads dominate the cost of any long agentic session. A job that switches models pays for its whole context again. Role choice happens at dispatch, never mid-job.
@@ -301,7 +301,7 @@ This is close to what `AGENTS.md` already asks of contributors, and deliberately
 
 Identity loads wherever the user is present: the concierge, and a direct executor session — the `:code` door and any follow-up sent into a finished job's own session (row 9.1). Dispatched jobs still get none; a job has no voice and no personality preamble, and paying for one on the bulk of the token spend is waste. The distinction is presence, not role.
 
-Operational doctrine is not identity and does not live in the file. The concierge's rules for running jobs — dispatch-then-stop, when to continue versus dispatch, handbacks are claims — are a constant in code, appended after the identity file in the concierge's system prompt: each line is coupled to the tool surface and must change in lockstep with it, at code cadence, not human cadence. A direct session that dispatches carries a shorter set: dispatch then stop, briefs are self-contained, check a handback with your own tools before repeating it. Most of the concierge's lines exist because it cannot read the code; a session that can needs none of them.
+Operational doctrine is not identity and does not live in the file. The concierge's rules for running jobs — dispatch-then-stop, when to continue versus dispatch, handbacks are claims — are a constant in code, appended after the identity file in the concierge's system prompt: each line is coupled to the tool surface and must change in lockstep with it, at code cadence, not human cadence. A direct session that dispatches carries a shorter set: stop when handing off the whole task; continue independent work when delegating part of it; briefs are self-contained; check a handback with your own tools before repeating it. Parent and child must not edit the same files concurrently. Most of the concierge's lines exist because it cannot read the code; a session that can needs none of them.
 
 ### 5.2 Distilled tier
 
