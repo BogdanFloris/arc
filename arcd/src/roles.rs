@@ -151,12 +151,52 @@ impl<'a> Built<'a> {
                 compact_at: None,
             });
         };
+        // the first choice is the default until a selection event says otherwise;
+        // the rest are built now so a missing credential is known at startup
+        let mut choices = configured.choices.iter().map(|choice| {
+            (
+                choice.as_str(),
+                config
+                    .models
+                    .get(choice)
+                    .expect("config validation requires every choice to be a preset"),
+            )
+        });
+        let configured = match choices.next() {
+            Some((_, preset)) => preset,
+            None => configured,
+        };
+        for (choice, preset) in choices {
+            if let Err(error) = self.provider_for(choice, preset, config) {
+                tracing::warn!(role = name, choice, error = %error, "a model choice is unavailable");
+            }
+        }
         let thinking = configured.thinking;
-        let key = configured.key.clone();
         let compact_at = configured
             .context_window
             .map(|window| compact_at_for(window, config.compaction.fraction));
-        let (provider, model) = match configured.provider {
+        let (provider, model) = self.provider_for(name, configured, config)?;
+        Ok(Runner {
+            role,
+            provider,
+            model,
+            thinking,
+            system,
+            compact_at,
+        })
+    }
+
+    fn provider_for(
+        &mut self,
+        name: &str,
+        configured: &RoleConfig,
+        config: &Config,
+    ) -> Result<(Arc<dyn Provider>, String)> {
+        let key = configured.key.clone();
+        let provider = configured
+            .provider
+            .expect("config validation requires a provider on an inline role or preset");
+        Ok(match provider {
             RoleProvider::Local => (
                 self.sidecar(),
                 configured.model.clone().unwrap_or_else(|| config.model()),
@@ -200,14 +240,6 @@ impl<'a> Built<'a> {
                         .expect("config validation requires a model for codex"),
                 )
             }
-        };
-        Ok(Runner {
-            role,
-            provider,
-            model,
-            thinking,
-            system,
-            compact_at,
         })
     }
 
@@ -561,6 +593,41 @@ key      = "codex"
             !rendered.contains("eyJhbGciOiJub25lIn0"),
             "a token reached a Debug line: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_role_with_choices_runs_the_first_and_only_warns_about_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = r#"
+[roles.executor]
+choices = ["flash", "sol"]
+
+[models.flash]
+provider       = "openai_compat"
+model          = "deepseek-v4-flash"
+endpoint       = "https://opencode.example"
+key            = "opencode-go"
+thinking       = "low"
+context_window = 100000
+
+[models.sol]
+provider = "codex"
+model    = "gpt-5.6-sol"
+key      = "codex"
+"#;
+
+        let roles = with_secrets(config, dir.path(), &[("opencode-go", "sk-go")])
+            .expect("the default choice resolves; the codex credential is only missing");
+        let executor = roles.executor();
+        assert_eq!(executor.provider.name(), "openai-compat");
+        assert_eq!(executor.model, "deepseek-v4-flash");
+        assert_eq!(executor.thinking, arc_core::provider::Thinking::Low);
+        assert_eq!(executor.compact_at, Some(80_000));
+
+        let empty = tempfile::tempdir().expect("temp dir");
+        let err =
+            with_secrets(config, empty.path(), &[]).expect_err("the default's key is missing");
+        assert!(format!("{err:#}").contains("opencode-go"), "{err:#}");
     }
 
     #[test]

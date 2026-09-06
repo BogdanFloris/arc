@@ -21,7 +21,8 @@ pub fn credential_name(config: &Config) -> &str {
     ]
     .into_iter()
     .flatten()
-    .find(|role| role.provider == RoleProvider::Codex)
+    .chain(config.models.values())
+    .find(|role| role.provider == Some(RoleProvider::Codex))
     .and_then(|role| role.key.as_deref())
     .unwrap_or(DEFAULT_CREDENTIAL)
 }
@@ -77,5 +78,11 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(credential_name(&config), "chatgpt-pro");
+
+        let config: Config = toml::from_str(
+            "[models.sol]\nprovider = \"codex\"\nmodel = \"gpt-5.6-sol\"\nkey = \"plan\"\n",
+        )
+        .expect("parses");
+        assert_eq!(credential_name(&config), "plan", "presets count too");
     }
 }

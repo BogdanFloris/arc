@@ -42,6 +42,11 @@ pub struct Config {
 
     pub roles: RolesConfig,
 
+    /// Named presets a role may list in `choices`: what is possible. The
+    /// selection among them is an event in the log, never a config edit.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, RoleConfig>,
+
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, ProjectConfig>,
 }
@@ -113,7 +118,13 @@ impl CounselConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleConfig {
-    pub provider: RoleProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<RoleProvider>,
+
+    /// Preset names from `[models]`, first is the default. A role with
+    /// choices declares nothing else inline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -191,8 +202,33 @@ impl RolesConfig {
 }
 
 impl RoleConfig {
-    fn validate(&self, name: &str) -> Result<()> {
-        match self.provider {
+    fn validate(&self, name: &str, models: &BTreeMap<String, RoleConfig>) -> Result<()> {
+        if !self.choices.is_empty() {
+            ensure!(
+                self.provider.is_none()
+                    && self.model.is_none()
+                    && self.endpoint.is_none()
+                    && self.key.is_none()
+                    && self.context_window.is_none()
+                    && self.thinking == Thinking::Default,
+                "role `{name}` lists choices, so it declares nothing else inline; the presets carry it"
+            );
+            for choice in &self.choices {
+                ensure!(
+                    models.contains_key(choice),
+                    "role `{name}` chooses `{choice}`, which is not a `[models.{choice}]` preset"
+                );
+                ensure!(
+                    self.choices.iter().filter(|it| *it == choice).count() == 1,
+                    "role `{name}` lists `{choice}` twice"
+                );
+            }
+            return Ok(());
+        }
+        let Some(provider) = self.provider else {
+            bail!("role `{name}` needs a provider, or a list of choices");
+        };
+        match provider {
             RoleProvider::Local => {
                 ensure!(
                     self.endpoint.is_none(),
@@ -216,13 +252,13 @@ impl RoleConfig {
                 "role `{name}` needs a key naming the credential file `arcd login codex` writes"
             ),
         }
-        if !matches!(self.provider, RoleProvider::Local) {
+        if !matches!(provider, RoleProvider::Local) {
             ensure!(
                 self.model.as_ref().is_some_and(|model| !model.is_empty()),
                 "role `{name}` needs a model: only the sidecar can name its own"
             );
         }
-        match (self.provider, self.thinking) {
+        match (provider, self.thinking) {
             (_, Thinking::Default)
             | (RoleProvider::Gemini | RoleProvider::OpenAiCompat | RoleProvider::Codex, _)
             | (RoleProvider::Local, Thinking::Minimal) => {}
@@ -342,6 +378,7 @@ impl Default for Config {
             consolidation: ConsolidationConfig::default(),
             compaction: CompactionConfig::default(),
             roles: RolesConfig::default(),
+            models: BTreeMap::new(),
             projects: BTreeMap::new(),
         }
     }
@@ -379,8 +416,15 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.compaction.validate()?;
+        for (name, preset) in &self.models {
+            ensure!(
+                preset.choices.is_empty(),
+                "preset `models.{name}` cannot itself list choices"
+            );
+            preset.validate(&format!("models.{name}"), &BTreeMap::new())?;
+        }
         for (name, role) in self.roles.configured() {
-            role.validate(name)?;
+            role.validate(name, &self.models)?;
         }
         if let Some(counsel) = &self.roles.counsel {
             counsel.validate()?;
@@ -464,7 +508,8 @@ mod tests {
             compaction: super::CompactionConfig { fraction: 0.7 },
             roles: RolesConfig {
                 concierge: Some(RoleConfig {
-                    provider: RoleProvider::Gemini,
+                    provider: Some(RoleProvider::Gemini),
+                    choices: Vec::new(),
                     model: Some("gemini-3.7-flash".to_owned()),
                     endpoint: None,
                     key: Some("gemini".to_owned()),
@@ -472,7 +517,8 @@ mod tests {
                     context_window: None,
                 }),
                 executor: Some(RoleConfig {
-                    provider: RoleProvider::OpenAiCompat,
+                    provider: Some(RoleProvider::OpenAiCompat),
+                    choices: Vec::new(),
                     model: Some("deepseek-v4-pro".to_owned()),
                     endpoint: Some("http://127.0.0.1:4096".to_owned()),
                     key: Some("opencode-go".to_owned()),
@@ -480,7 +526,8 @@ mod tests {
                     context_window: Some(128_000),
                 }),
                 archivist: Some(RoleConfig {
-                    provider: RoleProvider::Local,
+                    provider: Some(RoleProvider::Local),
+                    choices: Vec::new(),
                     model: None,
                     endpoint: None,
                     key: None,
@@ -493,6 +540,7 @@ mod tests {
                     fallback_model: Some("sonnet".to_owned()),
                 }),
             },
+            models: BTreeMap::new(),
             projects: BTreeMap::from([(
                 "arc".to_owned(),
                 ProjectConfig {
@@ -549,12 +597,12 @@ provider = "local"
         );
 
         let concierge = config.roles.concierge.expect("concierge is configured");
-        assert_eq!(concierge.provider, RoleProvider::Gemini);
+        assert_eq!(concierge.provider, Some(RoleProvider::Gemini));
         assert_eq!(concierge.model.as_deref(), Some("gemini-3.7-flash"));
         let executor = config.roles.executor.expect("executor is configured");
         assert_eq!(executor.endpoint.as_deref(), Some("http://127.0.0.1:4096"));
         let archivist = config.roles.archivist.expect("archivist is configured");
-        assert_eq!(archivist.provider, RoleProvider::Local);
+        assert_eq!(archivist.provider, Some(RoleProvider::Local));
         assert_eq!(archivist.model, None, "the sidecar names its own model");
     }
 
@@ -642,12 +690,79 @@ provider = "local"
     }
 
     #[test]
+    fn a_role_may_choose_among_presets_and_the_menu_is_checked() {
+        let config = parse(
+            r#"
+[roles.executor]
+choices = ["flash", "sol"]
+
+[models.flash]
+provider = "openai_compat"
+model    = "deepseek-v4-flash"
+endpoint = "https://opencode.ai/zen/go"
+key      = "opencode-go"
+
+[models.sol]
+provider = "codex"
+model    = "gpt-5.6-sol"
+key      = "codex"
+thinking = "high"
+"#,
+        );
+        let executor = config.roles.executor.expect("configured");
+        assert_eq!(executor.choices, ["flash", "sol"]);
+        assert_eq!(executor.provider, None);
+        assert_eq!(config.models["sol"].thinking, Thinking::High);
+
+        let err = rejected("[roles.executor]\nchoices = [\"nope\"]\n");
+        assert!(
+            err.contains("nope") && err.contains("[models.nope]"),
+            "{err}"
+        );
+
+        let err = rejected(
+            r#"
+[roles.executor]
+choices  = ["flash"]
+provider = "local"
+
+[models.flash]
+provider = "local"
+"#,
+        );
+        assert!(err.contains("nothing else inline"), "{err}");
+
+        let err = rejected(
+            r#"
+[roles.executor]
+choices = ["flash", "flash"]
+
+[models.flash]
+provider = "local"
+"#,
+        );
+        assert!(err.contains("twice"), "{err}");
+
+        let err = rejected("[models.bad]\nchoices = [\"x\"]\n");
+        assert!(
+            err.contains("models.bad") && err.contains("choices"),
+            "{err}"
+        );
+
+        let err = rejected("[models.bad]\nprovider = \"gemini\"\nkey = \"gemini\"\n");
+        assert!(err.contains("models.bad") && err.contains("model"), "{err}");
+
+        let err = rejected("[roles.executor]\nmodel = \"x\"\n");
+        assert!(err.contains("provider, or a list of choices"), "{err}");
+    }
+
+    #[test]
     fn a_codex_role_parses_and_needs_a_credential_name() {
         let config = parse(
             "[roles.executor]\nprovider = \"codex\"\nmodel = \"gpt-5.5\"\nkey = \"codex\"\nthinking = \"medium\"\n",
         );
         let executor = config.roles.executor.expect("configured");
-        assert_eq!(executor.provider, RoleProvider::Codex);
+        assert_eq!(executor.provider, Some(RoleProvider::Codex));
         assert_eq!(executor.endpoint, None, "the backend has a default");
 
         let err = rejected("[roles.executor]\nprovider = \"codex\"\nmodel = \"gpt-5.5\"\n");
