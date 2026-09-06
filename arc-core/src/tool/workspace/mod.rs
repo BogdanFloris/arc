@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod edit;
+pub mod patch;
 pub mod read;
 pub mod write;
 
@@ -181,7 +182,8 @@ pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
         Box::new(bash::Bash::new()),
         Box::new(edit::Edit::new(Arc::clone(&workspace))),
         Box::new(read::Read::new(Arc::clone(&workspace))),
-        Box::new(write::Write::new(workspace)),
+        Box::new(write::Write::new(Arc::clone(&workspace))),
+        Box::new(patch::ApplyPatch::new(workspace)),
     ]
 }
 
@@ -196,11 +198,11 @@ mod tests {
     use crate::tool::ToolSource;
 
     #[test]
-    fn the_workspace_source_is_bash_edit_read_and_write() {
+    fn the_workspace_source_is_bash_edit_read_write_and_apply_patch() {
         let tools = super::tools(std::sync::Arc::new(Workspace::new()));
 
         let names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
-        assert_eq!(names, ["bash", "edit", "read", "write"]);
+        assert_eq!(names, ["bash", "edit", "read", "write", "apply_patch"]);
         assert!(
             tools
                 .iter()

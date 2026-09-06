@@ -20,6 +20,8 @@ pub(super) struct Parser {
 
 const WEB_SEARCH: &str = "web_search";
 
+const CUSTOM_INPUT: &str = super::CUSTOM_INPUT;
+
 impl FrameParser for Parser {
     const PROVIDER: &'static str = "codex";
 
@@ -37,14 +39,15 @@ impl FrameParser for Parser {
                     .item
                     .ok_or_else(|| malformed("output_item.added", payload))?;
                 match item.kind() {
-                    "function_call" => {
+                    "function_call" | "custom_tool_call" => {
                         let index = event.output_index.unwrap_or_default();
+                        let custom = item.kind() == "custom_tool_call";
                         self.building.insert(
                             index,
                             Building {
                                 call_id: item.field("call_id"),
                                 name: item.field("name"),
-                                arguments: item.field("arguments"),
+                                arguments: item.field(if custom { "input" } else { "arguments" }),
                             },
                         );
                     }
@@ -55,7 +58,7 @@ impl FrameParser for Parser {
                     _ => {}
                 }
             }
-            "response.function_call_arguments.delta" => {
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = event.output_index.unwrap_or_default();
                 let Some(building) = self.building.get_mut(&index) else {
                     return Err(Error::MalformedStream(format!(
@@ -66,11 +69,12 @@ impl FrameParser for Parser {
                     .arguments
                     .push_str(event.delta.as_deref().unwrap_or_default());
             }
-            "response.function_call_arguments.done" => {
+            "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
                 let index = event.output_index.unwrap_or_default();
-                if let (Some(building), Some(arguments)) =
-                    (self.building.get_mut(&index), event.arguments)
-                {
+                if let (Some(building), Some(arguments)) = (
+                    self.building.get_mut(&index),
+                    event.arguments.or(event.input),
+                ) {
                     building.arguments = arguments;
                 }
             }
@@ -79,6 +83,19 @@ impl FrameParser for Parser {
                     .item
                     .ok_or_else(|| malformed("output_item.done", payload))?;
                 match item.kind() {
+                    "custom_tool_call" => {
+                        let index = event.output_index.unwrap_or_default();
+                        let building = self.building.remove(&index).unwrap_or_default();
+                        let input = item.get("input").map_or(building.arguments, Item::text);
+                        let position = u32::try_from(self.finished.len()).unwrap_or(u32::MAX);
+                        self.finished.push(ToolCall {
+                            id: item.get("call_id").map_or(building.call_id, Item::text),
+                            index: position,
+                            name: item.get("name").map_or(building.name, Item::text),
+                            arguments: serde_json::json!({ CUSTOM_INPUT: input }).to_string(),
+                            provider_roundtrip: Vec::new(),
+                        });
+                    }
                     "function_call" => {
                         let index = event.output_index.unwrap_or_default();
                         let building = self.building.remove(&index).unwrap_or_default();
@@ -252,6 +269,7 @@ struct Event {
     output_index: Option<u32>,
     delta: Option<String>,
     arguments: Option<String>,
+    input: Option<String>,
     item: Option<Item>,
     response: Option<ResponseJson>,
     code: Option<String>,
@@ -541,6 +559,45 @@ mod tests {
             urls,
             ["https://a.example/x", "https://b.example/y"],
             "deduplicated by url"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_tool_call_streams_its_input_into_the_json_input_property() {
+        let events = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c",
+                            "name": "apply_patch", "input": ""}}),
+            json!({"type": "response.custom_tool_call_input.delta", "output_index": 0, "delta": "*** Begin Patch\n"}),
+            json!({"type": "response.custom_tool_call_input.delta", "output_index": 0, "delta": "*** Delete File: x\n*** End Patch"}),
+            json!({"type": "response.custom_tool_call_input.done", "output_index": 0,
+                   "input": "*** Begin Patch\n*** Delete File: x\n*** End Patch"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_c",
+                            "name": "apply_patch", "input": "*** Begin Patch\n*** Delete File: x\n*** End Patch"}}),
+            completed(5, 5, 0),
+        ];
+
+        let seen = ok(vec![sse(&events)]).await;
+
+        let [
+            CompletionDelta::ToolCall(call),
+            CompletionDelta::Done {
+                stop: Stop::ToolCalls,
+                ..
+            },
+        ] = seen.as_slice()
+        else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            (call.id.as_str(), call.name.as_str()),
+            ("call_c", "apply_patch")
+        );
+        let args: Value = serde_json::from_str(&call.arguments).expect("json object");
+        assert_eq!(
+            args["input"],
+            "*** Begin Patch\n*** Delete File: x\n*** End Patch"
         );
     }
 

@@ -127,11 +127,13 @@ Everything else on the plan has 0-day retention today. DeepSeek's zero-retention
 ```toml
 [roles.executor]
 provider       = "codex"
-model          = "gpt-5.5"
+model          = "gpt-5.6-sol"
 key            = "codex"
 thinking       = "medium"
 context_window = 272000
 ```
+
+Every workspace project also holds `apply_patch`, the edit grammar these models are trained on; the codex provider sends it as a custom grammar tool, other providers as a plain function.
 
 **Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory. First-party CLI, which is the sanctioned path.
 

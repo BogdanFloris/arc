@@ -25,6 +25,34 @@ const ACCOUNT_HEADER: &str = "chatgpt-account-id";
 // the backend refuses a request without instructions
 const NO_SYSTEM: &str = "You are a helpful assistant.";
 
+// Codex's own grammar for apply_patch (codex-rs/core/assets/tools/apply_patch.lark);
+// the model was trained against it, so it goes out verbatim as a custom tool
+const APPLY_PATCH_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"#;
+
+const APPLY_PATCH: &str = crate::tool::workspace::patch::NAME;
+
+// a custom tool's text lands in the one string property the JSON tool declares
+const CUSTOM_INPUT: &str = "input";
+
 pub struct Codex {
     endpoint: String,
     tokens: Tokens,
@@ -188,6 +216,21 @@ enum Item<'a> {
         call_id: &'a str,
         output: &'a str,
     },
+
+    CustomCall {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        call_id: &'a str,
+        name: &'a str,
+        input: String,
+    },
+
+    CustomOutput {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        call_id: &'a str,
+        output: &'a str,
+    },
 }
 
 #[derive(Serialize)]
@@ -221,23 +264,55 @@ enum WireTool<'a> {
         #[serde(rename = "type")]
         kind: &'static str,
     },
+
+    Custom {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: &'a str,
+        description: &'a str,
+        format: Grammar,
+    },
+}
+
+#[derive(Serialize)]
+struct Grammar {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    syntax: &'static str,
+    definition: &'static str,
 }
 
 impl<'a> Payload<'a> {
     fn new(request: &'a CompletionRequest) -> Result<Self, Error> {
         let mut input = Vec::with_capacity(request.messages.len());
+        let mut custom_calls = std::collections::HashSet::new();
         for message in &request.messages {
-            items(message, &mut input)?;
+            items(message, &mut input, &mut custom_calls)?;
         }
         let mut tools: Vec<WireTool> = request
             .tools
             .iter()
-            .map(|tool: &ToolDefinition| WireTool::Function {
-                kind: "function",
-                name: &tool.name,
-                description: &tool.description,
-                parameters: &tool.parameters,
-                strict: false,
+            .map(|tool: &ToolDefinition| {
+                if tool.name == APPLY_PATCH {
+                    WireTool::Custom {
+                        kind: "custom",
+                        name: &tool.name,
+                        description: &tool.description,
+                        format: Grammar {
+                            kind: "grammar",
+                            syntax: "lark",
+                            definition: APPLY_PATCH_GRAMMAR,
+                        },
+                    }
+                } else {
+                    WireTool::Function {
+                        kind: "function",
+                        name: &tool.name,
+                        description: &tool.description,
+                        parameters: &tool.parameters,
+                        strict: false,
+                    }
+                }
             })
             .collect();
         if request.web {
@@ -278,7 +353,11 @@ fn effort(thinking: Thinking) -> Option<&'static str> {
     }
 }
 
-fn items<'a>(message: &'a Message, out: &mut Vec<Item<'a>>) -> Result<(), Error> {
+fn items<'a>(
+    message: &'a Message,
+    out: &mut Vec<Item<'a>>,
+    custom_calls: &mut std::collections::HashSet<&'a str>,
+) -> Result<(), Error> {
     match message {
         Message::Text { role, content, .. } => match role {
             Role::User => out.push(Item::User {
@@ -324,19 +403,43 @@ fn items<'a>(message: &'a Message, out: &mut Vec<Item<'a>>) -> Result<(), Error>
                 out.push(Item::Replayed(replayed));
             }
             for call in calls {
-                out.push(Item::FunctionCall {
-                    kind: "function_call",
-                    call_id: &call.id,
-                    name: &call.name,
-                    arguments: &call.arguments,
+                if call.name == APPLY_PATCH {
+                    custom_calls.insert(call.id.as_str());
+                    let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|args| args[CUSTOM_INPUT].as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    out.push(Item::CustomCall {
+                        kind: "custom_tool_call",
+                        call_id: &call.id,
+                        name: &call.name,
+                        input,
+                    });
+                } else {
+                    out.push(Item::FunctionCall {
+                        kind: "function_call",
+                        call_id: &call.id,
+                        name: &call.name,
+                        arguments: &call.arguments,
+                    });
+                }
+            }
+        }
+        Message::ToolResult { call_id, content } => {
+            if custom_calls.contains(call_id.as_str()) {
+                out.push(Item::CustomOutput {
+                    kind: "custom_tool_call_output",
+                    call_id,
+                    output: content,
+                });
+            } else {
+                out.push(Item::FunctionOutput {
+                    kind: "function_call_output",
+                    call_id,
+                    output: content,
                 });
             }
         }
-        Message::ToolResult { call_id, content } => out.push(Item::FunctionOutput {
-            kind: "function_call_output",
-            call_id,
-            output: content,
-        }),
     }
     Ok(())
 }
@@ -638,6 +741,83 @@ mod tests {
                 {"type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{\"path\":\"a\"}"},
                 {"type": "function_call_output", "call_id": "call_a", "output": "09:12"},
                 {"type": "function_call_output", "call_id": "call_b", "output": "fn main() {}"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_goes_out_as_a_custom_grammar_tool_and_replays_as_custom_items() {
+        let mut req = request(None, &[(Role::User, "fix it")]);
+        req.tools = vec![
+            ToolDefinition {
+                name: "apply_patch".to_owned(),
+                description: "Edit files with a patch.".to_owned(),
+                parameters: json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+            },
+            ToolDefinition {
+                name: "read".to_owned(),
+                description: "Read a file.".to_owned(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            },
+        ];
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n-x\n+y\n*** End Patch";
+        req.messages.push(Message::ToolCalls {
+            calls: vec![
+                ToolCall {
+                    id: "call_p".to_owned(),
+                    index: 0,
+                    name: "apply_patch".to_owned(),
+                    arguments: json!({"input": patch}).to_string(),
+                    provider_roundtrip: Vec::new(),
+                },
+                ToolCall {
+                    id: "call_r".to_owned(),
+                    index: 1,
+                    name: "read".to_owned(),
+                    arguments: r#"{"path":"a.rs"}"#.to_owned(),
+                    provider_roundtrip: Vec::new(),
+                },
+            ],
+            reasoning: None,
+        });
+        req.messages.push(Message::ToolResult {
+            call_id: "call_p".to_owned(),
+            content: "Applied the patch:\nM a.rs".to_owned(),
+        });
+        req.messages.push(Message::ToolResult {
+            call_id: "call_r".to_owned(),
+            content: "y".to_owned(),
+        });
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        let body = body(&requests);
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["tools"][0]["format"]["type"], "grammar");
+        assert_eq!(body["tools"][0]["format"]["syntax"], "lark");
+        assert!(
+            body["tools"][0]["format"]["definition"]
+                .as_str()
+                .unwrap()
+                .starts_with("start: begin_patch hunk+ end_patch"),
+            "{body}"
+        );
+        assert_eq!(
+            body["tools"][0].get("parameters"),
+            None,
+            "a custom tool has no schema"
+        );
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(
+            body["input"],
+            json!([
+                {"role": "user", "content": [{"type": "input_text", "text": "fix it"}]},
+                {"type": "custom_tool_call", "call_id": "call_p", "name": "apply_patch", "input": patch},
+                {"type": "function_call", "call_id": "call_r", "name": "read", "arguments": "{\"path\":\"a.rs\"}"},
+                {"type": "custom_tool_call_output", "call_id": "call_p", "output": "Applied the patch:\nM a.rs"},
+                {"type": "function_call_output", "call_id": "call_r", "output": "y"},
             ])
         );
     }
