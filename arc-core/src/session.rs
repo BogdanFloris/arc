@@ -1227,7 +1227,7 @@ impl Engine {
             session_id,
         };
 
-        let mut compacted = false;
+        let mut attempted_compaction = None;
         let reply = loop {
             // the last step offers no tools, so the model has to answer
             let last_step = steps >= max_tool_steps(runner.role);
@@ -1253,10 +1253,9 @@ impl Engine {
                     &mut cancel_rx,
                 )
                 .await?;
-            let over_budget = !compacted
-                && runner.compact_at.is_some_and(|limit| {
-                    step_usage.is_some_and(|usage| usage.input_tokens >= limit)
-                });
+            let over_budget = runner
+                .compact_at
+                .is_some_and(|limit| step_usage.is_some_and(|usage| usage.input_tokens >= limit));
 
             match ending {
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
@@ -1300,12 +1299,15 @@ impl Engine {
                     }
                     self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
                     if over_budget {
-                        compacted = true;
-                        if self.compact(runner, session_id, turn_id).await? {
-                            let rows = self.with_store(|store| {
-                                store.projection().lineage_messages(session_id)
-                            })?;
-                            transcript = rebuild_transcript(&rows);
+                        let cutoff = self.compaction_cutoff(session_id)?;
+                        if cutoff > attempted_compaction {
+                            attempted_compaction = cutoff;
+                            if self.compact(runner, session_id, turn_id).await? {
+                                let rows = self.with_store(|store| {
+                                    store.projection().lineage_messages(session_id)
+                                })?;
+                                transcript = rebuild_transcript(&rows);
+                            }
                         }
                     }
                 }
@@ -1327,11 +1329,22 @@ impl Engine {
                     });
                     // a message that lands right as the model stops keeps
                     // the turn going instead of ending it unanswered
-                    if self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)? {
-                        continue;
-                    }
+                    let steered =
+                        self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
                     if over_budget {
-                        self.compact(runner, session_id, turn_id).await?;
+                        let cutoff = self.compaction_cutoff(session_id)?;
+                        if cutoff > attempted_compaction {
+                            attempted_compaction = cutoff;
+                            if self.compact(runner, session_id, turn_id).await? && steered {
+                                let rows = self.with_store(|store| {
+                                    store.projection().lineage_messages(session_id)
+                                })?;
+                                transcript = rebuild_transcript(&rows);
+                            }
+                        }
+                    }
+                    if steered {
+                        continue;
                     }
                     span.record("outcome", "done");
                     span.record("assistant_seq", seq);
@@ -1972,7 +1985,9 @@ impl Engine {
             span.record("outcome", "nothing_to_compact");
             return Ok(false);
         }
-        let users_words: Vec<&str> = rows
+        let original_rows =
+            self.with_store(|store| store.projection().original_lineage_rows(session_id))?;
+        let users_words: Vec<&str> = original_rows
             .iter()
             .filter(|(seq, _)| *seq <= through_seq)
             .filter_map(|(_, row)| match row {
@@ -2040,23 +2055,43 @@ impl Engine {
         Ok(true)
     }
 
-    /// The seq to compact through: the session's own rows keep its last two
-    /// user-initiated exchanges whole (or its last one, with fewer than
-    /// three), and everything before that is fair game. `None` when there is
-    /// nothing to cut — fewer than one own user message, or that message is
-    /// already the earliest thing in the lineage.
     fn compaction_cutoff(&self, session_id: &str) -> Result<Option<u64>, Error> {
-        let own_user_seqs =
-            self.with_store(|store| store.projection().own_user_message_seqs(session_id))?;
-        let anchor = if own_user_seqs.len() >= 3 {
-            own_user_seqs[own_user_seqs.len() - 2]
+        let (own_user_seqs, rows) = self.with_store(|store| {
+            Ok::<_, Error>((
+                store.projection().own_user_message_seqs(session_id)?,
+                store.projection().lineage_messages_with_seq(session_id)?,
+            ))
+        })?;
+        let exchange_cutoff = if own_user_seqs.len() >= 3 {
+            own_user_seqs.get(own_user_seqs.len() - 2)
         } else {
-            match own_user_seqs.last() {
-                Some(seq) => *seq,
-                None => return Ok(None),
+            own_user_seqs.last()
+        }
+        .and_then(|seq| seq.checked_sub(1));
+        let mut open = std::collections::HashSet::new();
+        let mut batches = Vec::new();
+        for (seq, row) in &rows {
+            match row {
+                MessageRow::ToolCall { call_id, .. } => {
+                    open.insert(call_id);
+                }
+                MessageRow::ToolResult { call_id, .. }
+                    if open.remove(call_id) && open.is_empty() =>
+                {
+                    batches.push(*seq);
+                }
+                _ => {}
             }
-        };
-        Ok(Some(anchor.saturating_sub(1)))
+        }
+        let batch_cutoff = batches.len().checked_sub(3).map(|i| batches[i]);
+        let cutoff = exchange_cutoff.max(batch_cutoff);
+        Ok(cutoff.filter(|cutoff| {
+            rows.iter().any(|(seq, row)| {
+                *seq <= *cutoff
+                    && !matches!(row, MessageRow::Message { turn_id, source, .. }
+                        if turn_id.is_empty() && *source == Source::Model as i32)
+            })
+        }))
     }
 
     /// A single non-streamed completion for the compaction pass: no tools
@@ -8090,6 +8125,89 @@ mod tests {
         let (role, content) = turn(&requests[4].messages[0]);
         assert_eq!(role, Role::User);
         assert!(content.starts_with("Goal"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn one_user_request_compacts_twice_without_losing_instructions_or_tool_pairs() {
+        const LIMIT: u32 = 42;
+        let mut script = Vec::new();
+        for step in 0..5 {
+            script.push(vec![
+                Ok(call(&format!("c{step}-a"), 0, "lookup", "{}")),
+                Ok(call(&format!("c{step}-b"), 1, "lookup", "{}")),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: if step == 2 || step == 4 { LIMIT } else { 1 },
+                        output_tokens: 5,
+                    },
+                    stop: Stop::ToolCalls,
+                }),
+            ]);
+            if step == 2 || step == 4 {
+                script.push(done_reply("Goal\nContinue the work."));
+            }
+        }
+        script.push(done_reply("finished"));
+        let provider = ScriptedProvider::scripted(script);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let run = Runner {
+            compact_at: Some(LIMIT),
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "Keep the public API unchanged.", tx)
+            .await
+            .expect("long turn");
+        let events = replay_log(dir.path());
+        let compactions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                session_event::Event::SessionCompacted(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compactions.len(), 2);
+        assert!(compactions[0].through_seq < compactions[1].through_seq);
+        for compacted in &compactions {
+            assert_eq!(
+                compacted
+                    .summary
+                    .matches("Keep the public API unchanged.")
+                    .count(),
+                1
+            );
+        }
+        let requests = provider.requests();
+        for request in &requests {
+            let mut open = std::collections::HashSet::new();
+            for message in &request.messages {
+                match message {
+                    Message::ToolCalls { calls, .. } => {
+                        open.extend(calls.iter().map(|call| call.id.as_str()));
+                    }
+                    Message::ToolResult { call_id, .. } => {
+                        assert!(open.remove(call_id.as_str()), "result without call");
+                    }
+                    Message::Text { .. } => {}
+                }
+            }
+            assert!(open.is_empty(), "call without result");
+        }
+        let mut rebuilt = Projection::in_memory().expect("projection");
+        for event in replay_events(dir.path()) {
+            rebuilt.apply(&event).expect("replay");
+        }
+        let actual = rebuilt
+            .lineage_messages(&reply.session_id)
+            .expect("lineage");
+        let expected = engine
+            .with_store(|store| store.projection().lineage_messages(&reply.session_id))
+            .expect("live lineage");
+        assert_eq!(actual, expected);
+        assert_eq!(requests.len(), 8);
     }
 
     #[tokio::test]

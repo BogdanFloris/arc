@@ -271,7 +271,8 @@ A long session outgrows its window. The answer is an event, not an in-memory con
 - **`SessionCompacted`** records the seq the summary covers through, the summary text, the prompt version that wrote it, and the model. On replay the transcript builder shows the model the summary in place of everything through that seq, then the rest verbatim. A rebuild reproduces the same transcript without calling a model, which is what invariants 1 and 2 require. Nothing leaves the log; the archive and the TUI still hold every message.
 - **The trigger is measured.** Providers report prompt tokens on every step, and the last step's count is the live context size. Each role's config names its `context_window`, and compaction runs when a step's prompt tokens cross a fraction of it. Session totals are the wrong number: they sum every step.
 - **The session's own model writes the summary.** It holds the context and its cache is warm. The span carries a compaction label. The output is validated before it is appended; a summary that does not parse writes nothing and the turn continues uncompacted.
-- **User messages are never paraphrased.** The summary carries them verbatim, and the last few turns stay whole. Tool output goes first.
+- **User messages are never paraphrased.** Code copies them from the original branch history on every compaction, including repeated compactions. Keep the last two user exchanges when possible; a long exchange may instead compact through a completed tool batch, keeping the last two batches whole. Never separate a tool call from its result.
+- **A turn may compact repeatedly.** Recheck measured prompt tokens after each step. Attempt only when the eligible cutoff advances, including after a failed summary, so unchanged context cannot cause a retry loop.
 - **The tree is unaffected.** A fork before the event inherits the full prefix; a fork after inherits the summary.
 - **`:compact`** appends the same event by hand.
 

@@ -610,9 +610,16 @@ impl Projection {
         lineage_rows(&self.conn, session_id)
     }
 
+    pub(crate) fn original_lineage_rows(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(u64, MessageRow)>, Error> {
+        collect_lineage_rows(&self.conn, session_id, false)
+    }
+
     /// Seqs of this session's own user-authored messages (`Role::User`,
     /// `Source::User`), oldest first — never rows inherited from a fork
-    /// parent. The compaction cutoff is chosen from these alone.
+    /// parent.
     pub(crate) fn own_user_message_seqs(&self, session_id: &str) -> Result<Vec<u64>, Error> {
         own_user_message_seqs(&self.conn, session_id)
     }
@@ -1228,6 +1235,14 @@ pub(crate) fn lineage_messages(
 }
 
 fn lineage_rows(conn: &Connection, session_id: &str) -> Result<Vec<(u64, MessageRow)>, Error> {
+    collect_lineage_rows(conn, session_id, true)
+}
+
+fn collect_lineage_rows(
+    conn: &Connection,
+    session_id: &str,
+    compacted: bool,
+) -> Result<Vec<(u64, MessageRow)>, Error> {
     let mut chain: Vec<(String, u64)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
     let mut current = session_id.to_owned();
@@ -1250,15 +1265,16 @@ fn lineage_rows(conn: &Connection, session_id: &str) -> Result<Vec<(u64, Message
             .into_iter()
             .filter(|(seq, _)| *seq <= truncate_at)
             .collect();
-        rows.extend(apply_compaction(
-            conn,
-            &ancestor_id,
-            Some(truncate_at),
-            ancestor_rows,
-        )?);
+        rows.extend(ancestor_rows);
+        if compacted {
+            rows = apply_compaction(conn, &ancestor_id, Some(truncate_at), rows)?;
+        }
     }
     let own_rows = messages_with_seq(conn, session_id)?;
-    rows.extend(apply_compaction(conn, session_id, None, own_rows)?);
+    rows.extend(own_rows);
+    if compacted {
+        rows = apply_compaction(conn, session_id, None, rows)?;
+    }
     Ok(rows)
 }
 
@@ -3382,6 +3398,60 @@ mod tests {
                 message_row("b1")
             ]
         );
+    }
+
+    #[test]
+    fn repeated_compaction_in_a_fork_replaces_inherited_rows_and_preserves_originals() {
+        let events = [
+            session_created(0),
+            message_appended(1, "original instruction"),
+            message_appended(2, "parent tail"),
+            session_compacted(3, "s-01", 1, "Goal\nparent summary"),
+            fork_created(4, "s-fork", "s-01", 3),
+            message_appended_for(5, "s-fork", "child instruction"),
+            session_compacted(6, "s-fork", 2, "Goal\nfirst child summary"),
+            message_appended_for(7, "s-fork", "child tail"),
+            session_compacted(8, "s-fork", 5, "Goal\nsecond child summary"),
+            fork_created(9, "s-before", "s-fork", 7),
+            fork_created(10, "s-after", "s-fork", 8),
+        ];
+        for _ in 0..2 {
+            let mut projection = Projection::in_memory().expect("open");
+            for event in &events {
+                projection.apply(event).expect("replay");
+            }
+            assert_eq!(
+                projection.lineage_messages("s-before").expect("before"),
+                [
+                    summary_row("Goal\nfirst child summary"),
+                    message_row("child instruction"),
+                    message_row("child tail"),
+                ]
+            );
+            assert_eq!(
+                projection.lineage_messages("s-after").expect("after"),
+                [
+                    summary_row("Goal\nsecond child summary"),
+                    message_row("child tail"),
+                ]
+            );
+            let originals: Vec<_> = projection
+                .original_lineage_rows("s-after")
+                .expect("originals")
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect();
+            assert_eq!(
+                originals,
+                [
+                    "original instruction",
+                    "parent tail",
+                    "child instruction",
+                    "child tail"
+                ]
+                .map(message_row)
+            );
+        }
     }
 
     fn branch_marked(seq: u64, id: &str, disposition: i32) -> Event {
