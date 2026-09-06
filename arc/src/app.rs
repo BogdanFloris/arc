@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, ProjectInfo, Role, SessionInfo, SessionRole, Source,
-    ToolOutcome, branch_marked, history_entry, job_info,
+    HistoryEntry, HistoryMessage, JobInfo, ModelChoice, ProjectInfo, Role, SessionInfo,
+    SessionRole, Source, ToolOutcome, branch_marked, history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -36,6 +36,11 @@ pub enum Command {
     },
     ListJobs,
     ListProjects,
+    ListModels,
+    SelectModel {
+        role: SessionRole,
+        choice: String,
+    },
     CancelJob {
         session_id: String,
     },
@@ -111,6 +116,7 @@ pub enum NetEvent {
     JobItems(Vec<JobInfo>),
     ProjectItems(Vec<ProjectInfo>),
     ProjectsSeeded(Vec<ProjectInfo>),
+    ModelItems(Vec<ModelChoice>),
     SessionAppended {
         session_id: String,
     },
@@ -161,6 +167,13 @@ pub struct Picker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projects {
     pub items: Vec<ProjectInfo>,
+    pub selected: usize,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Models {
+    pub items: Vec<ModelChoice>,
     pub selected: usize,
     pub loaded: bool,
 }
@@ -253,6 +266,7 @@ pub struct App {
     pub review: Option<Review>,
     pub jobs: Option<Jobs>,
     pub projects: Option<Projects>,
+    pub models: Option<Models>,
     pub help: bool,
     pub help_scroll: usize,
     pub search: Option<Search>,
@@ -313,6 +327,7 @@ impl App {
             review: None,
             jobs: None,
             projects: None,
+            models: None,
             help: false,
             help_scroll: 0,
             search: None,
@@ -430,6 +445,9 @@ impl App {
         }
         if self.projects.is_some() {
             return self.on_projects_key(key.code);
+        }
+        if self.models.is_some() {
+            return self.on_models_key(key.code);
         }
         if self.picker.is_some() {
             return self.on_picker_key(key.code);
@@ -596,7 +614,8 @@ impl App {
             KeyCode::Char('s') => return self.open_picker(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('J') => return Some(self.open_jobs()),
-            KeyCode::Char('M') => return Some(self.open_review()),
+            KeyCode::Char('Q') => return Some(self.open_review()),
+            KeyCode::Char('M') => return Some(self.open_models()),
             KeyCode::Char('C') => return Some(self.open_projects()),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
@@ -924,6 +943,7 @@ impl App {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
                     "jobs" => return Some(self.open_jobs()),
+                    "model" => return Some(self.open_models()),
                     "help" => self.help = true,
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
@@ -1102,6 +1122,43 @@ impl App {
             loaded: false,
         });
         Command::ListProjects
+    }
+
+    fn open_models(&mut self) -> Command {
+        self.models = Some(Models {
+            items: Vec::new(),
+            selected: 0,
+            loaded: false,
+        });
+        Command::ListModels
+    }
+
+    fn on_models_key(&mut self, code: KeyCode) -> Option<Command> {
+        let models = self.models.as_mut().expect("models is open");
+        let last = models.items.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.models = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                models.selected = models.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                models.selected = (models.selected + 1).min(last);
+            }
+            KeyCode::Enter => {
+                let chosen = models.items.get(models.selected).map(|choice| {
+                    (
+                        SessionRole::try_from(choice.role).unwrap_or(SessionRole::Unspecified),
+                        choice.name.clone(),
+                    )
+                });
+                if let Some((role, choice)) = chosen {
+                    self.models = None;
+                    return Some(Command::SelectModel { role, choice });
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     fn on_projects_key(&mut self, code: KeyCode) -> Option<Command> {
@@ -1834,6 +1891,19 @@ impl App {
                     projects.selected = 0;
                     projects.items = items;
                     projects.loaded = true;
+                }
+                None
+            }
+            NetEvent::ModelItems(items) => {
+                if let Some(models) = self.models.as_mut() {
+                    // land on the executor's pick: the one most often changed
+                    models.selected = items
+                        .iter()
+                        .position(|c| c.selected && c.role == SessionRole::Executor as i32)
+                        .or_else(|| items.iter().position(|c| c.selected))
+                        .unwrap_or(0);
+                    models.items = items;
+                    models.loaded = true;
                 }
                 None
             }
@@ -5152,13 +5222,70 @@ mod tests {
     }
 
     #[test]
-    fn shift_m_opens_review_from_normal_mode_same_as_colon_review() {
+    fn shift_q_opens_review_from_normal_mode_same_as_colon_review() {
         let mut app = normal_app();
 
-        let command = app.on_key(key(KeyCode::Char('M')));
+        let command = app.on_key(key(KeyCode::Char('Q')));
 
         assert!(matches!(command, Some(Command::ReviewList { .. })));
         assert!(app.review.is_some());
+    }
+
+    fn choice(role: SessionRole, name: &str, selected: bool) -> ModelChoice {
+        ModelChoice {
+            role: role as i32,
+            name: name.to_owned(),
+            provider: "codex".to_owned(),
+            model: format!("model-{name}"),
+            thinking: "medium".to_owned(),
+            selected,
+        }
+    }
+
+    #[test]
+    fn shift_m_opens_the_model_picker_and_enter_selects_the_pointed_choice() {
+        let mut app = normal_app();
+
+        let command = app.on_key(key(KeyCode::Char('M')));
+        assert_eq!(command, Some(Command::ListModels));
+        assert!(!app.models.as_ref().expect("picker is open").loaded);
+
+        app.on_net(NetEvent::ModelItems(vec![
+            choice(SessionRole::Concierge, "astra", true),
+            choice(SessionRole::Executor, "sol", true),
+            choice(SessionRole::Executor, "glm-flash", false),
+        ]));
+        assert_eq!(
+            app.models.as_ref().unwrap().selected,
+            1,
+            "the cursor lands on the executor's current pick"
+        );
+
+        app.on_key(key(KeyCode::Char('j')));
+        let command = app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            command,
+            Some(Command::SelectModel {
+                role: SessionRole::Executor,
+                choice: "glm-flash".to_owned(),
+            })
+        );
+        assert_eq!(app.models, None, "enter closes the picker");
+
+        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.models, None);
+    }
+
+    #[test]
+    fn colon_model_opens_the_same_picker() {
+        let mut app = normal_app();
+        app.on_key(key(KeyCode::Char(':')));
+        typed(&mut app, "model");
+        let command = app.on_key(key(KeyCode::Enter));
+        assert_eq!(command, Some(Command::ListModels));
+        assert!(app.models.is_some());
     }
 
     #[test]

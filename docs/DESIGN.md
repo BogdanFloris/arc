@@ -407,7 +407,7 @@ trait Provider {
 
 This is how §12's routing question gets answered without a runtime difficulty classifier: the mapping is static config, and the role label rides every `CompletionRequest` onto its span (§8), so traces attribute spend by role from the first day.
 
-**A role resolves to one configured model in Phase 3.** A provider failure is reported to the client. Add an explicit fallback policy only when real outages or spend data show that it is needed.
+**A role resolves to one model at a time; config declares the menu, the log records the pick.** `[models]` presets and a role's `choices` say what is possible (amended 2026-09-06); a `RoleModelSelected` event says what was chosen, so the selection survives restarts by replay and never edits the human-owned config. The first choice is the default until an event says otherwise, and a pick that is no longer configured falls back to it. Open sessions keep their model under the pin below; new sessions and forks take the current pick. A provider failure is reported to the client. Add an explicit fallback policy only when real outages or spend data show that it is needed.
 
 **The archivist is a role, not a lesser tier.** Its profile — bulk, structured, latency-insensitive — is exactly what a small model is good at and exactly what should never be paid for hosted. The role is named for the work, not for where the model runs, so moving it to a hosted model would not rename it.
 

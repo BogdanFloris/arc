@@ -66,6 +66,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(projects) = &app.projects {
         draw_projects(frame, frame.area(), projects);
     }
+    if let Some(models) = &app.models {
+        draw_models(frame, frame.area(), models);
+    }
     if app.help {
         draw_help(frame, app, frame.area());
     }
@@ -490,6 +493,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             || app.review.is_some()
             || app.jobs.is_some()
             || app.projects.is_some()
+            || app.models.is_some()
             || app.help
         {
             theme::DIM
@@ -533,6 +537,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             && app.review.is_none()
             && app.jobs.is_none()
             && app.projects.is_none()
+            && app.models.is_none()
             && !app.help)
     {
         let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
@@ -925,6 +930,60 @@ fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects)
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_models(frame: &mut Frame, full: Rect, models: &crate::app::Models) {
+    let rows = models.items.len().max(1);
+    let area = popup(
+        frame,
+        full,
+        78,
+        u16::try_from(rows).unwrap_or(u16::MAX),
+        "model",
+    );
+
+    let mut lines = Vec::new();
+    if models.items.is_empty() {
+        let word = if models.loaded {
+            "no model choices configured"
+        } else {
+            "loading"
+        };
+        lines.push(Line::styled(format!("   {word}"), theme::DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let name_width = models
+        .items
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let visible = area.height as usize;
+    let start = models.selected.saturating_sub(visible.saturating_sub(1));
+    let room = (area.width as usize).saturating_sub(name_width + 16);
+    let end = models.items.len().min(start + visible);
+    for (row, choice) in models.items.iter().enumerate().take(end).skip(start) {
+        let pointed = row == models.selected;
+        let (prefix, style) = if pointed {
+            (" > ", theme::ACCENT)
+        } else {
+            ("   ", theme::PLAIN)
+        };
+        let role = arc_core::provider::role_label(
+            arc_proto::v1::SessionRole::try_from(choice.role)
+                .unwrap_or(arc_proto::v1::SessionRole::Unspecified),
+        );
+        let mark = if choice.selected { "*" } else { " " };
+        let detail = format!("{} {} {}", choice.provider, choice.model, choice.thinking);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{role:<9} "), theme::DIM),
+            Span::styled(format!("{mark}{:<name_width$}", choice.name), style),
+            Span::styled(format!("  {}", elide(&detail, room)), theme::DIM),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 // grouped and built from the table below so a changed key and its
 // documentation land in the same diff
 const HELP: &[(&str, &[&str])] = &[
@@ -949,8 +1008,9 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
             "ctrl-o            toggle thought traces / handback summaries",
-            "? J M             help / jobs / review popups",
+            "? J Q             help / jobs / review queue popups",
             "C                 pick a project; enter opens it like :code",
+            "M                 pick a model per role; * marks the current one, the pick outlives restarts",
             "ctrl-c            quit",
             ":                 command mode",
         ],
@@ -980,6 +1040,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":q :q! :qa :quit  quit",
             ":review           open the review pane",
             ":jobs             open the jobs pane",
+            ":model            open the model picker",
             ":code <project>   open a bound executor session, no dispatch",
             "                  a local launch inside a project's root opens this door on its own",
             ":fork             branch at the visual selection",
@@ -1209,7 +1270,7 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 
 #[cfg(test)]
 mod tests {
-    use arc_proto::v1::{JobInfo, SessionInfo, SessionRole, job_info};
+    use arc_proto::v1::{JobInfo, ModelChoice, SessionInfo, SessionRole, job_info};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1217,7 +1278,48 @@ mod tests {
     use super::{
         disposition_tag, draw, job_label, label, last_active, picker_label, strip_label, wrap_input,
     };
-    use crate::app::{App, Block, Mode, Search, Status};
+    use crate::app::{App, Block, Mode, Models, Search, Status};
+
+    #[test]
+    fn the_model_picker_lists_each_roles_choices_and_marks_the_current_one() {
+        let mut app = App::new();
+        let choice = |role: SessionRole, name: &str, model: &str, selected: bool| ModelChoice {
+            role: role as i32,
+            name: name.to_owned(),
+            provider: "codex".to_owned(),
+            model: model.to_owned(),
+            thinking: "medium".to_owned(),
+            selected,
+        };
+        app.models = Some(Models {
+            items: vec![
+                choice(SessionRole::Concierge, "astra", "gpt-6-astra", true),
+                choice(SessionRole::Executor, "sol", "gpt-5.6-sol", true),
+                choice(SessionRole::Executor, "glm-flash", "glm-5.3-flash", false),
+            ],
+            selected: 2,
+            loaded: true,
+        });
+
+        let text = plain_text(&rendered(&mut app));
+
+        assert!(
+            text.contains(" model "),
+            "the popup is titled model:\n{text}"
+        );
+        assert!(
+            text.contains("   concierge *astra      codex gpt-6-astra medium"),
+            "{text}"
+        );
+        assert!(
+            text.contains("   executor  *sol        codex gpt-5.6-sol medium"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" > executor   glm-flash  codex glm-5.3-flash medium"),
+            "the pointed row carries the cursor, not the mark:\n{text}"
+        );
+    }
 
     fn rendered(app: &mut App) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(100, 30);

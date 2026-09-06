@@ -155,6 +155,9 @@ fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>
                 text: delta.text,
             });
         }
+        Some(notification::Event::ModelsChanged(list)) => {
+            let _ = events.send(NetEvent::ModelItems(list.choices));
+        }
         None => {}
     }
 }
@@ -182,6 +185,10 @@ async fn handle(
         }
         Command::ListJobs => list_jobs(&mut client, events).await,
         Command::ListProjects => list_projects(&mut client, events).await,
+        Command::ListModels => models(client.models().await, events),
+        Command::SelectModel { role, choice } => {
+            models(client.select_model(role, &choice).await, events)
+        }
         Command::CancelJob { session_id } => verdict(client.cancel_job(&session_id).await, events),
         Command::DropSteers { session_id } => {
             verdict(client.drop_steers(&session_id).await, events)
@@ -319,6 +326,23 @@ async fn list_projects(
     match client.projects().await {
         Ok(projects) => {
             let _ = events.send(NetEvent::ProjectItems(projects));
+            Ok(())
+        }
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn models(
+    outcome: Result<Vec<arc_proto::v1::ModelChoice>, Error>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    match outcome {
+        Ok(items) => {
+            let _ = events.send(NetEvent::ModelItems(items));
             Ok(())
         }
         Err(Error::Server { code, msg }) => {
