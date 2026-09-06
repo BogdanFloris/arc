@@ -639,6 +639,8 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_round_trips() {
         let session = SessionInfo {
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
             preview: "hello arc".to_owned(),
             last_at: None,
             id: "s-1".to_owned(),

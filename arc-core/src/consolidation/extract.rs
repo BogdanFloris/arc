@@ -212,9 +212,13 @@ const RECALL_TOOLS: &[&str] = &[
     "session_read",
 ];
 
-pub const TITLE_PROMPT: &str = "Write a short title for this conversation. \
-At most six words, plain words, no quotes, no trailing punctuation. \
-Reply with the title only.";
+pub const TITLE_PROMPT: &str = "Name the concrete task or topic that will help the user find this session later. \
+Prefer the component, problem, or decision over generic words such as discussion, update, \
+analysis, or work. Ignore greetings and assistant narration. Preserve useful project and \
+component names. Examples: Session picker keyboard navigation; SPI display wiring; \
+Compaction across tool batches. At most six words, plain words, no quotes or trailing \
+punctuation. Reply with the title only. If the conversation contains only greetings \
+or no identifiable topic, reply with an empty string.";
 
 const TITLE_INPUT_CAP: usize = 500;
 
@@ -520,7 +524,7 @@ impl Extractor for ModelExtractor {
     #[tracing::instrument(
         name = "consolidation.title",
         skip_all,
-        fields(task = "consolidation", session_id = %session.session_id)
+        fields(task = "consolidation", prompt_version = "title-v2", session_id = %session.session_id)
     )]
     async fn title(&self, session: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
         let Some(prompt) = title_prompt(session) else {
@@ -557,22 +561,64 @@ impl Extractor for ModelExtractor {
 }
 
 fn title_prompt(session: &SessionSnapshot) -> Option<String> {
-    let first_user = first_message(session, Role::User)?;
-    let first_assistant = first_message(session, Role::Assistant)?;
-    Some(format!(
-        "User: {}\nAssistant: {}",
-        cap_chars(first_user, TITLE_INPUT_CAP),
-        cap_chars(first_assistant, TITLE_INPUT_CAP),
-    ))
-}
-
-fn first_message(session: &SessionSnapshot, role: Role) -> Option<&str> {
-    session.rows.iter().find_map(|row| match row {
-        MessageRow::Message {
-            role: r, content, ..
-        } if *r == role as i32 => Some(content.as_str()),
-        _ => None,
-    })
+    let messages: Vec<(Role, &str)> = session
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            MessageRow::Message {
+                role,
+                source,
+                content,
+                ..
+            } if *role == Role::User as i32 && *source != arc_proto::v1::Source::System as i32 => {
+                Some((Role::User, content.as_str()))
+            }
+            MessageRow::Message { role, content, .. } if *role == Role::Assistant as i32 => {
+                Some((Role::Assistant, content.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, (role, _))| *role == Role::User)
+        .map(|(index, _)| index)
+        .collect();
+    let assistants: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, (role, _))| *role == Role::Assistant)
+        .map(|(index, _)| index)
+        .collect();
+    if users.is_empty() || assistants.is_empty() {
+        return None;
+    }
+    let mut selected: Vec<usize> = users
+        .iter()
+        .take(3)
+        .chain(users.iter().rev().take(3))
+        .chain(assistants.first())
+        .chain(assistants.last())
+        .copied()
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    Some(
+        selected
+            .into_iter()
+            .map(|index| {
+                let (role, content) = messages[index];
+                let label = if role == Role::User {
+                    "User"
+                } else {
+                    "Assistant"
+                };
+                format!("{label}: {}", cap_chars(content, TITLE_INPUT_CAP))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn cap_chars(text: &str, limit: usize) -> String {
@@ -1409,6 +1455,41 @@ mod tests {
         let long = "word ".repeat(20);
         let title = sanitize_title(&long).expect("non-empty");
         assert_eq!(title.chars().count(), 60);
+    }
+
+    #[test]
+    fn titles_include_the_task_after_an_opening_greeting() {
+        let mut snapshot = snapshot(Vec::new());
+        for (role, source, content) in [
+            (Role::Assistant, 0, "Hello!"),
+            (Role::User, 0, "Fix session picker keyboard navigation"),
+            (
+                Role::User,
+                arc_proto::v1::Source::System as i32,
+                "Private handback",
+            ),
+            (
+                Role::Assistant,
+                0,
+                "The filtered result now receives focus.",
+            ),
+        ] {
+            snapshot.rows.push(MessageRow::Message {
+                role: role as i32,
+                source,
+                content: content.to_owned(),
+                partial: false,
+                turn_id: "t-1".to_owned(),
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
+                grounding_json: String::new(),
+            });
+        }
+        let prompt = title_prompt(&snapshot).expect("conversation");
+        assert!(prompt.contains("Fix session picker keyboard navigation"));
+        assert!(prompt.contains("The filtered result now receives focus."));
+        assert!(!prompt.contains("Private handback"));
     }
 
     #[test]

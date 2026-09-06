@@ -42,14 +42,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let body = if transcript.height >= MASTHEAD_FLOOR {
-        let [masthead, rest] =
-            Layout::vertical([Constraint::Length(MASTHEAD), Constraint::Fill(1)]).areas(transcript);
-        draw_masthead(frame, inset(masthead), app);
-        rest
+    let masthead_height = if app.transcript.is_empty() && transcript.height >= MASTHEAD_FLOOR {
+        MASTHEAD
     } else {
-        transcript
+        1
     };
+    let [masthead, body] =
+        Layout::vertical([Constraint::Length(masthead_height), Constraint::Fill(1)])
+            .areas(transcript);
+    if masthead_height == MASTHEAD {
+        draw_masthead(frame, inset(masthead), app);
+    } else {
+        draw_session_heading(frame, inset(masthead), app);
+    }
 
     draw_transcript(frame, inset(body), app);
     draw_rule(frame, rule, app);
@@ -72,6 +77,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(frame, app, frame.area());
     }
+    if app.inspection.is_some() {
+        draw_inspection(frame, app, frame.area());
+    }
 }
 
 fn inset(area: Rect) -> Rect {
@@ -87,6 +95,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let (lines, bounds) = transcript_layout(app, area.width as usize);
     let max_back = lines.len().saturating_sub(height);
     app.scroll_back = app.scroll_back.min(max_back);
+    if std::mem::take(&mut app.restore_anchor) {
+        if let Some((block, offset)) = app.viewport_anchor {
+            if let Some(&(from, to)) = bounds.get(block) {
+                let start = from + offset.min(to.saturating_sub(from + 1));
+                app.scroll_back = lines.len().saturating_sub(start + height).min(max_back);
+            }
+        }
+    }
 
     if let Some(boundary) = app.visual_boundary().or_else(|| app.search_block()) {
         bring_into_view(app, &bounds, boundary, lines.len(), height, max_back);
@@ -94,6 +110,16 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let end = lines.len() - app.scroll_back;
     let start = end.saturating_sub(height);
+    app.visible_blocks = bounds
+        .iter()
+        .enumerate()
+        .filter(|(_, (from, to))| *to > start && *from < end)
+        .map(|(index, _)| index)
+        .collect();
+    app.viewport_anchor = app
+        .visible_blocks
+        .first()
+        .map(|&index| (index, start.saturating_sub(bounds[index].0)));
     let selected = highlight_ranges(app, &bounds);
     // pad the top so a short transcript still sits on the bottom
     let mut visible: Vec<Line> = vec![Line::default(); height.saturating_sub(end - start)];
@@ -246,13 +272,28 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                 open,
                 ..
             } => {
-                let state = outcome.unwrap_or("...");
-                let text = if args.is_empty() {
-                    format!("{name} · {state}")
-                } else {
-                    format!("{name} {args} · {state}")
-                };
-                out.push(Line::styled(elide(&text, width), theme::DIM));
+                let state = outcome.unwrap_or("running");
+                let fold = if *open { "−" } else { "+" };
+                let args = crate::app::tool_summary(args).replace(['\n', '\r'], " ");
+                let suffix = format!(" · {state}");
+                let header = format!("{fold} {name} {args}");
+                out.push(Line::from(vec![
+                    Span::styled(
+                        elide(
+                            header.trim_end(),
+                            width.saturating_sub(suffix.chars().count()),
+                        ),
+                        theme::DIM,
+                    ),
+                    Span::styled(
+                        suffix,
+                        if *outcome == Some("error") {
+                            theme::ERROR
+                        } else {
+                            theme::DIM
+                        },
+                    ),
+                ]));
                 if *open && !content.is_empty() {
                     push_capped(&mut out, content, width, theme::DIM);
                 }
@@ -319,10 +360,121 @@ fn push_capped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: St
         let cut = wrapped.len() - TOOL_CONTENT_CAP;
         wrapped.truncate(TOOL_CONTENT_CAP);
         out.extend(wrapped);
-        out.push(Line::styled(format!("… {cut} more lines"), theme::DIM));
+        out.push(Line::styled(
+            format!("… {cut} more lines · o full output"),
+            theme::DIM,
+        ));
     } else {
         out.extend(wrapped);
     }
+}
+
+fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
+    let session = app
+        .session_id
+        .as_ref()
+        .and_then(|id| app.sessions.iter().find(|s| &s.id == id));
+    let title = session
+        .filter(|s| !s.title.is_empty())
+        .map(|s| s.title.as_str())
+        .or_else(|| {
+            app.transcript.iter().find_map(|block| match block {
+                Block::You(text) => text.lines().next(),
+                _ => None,
+            })
+        })
+        .unwrap_or("New conversation");
+    let model = session
+        .map(|s| s.model.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model unavailable");
+    let room = usize::from(area.width);
+    let model = elide(model, room / 3);
+    let title = elide(title, room.saturating_sub(model.chars().count() + 7));
+    let gap = room.saturating_sub(title.chars().count() + model.chars().count() + 6);
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled("arc · ", theme::ACCENT),
+            Span::styled(title, theme::PLAIN),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(model, theme::DIM),
+        ]),
+        area,
+    );
+}
+
+fn draw_inspection(frame: &mut Frame, app: &mut App, full: Rect) {
+    let inspection = app.inspection.as_mut().expect("inspection");
+    let Some(block) = app.transcript.get(inspection.block) else {
+        return;
+    };
+    let (title, content) = match block {
+        Block::Tool {
+            name,
+            args,
+            outcome,
+            content,
+            ..
+        } => {
+            let arguments = match serde_json::from_str::<serde_json::Value>(args) {
+                Ok(serde_json::Value::Object(fields)) => fields
+                    .iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{key}: {}",
+                            value
+                                .as_str()
+                                .map_or_else(|| value.to_string(), str::to_owned)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => args.clone(),
+            };
+            (
+                format!("{name} · {}", outcome.unwrap_or("running")),
+                format!("Arguments\n{arguments}\n\nOutput\n{content}"),
+            )
+        }
+        Block::Thought { text, .. } => ("thought".to_owned(), text.clone()),
+        Block::Handback { subject, body, .. } => (subject.clone(), body.clone()),
+        _ => return,
+    };
+    let area = popup(
+        frame,
+        full,
+        full.width.saturating_sub(4),
+        full.height.saturating_sub(4),
+        &title,
+    );
+    let [body, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    let mut lines = Vec::new();
+    push_wrapped(&mut lines, &content, usize::from(body.width), theme::PLAIN);
+    let total = lines.len();
+    inspection.scroll = inspection
+        .scroll
+        .min(total.saturating_sub(usize::from(body.height)));
+    let start = inspection.scroll;
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(usize::from(body.height))
+                .collect::<Vec<_>>(),
+        ),
+        body,
+    );
+    frame.render_widget(
+        Line::styled(
+            elide(
+                &format!("j/k scroll · g/G top/end · q close · {}/{total}", start + 1),
+                usize::from(footer.width),
+            ),
+            theme::DIM,
+        ),
+        footer,
+    );
 }
 
 fn draw_masthead(frame: &mut Frame, area: Rect, app: &App) {
@@ -342,6 +494,12 @@ fn draw_masthead(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+    if area.height > WORDMARK_ROWS {
+        frame.render_widget(
+            Line::styled("Enter send · Esc normal · Ctrl-P sessions", theme::DIM),
+            Rect::new(area.x, area.y + WORDMARK_ROWS, area.width, 1),
+        );
+    }
 }
 
 fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
@@ -358,9 +516,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     if !mode_word.is_empty() {
         left.push(mode_word.to_owned());
     }
-    if let Some(door) = app.open_door_label() {
-        left.push(door);
-    }
+    left.push(app.open_door_label().unwrap_or_else(|| "chat".to_owned()));
     if app.review_pending > 0 {
         left.push(format!("review {}", app.review_pending));
     }
@@ -375,7 +531,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
             let seconds = app.turn_elapsed_seconds().unwrap_or(0);
             let tokens = format_tokens(app.streamed_tokens_estimate());
             words.push(Span::styled(
-                format!(" streaming {seconds}s · ~{tokens} tok"),
+                format!(" streaming {seconds}s · ~{tokens} tok · Esc Esc stop"),
                 theme::DIM,
             ));
         }
@@ -383,6 +539,14 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         Status::Idle => {
             if let Some(code) = &app.last_error {
                 words.push(Span::styled(format!(" {code}"), theme::ERROR));
+            } else {
+                let hint = match app.mode {
+                    Mode::Normal => " Tab chat/code · o inspect · ? help",
+                    Mode::Visual => " j/k select · Enter inspect · f fork · Esc back",
+                    Mode::Insert => " Esc normal · Ctrl-P sessions",
+                    Mode::Cmd => " :chat · :code · :help",
+                };
+                words.push(Span::styled(hint, theme::DIM));
             }
         }
     }
@@ -538,7 +702,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             && app.jobs.is_none()
             && app.projects.is_none()
             && app.models.is_none()
-            && !app.help)
+            && !app.help
+            && app.inspection.is_none())
     {
         let col = u16::try_from(cursor_col).unwrap_or(u16::MAX);
         let row = u16::try_from(cursor_row.saturating_sub(start)).unwrap_or(u16::MAX);
@@ -599,12 +764,48 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
             .collect()
     };
     let height = rows.len() + 1;
-    let area = popup(
+    let scope = if picker.show_all {
+        "all projects + jobs"
+    } else {
+        app.open_project().unwrap_or("conversations")
+    };
+    let view = if picker.tree { "tree" } else { "recent" };
+    let abandoned = if picker.show_abandoned {
+        " + abandoned"
+    } else {
+        ""
+    };
+    let title = format!("sessions · {scope} · {view}{abandoned}");
+    let inner = popup(
         frame,
         full,
         64,
-        u16::try_from(height).unwrap_or(u16::MAX),
-        "sessions",
+        u16::try_from(height + 2).unwrap_or(u16::MAX),
+        &title,
+    );
+    let [area, footer] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(inner);
+    let selected_title = app
+        .picker_session(picker.selected)
+        .map_or("New session", |session| {
+            if session.title.is_empty() {
+                session.preview.lines().next().unwrap_or("")
+            } else {
+                session.title.as_str()
+            }
+        });
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                elide(selected_title, usize::from(footer.width)),
+                theme::PLAIN,
+            ),
+            Line::styled(
+                "/ filter · Tab view · a all · x abandoned · Enter open",
+                theme::DIM,
+            ),
+        ]),
+        footer,
     );
     let width = area.width;
 
@@ -880,14 +1081,39 @@ fn draw_jobs(frame: &mut Frame, full: Rect, jobs: &crate::app::Jobs) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn menu_area(
+    frame: &mut Frame,
+    full: Rect,
+    width: u16,
+    rows: usize,
+    title: &str,
+    hint: &str,
+) -> Rect {
+    let inner = popup(
+        frame,
+        full,
+        width,
+        u16::try_from(rows + 1).unwrap_or(u16::MAX),
+        title,
+    );
+    let [body, footer] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Line::styled(elide(hint, usize::from(footer.width)), theme::DIM),
+        footer,
+    );
+    body
+}
+
 fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects) {
     let rows = projects.items.len().max(1);
-    let area = popup(
+    let area = menu_area(
         frame,
         full,
         72,
-        u16::try_from(rows).unwrap_or(u16::MAX),
+        rows,
         "code",
+        "j/k select · Enter open code session · q close",
     );
 
     let mut lines = Vec::new();
@@ -932,12 +1158,13 @@ fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects)
 
 fn draw_models(frame: &mut Frame, full: Rect, models: &crate::app::Models) {
     let rows = models.items.len().max(1);
-    let area = popup(
+    let area = menu_area(
         frame,
         full,
         78,
-        u16::try_from(rows).unwrap_or(u16::MAX),
+        rows,
         "model",
+        "Enter sets default for new sessions and forks · q close",
     );
 
     let mut lines = Vec::new();
@@ -988,6 +1215,22 @@ fn draw_models(frame: &mut Frame, full: Rect, models: &crate::app::Models) {
 // documentation land in the same diff
 const HELP: &[(&str, &[&str])] = &[
     (
+        "coding essentials",
+        &[
+            "enter             send; typing during work steers the next step",
+            "esc esc           stop a turn (from insert mode)",
+            "tab               switch chat/code in normal mode",
+            ":chat :code       concierge / project picker",
+            "ctrl-p            find a session; / filters, enter opens the match",
+            "ctrl-o            fold the pointed or visible tool/thought",
+            "v then j/k        point at messages, tools, or thoughts",
+            "o or visual enter full arguments and output; j/k scroll, G end",
+            "O                 expand/collapse all, retaining your place",
+            ":compact          compact the current idle session",
+            "M                 defaults for new sessions; open sessions stay pinned",
+        ],
+    ),
+    (
         "normal mode",
         &[
             "i I a A           insert (before, line start, after, line end)",
@@ -1007,7 +1250,7 @@ const HELP: &[(&str, &[&str])] = &[
             "R                 rewind: walk your messages; enter reforks before it, refills the input",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
-            "ctrl-o            toggle thought traces / handback summaries",
+            "ctrl-o            fold one tool / thought / handback",
             "? J Q             help / jobs / review queue popups",
             "C                 pick a project; enter opens it like :code",
             "M                 pick a model per role; * marks the current one, the pick outlives restarts",
@@ -1042,7 +1285,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":jobs             open the jobs pane",
             ":model            open the model picker",
             ":code <project>   open a bound executor session, no dispatch",
-            "                  a local launch inside a project's root opens this door on its own",
+            "                  without a project, open the project picker",
             ":fork             branch at the visual selection",
             ":help             this popup (j k scroll it)",
         ],
@@ -1322,10 +1565,93 @@ mod tests {
     }
 
     fn rendered(app: &mut App) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(100, 30);
+        rendered_at(app, 100, 30)
+    }
+
+    fn rendered_at(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| draw(frame, app)).expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_session_header_and_full_tool_view_work_at_two_widths() {
+        use crate::app::{Block, NetEvent};
+
+        let mut app = App::new();
+        let mut info = session(
+            "s-code",
+            "Session picker keyboard navigation",
+            "Fix navigation",
+        );
+        info.model = "pinned-model".to_owned();
+        app.on_net(NetEvent::Sessions(vec![info]));
+        app.session_id = Some("s-code".to_owned());
+        app.transcript = vec![
+            Block::You("Fix session picker navigation".to_owned()),
+            Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: r#"{"command":"just test","workdir":"/workspace/arc"}"#.to_owned(),
+                outcome: Some("error"),
+                content: (1..=80)
+                    .map(|n| format!("output line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                open: false,
+            },
+        ];
+        app.on_key(key(KeyCode::Esc));
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("Session picker keyboard navigation"));
+        assert!(text.contains("pinned-model"));
+        assert!(text.contains("error"));
+        println!("SESSION FRAME\n{text}");
+        app.on_key(key(KeyCode::Char('o')));
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("/workspace/arc"));
+        app.on_key(key(KeyCode::Char('G')));
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("output line 80"));
+        app.on_key(key(KeyCode::Char('G')));
+        let narrow = plain_text(&rendered_at(&mut app, 40, 12));
+        assert!(narrow.contains("output line 80"));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.inspection.is_none());
+    }
+
+    #[test]
+    fn folding_one_tool_preserves_the_top_visible_block() {
+        use crate::app::Block;
+
+        let mut app = App::new();
+        app.transcript = (0..40)
+            .map(|n| Block::Tool {
+                call_id: n.to_string(),
+                name: "read".to_owned(),
+                args: format!("file-{n}"),
+                outcome: Some("ok"),
+                content: "detail\n".repeat(12),
+                open: false,
+            })
+            .collect();
+        app.scroll_back = 20;
+        rendered(&mut app);
+        let anchor = app.viewport_anchor;
+        app.on_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        ));
+        rendered(&mut app);
+        assert_eq!(app.viewport_anchor, anchor);
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|block| matches!(block, Block::Tool { open: true, .. }))
+                .count(),
+            1
+        );
     }
 
     fn reversed(text: &str, buffer: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -1747,6 +2073,8 @@ mod tests {
 
     fn session(id: &str, title: &str, preview: &str) -> SessionInfo {
         SessionInfo {
+            provider: String::new(),
+            model: String::new(),
             id: id.to_owned(),
             title: title.to_owned(),
             started_at: None,
@@ -1764,6 +2092,8 @@ mod tests {
     fn active_ago(now: chrono::DateTime<chrono::Utc>, seconds_ago: i64) -> SessionInfo {
         let at = now - chrono::Duration::seconds(seconds_ago);
         SessionInfo {
+            provider: String::new(),
+            model: String::new(),
             id: "s".to_owned(),
             title: String::new(),
             preview: String::new(),
@@ -2087,8 +2417,14 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
 
         let text = plain_text(&rendered(&mut app));
-        let root_line = text.lines().find(|l| l.contains("conversation")).unwrap();
-        let fork_line = text.lines().find(|l| l.contains("branch")).unwrap();
+        let root_line = text
+            .lines()
+            .find(|l| l.contains("conversation") && l.contains("now"))
+            .unwrap();
+        let fork_line = text
+            .lines()
+            .find(|l| l.contains("branch") && l.contains("now"))
+            .unwrap();
         assert!(
             root_line.contains(" now") && fork_line.contains(" now"),
             "both rows show the same time band for the alignment check"

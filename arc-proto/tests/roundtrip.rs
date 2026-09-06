@@ -317,6 +317,8 @@ fn server_frame_arms_round_trip() {
     let arms = [
         server_frame::Msg::SessionList(SessionList {
             sessions: vec![SessionInfo {
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
                 id: "s-01".to_string(),
                 title: "first light".to_string(),
                 started_at: Some(ts()),

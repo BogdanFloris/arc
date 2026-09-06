@@ -41,12 +41,15 @@ options:
   -h, --help     print this message
 
 keys:
-  insert mode (the default)  type; enter sends; esc leaves
-  normal mode                h l 0 $ w b  i I a A  x D dd
-                             j k ctrl-d ctrl-u G gg   scroll
-  any mode                   pageup / pagedown        scroll
-                             s or ctrl-p  sessions    ctrl-n  new session
-                             :q           quit";
+  insert mode    enter sends; ctrl-j adds a newline; esc leaves
+  normal mode    tab switches chat/code; :chat opens chat; :code picks a project
+                 ctrl-p sessions; / filters; enter opens the match
+                 ctrl-o folds one tool; o shows full output; O folds all
+                 v then j/k selects messages and tools; enter inspects
+                 j/k scroll; ctrl-u/ctrl-d page; gg/G top/end
+                 M model defaults; J jobs; Q review; ? help
+  running turn   type to steer; esc esc stops from insert mode
+  any mode       pageup/pagedown scroll; ctrl-c quits";
 
 #[tokio::main]
 async fn main() -> Result<()> {

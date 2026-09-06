@@ -186,6 +186,8 @@ pub struct SessionSummary {
     pub source: i32,
     pub parent_session: String,
     pub disposition: i32,
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1144,7 +1146,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
                 (SELECT MAX(m.ts) FROM messages m
                  WHERE m.session_id = s.id AND m.kind = ?2),
                 s.role, s.project, coalesce(s.dispatched_by, ''), s.source,
-                coalesce(s.parent_session, ''), coalesce(s.disposition, 0)
+                coalesce(s.parent_session, ''), coalesce(s.disposition, 0),
+                coalesce(s.provider, ''), coalesce(s.model, '')
          FROM sessions s ORDER BY s.started_at, s.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![Role::User as i32, KIND_MESSAGE], |row| {
@@ -1160,6 +1163,8 @@ pub(crate) fn sessions(conn: &Connection) -> Result<Vec<SessionSummary>, Error> 
             source: row.get(8)?,
             parent_session: row.get(9)?,
             disposition: row.get(10)?,
+            provider: row.get(11)?,
+            model: row.get(12)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -3612,6 +3617,8 @@ mod tests {
         assert_eq!(
             sessions[1],
             SessionSummary {
+                provider: "gemini".to_owned(),
+                model: "gemini-3-pro".to_owned(),
                 id: "s-a".to_string(),
                 title: "also second".to_string(),
                 started_at: Some(200_000_000),

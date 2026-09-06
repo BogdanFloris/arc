@@ -446,6 +446,12 @@ Protobuf over WebSocket (`wire.proto`), served by `arcd` on localhost. Remote ac
 
 The protocol serves the TUI in Phase 3: send a message, receive streamed deltas and tool-call events, and query sessions and history. Sessions are created implicitly — send with an empty session id and the daemon replies with the assigned one. Clients hold no durable state. The door is the client's choice: a local client started inside a configured project's root opens a bound executor session there, pending until the first message; started anywhere else, or from a remote client whose directory means nothing to the daemon, it opens the conversation. Each door stays reachable from the other. Job status can be queried or refreshed by the TUI. Images, modality hints, unsolicited notifications, and additional transports arrive with the clients that require them.
 
+The TUI keeps the masthead on an empty conversation and uses a compact header during work: door, session title, and the session's recorded model. The model menu changes defaults for new sessions and forks; it never labels that default as an existing session's model. Session summaries carry the recorded provider and model additively on the wire.
+
+`Tab` in normal mode switches between the last concierge and code sessions visited in this client, preserving a draft at each door. `:chat` reaches the concierge; `:code` without a project opens the project picker. A switch never changes a session's role or model. While a turn streams, finish or stop it before switching doors. Tool results fold individually, keep the reading position when opened, and have a scrollable full-output view. The tool's retained result is the limit, not a second permanent display truncation.
+
+Session titles name the concrete task or topic, using bounded opening and recent conversation text rather than only the greeting exchange. Titling stays with idle consolidation and appends `SessionTitled`; existing titles are retained. A conversation containing only greetings may remain untitled until substantive activity arrives. Title prompt changes do not change memory extraction.
+
 Clients:
 
 - `arc` (TUI): first client, exercises everything — tree navigation, streaming, tool visibility, job status. Should use UDS when local, WebSocket when not.

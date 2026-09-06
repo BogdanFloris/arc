@@ -858,6 +858,8 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
         source: summary.source,
         parent_session: summary.parent_session.clone(),
         disposition: summary.disposition,
+        provider: summary.provider.clone(),
+        model: summary.model.clone(),
     }
 }
 
@@ -1608,6 +1610,8 @@ mod tests {
     #[test]
     fn session_info_carries_role_and_project() {
         let summary = SessionSummary {
+            provider: "provider".to_owned(),
+            model: "pinned-model".to_owned(),
             id: "s-1".to_string(),
             title: String::new(),
             started_at: None,
@@ -1623,6 +1627,8 @@ mod tests {
 
         let info = session_info(&summary);
 
+        assert_eq!(info.provider, "provider");
+        assert_eq!(info.model, "pinned-model");
         assert_eq!(info.role, SessionRole::Executor as i32);
         assert_eq!(info.project, "arc");
         assert_eq!(info.dispatched_by, "s-parent");
