@@ -29,6 +29,8 @@ message SessionInfo {
   string parent_session = 10;
   // a branch's standing; DISPOSITION_UNSPECIFIED for a root or an unmarked branch
   arc.v1.BranchMarked.Disposition disposition = 11;
+  string provider = 12;
+  string model = 13;
 }
 
 message ListSessions {}
