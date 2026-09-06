@@ -428,6 +428,8 @@ Two honest edges. The child inherits the user's environment — subscription aut
 
 ### 6.3 Transport and credentials
 
+The sidecar starts only when a configured role or one of its model choices uses the local provider. Omitted roles retain the local default. A hosted-only configuration does not load llama.cpp; the local configuration can remain for later use.
+
 The local provider is a llama.cpp `llama-server` sidecar supervised by `arcd`, spoken to as an OpenAI-compatible endpoint (`/v1/chat/completions`, HTTP + SSE, no auth). The same implementation covers vLLM or any OpenAI-compatible server by config. The sidecar releases device memory after an idle window (`--sleep-idle-seconds`), so an always-on daemon holds tens of MiB of VRAM between turns instead of several GiB, and pays about 1.5 s to wake. That is what makes a local default workable on a machine the user also games on.
 
 It is also why the same code reaches most hosted options: an OpenAI-compatible endpoint is a base URL, a key, and a model id.

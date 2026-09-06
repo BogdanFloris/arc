@@ -33,7 +33,12 @@ use crate::roles::Roles;
 use crate::server;
 
 pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
-    let sidecar = Sidecar::start(&config.llama, &config.model()).await?;
+    let sidecar = if config.needs_sidecar() {
+        Some(Sidecar::start(&config.llama, &config.model()).await?)
+    } else {
+        info!("no local roles configured; llama-server disabled");
+        None
+    };
     let identity = identity::load(dirs.identity()).context("loading the identity file")?;
     if let Some(text) = &identity {
         info!(chars = text.len(), "identity file loaded");
@@ -42,10 +47,13 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     }
     let identity_for_consolidation = identity.clone();
     let secrets = Secrets::new(dirs.secrets());
-    let roles = match Roles::resolve(&config, sidecar.endpoint(), &secrets, identity) {
+    let endpoint = sidecar.as_ref().map_or("", Sidecar::endpoint);
+    let roles = match Roles::resolve(&config, endpoint, &secrets, identity) {
         Ok(roles) => roles,
         Err(error) => {
-            sidecar.stop().await;
+            if let Some(sidecar) = sidecar {
+                sidecar.stop().await;
+            }
             return Err(error);
         }
     };
@@ -53,7 +61,9 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
         Ok(daemon) => daemon.serve().await,
         Err(error) => Err(error),
     };
-    sidecar.stop().await;
+    if let Some(sidecar) = sidecar {
+        sidecar.stop().await;
+    }
     served
 }
 

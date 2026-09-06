@@ -398,6 +398,24 @@ impl Default for LlamaConfig {
 }
 
 impl Config {
+    pub fn needs_sidecar(&self) -> bool {
+        [
+            self.roles.concierge.as_ref(),
+            self.roles.executor.as_ref(),
+            self.roles.archivist.as_ref(),
+        ]
+        .into_iter()
+        .any(|role| match role {
+            None => true,
+            Some(role) if role.choices.is_empty() => role.provider == Some(RoleProvider::Local),
+            Some(role) => role.choices.iter().any(|name| {
+                self.models
+                    .get(name)
+                    .is_some_and(|preset| preset.provider == Some(RoleProvider::Local))
+            }),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -455,6 +473,43 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+
+    #[test]
+    fn hosted_roles_skip_the_sidecar_but_local_choices_and_defaults_need_it() {
+        let mut config: Config = toml::from_str(
+            r#"
+[models.hosted]
+provider = "gemini"
+model = "test"
+key = "test"
+[models.local]
+provider = "local"
+[roles.concierge]
+choices = ["hosted"]
+[roles.executor]
+choices = ["hosted"]
+[roles.archivist]
+choices = ["hosted"]
+"#,
+        )
+        .expect("config");
+        config.validate().expect("valid");
+        assert!(!config.needs_sidecar());
+        config
+            .roles
+            .executor
+            .as_mut()
+            .unwrap()
+            .choices
+            .push("local".to_owned());
+        assert!(config.needs_sidecar());
+        config.roles.executor.as_mut().unwrap().choices.pop();
+        config.roles.archivist = Some(config.models["local"].clone());
+        assert!(config.needs_sidecar());
+        config.roles.archivist = None;
+        assert!(config.needs_sidecar());
+        assert!(Config::default().needs_sidecar());
+    }
 
     #[test]
     fn an_empty_file_is_the_defaults() {
