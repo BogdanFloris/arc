@@ -78,6 +78,36 @@ impl Secrets {
         }
         Ok(key)
     }
+
+    pub fn write(&self, name: &str, text: &str) -> Result<(), Error> {
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            return Err(Error::Name(name.to_owned()));
+        }
+        let io = |source| Error::Io {
+            name: name.to_owned(),
+            source,
+        };
+        let path = self.dir.join(name);
+        let staging = self.dir.join(format!("{name}.tmp"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write as _;
+            let mut file = options.open(&staging).map_err(io)?;
+            file.write_all(text.as_bytes()).map_err(io)?;
+            file.sync_all().map_err(io)?;
+        }
+        std::fs::rename(&staging, &path).map_err(io)
+    }
+
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +178,27 @@ mod tests {
     }
 
     #[test]
+    fn a_written_secret_is_owner_only_and_reads_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secrets = Secrets::new(dir.path());
+
+        secrets.write("codex", "{\"a\":1}").expect("writes");
+        secrets.write("codex", "{\"a\":2}").expect("overwrites");
+
+        let mode = std::fs::metadata(dir.path().join("codex"))
+            .expect("exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(secrets.read("codex").expect("reads"), "{\"a\":2}");
+        assert!(
+            !dir.path().join("codex.tmp").exists(),
+            "no staging file left"
+        );
+    }
+
+    #[test]
     fn a_name_that_walks_out_of_the_directory_is_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
         write(dir.path(), "gemini", "sk-abc123", 0o600);
@@ -156,6 +207,10 @@ mod tests {
             let err = Secrets::new(dir.path())
                 .read(name)
                 .expect_err("a secret name is a bare file name");
+            assert!(matches!(err, Error::Name(_)), "{name}: {err}");
+            let err = Secrets::new(dir.path())
+                .write(name, "x")
+                .expect_err("writes are held to the same rule");
             assert!(matches!(err, Error::Name(_)), "{name}: {err}");
         }
     }
