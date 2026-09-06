@@ -151,20 +151,10 @@ impl Daemon {
             .iter()
             .map(|(name, project)| (name.clone(), project_spec(project)))
             .collect();
-        let role_identities = roles
-            .all()
-            .into_iter()
-            .map(|runner| {
-                (
-                    runner.role,
-                    (runner.provider.name().to_owned(), runner.model.clone()),
-                )
-            })
-            .collect();
         let (notifier, _receiver) = broadcast::channel(NOTIFICATION_CAPACITY);
         let engine = Engine::new(store, registry)
             .with_projects(projects)
-            .with_role_identities(role_identities)
+            .with_role_choices(roles.choices())
             .with_notifier(notifier.clone())
             .with_expert_enabled(expert_enabled);
 
@@ -243,6 +233,7 @@ impl Daemon {
             .collect();
         let supervisor = Arc::new(
             Supervisor::new(Arc::clone(&self.engine), job_runners)
+                .with_menus(self.roles.menus())
                 .with_projects(project_roots)
                 .with_notifier(self.notifier.clone())
                 .with_concierge(self.roles.concierge().clone())

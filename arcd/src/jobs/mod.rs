@@ -78,6 +78,8 @@ pub enum SendOutcome {
 pub(crate) struct Shared {
     engine: Arc<Engine>,
     runners: BTreeMap<SessionRole, Runner>,
+    // every configured choice per role; the engine's recorded selection picks
+    menus: BTreeMap<SessionRole, Vec<(String, Runner)>>,
     concierge: Option<Runner>,
     projects: BTreeMap<String, Project>,
     identity: Option<String>,
@@ -99,6 +101,7 @@ impl Supervisor {
             shared: Shared {
                 engine,
                 runners,
+                menus: BTreeMap::new(),
                 concierge: None,
                 projects: BTreeMap::new(),
                 identity: None,
@@ -127,6 +130,12 @@ impl Supervisor {
     #[must_use]
     pub fn with_concierge(mut self, runner: Runner) -> Self {
         self.shared.concierge = Some(runner);
+        self
+    }
+
+    #[must_use]
+    pub fn with_menus(mut self, menus: BTreeMap<SessionRole, Vec<(String, Runner)>>) -> Self {
+        self.shared.menus = menus;
         self
     }
 
@@ -196,11 +205,7 @@ impl Supervisor {
     }
 
     pub(crate) fn role_runner(&self, role: SessionRole) -> Option<Runner> {
-        self.shared
-            .runners
-            .get(&role)
-            .cloned()
-            .or_else(|| self.shared.concierge.clone())
+        selected_runner(&self.shared, role).or_else(|| self.shared.concierge.clone())
     }
 
     pub(crate) fn project_list(&self) -> &[ProjectInfo] {
@@ -367,13 +372,33 @@ fn autonomy_allows(shared: &Shared, session_id: &str, content: &str, source: Sou
     false
 }
 
+/// The role's runner under the engine's current selection: the recorded
+/// choice when it is on the menu, else the menu's first, else the plain
+/// runner the supervisor was built with.
+fn selected_runner(shared: &Shared, role: SessionRole) -> Option<Runner> {
+    if let Some(menu) = shared.menus.get(&role).filter(|menu| !menu.is_empty()) {
+        let picked = shared.engine.selected_choice(role).ok().flatten();
+        let entry = picked
+            .and_then(|name| menu.iter().find(|(choice, _)| *choice == name))
+            .or_else(|| menu.first());
+        if let Some((_, runner)) = entry {
+            return Some(runner.clone());
+        }
+    }
+    shared.runners.get(&role).cloned()
+}
+
 fn concierge_runner(shared: &Shared) -> Result<Runner, SessionError> {
-    shared
-        .concierge
-        .clone()
+    let mut runner = selected_runner(shared, SessionRole::Concierge)
+        .or_else(|| shared.concierge.clone())
         .ok_or_else(|| SessionError::NoRunner {
             role: role_label(SessionRole::Concierge).to_owned(),
-        })
+        })?;
+    // the concierge's system prompt rides the runner given to the supervisor
+    if let Some(concierge) = &shared.concierge {
+        runner.system.clone_from(&concierge.system);
+    }
+    Ok(runner)
 }
 
 /// The runner a session the user (or a handback) writes into runs under,
@@ -389,8 +414,8 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
     let (SessionRole::Executor | SessionRole::Archivist) = role else {
         return concierge_runner(shared);
     };
-    let mut runner = match shared.runners.get(&role) {
-        Some(runner) => runner.clone(),
+    let mut runner = match selected_runner(shared, role) {
+        Some(runner) => runner,
         None => concierge_runner(shared)?,
     };
     if role == SessionRole::Executor {
@@ -449,7 +474,7 @@ fn spawn_job_checked(
     guard_absent: bool,
     initial_spent_tokens: u64,
 ) -> bool {
-    let Some(mut runner) = shared.runners.get(&job.role).cloned() else {
+    let Some(mut runner) = selected_runner(shared, job.role) else {
         warn!(
             session_id = %job.session_id,
             role = role_label(job.role),

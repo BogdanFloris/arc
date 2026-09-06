@@ -247,6 +247,10 @@ async fn request(
         Some(client_frame::Msg::ListProjects(_)) => {
             list_projects(ws, supervisor, frame.request_id).await
         }
+        Some(client_frame::Msg::ListModels(_)) => list_models(ws, engine, frame.request_id).await,
+        Some(client_frame::Msg::SelectModel(select)) => {
+            select_model(ws, engine, frame.request_id, select.role, &select.choice).await
+        }
         Some(client_frame::Msg::CancelJob(cancel)) => {
             cancel_job(ws, supervisor, frame.request_id, &cancel.session_id).await
         }
@@ -449,6 +453,35 @@ async fn list_projects(
     let msg = server_frame::Msg::ProjectList(ProjectList {
         projects: supervisor.project_list().to_vec(),
     });
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+async fn list_models(ws: &mut Socket, engine: &Engine, request_id: u64) -> ControlFlow<()> {
+    let msg = match engine.model_list() {
+        Ok(list) => server_frame::Msg::ModelList(list),
+        Err(error) => error_frame(error_code(&error), error),
+    };
+    flow(send_frame(ws, request_id, msg).await)
+}
+
+async fn select_model(
+    ws: &mut Socket,
+    engine: &Engine,
+    request_id: u64,
+    role: i32,
+    choice: &str,
+) -> ControlFlow<()> {
+    let role = SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified);
+    let msg = match engine
+        .select_model(role, choice)
+        .and_then(|()| engine.model_list())
+    {
+        Ok(list) => server_frame::Msg::ModelList(list),
+        Err(error) => {
+            warn!(%error, code = error_code(&error), "select_model failed");
+            error_frame(error_code(&error), error)
+        }
+    };
     flow(send_frame(ws, request_id, msg).await)
 }
 
@@ -777,6 +810,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::ModelMismatch { .. } => "model_mismatch",
         SessionError::Provider(_) => "provider",
         SessionError::UnknownProject { .. } => "unknown_project",
+        SessionError::UnknownChoice { .. } => "unknown_choice",
         SessionError::UnknownSession { .. } => "unknown_session",
         SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
         SessionError::NotABranch { .. } => "not_a_branch",
@@ -796,6 +830,8 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
         Some(client_frame::Msg::ListProjects(_)) => "list_projects",
+        Some(client_frame::Msg::ListModels(_)) => "list_models",
+        Some(client_frame::Msg::SelectModel(_)) => "select_model",
         Some(client_frame::Msg::Subscribe(_)) => "subscribe",
         Some(client_frame::Msg::CompactSession(_)) => "compact_session",
         Some(client_frame::Msg::CancelJob(_)) => "cancel_job",
@@ -854,11 +890,11 @@ mod tests {
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
         CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, HistoryEntry,
-        HistoryMessage, HistoryToolCall, HistoryToolResult, ListJobs, ListProjects, ListSessions,
-        MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete,
-        MemoryReviewList, Notification, ProjectInfo, Role, SessionCreated, SessionEvent,
-        SessionRole, Subscribe, ToolOutcome, event, job_info, memory_event, memory_record,
-        notification, session_event,
+        HistoryMessage, HistoryToolCall, HistoryToolResult, ListJobs, ListModels, ListProjects,
+        ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
+        MemoryReviewDelete, MemoryReviewList, Notification, ProjectInfo, Role, SelectModel,
+        SessionCreated, SessionEvent, SessionRole, Subscribe, ToolOutcome, event, job_info,
+        memory_event, memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -3450,6 +3486,60 @@ mod tests {
         match frame.msg {
             Some(server_frame::Msg::JobList(list)) => list.jobs,
             other => panic!("expected JobList, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_model_menu_lists_and_a_selection_answers_with_the_new_pick() {
+        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
+        let harness = Harness::with_executor(
+            Script::Canned(VecDeque::new()),
+            registry,
+            Script::Canned(VecDeque::new()),
+            projects,
+        )
+        .await;
+        let mut ws = harness.connect().await;
+
+        send(&mut ws, 1, client_frame::Msg::ListModels(ListModels {})).await;
+        let frame = next_frame(&mut ws).await;
+        let listed = match frame.msg {
+            Some(server_frame::Msg::ModelList(list)) => list.choices,
+            other => panic!("expected ModelList, got {other:?}"),
+        };
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].role, SessionRole::Executor as i32);
+        assert_eq!(listed[0].name, "test-model");
+        assert!(listed[0].selected, "the only choice is the pick");
+
+        send(
+            &mut ws,
+            2,
+            client_frame::Msg::SelectModel(SelectModel {
+                role: SessionRole::Executor as i32,
+                choice: "nope".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        match frame.msg {
+            Some(server_frame::Msg::Error(error)) => assert_eq!(error.code, "unknown_choice"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        send(
+            &mut ws,
+            3,
+            client_frame::Msg::SelectModel(SelectModel {
+                role: SessionRole::Executor as i32,
+                choice: "test-model".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        match frame.msg {
+            Some(server_frame::Msg::ModelList(list)) => assert!(list.choices[0].selected),
+            other => panic!("expected ModelList, got {other:?}"),
         }
     }
 

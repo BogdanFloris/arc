@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -8,7 +8,7 @@ use arc_core::provider::openai::OpenAiCompat;
 use arc_core::provider::sidecar::Sidecar;
 use arc_core::provider::{Provider, Thinking, gemini, role_label};
 use arc_core::secrets::Secrets;
-use arc_core::session::Runner;
+use arc_core::session::{ModelChoice, Runner};
 use arc_proto::v1::SessionRole;
 
 use crate::config::{Config, RoleConfig, RoleProvider};
@@ -56,11 +56,13 @@ fn concierge_system(identity: Option<String>) -> String {
     }
 }
 
+/// Per role, the runners its configured choices resolve to, in config order.
+/// The first is the default; the engine's recorded selection picks among them.
 #[derive(Debug)]
 pub struct Roles {
-    concierge: Runner,
-    executor: Runner,
-    archivist: Runner,
+    concierge: Vec<(String, Runner)>,
+    executor: Vec<(String, Runner)>,
+    archivist: Vec<(String, Runner)>,
 }
 
 impl Roles {
@@ -94,19 +96,46 @@ impl Roles {
     }
 
     pub fn concierge(&self) -> &Runner {
-        &self.concierge
+        &self.concierge[0].1
     }
 
     pub fn executor(&self) -> &Runner {
-        &self.executor
+        &self.executor[0].1
     }
 
     pub fn archivist(&self) -> &Runner {
-        &self.archivist
+        &self.archivist[0].1
     }
 
     pub fn all(&self) -> [&Runner; 3] {
-        [&self.concierge, &self.executor, &self.archivist]
+        [self.concierge(), self.executor(), self.archivist()]
+    }
+
+    pub fn menus(&self) -> BTreeMap<SessionRole, Vec<(String, Runner)>> {
+        BTreeMap::from([
+            (SessionRole::Concierge, self.concierge.clone()),
+            (SessionRole::Executor, self.executor.clone()),
+            (SessionRole::Archivist, self.archivist.clone()),
+        ])
+    }
+
+    pub fn choices(&self) -> BTreeMap<SessionRole, Vec<ModelChoice>> {
+        self.menus()
+            .into_iter()
+            .map(|(role, menu)| {
+                (
+                    role,
+                    menu.into_iter()
+                        .map(|(name, runner)| ModelChoice {
+                            name,
+                            provider: runner.provider.name().to_owned(),
+                            model: runner.model,
+                            thinking: runner.thinking,
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -139,38 +168,54 @@ impl<'a> Built<'a> {
         configured: Option<&RoleConfig>,
         config: &Config,
         system: Option<String>,
-    ) -> Result<Runner> {
+    ) -> Result<Vec<(String, Runner)>> {
         let name = role_label(role);
         let Some(configured) = configured else {
-            return Ok(Runner {
+            let runner = Runner {
                 role,
                 provider: self.sidecar(),
                 model: config.model(),
                 thinking: Thinking::Default,
                 system,
                 compact_at: None,
-            });
+            };
+            return Ok(vec![(runner.model.clone(), runner)]);
         };
-        // the first choice is the default until a selection event says otherwise;
-        // the rest are built now so a missing credential is known at startup
-        let mut choices = configured.choices.iter().map(|choice| {
-            (
-                choice.as_str(),
-                config
-                    .models
-                    .get(choice)
-                    .expect("config validation requires every choice to be a preset"),
-            )
-        });
-        let configured = match choices.next() {
-            Some((_, preset)) => preset,
-            None => configured,
-        };
-        for (choice, preset) in choices {
-            if let Err(error) = self.provider_for(choice, preset, config) {
-                tracing::warn!(role = name, choice, error = %error, "a model choice is unavailable");
+        if configured.choices.is_empty() {
+            let runner = self.runner(role, name, configured, config, system)?;
+            return Ok(vec![(runner.model.clone(), runner)]);
+        }
+        // the first choice must resolve: it is the default until a selection
+        // says otherwise; a later one that cannot is dropped with a warning
+        let mut menu = Vec::with_capacity(configured.choices.len());
+        for (position, choice) in configured.choices.iter().enumerate() {
+            let preset = config
+                .models
+                .get(choice)
+                .expect("config validation requires every choice to be a preset");
+            match self.runner(role, choice, preset, config, system.clone()) {
+                Ok(runner) => menu.push((choice.clone(), runner)),
+                Err(error) if position == 0 => {
+                    return Err(
+                        error.context(format!("the `{name}` role's default choice `{choice}`"))
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(role = name, choice, error = %error, "a model choice is unavailable");
+                }
             }
         }
+        Ok(menu)
+    }
+
+    fn runner(
+        &mut self,
+        role: SessionRole,
+        name: &str,
+        configured: &RoleConfig,
+        config: &Config,
+        system: Option<String>,
+    ) -> Result<Runner> {
         let thinking = configured.thinking;
         let compact_at = configured
             .context_window
@@ -623,6 +668,20 @@ key      = "codex"
         assert_eq!(executor.model, "deepseek-v4-flash");
         assert_eq!(executor.thinking, arc_core::provider::Thinking::Low);
         assert_eq!(executor.compact_at, Some(80_000));
+        let menu = roles.menus();
+        assert_eq!(
+            menu[&arc_proto::v1::SessionRole::Executor]
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["flash"],
+            "the unavailable choice is left off the menu"
+        );
+        assert_eq!(
+            roles.choices()[&arc_proto::v1::SessionRole::Concierge][0].name,
+            Config::default().model(),
+            "a role without choices is a one-entry menu named by its model"
+        );
 
         let empty = tempfile::tempdir().expect("temp dir");
         let err =
