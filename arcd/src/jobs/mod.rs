@@ -77,10 +77,8 @@ pub enum SendOutcome {
 #[derive(Clone)]
 pub(crate) struct Shared {
     engine: Arc<Engine>,
-    runners: BTreeMap<SessionRole, Runner>,
     // every configured choice per role; the engine's recorded selection picks
     menus: BTreeMap<SessionRole, Vec<(String, Runner)>>,
-    concierge: Option<Runner>,
     projects: BTreeMap<String, Project>,
     identity: Option<String>,
     live: Arc<LiveMap>,
@@ -96,13 +94,11 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(engine: Arc<Engine>, runners: BTreeMap<SessionRole, Runner>) -> Self {
+    pub fn new(engine: Arc<Engine>, menus: BTreeMap<SessionRole, Vec<(String, Runner)>>) -> Self {
         Self {
             shared: Shared {
                 engine,
-                runners,
-                menus: BTreeMap::new(),
-                concierge: None,
+                menus,
                 projects: BTreeMap::new(),
                 identity: None,
                 live: Arc::new(Mutex::new(HashMap::new())),
@@ -127,16 +123,23 @@ impl Supervisor {
         self
     }
 
-    #[must_use]
+    #[cfg(test)]
     pub fn with_concierge(mut self, runner: Runner) -> Self {
-        self.shared.concierge = Some(runner);
+        self.shared
+            .menus
+            .insert(SessionRole::Concierge, vec![(runner.model.clone(), runner)]);
         self
     }
 
-    #[must_use]
-    pub fn with_menus(mut self, menus: BTreeMap<SessionRole, Vec<(String, Runner)>>) -> Self {
-        self.shared.menus = menus;
-        self
+    #[cfg(test)]
+    pub fn for_test(engine: Arc<Engine>, runners: BTreeMap<SessionRole, Runner>) -> Self {
+        Self::new(
+            engine,
+            runners
+                .into_iter()
+                .map(|(role, runner)| (role, vec![(runner.model.clone(), runner)]))
+                .collect(),
+        )
     }
 
     #[must_use]
@@ -205,7 +208,8 @@ impl Supervisor {
     }
 
     pub(crate) fn role_runner(&self, role: SessionRole) -> Option<Runner> {
-        selected_runner(&self.shared, role).or_else(|| self.shared.concierge.clone())
+        selected_runner(&self.shared, role)
+            .or_else(|| selected_runner(&self.shared, SessionRole::Concierge))
     }
 
     pub(crate) fn project_list(&self) -> &[ProjectInfo] {
@@ -372,33 +376,19 @@ fn autonomy_allows(shared: &Shared, session_id: &str, content: &str, source: Sou
     false
 }
 
-/// The role's runner under the engine's current selection: the recorded
-/// choice when it is on the menu, else the menu's first, else the plain
-/// runner the supervisor was built with.
 fn selected_runner(shared: &Shared, role: SessionRole) -> Option<Runner> {
-    if let Some(menu) = shared.menus.get(&role).filter(|menu| !menu.is_empty()) {
-        let picked = shared.engine.selected_choice(role).ok().flatten();
-        let entry = picked
-            .and_then(|name| menu.iter().find(|(choice, _)| *choice == name))
-            .or_else(|| menu.first());
-        if let Some((_, runner)) = entry {
-            return Some(runner.clone());
-        }
-    }
-    shared.runners.get(&role).cloned()
+    let menu = shared.menus.get(&role)?;
+    let picked = shared.engine.selected_choice(role).ok().flatten();
+    picked
+        .and_then(|name| menu.iter().find(|(choice, _)| *choice == name))
+        .or_else(|| menu.first())
+        .map(|(_, runner)| runner.clone())
 }
 
 fn concierge_runner(shared: &Shared) -> Result<Runner, SessionError> {
-    let mut runner = selected_runner(shared, SessionRole::Concierge)
-        .or_else(|| shared.concierge.clone())
-        .ok_or_else(|| SessionError::NoRunner {
-            role: role_label(SessionRole::Concierge).to_owned(),
-        })?;
-    // the concierge's system prompt rides the runner given to the supervisor
-    if let Some(concierge) = &shared.concierge {
-        runner.system.clone_from(&concierge.system);
-    }
-    Ok(runner)
+    selected_runner(shared, SessionRole::Concierge).ok_or_else(|| SessionError::NoRunner {
+        role: role_label(SessionRole::Concierge).to_owned(),
+    })
 }
 
 /// The runner a session the user (or a handback) writes into runs under,
@@ -644,12 +634,71 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn the_selected_menu_entry_carries_its_model_and_prompt() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let mut first = runner(&provider);
+        first.model = "first-model".to_owned();
+        first.system = Some("first prompt".to_owned());
+        let mut second = first.clone();
+        second.model = "second-model".to_owned();
+        second.system = Some("second prompt".to_owned());
+        let menu = vec![("first".to_owned(), first), ("second".to_owned(), second)];
+        let choices = menu
+            .iter()
+            .map(|(name, runner)| arc_core::session::ModelChoice {
+                name: name.clone(),
+                provider: runner.provider.name().to_owned(),
+                model: runner.model.clone(),
+                thinking: runner.thinking,
+            })
+            .collect();
+        let engine = Arc::new(
+            Engine::new(
+                Store::new(
+                    Log::open(dir.path()).expect("log"),
+                    Projection::in_memory().expect("projection"),
+                ),
+                Registry::new(512),
+            )
+            .with_role_choices(BTreeMap::from([(SessionRole::Concierge, choices)])),
+        );
+        let supervisor = Supervisor::new(
+            Arc::clone(&engine),
+            BTreeMap::from([(SessionRole::Concierge, menu)]),
+        );
+        assert_eq!(
+            supervisor
+                .role_runner(SessionRole::Concierge)
+                .expect("default")
+                .model,
+            "first-model"
+        );
+        engine
+            .select_model(SessionRole::Concierge, "second")
+            .expect("select");
+        let selected = supervisor
+            .role_runner(SessionRole::Concierge)
+            .expect("selected");
+        assert_eq!(selected.model, "second-model");
+        assert_eq!(selected.system.as_deref(), Some("second prompt"));
+        assert_eq!(
+            supervisor
+                .role_runner(SessionRole::Executor)
+                .expect("concierge fallback")
+                .model,
+            "second-model"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_job_with_no_runner_for_its_role_logs_and_skips_without_a_panic() {
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
         let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
-        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
 
         supervisor.spawn(DispatchedJob {
             session_id: "s-ghost".to_owned(),
@@ -699,7 +748,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -788,7 +837,7 @@ mod tests {
         );
 
         let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
         supervisor.repair_restart_handbacks();
 
         assert_eq!(
@@ -801,7 +850,7 @@ mod tests {
         );
 
         let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
         supervisor.repair_restart_handbacks();
 
         assert_eq!(
@@ -826,7 +875,7 @@ mod tests {
         );
 
         let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
         supervisor.repair_restart_handbacks();
 
         assert_eq!(
@@ -848,7 +897,7 @@ mod tests {
         );
 
         let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::new(Arc::clone(&engine), BTreeMap::new());
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
         supervisor.repair_restart_handbacks();
 
         assert_eq!(
@@ -883,7 +932,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -939,7 +988,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1034,7 +1083,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child.clone(),
@@ -1139,7 +1188,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         let _stream = supervisor
             .send(
@@ -1233,7 +1282,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1295,7 +1344,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1369,7 +1418,7 @@ mod tests {
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor =
-            Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier.clone());
+            Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier.clone());
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1415,7 +1464,7 @@ mod tests {
         let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
         let provider = ScriptedProvider::scripted(vec![]);
         let runners = BTreeMap::from([(SessionRole::Executor, executor_runner(&provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
         let shared = &supervisor.shared;
 
         // stands in for a first resume already holding this session's slot
@@ -1475,7 +1524,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1528,7 +1577,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1585,7 +1634,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1626,7 +1675,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1725,7 +1774,7 @@ mod tests {
                 },
             ),
         ]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: sibling.clone(),

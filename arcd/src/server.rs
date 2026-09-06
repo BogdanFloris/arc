@@ -1137,7 +1137,7 @@ mod tests {
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
-                Supervisor::new(Arc::clone(&engine), job_runners)
+                Supervisor::for_test(Arc::clone(&engine), job_runners)
                     .with_projects(
                         project_roots
                             .into_iter()
@@ -1200,7 +1200,7 @@ mod tests {
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
-                Supervisor::new(Arc::clone(&engine), BTreeMap::new())
+                Supervisor::for_test(Arc::clone(&engine), BTreeMap::new())
                     .with_notifier(notifier.clone())
                     .with_concierge(runner),
             );
@@ -3810,7 +3810,7 @@ mod tests {
             compact_at: None,
         };
         let supervisor = Arc::new(
-            Supervisor::new(
+            Supervisor::for_test(
                 Arc::clone(&engine),
                 BTreeMap::from([(SessionRole::Executor, executor_runner)]),
             )

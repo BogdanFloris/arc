@@ -339,7 +339,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -410,7 +410,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -453,7 +453,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -496,7 +496,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -542,7 +542,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -581,7 +581,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -612,7 +612,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         // usage() reports 8 tokens combined; a cap of 5 is over budget as
         // soon as the brief turn lands
@@ -650,7 +650,7 @@ mod tests {
         let engine = engine_for_project(&dir, &root);
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         for i in 0..SPAWNED {
             let child_id = child_session(&engine, &concierge_provider);
@@ -694,7 +694,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -727,7 +727,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -763,7 +763,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -797,7 +797,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         // usage() reports 8 tokens combined; a cap of 5 is over budget as
         // soon as the brief turn lands
@@ -862,7 +862,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -932,7 +932,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1000,7 +1000,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1053,7 +1053,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1103,7 +1103,7 @@ mod tests {
             ),
             Registry::new(512),
         ));
-        let supervisor = Supervisor::new(engine, BTreeMap::new());
+        let supervisor = Supervisor::for_test(engine, BTreeMap::new());
 
         assert!(!supervisor.drop_steers("s-never-existed"));
     }

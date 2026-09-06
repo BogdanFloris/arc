@@ -13,8 +13,8 @@ use arc_core::tool::Registry;
 use arc_core::tool::builtin;
 use arc_core::tool::expert::Expert;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
-use arc_proto::v1::{Notification, ReviewChanged, SessionRole, notification};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use arc_proto::v1::{Notification, ReviewChanged, notification};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -213,10 +213,6 @@ impl Daemon {
             self.notifier.clone(),
         );
 
-        let job_runners = BTreeMap::from([
-            (SessionRole::Executor, self.roles.executor().clone()),
-            (SessionRole::Archivist, self.roles.archivist().clone()),
-        ]);
         let project_roots = self
             .config
             .projects
@@ -242,11 +238,9 @@ impl Daemon {
             })
             .collect();
         let supervisor = Arc::new(
-            Supervisor::new(Arc::clone(&self.engine), job_runners)
-                .with_menus(self.roles.menus())
+            Supervisor::new(Arc::clone(&self.engine), self.roles.menus())
                 .with_projects(project_roots)
                 .with_notifier(self.notifier.clone())
-                .with_concierge(self.roles.concierge().clone())
                 .with_identity(self.identity.clone())
                 .with_project_list(project_list),
         );

@@ -82,13 +82,7 @@ pub struct Engine {
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    // live turns only: a drive_turn registers on entry and a drop guard
-    // deregisters on every exit, so a session appears here only while its
-    // turn is actually running
-    cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
-    // same lifecycle as `cancels`: a per-turn inbox drained at step
-    // boundaries, so a message sent mid-turn lands without a new turn
-    inboxes: StdMutex<HashMap<String, mpsc::UnboundedSender<Inbound>>>,
+    live_turns: StdMutex<HashMap<String, LiveTurn>>,
     notifier: Option<broadcast::Sender<Notification>>,
 }
 
@@ -239,8 +233,7 @@ impl Engine {
             role_choices: BTreeMap::new(),
             expert_enabled: false,
             turns: StdMutex::new(HashMap::new()),
-            cancels: StdMutex::new(HashMap::new()),
-            inboxes: StdMutex::new(HashMap::new()),
+            live_turns: StdMutex::new(HashMap::new()),
             notifier: None,
         }
     }
@@ -266,10 +259,10 @@ impl Engine {
     }
 
     pub fn cancel_turn(&self, session_id: &str) -> bool {
-        let cancels = self.cancels.lock().expect("cancels lock poisoned");
-        match cancels.get(session_id) {
-            Some(tx) => {
-                let _ = tx.send(true);
+        let live = self.live_turns.lock().expect("live turns lock poisoned");
+        match live.get(session_id) {
+            Some(turn) => {
+                let _ = turn.cancel.send(true);
                 true
             }
             None => false,
@@ -279,9 +272,9 @@ impl Engine {
     /// Whether a turn is currently driving this session — the same registry
     /// `cancel_turn` checks, read without sending anything.
     pub fn turn_is_live(&self, session_id: &str) -> bool {
-        self.cancels
+        self.live_turns
             .lock()
-            .expect("cancels lock poisoned")
+            .expect("live turns lock poisoned")
             .contains_key(session_id)
     }
 
@@ -289,9 +282,10 @@ impl Engine {
     /// step boundary. Returns whether a turn was live and accepted it; a
     /// caller sees `false` when it must start a turn itself instead.
     pub fn queue_message(&self, session_id: &str, content: &str, source: Source) -> bool {
-        let inboxes = self.inboxes.lock().expect("inboxes lock poisoned");
-        match inboxes.get(session_id) {
-            Some(tx) => tx
+        let live = self.live_turns.lock().expect("live turns lock poisoned");
+        match live.get(session_id) {
+            Some(turn) => turn
+                .inbox
                 .send(Inbound {
                     content: content.to_owned(),
                     source,
@@ -1215,20 +1209,19 @@ impl Engine {
         let mut grounding: Option<String> = None;
 
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        self.cancels
-            .lock()
-            .expect("cancels lock poisoned")
-            .insert(session_id.to_owned(), cancel_tx);
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Inbound>();
-        self.inboxes
+        self.live_turns
             .lock()
-            .expect("inboxes lock poisoned")
-            .insert(session_id.to_owned(), inbox_tx);
-        // the drop guard is the honest shape: every exit from this loop,
-        // including a `?` early return, must deregister both entries
+            .expect("live turns lock poisoned")
+            .insert(
+                session_id.to_owned(),
+                LiveTurn {
+                    cancel: cancel_tx,
+                    inbox: inbox_tx,
+                },
+            );
         let _turn_guard = TurnRegistration {
-            cancels: &self.cancels,
-            inboxes: &self.inboxes,
+            live: &self.live_turns,
             session_id,
         };
 
@@ -2543,21 +2536,21 @@ enum Ending {
     Failed(provider::Error),
 }
 
+struct LiveTurn {
+    cancel: watch::Sender<bool>,
+    inbox: mpsc::UnboundedSender<Inbound>,
+}
+
 struct TurnRegistration<'a> {
-    cancels: &'a StdMutex<HashMap<String, watch::Sender<bool>>>,
-    inboxes: &'a StdMutex<HashMap<String, mpsc::UnboundedSender<Inbound>>>,
+    live: &'a StdMutex<HashMap<String, LiveTurn>>,
     session_id: &'a str,
 }
 
 impl Drop for TurnRegistration<'_> {
     fn drop(&mut self) {
-        self.cancels
+        self.live
             .lock()
-            .expect("cancels lock poisoned")
-            .remove(self.session_id);
-        self.inboxes
-            .lock()
-            .expect("inboxes lock poisoned")
+            .expect("live turns lock poisoned")
             .remove(self.session_id);
     }
 }
@@ -3089,24 +3082,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cancel_registry_is_empty_after_a_normal_turn() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("all done")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert!(
-            !engine.cancel_turn(&reply.session_id),
-            "the turn already ended; a second cancel finds nothing registered"
-        );
-    }
-
-    #[tokio::test]
     async fn queue_message_on_an_idle_session_returns_false_and_appends_nothing() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
@@ -3117,7 +3092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_message_is_refused_once_the_turn_has_ended() {
+    async fn a_finished_turn_unregisters_cancellation_and_messages() {
         let provider = ScriptedProvider::scripted(vec![done_reply("all done")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
@@ -3128,6 +3103,8 @@ mod tests {
             .await
             .expect("send");
 
+        assert!(!engine.turn_is_live(&reply.session_id));
+        assert!(!engine.cancel_turn(&reply.session_id));
         assert!(
             !engine.queue_message(&reply.session_id, "late", Source::User),
             "the turn ended; the inbox is deregistered"
@@ -3349,6 +3326,8 @@ mod tests {
             !engine.cancel_turn(&session_id),
             "the turn ended; the registry is clean"
         );
+        assert!(!engine.turn_is_live(&session_id));
+        assert!(!engine.queue_message(&session_id, "late", Source::User));
     }
 
     #[tokio::test]

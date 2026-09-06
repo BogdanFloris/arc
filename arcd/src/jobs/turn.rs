@@ -604,7 +604,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners).with_notifier(notifier);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -649,7 +649,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -699,7 +699,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         // usage() reports 8 tokens combined; a cap of 5 is over budget as
         // soon as the brief turn lands, before any steer is even queued
@@ -761,7 +761,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -815,7 +815,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         // total_tokens: 0 means the token dimension is unlimited; only
         // wall-clock is enforced
@@ -885,7 +885,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         // usage() reports 8 tokens per turn: the brief alone (8) stays under
         // a cap of 10, but the brief plus the first steer (16) crosses it,
@@ -946,7 +946,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1023,7 +1023,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -1095,7 +1095,7 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::new(Arc::clone(&engine), runners);
+        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
