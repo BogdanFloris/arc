@@ -69,6 +69,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-proto",
+ "base64",
  "chrono",
  "crc32fast",
  "expect-test",

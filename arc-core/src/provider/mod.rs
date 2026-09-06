@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod gemini;
 pub mod openai;
 pub mod sidecar;
@@ -184,6 +185,9 @@ pub enum Error {
 
     #[error("malformed provider stream: {0}")]
     MalformedStream(String),
+
+    #[error("provider refused the request: {0}")]
+    Refused(String),
 }
 
 impl Error {
