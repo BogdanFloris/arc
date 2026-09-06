@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use arc_core::provider::codex::{self, Codex};
 use arc_core::provider::gemini::Gemini;
 use arc_core::provider::openai::OpenAiCompat;
 use arc_core::provider::sidecar::Sidecar;
@@ -186,6 +187,19 @@ impl<'a> Built<'a> {
                         .expect("config validation requires a model for gemini"),
                 )
             }
+            RoleProvider::Codex => {
+                let endpoint = configured
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| codex::DEFAULT_ENDPOINT.to_owned());
+                (
+                    self.shared(name, RoleProvider::Codex, endpoint, key)?,
+                    configured
+                        .model
+                        .clone()
+                        .expect("config validation requires a model for codex"),
+                )
+            }
         };
         Ok(Runner {
             role,
@@ -223,6 +237,20 @@ impl<'a> Built<'a> {
             return Ok(Arc::clone(built));
         }
 
+        // the codex credential is a token file the provider keeps current, not a key to copy
+        if kind == RoleProvider::Codex {
+            let credential = client
+                .key
+                .as_deref()
+                .expect("config validation requires a credential name for codex");
+            let provider: Arc<dyn Provider> = Arc::new(
+                Codex::open(&client.endpoint, self.secrets.clone(), credential)
+                    .with_context(|| format!("the credential for the `{name}` role"))?,
+            );
+            self.providers.insert(client, Arc::clone(&provider));
+            return Ok(provider);
+        }
+
         let key = client
             .key
             .as_deref()
@@ -242,6 +270,7 @@ impl<'a> Built<'a> {
                 &client.endpoint,
                 key.expect("config validation requires a key for gemini"),
             )),
+            RoleProvider::Codex => unreachable!("codex is built above"),
         };
         self.providers.insert(client, Arc::clone(&provider));
         Ok(provider)
@@ -492,6 +521,45 @@ key      = "gemini"
         assert_eq!(
             concierge.provider.endpoint(),
             arc_core::provider::gemini::DEFAULT_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn a_codex_role_opens_its_credential_and_a_missing_one_names_the_login() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = r#"
+[roles.executor]
+provider = "codex"
+model    = "gpt-5.5"
+key      = "codex"
+"#;
+
+        let err = with_secrets(config, dir.path(), &[]).expect_err("no credential yet");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("executor") && chain.contains("arcd login codex"),
+            "{chain}"
+        );
+
+        // an unsigned JWT whose claims name chatgpt_account_id acct_1
+        let token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19.sig";
+        let credential = serde_json::json!({
+            "access_token": token,
+            "refresh_token": "rt",
+            "expires_at": u64::MAX,
+        })
+        .to_string();
+        let roles = with_secrets(config, dir.path(), &[("codex", &credential)])
+            .expect("the credential is there now");
+        assert_eq!(roles.executor().provider.name(), "codex");
+        assert_eq!(
+            roles.executor().provider.endpoint(),
+            arc_core::provider::codex::DEFAULT_ENDPOINT
+        );
+        let rendered = format!("{roles:?}");
+        assert!(
+            !rendered.contains("eyJhbGciOiJub25lIn0"),
+            "a token reached a Debug line: {rendered}"
         );
     }
 

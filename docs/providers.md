@@ -12,6 +12,8 @@ These outlive any particular plan.
 
 1. **No vendor lock-in.** Every provider sits behind the `Provider` trait and is swappable by config. The expert is an argv template. Voice stages are traits. Nothing in `arc-core` names a vendor.
 2. **ToS-clean only.** API keys, or subscriptions that are explicitly any-tool by design. No consumer OAuth driven from our own harness, no whitelist workarounds, no unpublished endpoints. Learned three times: the Claude OAuth ban of January 2026, Antigravity, the Kimi whitelist.
+
+   **One exception, Codex, amended 2026-09-06.** OpenAI has publicly endorsed third-party harnesses on a ChatGPT plan: an OpenAI executive stated that a ChatGPT account may be used inside third-party harnesses and named pi and OpenCode, and the Codex for Open Source page lists pi, OpenCode, Cline and OpenClaw as supported tools. The Codex harness itself is Apache-2.0 since 2026-08-20. So the "Sign in with ChatGPT" OAuth flow, driven from arc, is permitted for Codex. Anthropic and Google have made no such statement and still prohibit it, so the exception does not extend to them. The endorsement is public statements rather than terms, and Anthropic tolerated the same practice before banning it, so treat Codex OAuth as revocable: it must sit behind the `Provider` trait like everything else, and losing it must cost a config change, not a rewrite.
 3. **Route by role, not difficulty.** Config maps each task type to a model. There is no runtime difficulty classifier.
 4. **Caching matters.** Roughly 96% of the workload is cache reads. Caches are tied to a model and prompt prefix, so switching models makes a session pay for its full context again. Sessions therefore stay on one provider, and counsel is a tool rather than a routing choice.
 5. **Measure cost per completed task, not per token.** A cheaper model that consumes more tokens to finish the same job is not cheaper.
@@ -120,6 +122,17 @@ The relevant operating rules.
 
 Everything else on the plan has 0-day retention today. DeepSeek's zero-retention agreement has an expiry date; see the review triggers below.
 
+**ChatGPT plan through Codex — built 2026-09-06, not yet in the stack.** `provider = "codex"` on any role. Auth is the Codex CLI's own OAuth client through the device-code flow (`arcd login codex`, headless-friendly, prints a code to enter at `auth.openai.com/codex/device`); the credential is a JSON file under `data/secrets/` named by the role's `key`, refreshed in place before it expires, and the daemon needs a restart after a fresh login. The wire is the Responses API at `https://chatgpt.com/backend-api/codex/responses` with `store: false`, so the encrypted reasoning item is carried on each tool call's roundtrip bytes and replayed ahead of the calls, which is what keeps the model's chain of thought across a tool step. `thinking` maps to `reasoning.effort` with `low` as the floor; `default` sends nothing. A `usage_limit_reached` failure surfaces as a rate limit with the reset time. Plan metering is OpenAI's rolling 5-hour and weekly windows, not dollars, so its place in the stack is decided by a measured week, not by this file. Model ids are the Codex CLI's (`gpt-5.5` and its siblings; 272k context). Config:
+
+```toml
+[roles.executor]
+provider       = "codex"
+model          = "gpt-5.5"
+key            = "codex"
+thinking       = "medium"
+context_window = 272000
+```
+
 **Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory. First-party CLI, which is the sanctioned path.
 
 A coding job uses one `plan` and up to *N* `review` calls. Counsel use therefore scales with jobs and review rounds, not conversation. Each call is a short, read-only run over a few files. Measure its use before changing the design.
@@ -150,7 +163,7 @@ Revisit an option only when its reason changes.
 
 | Option | Reason |
 | --- | --- |
-| Claude / Gemini consumer OAuth driven in-harness | ToS, revocation risk. Principle 2. |
+| Claude / Gemini consumer OAuth driven in-harness | ToS, revocation risk. Principle 2. Codex is the one exception, for the reasons recorded there. |
 | Antigravity gateway | Unpublished endpoint; removed after Phase 1. |
 | Native Claude Code replacement at the same cost | Cannot beat an ~8× subscription subsidy. The cost calculation above confirms it. |
 | DevPass (LLM Gateway) — $29/$79/$179, ~3× value, frontier models any-tool | The only option that solves the concierge and the executor together with frontier models, and still rejected: cheapest tier alone exceeds the budget, the multiple is half of Go's, and it is the flat-rate-reseller category whose economics are unexplained. Now rejected with a number rather than a feeling. |
@@ -172,7 +185,7 @@ Review on events, not a schedule. Three triggers are already dated:
 
 Counsel rate-limiting is a trigger rather than a prediction: if a job ever stalls on it, retune the round bound and severity gate, or split counsel by mode, before moving anything else.
 
-Otherwise: any provider ToS or pricing change, Go leaving beta or changing its caps, a GLM-5.5-class release, a GPU upgrade (a 24 GB card makes a local `executor` tier worth re-testing), the first month of real trace data, and the first time Go's monthly cap is actually hit.
+Otherwise: any OpenAI statement or terms change on third-party harness use of a ChatGPT plan, which decides whether the Codex exception in principle 2 stands; any provider ToS or pricing change, Go leaving beta or changing its caps, a GLM-5.5-class release, a GPU upgrade (a 24 GB card makes a local `executor` tier worth re-testing), the first month of real trace data, and the first time Go's monthly cap is actually hit.
 
 ---
 

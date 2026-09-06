@@ -431,7 +431,7 @@ The local provider is a llama.cpp `llama-server` sidecar supervised by `arcd`, s
 
 It is also why the same code reaches most hosted options: an OpenAI-compatible endpoint is a base URL, a key, and a model id.
 
-Hosted providers use plain HTTP and SSE (`reqwest` + rustls), never vendor SDKs. Authentication is replaceable; for now it uses API keys only. The Google OAuth path was removed after hidden rate limits made it unreliable and its terms became questionable. Keys live in `data/secrets/` (0700 and excluded from backups). Phase 3 uses that storage for the concierge and the executor.
+Hosted providers use plain HTTP and SSE (`reqwest` + rustls), never vendor SDKs. Authentication is replaceable. It uses API keys, with one OAuth exception: the ChatGPT plan through the Codex backend, which OpenAI has publicly opened to third-party harnesses (`providers.md`, principle 2, amended 2026-09-06). `arcd login codex` runs the device-code flow and writes the credential as a file under `data/secrets/`; the provider refreshes it in place and never logs it. The Google OAuth path was removed after hidden rate limits made it unreliable and its terms became questionable; the Codex exception is held to the same test and goes the same way if OpenAI's position changes. Keys and credentials live in `data/secrets/` (0700 and excluded from backups). Phase 3 uses that storage for the concierge and the executor.
 
 Tool-calling and system-prompt differences are normalized in `arc-core`, never leaked to clients. The log records which model actually ran.
 

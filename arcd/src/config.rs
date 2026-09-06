@@ -140,6 +140,9 @@ pub enum RoleProvider {
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
     Gemini,
+    /// The `ChatGPT` plan through the Codex backend; `key` names the credential
+    /// file `arcd login codex` writes under `data/secrets/`.
+    Codex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -208,6 +211,10 @@ impl RoleConfig {
                 self.key.is_some(),
                 "role `{name}` needs a key: gemini has no unauthenticated endpoint"
             ),
+            RoleProvider::Codex => ensure!(
+                self.key.is_some(),
+                "role `{name}` needs a key naming the credential file `arcd login codex` writes"
+            ),
         }
         if !matches!(self.provider, RoleProvider::Local) {
             ensure!(
@@ -217,7 +224,7 @@ impl RoleConfig {
         }
         match (self.provider, self.thinking) {
             (_, Thinking::Default)
-            | (RoleProvider::Gemini | RoleProvider::OpenAiCompat, _)
+            | (RoleProvider::Gemini | RoleProvider::OpenAiCompat | RoleProvider::Codex, _)
             | (RoleProvider::Local, Thinking::Minimal) => {}
             (RoleProvider::Local, level) => bail!(
                 "role `{name}`: the sidecar reads `/no_think` out of the prompt and has no `{}` level; \
@@ -632,6 +639,22 @@ provider = "local"
         let err = toml::from_str::<Config>("[roles.executor]\nprovider = \"anthropic\"\n")
             .expect_err("an unconfigurable provider must not load");
         assert!(err.to_string().contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn a_codex_role_parses_and_needs_a_credential_name() {
+        let config = parse(
+            "[roles.executor]\nprovider = \"codex\"\nmodel = \"gpt-5.5\"\nkey = \"codex\"\nthinking = \"medium\"\n",
+        );
+        let executor = config.roles.executor.expect("configured");
+        assert_eq!(executor.provider, RoleProvider::Codex);
+        assert_eq!(executor.endpoint, None, "the backend has a default");
+
+        let err = rejected("[roles.executor]\nprovider = \"codex\"\nmodel = \"gpt-5.5\"\n");
+        assert!(
+            err.contains("executor") && err.contains("arcd login codex"),
+            "{err}"
+        );
     }
 
     #[test]

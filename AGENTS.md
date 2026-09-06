@@ -30,7 +30,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 1. **Append-only.** Durable state changes ONLY by appending an `Event` to the log. Never edit or rewrite log bytes. Hand-edits and migrations are events too.
 2. **Everything else is a projection.** SQLite index, memory state, session trees must be deterministic replays of the log. Any code that writes projection state outside replay is a bug.
 3. **Additive schemas.** Never renumber, remove, or repurpose a proto field. Old events must always decode. Reserve numbers when deprecating.
-4. **No vendor SDKs.** Providers are plain HTTP + SSE via reqwest behind the `Provider` trait. Auth is a swappable layer; API keys only for now.
+4. **No vendor SDKs.** Providers are plain HTTP + SSE via reqwest behind the `Provider` trait. Auth is a swappable layer: API keys, plus the one OAuth exception `docs/providers.md` principle 2 records (Codex). No other OAuth without amending that principle first.
 5. **Secrets never touch the log**, backups, traces, or test fixtures.
 6. **Memory is tools, not injection.** Nothing enters model context automatically except the identity file and the distilled-record index.
 7. **Identity file is human-owned.** Code may propose edits in session output; it never writes `data/identity.md`.

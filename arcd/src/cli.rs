@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum Command {
     Run,
     Rebuild,
+    Login,
     MemoryReplay {
         prompt: String,
         against: Option<String>,
@@ -55,6 +56,7 @@ fn installed_config(
 pub const USAGE: &str = "\
 usage: arcd run [--config <path>]
        arcd rebuild [--config <path>]
+       arcd login codex [--config <path>]
        arcd memory-replay --prompt <version> [--against <version>]
                           [--session <id>]... [--config <path>]
 
@@ -62,6 +64,8 @@ commands:
   run             start the daemon (default)
   rebuild         replay the log into a fresh index and diff it against the
                   live one, read-only
+  login codex     sign in to the ChatGPT plan with a device code and save the
+                  credential under data/secrets/; restart arcd afterwards
   memory-replay   re-run a consolidation prompt version over the log and
                   report the resulting memory state, read-only
 
@@ -77,6 +81,7 @@ options:
 enum Name {
     Run,
     Rebuild,
+    Login,
     MemoryReplay,
 }
 
@@ -122,6 +127,17 @@ where
             Some("--session") => sessions.push(value(&mut args, "--session")?),
             Some("run") if command.is_none() => command = Some(Name::Run),
             Some("rebuild") if command.is_none() => command = Some(Name::Rebuild),
+            Some("login") if command.is_none() => {
+                match args.next().as_deref().and_then(|it| it.to_str()) {
+                    Some("codex") => command = Some(Name::Login),
+                    Some(other) => {
+                        return Err(format!(
+                            "login: unknown provider `{other}`; only codex has a login"
+                        ));
+                    }
+                    None => return Err("login needs a provider: arcd login codex".to_owned()),
+                }
+            }
             Some("memory-replay") if command.is_none() => command = Some(Name::MemoryReplay),
             _ => {
                 let shown = arg.to_string_lossy().into_owned();
@@ -143,6 +159,7 @@ where
     let command = match name {
         Name::Run => Command::Run,
         Name::Rebuild => Command::Rebuild,
+        Name::Login => Command::Login,
         Name::MemoryReplay => Command::MemoryReplay {
             prompt: prompt.ok_or_else(|| "memory-replay needs --prompt <version>".to_owned())?,
             against,
@@ -257,6 +274,23 @@ mod tests {
             ok(&["arcd", "--config", "/etc/arc.toml", "rebuild"]).config,
             PathBuf::from("/etc/arc.toml")
         );
+    }
+
+    #[test]
+    fn login_names_its_provider_and_nothing_else() {
+        assert_eq!(ok(&["arcd", "login", "codex"]).command, Command::Login);
+        assert_eq!(
+            ok(&["arcd", "login", "codex", "--config", "/etc/arc.toml"]).config,
+            PathBuf::from("/etc/arc.toml")
+        );
+        for args in [
+            vec!["arcd", "login"],
+            vec!["arcd", "login", "gemini"],
+            vec!["arcd", "login", "codex", "extra"],
+            vec!["arcd", "login", "codex", "--prompt", "v1"],
+        ] {
+            assert!(parse(args.clone()).is_err(), "{args:?} should not parse");
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod dirs;
 mod identity;
 mod jobs;
 mod llama;
+mod login;
 mod rebuild;
 mod replay;
 mod roles;
@@ -64,6 +65,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run => daemon::run(config, dirs).await,
         Command::Rebuild => rebuild::run(&dirs),
+        Command::Login => login::codex(&config, &dirs).await,
         Command::MemoryReplay {
             prompt,
             against,
