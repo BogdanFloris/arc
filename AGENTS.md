@@ -24,6 +24,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 
 - `just build` / `just test` / `just fmt` / `just lint` — use these, not raw cargo, so flags stay consistent.
 - Run `just fmt` and `just lint` before declaring any task done. Warnings are not acceptable in new code.
+- Assign disjoint files when delegating. Workspace-wide formatting belongs to integration, after other writers stop. A child reports formatting needed unless its brief explicitly assigns integration and confirms exclusive workspace access. Keep the read-before-edit checks; reread after formatting.
 
 ## Invariants — never violate
 

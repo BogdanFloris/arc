@@ -218,6 +218,8 @@ An earlier draft made the summary the dispatch call's own delayed `ToolResultRec
 
 Coding is the first job kind, not a privileged one. Its loop is deliberately small: send messages, run requested tools, append results, and stop when the model stops. ARC adds strict `edit`, durable events, and a per-job budget. Planning, review, retry policy, and similar workflow choices belong in prompts or configuration until repeated use proves they need machinery.
 
+**Shared-workspace coordination belongs in the coding prompts.** Briefs assign disjoint files. Workspace-wide formatting is integration work, performed after other writers stop. A child reports formatting needed unless its brief explicitly assigns integration and confirms exclusive workspace access. Read-before-edit checks remain strict; formatting requires rereading affected files, not bypassing stale-read errors.
+
 ### 4.2 Workspaces
 
 A session may be bound to a project: `sessions.project` plus a set of granted roots on disk. The project's own root is granted read-write. Anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. The binding scopes the workspace tools, and every path those tools resolve must sit under one of the grants.

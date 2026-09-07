@@ -10,7 +10,9 @@ fn job_preamble(root: &Path) -> String {
          in {}. Be concise. Show file paths clearly. Comments only where AGENTS.md allows \
          one. When a brief asks for commits and holds several tasks, commit each \
          task on its own. When you are done, your final message is the job's \
-         report.",
+         report. Edit only the files assigned in the brief. Workspace-wide formatting \
+         belongs to integration: run it only if the brief assigns you integration and \
+         confirms other writers have stopped. Otherwise report that formatting is needed.",
         root.display()
     )
 }
@@ -24,6 +26,8 @@ fn direct_preamble(root: &Path) -> String {
          When you hand off the whole task, end your reply; the handback arrives on its own. \
          When you delegate part of a task, continue independent work. Do not edit \
          the same files as a running child. \
+         Assign disjoint files in each brief. Reserve workspace-wide formatting for \
+         integration after all writers have stopped; children report formatting needed. \
          Briefs are self-contained: the child sees nothing of this session. \
          Check a handback against the workspace with your own tools before \
          repeating it.",
@@ -225,6 +229,18 @@ mod tests {
         assert_ne!(job, direct);
         assert!(job.contains("non-interactively"));
         assert!(direct.contains("interactively with the user"));
+    }
+
+    #[test]
+    fn formatter_coordination_survives_without_project_guidance() {
+        let root = Path::new("/project");
+        let direct = direct_preamble(root);
+        let job = job_preamble(root);
+        assert!(direct.contains("Assign disjoint files in each brief."));
+        assert!(direct.contains("integration after all writers have stopped"));
+        assert!(job.contains("only if the brief assigns you integration"));
+        assert!(job.contains("confirms other writers have stopped"));
+        assert!(job.contains("Otherwise report that formatting is needed."));
     }
 
     #[tokio::test]
