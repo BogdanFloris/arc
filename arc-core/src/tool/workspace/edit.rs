@@ -32,7 +32,8 @@ impl Tool for Edit {
             description: "Replace one exact occurrence of old with new in a file. path must \
                           be absolute. old must match exactly once; include enough \
                           surrounding context to make it unique. Requires having read the \
-                          file in this session, with no changes since."
+                          file using the `read` tool in this session, with no changes since. \
+                          Reading through Bash does not count."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

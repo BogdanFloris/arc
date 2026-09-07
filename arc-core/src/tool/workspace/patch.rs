@@ -37,8 +37,9 @@ impl Tool for ApplyPatch {
                           by `+` lines, `*** Delete File: path`, or `*** Update File: path` \
                           (optionally `*** Move to: path`) followed by `@@ context` headers and \
                           ` `, `-`, `+` lines. Paths are relative to the project root or \
-                          absolute. Updating or deleting a file requires having read it in this \
-                          session, with no changes since. A patch applies whole or not at all."
+                          absolute. Updating or deleting a file requires having read it using \
+                          the `read` tool in this session, with no changes since. Reading through \
+                          Bash does not count. A patch applies whole or not at all."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

@@ -165,12 +165,13 @@ pub(crate) fn ensure_fresh(
 ) -> Result<(), String> {
     match workspace.recorded_hash(session_id, path) {
         None => Err(format!(
-            "{} has not been read in this session. Read it before modifying it.",
+            "{} has not been read in this session. Read it using the `read` tool before \
+             modifying it. Reading through Bash does not count.",
             path.display()
         )),
         Some(hash) if hash != hash_of(current_bytes) => Err(format!(
-            "{} has changed since it was last read in this session. Read it again before \
-             modifying it.",
+            "{} has changed since it was last read in this session. Read it again using \
+             the `read` tool before modifying it. Reading through Bash does not count.",
             path.display()
         )),
         Some(_) => Ok(()),
@@ -196,6 +197,37 @@ mod tests {
 
     use super::{Access, Grant, Grants, Mode, Workspace};
     use crate::tool::ToolSource;
+
+    #[test]
+    fn freshness_errors_name_the_read_tool() {
+        let workspace = Workspace::new();
+        let path = std::path::Path::new("/workspace/file");
+        let unread = super::ensure_fresh(&workspace, "s1", path, b"old").unwrap_err();
+        workspace.record_read("s1", path, b"old");
+        let stale = super::ensure_fresh(&workspace, "s1", path, b"new").unwrap_err();
+        for error in [unread, stale] {
+            assert!(error.contains("the `read` tool"), "{error}");
+            assert!(
+                error.contains("Reading through Bash does not count."),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn modifying_tool_descriptions_name_the_read_tool() {
+        for tool in super::tools(std::sync::Arc::new(Workspace::new())) {
+            let definition = tool.definition();
+            if matches!(definition.name.as_str(), "edit" | "write" | "apply_patch") {
+                assert!(definition.description.contains("the `read` tool"));
+                assert!(
+                    definition
+                        .description
+                        .contains("Reading through Bash does not count.")
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_workspace_source_is_bash_edit_read_write_and_apply_patch() {

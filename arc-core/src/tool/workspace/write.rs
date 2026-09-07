@@ -30,7 +30,8 @@ impl Tool for Write {
             name: "write".to_owned(),
             description: "Write a file's full contents, creating it if it does not exist. \
                           path must be absolute. Overwriting a file that already exists \
-                          requires having read it in this session, with no changes since."
+                          requires having read it using the `read` tool in this session, \
+                          with no changes since. Reading through Bash does not count."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
