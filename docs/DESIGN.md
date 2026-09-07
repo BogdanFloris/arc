@@ -222,6 +222,8 @@ Coding is the first job kind, not a privileged one. Its loop is deliberately sma
 
 **Shared-workspace coordination belongs in the coding prompts.** Briefs assign disjoint files. Workspace-wide formatting is integration work, performed after other writers stop. A child reports formatting needed unless its brief explicitly assigns integration and confirms exclusive workspace access. Read-before-edit checks remain strict; formatting requires rereading affected files, not bypassing stale-read errors.
 
+**Coding workflow corrections persist in harness-owned preambles.** Both direct sessions and jobs define cross-layer handoff interfaces before delegation, build a small end-to-end slice, run focused tests, and wait for a child's ready handback before checks spanning its files. Full-suite checks follow integration. These are versioned prompt rules, tested with the runner and byte-stable within a task; they do not rewrite the human-owned identity or add memory injection. Project-specific test conventions belong in `AGENTS.md`.
+
 ### 4.2 Workspaces
 
 A session may be bound to a project: `sessions.project` plus a set of granted roots on disk. The project's own root is granted read-write. Anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. The binding scopes the workspace tools, and every path those tools resolve must sit under one of the grants.

@@ -4,6 +4,11 @@ use tracing::warn;
 
 use crate::identity;
 
+const DEVELOPMENT_LOOP: &str = "For cross-layer changes, define handoff interfaces before delegating. Build the \
+     smallest end-to-end slice and get its focused tests passing before expanding. \
+     Run checks spanning a child's files only after its handback says they are ready. \
+     Inspect failure details before changing code; run the full suite after integration.";
+
 fn job_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working non-interactively \
@@ -12,7 +17,8 @@ fn job_preamble(root: &Path) -> String {
          task on its own. When you are done, your final message is the job's \
          report. Edit only the files assigned in the brief. Workspace-wide formatting \
          belongs to integration: run it only if the brief assigns you integration and \
-         confirms other writers have stopped. Otherwise report that formatting is needed.",
+         confirms other writers have stopped. Otherwise report that formatting is needed.\n\n\
+         {DEVELOPMENT_LOOP}",
         root.display()
     )
 }
@@ -30,7 +36,7 @@ fn direct_preamble(root: &Path) -> String {
          integration after all writers have stopped; children report formatting needed. \
          Briefs are self-contained: the child sees nothing of this session. \
          Check a handback against the workspace with your own tools before \
-         repeating it.",
+         repeating it.\n\n{DEVELOPMENT_LOOP}",
         root.display()
     )
 }
@@ -241,6 +247,24 @@ mod tests {
         assert!(job.contains("only if the brief assigns you integration"));
         assert!(job.contains("confirms other writers have stopped"));
         assert!(job.contains("Otherwise report that formatting is needed."));
+    }
+
+    #[test]
+    fn both_coding_doors_keep_the_development_loop_without_changing_identity() {
+        let dir = TempDir::new().unwrap();
+        let identity = "Human-owned identity.\n";
+        let direct = direct_system_prompt(dir.path(), Some(identity));
+        let job = job_system_prompt(dir.path());
+        for prompt in [&direct, &job] {
+            assert_eq!(prompt.matches(DEVELOPMENT_LOOP).count(), 1);
+            assert!(prompt.contains("define handoff interfaces before delegating"));
+            assert!(prompt.contains("smallest end-to-end slice"));
+            assert!(prompt.contains("only after its handback says they are ready"));
+            assert!(prompt.contains("full suite after integration"));
+        }
+        assert!(direct.ends_with(identity.trim_end()));
+        assert_eq!(direct, direct_system_prompt(dir.path(), Some(identity)));
+        assert_eq!(job, job_system_prompt(dir.path()));
     }
 
     #[tokio::test]
