@@ -264,9 +264,13 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
             } => {
                 let state = outcome.unwrap_or("running");
                 let fold = if *open { "−" } else { "+" };
-                let args = crate::app::tool_summary(args).replace(['\n', '\r'], " ");
                 let suffix = format!(" · {state}");
-                let header = format!("{fold} {name} {args}");
+                let header = if *open {
+                    format!("{fold} {name}")
+                } else {
+                    let summary = crate::app::tool_summary(args).replace(['\n', '\r'], " ");
+                    format!("{fold} {name} {summary}")
+                };
                 out.push(Line::from(vec![
                     Span::styled(
                         elide(
@@ -284,8 +288,19 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                         },
                     ),
                 ]));
-                if *open && !content.is_empty() {
-                    push_wrapped(&mut out, content, width, theme::DIM);
+                if *open {
+                    push_tool_input(&mut out, name, args, width);
+                    let completion = outcome.map(|state| tool_completion(name, state, content));
+                    let output = completion
+                        .as_ref()
+                        .map_or(content.as_str(), |(_, text)| *text);
+                    if outcome.is_some() || !output.is_empty() {
+                        out.push(Line::styled("Output", theme::DIM));
+                        push_literal(&mut out, output, width);
+                    }
+                    if let Some((status, _)) = completion {
+                        out.push(Line::styled(format!("Status: {status}"), theme::DIM));
+                    }
                 }
             }
             Block::Sources(sources) => {
@@ -336,6 +351,93 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: S
         for line in textwrap::wrap(paragraph, options.clone()) {
             out.push(Line::styled(line.into_owned(), style));
         }
+    }
+}
+
+fn push_tool_input(out: &mut Vec<Line<'static>>, name: &str, args: &str, width: usize) {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(mut fields)) => {
+            if name == "bash" {
+                if let Some(serde_json::Value::String(command)) = fields.get("command") {
+                    out.push(Line::styled("Command", theme::DIM));
+                    push_literal(out, command, width);
+                    fields.remove("command");
+                }
+            }
+            if !fields.is_empty() {
+                out.push(Line::styled("Input", theme::DIM));
+                for (key, value) in fields {
+                    push_literal(out, &format!("{key}:"), width);
+                    push_input_value(out, &value, width);
+                }
+            }
+        }
+        Ok(value) => {
+            out.push(Line::styled("Input", theme::DIM));
+            push_input_value(out, &value, width);
+        }
+        Err(_) => {
+            out.push(Line::styled("Input", theme::DIM));
+            push_literal(out, args, width);
+        }
+    }
+}
+
+fn push_input_value(out: &mut Vec<Line<'static>>, value: &serde_json::Value, width: usize) {
+    if let Some(text) = value.as_str() {
+        push_literal(out, text, width);
+    } else {
+        push_literal(
+            out,
+            &serde_json::to_string_pretty(value).unwrap_or_default(),
+            width,
+        );
+    }
+}
+
+// Bash errors prefix retained output with their exit status.
+fn tool_completion<'a>(name: &str, outcome: &str, content: &'a str) -> (String, &'a str) {
+    if name == "bash" {
+        if outcome == "ok" {
+            return ("exit 0".to_owned(), content);
+        }
+        if outcome == "error" {
+            let (first, rest) = content.split_once('\n').unwrap_or((content, ""));
+            if first
+                .strip_prefix("exit ")
+                .is_some_and(|code| code == "signal" || code.parse::<i32>().is_ok())
+            {
+                return (first.to_owned(), rest);
+            }
+        }
+    }
+    (outcome.to_owned(), content)
+}
+
+fn push_literal(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
+    let width = width.max(2);
+    for source in text.split('\n') {
+        let mut row = String::new();
+        let mut column = 0;
+        let mut source_column = 0;
+        for c in source.chars() {
+            let (c, count) = if c == '\t' {
+                (' ', 8 - source_column % 8)
+            } else {
+                (c, 1)
+            };
+            let cell_width = textwrap::core::display_width(c.encode_utf8(&mut [0; 4]));
+            source_column += cell_width * count;
+            for _ in 0..count {
+                if column + cell_width > width {
+                    out.push(Line::styled(std::mem::take(&mut row), theme::PLAIN));
+                    column = 0;
+                }
+                row.push(c);
+                column += cell_width;
+            }
+        }
+        out.push(Line::styled(row, theme::PLAIN));
     }
 }
 
@@ -1794,7 +1896,7 @@ mod tests {
         let text = plain_text(&rendered_at(&mut app, 76, 16));
         assert!(text.contains("details on"), "{text}");
         assert!(text.contains("Checking the failing test"), "{text}");
-        assert!(text.contains("− bash just test · running"), "{text}");
+        assert!(text.contains("− bash · running"), "{text}");
         println!("DETAILS STREAMING FRAME\n{text}");
         app.on_key(ctrl('o'));
         let text = plain_text(&rendered_at(&mut app, 76, 16));
@@ -1904,6 +2006,149 @@ mod tests {
     }
 
     #[test]
+    fn multiline_bash_command_output_and_exit_status_render_separately() {
+        use crate::app::NetEvent;
+        use arc_proto::v1::ToolOutcome;
+
+        let mut app = App::new();
+        let command = "python3 - <<'PY'\nitems = [1, 2]\n\nfor item in items:\n    print(item)\nPY";
+        app.on_key(ctrl('o'));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s1".to_owned(),
+        });
+        app.on_net(NetEvent::ToolStarted {
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            arguments_json: serde_json::json!({"command": command}).to_string(),
+        });
+        let running = plain_text(&rendered_at(&mut app, 76, 24));
+        for line in command.split('\n').filter(|line| !line.is_empty()) {
+            assert!(
+                running
+                    .lines()
+                    .any(|row| row.trim_end() == format!("  {line}")),
+                "{running}"
+            );
+        }
+        assert!(running.contains("− bash · running"), "{running}");
+        assert!(!running.contains("Status:"), "{running}");
+        assert!(!running.contains("\\n"), "{running}");
+        app.on_net(NetEvent::ToolEnded {
+            call_id: "t1".to_owned(),
+            outcome: ToolOutcome::Error as i32,
+            content: "exit 3\nfirst line\n    indented output\n--- stderr ---\nproblem".to_owned(),
+        });
+        let text = plain_text(&rendered_at(&mut app, 76, 24));
+        assert!(text.contains("      print(item)"), "{text}");
+        assert!(text.contains("      indented output"), "{text}");
+        assert!(text.contains("--- stderr ---"), "{text}");
+        assert!(text.find("Command").unwrap() < text.find("Output").unwrap());
+        assert!(text.find("problem").unwrap() < text.find("Status: exit 3").unwrap());
+        assert_eq!(text.matches("exit 3").count(), 1, "{text}");
+        println!("MULTILINE BASH FRAME\n{text}");
+        app.on_key(ctrl('o'));
+        let compact = plain_text(&rendered_at(&mut app, 76, 12));
+        assert!(compact.contains("+ bash python3"), "{compact}");
+        assert!(!compact.contains("Output"), "{compact}");
+        assert!(!compact.contains("print(item)"), "{compact}");
+        println!("COMPACT BASH FRAME\n{compact}");
+    }
+
+    #[test]
+    fn bash_completion_uses_retained_status_without_inventing_exit_codes() {
+        for (outcome, content, status) in [
+            ("ok", "exit 9\nhello", "exit 0"),
+            ("error", "exit signal\ninterrupted", "exit signal"),
+            ("error", "ERROR: timed out after 1s.", "error"),
+            ("error", "ERROR: command is empty.", "error"),
+            ("unknown", "", "unknown"),
+        ] {
+            let mut app = App::new();
+            app.on_key(ctrl('o'));
+            app.push_block(Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: r#"{"command":"echo hello"}"#.to_owned(),
+                outcome: Some(outcome),
+                content: content.to_owned(),
+                open: false,
+            });
+            let text = plain_text(&rendered_at(&mut app, 76, 16));
+            assert!(text.contains(&format!("Status: {status}")), "{text}");
+            if outcome != "error" || content.starts_with("ERROR:") {
+                for line in content.lines() {
+                    assert!(text.contains(line), "{text}");
+                }
+            }
+            if outcome == "ok" {
+                println!("BASH SUCCESS FRAME\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_inputs_decode_strings_and_keep_other_json_readable() {
+        let mut app = App::new();
+        app.on_key(ctrl('o'));
+        app.push_block(Block::Tool {
+            call_id: "t1".to_owned(), name: "write".to_owned(),
+            args: serde_json::json!({"path":"example.txt", "content":"first\n    second", "options":{"flag":true}}).to_string(),
+            outcome: None, content: String::new(), open: false,
+        });
+        let text = plain_text(&rendered_at(&mut app, 76, 24));
+        assert!(text.contains("      second"), "{text}");
+        assert!(text.contains("example.txt"), "{text}");
+        assert!(text.contains("\"flag\": true"), "{text}");
+        assert!(!text.contains("\\n"), "{text}");
+        println!("GENERAL TOOL INPUT FRAME\n{text}");
+        for args in [
+            "{partial JSON",
+            "raw\n    input",
+            r#""decoded\n    string""#,
+        ] {
+            app.set_blocks(vec![Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "other".to_owned(),
+                args: args.to_owned(),
+                outcome: None,
+                content: String::new(),
+                open: true,
+            }]);
+            let text = plain_text(&rendered_at(&mut app, 76, 16));
+            assert!(text.contains("Input"), "{text}");
+            assert!(!text.contains("\\n"), "{text}");
+        }
+    }
+
+    #[test]
+    fn literal_tool_text_keeps_spaces_blank_lines_and_long_unicode_lines() {
+        let input = "  abc  def\n\n    界界界界界界界界界界界界界界界界界界界界\n\tend";
+        let mut app = App::new();
+        app.on_key(ctrl('o'));
+        app.push_block(Block::Tool {
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            args: serde_json::json!({"command":input}).to_string(),
+            outcome: None,
+            content: String::new(),
+            open: false,
+        });
+        let text = plain_text(&rendered_at(&mut app, 40, 16));
+        assert!(text.contains("    abc  def"), "{text}");
+        assert_eq!(text.matches('界').count(), 20, "{text}");
+        assert!(text.contains("          end"), "{text}");
+        let mut lines = Vec::new();
+        super::push_literal(&mut lines, input, 36);
+        assert_eq!(lines[0].to_string(), "  abc  def");
+        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(
+            lines[2].to_string() + &lines[3].to_string(),
+            input.lines().nth(2).unwrap()
+        );
+        println!("NARROW LITERAL INPUT FRAME\n{text}");
+    }
+
+    #[test]
     fn session_details_open_all_tool_blocks() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
@@ -1917,7 +2162,7 @@ mod tests {
 
         app.on_key(ctrl('o'));
         let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("bash cargo test · ok"), "both headers render");
+        assert_eq!(text.matches("− bash · ok").count(), 2, "{text}");
         assert!(
             text.contains("42 passed"),
             "every tool follows the session setting"
