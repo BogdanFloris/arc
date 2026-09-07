@@ -22,8 +22,9 @@ install: build-release
     systemctl --user enable arcd
     systemctl --user restart arcd
 
-test:
-    cargo test --workspace
+[positional-arguments]
+test *args:
+    @python3 scripts/test.py "$@"
 
 fmt:
     cargo fmt --all

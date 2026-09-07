@@ -78,6 +78,7 @@
             pkgs.openssl
             pkgs.sqlite
             pkgs.just
+            pkgs.python3
             pkgs.ripgrep
           ]
           ++ pkgs.lib.optional (traceProcessorBinaries ? ${system}) traceProcessor;

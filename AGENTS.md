@@ -23,6 +23,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 ## Commands
 
 - `just build` / `just test` / `just fmt` / `just lint` — use these, not raw cargo, so flags stay consistent.
+- `just test -p arc-core <filter>` narrows a test run. Summaries name failures and the full log under `target/test-logs/`; inspect that log instead of rerunning for output. For rendered frames, use `ARC_TEST_PASSTHROUGH=1 just test -p arc <filter> -- --nocapture`. See `docs/testing.md`.
 - Run `just fmt` and `just lint` before declaring any task done. Warnings are not acceptable in new code.
 - Assign disjoint files when delegating. Workspace-wide formatting belongs to integration, after other writers stop. A child reports formatting needed unless its brief explicitly assigns integration and confirms exclusive workspace access. Keep the read-before-edit checks; reread after formatting.
 
