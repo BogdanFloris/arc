@@ -720,7 +720,7 @@ impl Engine {
                     "Dispatched {} into {project} as session {child_id} ({}). The job is \
                      running; its summary will arrive here as a handback when it \
                      finishes. Do not call continue_job to ask for status or results — \
-                     each message costs the job a full turn. End this reply and wait.",
+                     each message costs the job a full turn.",
                     provider::role_label(role),
                     match intent {
                         Intent::Analyze => "analyze: read-only, it reports but cannot edit",
@@ -6667,6 +6667,10 @@ mod tests {
         assert!(result.content.contains(&child_id), "{}", result.content);
         assert!(result.content.contains("executor"), "{}", result.content);
         assert!(result.content.contains("arc"), "{}", result.content);
+        assert!(result.content.contains("summary will arrive here as a handback"));
+        assert!(result.content.contains("Do not call continue_job to ask for status"));
+        assert!(!result.content.contains("End this reply"));
+        assert!(!result.content.contains("wait"));
         assert!(
             result.content.contains("(implement: read-write)"),
             "{}",
