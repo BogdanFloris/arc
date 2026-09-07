@@ -51,6 +51,12 @@ As configured on 2026-09-06:
 The llama.cpp settings remain available, but no configured role uses them.
 The daemon therefore does not start the sidecar.
 
+OpenCode Go requires `x-opencode-session` from 2026-09-06. The OpenAI-compatible
+provider sends ARC's session ID from `CompletionRequest.cache_key` in that
+header and identifies itself as `arc/<version>`. Turns, compaction, titles,
+extraction, and deduplication carry the source session's ID, stable across
+calls and restarts. Standalone probes must supply their own conversation ID.
+
 ### Earlier stack and measurements
 
 The following records the earlier local-archivist setup and its measurements.

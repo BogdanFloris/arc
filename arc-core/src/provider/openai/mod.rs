@@ -47,6 +47,7 @@ impl OpenAiCompat {
             key,
             // no pooling: a stale keep-alive kills the tool loop's second call
             http: reqwest::Client::builder()
+                .user_agent(concat!("arc/", env!("CARGO_PKG_VERSION")))
                 .pool_max_idle_per_host(0)
                 .build()
                 .expect("default reqwest client"),
@@ -84,11 +85,15 @@ impl Provider for OpenAiCompat {
     ) -> BoxFuture<'_, Result<CompletionStream, Error>> {
         Box::pin(async move {
             let payload = Payload::new(&request)?;
+            let session_id = request.cache_key.as_deref();
 
             let mut request = self
                 .http
                 .post(format!("{}{COMPLETIONS_PATH}", self.endpoint))
                 .header(ACCEPT, "text/event-stream");
+            if let Some(session_id) = session_id {
+                request = request.header("x-opencode-session", session_id);
+            }
             if let Some(key) = &self.key {
                 request = request.header(AUTHORIZATION, format!("Bearer {key}"));
             }
@@ -355,6 +360,53 @@ mod tests {
             json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
             json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
         )
+    }
+
+    #[tokio::test]
+    async fn routing_headers_keep_the_conversation_id_across_calls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(COMPLETIONS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body("ok")))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompat::keyed(&server.uri(), "test-key".to_owned());
+        for session_id in [
+            Some("session-a"),
+            Some("session-a"),
+            Some("session-b"),
+            None,
+        ] {
+            let mut req = request(None, &[(Role::User, "hi")]);
+            req.cache_key = session_id.map(str::to_owned);
+            provider
+                .complete(req)
+                .await
+                .expect("complete")
+                .collect::<Vec<_>>()
+                .await;
+        }
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 4);
+        for (request, expected) in requests.iter().zip([
+            Some("session-a"),
+            Some("session-a"),
+            Some("session-b"),
+            None,
+        ]) {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-opencode-session")
+                    .map(|value| value.to_str().unwrap()),
+                expected,
+            );
+            assert_eq!(
+                request.headers["user-agent"],
+                concat!("arc/", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(request.headers["authorization"], "Bearer test-key");
+        }
     }
 
     #[tokio::test]

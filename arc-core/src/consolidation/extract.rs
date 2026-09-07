@@ -337,6 +337,7 @@ impl ModelExtractor {
         operations: Vec<RawOperation>,
         index: &[MemoryIndexEntry],
         seed: u64,
+        session_id: &str,
     ) -> (Vec<RawOperation>, DedupStats) {
         let mut stats = DedupStats::default();
         let mut stage1 = Vec::with_capacity(operations.len());
@@ -392,7 +393,7 @@ impl ModelExtractor {
                 continue;
             }
             stats.calls += 1;
-            match self.forced_choice(&op, &candidates, seed).await {
+            match self.forced_choice(&op, &candidates, seed, session_id).await {
                 Some(DedupChoice::Duplicate) => stats.dropped += 1,
                 Some(DedupChoice::Supersede(target_id)) => {
                     stats.converted += 1;
@@ -421,6 +422,7 @@ impl ModelExtractor {
         op: &RawOperation,
         candidates: &[&MemoryIndexEntry],
         seed: u64,
+        session_id: &str,
     ) -> Option<DedupChoice> {
         let request = CompletionRequest {
             model: self.model.clone(),
@@ -435,7 +437,7 @@ impl ModelExtractor {
             tools: Vec::new(),
             seed: Some(seed),
             web: false,
-            cache_key: None,
+            cache_key: Some(session_id.to_owned()),
         };
         let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
             Ok(Ok(text)) => text,
@@ -492,7 +494,7 @@ impl Extractor for ModelExtractor {
             tools: Vec::new(),
             seed: Some(seed),
             web: false,
-            cache_key: None,
+            cache_key: Some(session.session_id.clone()),
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
@@ -504,7 +506,9 @@ impl Extractor for ModelExtractor {
             })??;
         let operations = parse_operations(&text)?;
         tracing::debug!(operations = operations.len(), "extraction parsed");
-        let (operations, stats) = self.dedup(operations, &session.memory_index, seed).await;
+        let (operations, stats) = self
+            .dedup(operations, &session.memory_index, seed, &session.session_id)
+            .await;
         let span = tracing::Span::current();
         if stats.dropped > 0 {
             span.record("counter.dedup_dropped", stats.dropped);
@@ -546,7 +550,7 @@ impl Extractor for ModelExtractor {
                     .unwrap_or_else(|| session_seed(&session.session_id)),
             ),
             web: false,
-            cache_key: None,
+            cache_key: Some(session.session_id.clone()),
         };
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
@@ -1146,14 +1150,18 @@ mod tests {
     ) -> Result<Vec<memory_event::Event>, crate::consolidation::ExtractError> {
         let provider = ScriptedProvider::scripted(scripts);
         let extractor = ModelExtractor::new(
-            provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "test-model",
             Thinking::Minimal,
             Duration::from_secs(5),
             None,
             vec!["global".to_owned(), "arc".to_owned()],
         );
-        extractor.extract(&snapshot(index)).await
+        let result = extractor.extract(&snapshot(index)).await;
+        for request in provider.requests() {
+            assert_eq!(request.cache_key.as_deref(), Some("s-1"));
+        }
+        result
     }
 
     const WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"preference",
@@ -1225,6 +1233,10 @@ mod tests {
         );
 
         let title_request = &provider.requests()[1];
+        assert_eq!(
+            title_request.cache_key.as_deref(),
+            Some(reply.session_id.as_str())
+        );
         assert_eq!(title_request.system.as_deref(), Some(TITLE_PROMPT));
         let [
             Message::Text {
@@ -1244,6 +1256,10 @@ mod tests {
         );
 
         let request = &provider.requests()[2];
+        assert_eq!(
+            request.cache_key.as_deref(),
+            Some(reply.session_id.as_str())
+        );
         assert_eq!(request.system.as_deref(), Some(PROMPT_V4));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
