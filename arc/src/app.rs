@@ -2280,7 +2280,16 @@ impl App {
     }
 
     fn toggle_open_blocks(&mut self) {
-        self.restore_anchor = true;
+        self.restore_anchor = self.scroll_back > 0;
+        if self.show_details {
+            if let Some((block, offset)) = &mut self.viewport_anchor {
+                if self.transcript.get(*block).is_some_and(|entry| {
+                    matches!(entry.block, Block::Tool { .. } | Block::Thought { .. })
+                }) {
+                    *offset = 0;
+                }
+            }
+        }
         self.details_held_focus = self.visual_boundary().or_else(|| self.search_block());
         self.show_details = !self.show_details;
         for entry in &mut self.transcript {

@@ -1793,6 +1793,11 @@ mod tests {
         println!("SESSION FRAME\n{text}");
         app.on_key(ctrl('o'));
         let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("output line 80"));
+        assert_eq!(app.scroll_back, 0);
+        app.on_key(key(KeyCode::Char('g')));
+        app.on_key(key(KeyCode::Char('g')));
+        let text = plain_text(&rendered(&mut app));
         assert!(text.contains("output line 1"));
         app.on_key(key(KeyCode::Char('G')));
         let text = plain_text(&rendered(&mut app));
@@ -1843,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn toggling_details_in_visual_keeps_the_view_across_redraws() {
+    fn toggling_details_in_visual_stays_at_the_bottom_across_redraws() {
         let mut app = App::new();
         for n in 0..40 {
             app.push_block(Block::Tool {
@@ -1859,17 +1864,71 @@ mod tests {
         rendered(&mut app);
         app.on_key(key(KeyCode::Char('v')));
         rendered(&mut app);
-        let anchor = app.viewport_anchor;
         let selected = app.visual_boundary();
         app.on_key(ctrl('o'));
         for _ in 0..2 {
             rendered(&mut app);
-            assert_eq!(app.viewport_anchor, anchor);
+            assert_eq!(app.scroll_back, 0);
             assert_eq!(app.visual_boundary(), selected);
         }
         app.on_key(ctrl('o'));
         rendered(&mut app);
-        assert_eq!(app.viewport_anchor, anchor);
+        assert_eq!(app.scroll_back, 0);
+    }
+
+    #[test]
+    fn toggling_details_keeps_the_latest_message_visible() {
+        for long in [false, true] {
+            let mut app = App::new();
+            app.push_block(Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: r#"{"command":"just test"}"#.to_owned(),
+                outcome: Some("ok"),
+                content: "test output\n".repeat(if long { 40 } else { 1 }),
+                open: false,
+            });
+            app.push_block(Block::You("Latest message".to_owned()));
+            rendered_at(&mut app, 76, 16);
+            for _ in 0..2 {
+                app.on_key(ctrl('o'));
+                let text = plain_text(&rendered_at(&mut app, 76, 16));
+                assert_eq!(app.scroll_back, 0);
+                assert!(text.contains("Latest message"), "{text}");
+                println!("BOTTOM ANCHOR FRAME\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn collapsing_visible_tool_details_anchors_to_its_summary() {
+        let mut app = App::new();
+        for n in 0..40 {
+            app.push_block(Block::Tool {
+                call_id: n.to_string(),
+                name: "read".to_owned(),
+                args: format!("file-{n}"),
+                outcome: Some("ok"),
+                content: "detail\n".repeat(12),
+                open: false,
+            });
+        }
+        app.on_key(ctrl('o'));
+        let mut found = None;
+        for back in 200..240 {
+            app.scroll_back = back;
+            rendered_at(&mut app, 76, 16);
+            if let Some((block, offset)) = app.viewport_anchor {
+                if offset > 3 {
+                    found = Some(block);
+                    break;
+                }
+            }
+        }
+        let block = found.expect("viewport starts inside tool output");
+        app.on_key(ctrl('o'));
+        rendered_at(&mut app, 76, 16);
+        assert_eq!(app.viewport_anchor, Some((block, 0)));
     }
 
     #[test]
