@@ -481,18 +481,18 @@ mod tests {
             outcome,
             Outcome::Consolidated {
                 session_id: reply.session_id.clone(),
-                through_seq: 2,
+                through_seq: 3,
                 records: 0,
                 records_created: 0,
                 records_superseded: 0,
             }
         );
         let events = replay_events(dir.path());
-        assert_eq!(events.len(), 4, "the turn plus exactly one marker");
+        assert_eq!(events.len(), 5, "the turn plus exactly one marker");
         let last = events.last().expect("events");
         assert_eq!(last.source, Source::System as i32, "arcd initiated this");
         assert_eq!(marker(last).session_id, reply.session_id);
-        assert_eq!(marker(last).through_seq, 2);
+        assert_eq!(marker(last).through_seq, 3);
         assert_eq!(marker(last).prompt_version, "");
 
         let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &HashSet::new())
@@ -517,7 +517,7 @@ mod tests {
             .expect("pass");
 
         assert_eq!(outcome, Outcome::NothingDue);
-        assert_eq!(replay_events(dir.path()).len(), 3, "no marker appended");
+        assert_eq!(replay_events(dir.path()).len(), 4, "no marker appended");
     }
 
     #[tokio::test]
@@ -885,7 +885,7 @@ mod tests {
             .expect("snapshot")
             .expect("the session is due");
         assert_eq!(snapshot.session_id, reply.session_id);
-        assert_eq!(snapshot.latest_seq, 2);
+        assert_eq!(snapshot.latest_seq, 3);
         assert_eq!(snapshot.rows.len(), 2, "both prose rows, for 7.2");
 
         let (tx, _rx) = channel();
@@ -926,7 +926,7 @@ mod tests {
             .with_store(|store| store.due_for_consolidation(ALL_IDLE))
             .expect("due");
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].latest_seq, 4, "coverage will span the new turn");
+        assert_eq!(due[0].latest_seq, 6, "coverage will span the new turn");
     }
 
     #[tokio::test]
@@ -954,21 +954,21 @@ mod tests {
             outcome,
             Outcome::Consolidated {
                 session_id: reply.session_id.clone(),
-                through_seq: 2,
+                through_seq: 3,
                 records: 1,
                 records_created: 1,
                 records_superseded: 0,
             }
         );
         let events = replay_events(dir.path());
-        assert_eq!(events.len(), 5);
-        let record_event = &events[3];
+        assert_eq!(events.len(), 6);
+        let record_event = &events[4];
         assert_eq!(record_event.source, Source::System as i32);
         assert!(
             matches!(record_event.payload, Some(event::Payload::Memory(_))),
             "the record precedes the marker"
         );
-        assert_eq!(marker(&events[4]).through_seq, 2);
+        assert_eq!(marker(&events[5]).through_seq, 3);
 
         let mut fresh = Projection::in_memory().expect("open");
         for event in &events {
@@ -1081,7 +1081,7 @@ mod tests {
             panic!("got: {err:?}");
         };
         assert_eq!(session_id, reply.session_id);
-        assert_eq!(replay_events(dir.path()).len(), 3, "log untouched");
+        assert_eq!(replay_events(dir.path()).len(), 4, "log untouched");
     }
 
     #[tokio::test]
@@ -1154,7 +1154,7 @@ mod tests {
             outcome,
             Outcome::Consolidated {
                 session_id: session_id.clone(),
-                through_seq: 2,
+                through_seq: 3,
                 records: 0,
                 records_created: 0,
                 records_superseded: 0,

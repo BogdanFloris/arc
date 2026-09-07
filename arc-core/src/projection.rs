@@ -27,13 +27,21 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 18;
+pub(crate) const SCHEMA_VERSION: u32 = 19;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 const SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS context_status (
+    session_id TEXT PRIMARY KEY,
+    input_tokens INTEGER NOT NULL,
+    context_window INTEGER,
+    compact_at INTEGER,
+    observed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
     parent_session TEXT,
@@ -440,6 +448,22 @@ impl Projection {
                 }
                 session_event::Event::SessionCompacted(compacted) => {
                     insert_compaction(&tx, event, compacted)?;
+                    tx.execute(
+                        "DELETE FROM context_status WHERE session_id = ?1",
+                        [&compacted.session_id],
+                    )?;
+                }
+                session_event::Event::ContextMeasured(measured) => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO context_status VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            measured.session_id,
+                            measured.input_tokens,
+                            measured.context_window,
+                            measured.compact_at,
+                            event.ts.as_ref().map_or(0, |ts| ts.seconds)
+                        ],
+                    )?;
                 }
             },
             event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
@@ -896,6 +920,13 @@ pub struct Reader {
 }
 
 impl Reader {
+    pub fn context_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(arc_proto::v1::ContextMeasured, i64)>, Error> {
+        context_status(&self.conn(), session_id)
+    }
+
     pub fn open(path: &Path) -> Result<Self, Error> {
         let conn = Connection::open_with_flags(
             path,
@@ -1538,6 +1569,22 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
     }
 }
 
+fn context_status(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(arc_proto::v1::ContextMeasured, i64)>, Error> {
+    Ok(conn.query_row(
+        "SELECT input_tokens, context_window, compact_at, observed_at FROM context_status WHERE session_id = ?1",
+        [session_id],
+        |row| Ok((arc_proto::v1::ContextMeasured {
+            session_id: session_id.to_owned(),
+            input_tokens: row.get(0)?,
+            context_window: row.get(1)?,
+            compact_at: row.get(2)?,
+        }, row.get(3)?)),
+    ).optional()?)
+}
+
 fn event_kind(payload: &event::Payload) -> &'static str {
     match payload {
         event::Payload::Session(SessionEvent { event: Some(kind) }) => match kind {
@@ -1550,6 +1597,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
             session_event::Event::SessionTitled(_) => "session_titled",
             session_event::Event::SessionCompacted(_) => "session_compacted",
+            session_event::Event::ContextMeasured(_) => "context_measured",
         },
         event::Payload::Memory(MemoryEvent { event: Some(kind) }) => match kind {
             memory_event::Event::RecordCreated(_) => "memory_record_created",
@@ -2211,6 +2259,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_replay_keeps_only_the_last_step_and_compaction_invalidates_it() {
+        let measured = |seq, tokens| Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ContextMeasured(
+                    arc_proto::v1::ContextMeasured {
+                        session_id: "s-01".to_owned(),
+                        input_tokens: tokens,
+                        context_window: Some(272_000),
+                        compact_at: Some(217_600),
+                    },
+                )),
+            })),
+        };
+        let mut fork = session_created(4);
+        let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = &mut fork.payload
+        else {
+            panic!("session");
+        };
+        created.session_id = "child".to_owned();
+        created.parent_session = "s-01".to_owned();
+        created.fork_point = 3;
+        let events = [
+            session_created(1),
+            measured(2, 100_000),
+            measured(3, 84_000),
+            fork,
+        ];
+        for _ in 0..2 {
+            let mut projection = Projection::in_memory().unwrap();
+            for event in &events {
+                projection.apply(event).unwrap();
+            }
+            let (context, at) = super::context_status(&projection.conn, "s-01")
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.input_tokens, 84_000);
+            assert_eq!(context.context_window, Some(272_000));
+            assert_eq!(at, TS_SECONDS);
+            assert!(
+                super::context_status(&projection.conn, "child")
+                    .unwrap()
+                    .is_none()
+            );
+            projection
+                .apply(&Event {
+                    seq: 5,
+                    ts: Some(timestamp()),
+                    source: Source::System as i32,
+                    payload: Some(event::Payload::Session(SessionEvent {
+                        event: Some(session_event::Event::SessionCompacted(SessionCompacted {
+                            session_id: "s-01".to_owned(),
+                            through_seq: 3,
+                            summary: "summary".to_owned(),
+                            ..Default::default()
+                        })),
+                    })),
+                })
+                .unwrap();
+            assert!(
+                super::context_status(&projection.conn, "s-01")
+                    .unwrap()
+                    .is_none()
+            );
+            projection.apply(&measured(6, 10_000)).unwrap();
+            assert_eq!(
+                super::context_status(&projection.conn, "s-01")
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .input_tokens,
+                10_000
+            );
+        }
+    }
+
     fn session_created(seq: u64) -> Event {
         Event {
             seq,
@@ -2325,6 +2454,7 @@ mod tests {
     fn expected_tables() -> Vec<String> {
         [
             "compactions",
+            "context_status",
             "memory_fts",
             "memory_fts_config",
             "memory_fts_content",

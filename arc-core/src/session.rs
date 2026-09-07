@@ -57,6 +57,7 @@ pub struct Runner {
     /// The prompt-token count that triggers compaction (§4.4); `None` for a
     /// role with no configured `context_window`, which never compacts.
     pub compact_at: Option<u32>,
+    pub context_window: Option<u32>,
     /// Whether sessions on this model hold `consult_expert` (§6.2): a
     /// property of the model preset, not the role.
     pub counsel: bool,
@@ -1284,6 +1285,17 @@ impl Engine {
                     &mut cancel_rx,
                 )
                 .await?;
+            if let Some(usage) = step_usage {
+                self.record(
+                    Source::System,
+                    session_event::Event::ContextMeasured(arc_proto::v1::ContextMeasured {
+                        session_id: session_id.to_owned(),
+                        input_tokens: usage.input_tokens,
+                        context_window: runner.context_window,
+                        compact_at: runner.compact_at,
+                    }),
+                )?;
+            }
             let over_budget = runner
                 .compact_at
                 .is_some_and(|limit| step_usage.is_some_and(|usage| usage.input_tokens >= limit));
@@ -1555,6 +1567,7 @@ impl Engine {
                     }
                 }
                 Some(Ok(CompletionDelta::Grounding(json))) => *grounding = Some(json),
+                Some(Ok(CompletionDelta::UnmeasuredDone { stop })) => break Ending::Done(stop),
                 Some(Ok(CompletionDelta::Done { usage, stop })) => {
                     let total = total_usage.get_or_insert(Usage::default());
                     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -2174,9 +2187,15 @@ impl Engine {
                 CompletionDelta::Done {
                     stop: Stop::ToolCalls,
                     ..
+                }
+                | CompletionDelta::UnmeasuredDone {
+                    stop: Stop::ToolCalls,
                 } => {
                     return Err("the model stopped for tool calls with no tools offered".to_owned());
                 }
+                CompletionDelta::UnmeasuredDone {
+                    stop: Stop::EndTurn,
+                } => finished = true,
             }
         }
         if !finished {
@@ -2353,6 +2372,7 @@ fn session_id_of(event: &session_event::Event) -> &str {
         session_event::Event::SessionConsolidated(e) => &e.session_id,
         session_event::Event::SessionTitled(e) => &e.session_id,
         session_event::Event::SessionCompacted(e) => &e.session_id,
+        session_event::Event::ContextMeasured(e) => &e.session_id,
     }
 }
 
@@ -2621,6 +2641,70 @@ mod tests {
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
     use crate::tool::{Intent, JobRequest, Registry, Tool, ToolReply, ToolSource, TurnContext};
 
+    fn conversation_log(path: &std::path::Path) -> Vec<session_event::Event> {
+        replay_log(path)
+            .into_iter()
+            .filter(|event| !matches!(event, session_event::Event::ContextMeasured(_)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn context_records_each_measured_step_not_turn_totals_or_missing_usage() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
+            vec![
+                Ok(CompletionDelta::Text("done".to_owned())),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: 84_000,
+                        output_tokens: 7,
+                    },
+                    stop: Stop::EndTurn,
+                }),
+            ],
+            vec![
+                Ok(CompletionDelta::Text("unmetered".to_owned())),
+                Ok(CompletionDelta::UnmeasuredDone {
+                    stop: Stop::EndTurn,
+                }),
+            ],
+        ]);
+        let dir = TempDir::new().unwrap();
+        let (engine, mut run) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found", true)]));
+        run.context_window = Some(272_000);
+        run.compact_at = Some(217_600);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "question", tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.usage.unwrap().input_tokens,
+            84_000 + usage().input_tokens
+        );
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&reply.session_id), "again", tx)
+            .await
+            .unwrap();
+        let measurements: Vec<_> = replay_log(dir.path())
+            .into_iter()
+            .filter_map(|event| {
+                if let session_event::Event::ContextMeasured(measured) = event {
+                    Some(measured)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(measurements.len(), 2);
+        assert_eq!(measurements[0].input_tokens, usage().input_tokens);
+        assert_eq!(measurements[1].input_tokens, 84_000);
+        assert_eq!(measurements[1].context_window, Some(272_000));
+        assert_eq!(measurements[1].compact_at, Some(217_600));
+    }
+
     fn seeded_session() -> session_event::Event {
         session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
             session_id: "s-01".to_owned(),
@@ -2786,9 +2870,9 @@ mod tests {
         assert_eq!(reply.usage, Some(usage()));
         assert!(!reply.partial);
         assert!(!reply.step_capped, "the model finished on its own");
-        assert_eq!(reply.seq, 2);
+        assert_eq!(reply.seq, 3);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 3);
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
@@ -2813,7 +2897,7 @@ mod tests {
             engine
                 .with_store(|store| store.projection().last_seq())
                 .expect("last_seq"),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             engine
@@ -2860,8 +2944,8 @@ mod tests {
         }
         assert_eq!(
             session_ids,
-            vec![reply.session_id.clone(); 3],
-            "SessionCreated, the user message, and the assistant reply each notify"
+            vec![reply.session_id.clone(); 4],
+            "creation, user message, context measurement, and reply each notify"
         );
     }
 
@@ -2877,7 +2961,11 @@ mod tests {
             .await
             .expect("send_message");
 
-        assert_eq!(replay_log(dir.path()).len(), 3, "the append is unaffected");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            3,
+            "the append is unaffected"
+        );
     }
 
     #[tokio::test]
@@ -2898,7 +2986,7 @@ mod tests {
             .await
             .expect("second send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 5, "exactly one SessionCreated");
 
         let requests = provider.requests();
@@ -2956,7 +3044,7 @@ mod tests {
             "the refusal names both roles: {msg}"
         );
         assert_eq!(
-            replay_log(dir.path()).len(),
+            conversation_log(dir.path()).len(),
             2,
             "the refusal appended nothing"
         );
@@ -3029,7 +3117,7 @@ mod tests {
 
         assert!(reply.partial);
         assert_eq!(reply.usage, None);
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial tex");
@@ -3059,7 +3147,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 3, "the partial text was still appended");
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
@@ -3081,7 +3169,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(
             events.len(),
             2,
@@ -3102,7 +3190,7 @@ mod tests {
             .expect_err("must surface");
 
         assert!(matches!(err, Error::EmptyReply), "got: {err:?}");
-        assert_eq!(replay_log(dir.path()).len(), 2);
+        assert_eq!(conversation_log(dir.path()).len(), 2);
     }
 
     #[tokio::test]
@@ -3121,7 +3209,7 @@ mod tests {
         let (engine, _run) = engine(&provider, &dir);
 
         assert!(!engine.queue_message("s-never-existed", "hi", Source::User));
-        assert!(replay_log(dir.path()).is_empty());
+        assert!(conversation_log(dir.path()).is_empty());
     }
 
     #[tokio::test]
@@ -3156,7 +3244,7 @@ mod tests {
             .await
             .expect("send");
 
-        let logged = replay_log(dir.path());
+        let logged = conversation_log(dir.path());
         let user = appended(&logged[1]);
         assert_eq!(user.content, "hi");
         assert_eq!(replay_events(dir.path())[1].source, Source::System as i32);
@@ -3210,7 +3298,7 @@ mod tests {
         let reply = handle.await.expect("task").expect("a clean reply");
         assert!(!reply.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let issued_call = issued(&events[2]);
         assert_eq!(issued_call.call_id, "c1");
         let result = resulted(&events[3]);
@@ -3283,7 +3371,7 @@ mod tests {
         let reply = handle.await.expect("task").expect("a clean reply");
         assert!(!reply.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 5);
         let first_reply = appended(&events[2]);
         assert_eq!(first_reply.content, "stopped");
@@ -3291,7 +3379,7 @@ mod tests {
         assert_eq!(injected.content, "queued at the finish");
         let second_reply = appended(&events[4]);
         assert_eq!(second_reply.content, "second reply");
-        assert_eq!(reply.seq, 4, "the reply points at the second completion");
+        assert_eq!(reply.seq, 6, "the reply points at the second completion");
 
         assert_eq!(
             provider.requests().len(),
@@ -3350,7 +3438,7 @@ mod tests {
             .expect("a clean partial reply, not an error");
         assert!(reply.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let assistant = appended(events.last().expect("an appended event"));
         assert!(assistant.partial);
         assert_eq!(assistant.content, "partial");
@@ -3410,7 +3498,7 @@ mod tests {
             .expect("a clean partial reply, not an error");
         assert!(reply.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let results: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -3438,7 +3526,7 @@ mod tests {
             .expect("send");
 
         assert!(!reply.partial);
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(appended(&events[2]).content, "nobody watched");
     }
 
@@ -3455,7 +3543,7 @@ mod tests {
             .expect_err("must refuse");
 
         assert!(matches!(err, Error::EmptyMessage), "got: {err:?}");
-        assert_eq!(replay_log(dir.path()).len(), 0, "log untouched");
+        assert_eq!(conversation_log(dir.path()).len(), 0, "log untouched");
         assert!(provider.requests().is_empty(), "provider never called");
     }
 
@@ -3532,7 +3620,7 @@ mod tests {
             })
         );
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 5);
         let user = appended(&events[1]);
         let issued_call = issued(&events[2]);
@@ -3621,7 +3709,7 @@ mod tests {
 
         assert!(!reply.step_capped, "server calls are not tool steps");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 4, "created, user message, server call, reply");
         let user = appended(&events[1]);
         let call = server_called(&events[2]);
@@ -3679,7 +3767,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(
             events.len(),
             4,
@@ -3721,7 +3809,7 @@ mod tests {
             .expect("send")
             .session_id;
 
-        let logged = replay_log(dir.path())
+        let logged = conversation_log(dir.path())
             .into_iter()
             .find_map(|event| match event {
                 session_event::Event::ToolCallIssued(call) => Some(call),
@@ -3777,7 +3865,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let first = issued(&events[2]);
         let second = issued(&events[3]);
         assert_eq!((first.index, first.call_id.as_str()), (0, "a"));
@@ -3826,7 +3914,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let ids: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -3879,7 +3967,7 @@ mod tests {
             .await
             .expect("send after restart");
 
-        let ids: Vec<String> = replay_log(dir.path())
+        let ids: Vec<String> = conversation_log(dir.path())
             .iter()
             .filter_map(|event| match event {
                 session_event::Event::ToolCallIssued(c) => Some(c.call_id.clone()),
@@ -4114,7 +4202,7 @@ mod tests {
             .expect("send");
         assert!(!reply.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert_eq!(result.content, "ERROR: nope");
@@ -4145,7 +4233,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 6);
         let step_text = appended(&events[2]);
         assert_eq!(step_text.content, "checking");
@@ -4183,7 +4271,7 @@ mod tests {
             "usage accumulates across both completion steps"
         );
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let user = appended(&events[1]);
         let step_text = appended(&events[2]);
         let final_text = appended(&events[5]);
@@ -4240,7 +4328,7 @@ mod tests {
             requests[MAX_TOOL_STEPS].tools.is_empty(),
             "the final completion offers no tools"
         );
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(appended(events.last().expect("events")).content, "enough");
         assert!(!reply.partial);
         assert!(
@@ -4307,7 +4395,7 @@ mod tests {
 
         let forwarded = drain(&mut rx);
         assert!(forwarded.contains(&EngineEvent::Reasoning("hmm".to_owned())));
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
     }
@@ -4376,7 +4464,7 @@ mod tests {
             Some("let me check the clock"),
             "the head replays as reasoning on the next step"
         );
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let texts: Vec<String> = events
             .iter()
             .filter_map(|event| match event {
@@ -4415,7 +4503,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert!(result.truncated);
         assert_eq!(result.content, "01234567 [truncated]");
@@ -4436,6 +4524,7 @@ mod tests {
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -4467,6 +4556,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
 
@@ -4481,7 +4571,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
@@ -4682,6 +4772,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -5030,6 +5121,7 @@ mod tests {
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -5220,7 +5312,7 @@ mod tests {
             "the project's workspace tool was offered: {:?}",
             requests[0].tools
         );
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert_eq!(result.content, "workspace file");
@@ -5256,7 +5348,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.content, "nix,develop,-c");
     }
@@ -5290,7 +5382,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.content, "");
     }
@@ -5328,7 +5420,7 @@ mod tests {
             "an unbound session must not be offered a workspace tool: {:?}",
             requests[0].tools
         );
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(
@@ -5366,7 +5458,7 @@ mod tests {
             .expect("a project missing from config still gets builtin only");
 
         assert!(!reply.partial);
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(
@@ -5604,7 +5696,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
@@ -5651,7 +5743,7 @@ mod tests {
             .create_bound_session(&run, "arc", SessionRole::Concierge, None)
             .expect("create a bound session");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
@@ -5736,7 +5828,7 @@ mod tests {
         let session_id = engine
             .create_bound_session(&run, "arc", SessionRole::Executor, None)
             .expect("create a bound session");
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
@@ -5786,7 +5878,7 @@ mod tests {
             .create_bound_session(&run, "arc", SessionRole::Executor, None)
             .expect("create a bound session");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated first, got {:?}", events[0]);
         };
@@ -5810,7 +5902,11 @@ mod tests {
 
         assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
         assert!(err.to_string().contains("ghost"));
-        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            0,
+            "nothing was appended"
+        );
     }
 
     #[tokio::test]
@@ -5830,7 +5926,11 @@ mod tests {
             .expect_err("a missing root must fail at creation");
 
         assert!(matches!(err, Error::Grants { ref project, .. } if project == "arc"));
-        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            0,
+            "nothing was appended"
+        );
     }
 
     #[tokio::test]
@@ -5856,7 +5956,7 @@ mod tests {
             .create_direct_session(&run, "arc", SessionRole::Executor)
             .expect(":code opens a direct session");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 1, "no dispatch, so nothing else was appended");
         let session_event::Event::SessionCreated(created) = &events[0] else {
             panic!("expected SessionCreated, got {:?}", events[0]);
@@ -5906,7 +6006,11 @@ mod tests {
 
         assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
         assert!(err.to_string().contains("ghost"));
-        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            0,
+            "nothing was appended"
+        );
     }
 
     #[tokio::test]
@@ -5949,7 +6053,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert_eq!(result.content, "hi");
@@ -6002,7 +6106,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let inside = resulted(&events[4]);
         let outside = resulted(&events[5]);
         assert_eq!(inside.outcome, ToolOutcome::Ok as i32);
@@ -6065,7 +6169,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert_eq!(
@@ -6124,7 +6228,7 @@ mod tests {
             .expect("fork_session");
 
         assert_ne!(fork_id, parent_id);
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(created) = events.last().expect("an event") else {
             panic!(
                 "expected the fork's SessionCreated last, got {:?}",
@@ -6175,7 +6279,11 @@ mod tests {
             .expect_err("an unknown parent must be refused");
 
         assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
-        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            0,
+            "nothing was appended"
+        );
     }
 
     #[tokio::test]
@@ -6202,7 +6310,11 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidForkPoint { fork_point, .. } if fork_point == tool_call_seq)
         );
-        assert_eq!(replay_log(dir.path()).len(), 5, "nothing new was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            5,
+            "nothing new was appended"
+        );
     }
 
     #[tokio::test]
@@ -6246,7 +6358,7 @@ mod tests {
             .mark_branch(&fork_id, branch_marked::Disposition::Real)
             .expect("mark_branch");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         match events.last().expect("an event") {
             session_event::Event::BranchMarked(marked) => {
                 assert_eq!(marked.session_id, fork_id);
@@ -6284,7 +6396,7 @@ mod tests {
             matches!(err, Error::NotABranch { ref session_id } if *session_id == reply.session_id)
         );
         assert!(
-            replay_log(dir.path())
+            conversation_log(dir.path())
                 .iter()
                 .all(|event| !matches!(event, session_event::Event::BranchMarked(_))),
             "nothing was appended"
@@ -6302,7 +6414,11 @@ mod tests {
             .expect_err("an unknown session must be refused");
 
         assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
-        assert_eq!(replay_log(dir.path()).len(), 0, "nothing was appended");
+        assert_eq!(
+            conversation_log(dir.path()).len(),
+            0,
+            "nothing was appended"
+        );
     }
 
     #[tokio::test]
@@ -6321,7 +6437,7 @@ mod tests {
             .await
             .expect("send");
         let root = first.session_id.clone();
-        let root_user_seq = first.seq - 1;
+        let root_user_seq = first.seq - 2;
 
         let branch = engine
             .fork_session(&root, first.seq)
@@ -6460,7 +6576,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("granted"), "{}", result.content);
@@ -6512,7 +6628,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 6);
         let session_event::Event::SessionCreated(child) = &events[3] else {
             panic!("expected the child SessionCreated, got {:?}", events[3]);
@@ -6569,6 +6685,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
@@ -6625,7 +6742,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(child) = &events[3] else {
             panic!("expected the child SessionCreated, got {:?}", events[3]);
         };
@@ -6682,7 +6799,7 @@ mod tests {
             .await
             .expect("a bad dispatch fails the call, not the turn");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 5, "no child session was created");
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
@@ -6727,7 +6844,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(child) = &events[3] else {
             panic!("expected the child SessionCreated, got {:?}", events[3]);
         };
@@ -6803,7 +6920,7 @@ mod tests {
             .await
             .expect("send");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let session_event::Event::SessionCreated(child) = &events[3] else {
             panic!("expected the child SessionCreated, got {:?}", events[3]);
         };
@@ -6892,7 +7009,7 @@ mod tests {
             .expect("a bounced dispatch fails the call, not the turn");
 
         assert!(second.jobs.is_empty(), "no second child was spawned");
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 11, "no SessionCreated in the second turn");
         let result = resulted(&events[9]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
@@ -7109,7 +7226,7 @@ mod tests {
             }]
         );
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert!(result.content.contains("Continuing"), "{}", result.content);
@@ -7142,7 +7259,7 @@ mod tests {
             .expect("a bad continue_job fails the call, not the turn");
 
         assert!(reply.continues.is_empty());
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("s-ghost"), "{}", result.content);
@@ -7189,7 +7306,7 @@ mod tests {
             .expect("a bad continue_job fails the call, not the turn");
 
         assert!(reply.continues.is_empty());
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("concierge"), "{}", result.content);
@@ -7286,7 +7403,7 @@ mod tests {
             reply.continues.is_empty(),
             "the mismatch refuses the resume"
         );
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("model-a"), "{}", result.content);
@@ -7316,6 +7433,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -7351,6 +7469,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -7382,6 +7501,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let (tx, _rx) = channel();
@@ -7662,7 +7782,7 @@ mod tests {
 
     async fn wait_for_event_count(dir: &std::path::Path, want: usize) {
         for _ in 0..400 {
-            if replay_log(dir).len() >= want {
+            if conversation_log(dir).len() >= want {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -7694,7 +7814,7 @@ mod tests {
         assert_eq!(continued.session_id, reply.session_id);
         assert!(!continued.partial);
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(
             events.len(),
             4,
@@ -7740,7 +7860,7 @@ mod tests {
             .expect("continue_session");
 
         assert!(!reply.partial);
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(
             events.len(),
             2,
@@ -7790,7 +7910,7 @@ mod tests {
 
         assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
         assert_eq!(
-            replay_log(dir.path()).len(),
+            conversation_log(dir.path()).len(),
             2,
             "the refusal appended nothing"
         );
@@ -7844,7 +7964,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
-            replay_log(dir.path()).len(),
+            conversation_log(dir.path()).len(),
             2,
             "continue_session stays blocked while the user turn holds the guard"
         );
@@ -7853,7 +7973,7 @@ mod tests {
         let sent = turn.await.expect("turn task");
         let continued = continue_handle.await.expect("continue_session task");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(
             events.len(),
             4,
@@ -7970,7 +8090,7 @@ mod tests {
             .await
             .expect("a bad dispatch fails the call, not the turn");
 
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         assert_eq!(events.len(), 5, "no child session was created");
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
@@ -8166,6 +8286,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            context_window: None,
             counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
@@ -8206,7 +8327,7 @@ mod tests {
             "compaction never offers tools"
         );
 
-        let logged = replay_log(dir.path());
+        let logged = conversation_log(dir.path());
         let compacted = compacted_event(&logged).expect("a SessionCompacted event landed");
         assert!(
             compacted.summary.starts_with("Goal"),
@@ -8251,6 +8372,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            context_window: None,
             counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
@@ -8259,7 +8381,7 @@ mod tests {
             .send_message(&run, None, "Keep the public API unchanged.", tx)
             .await
             .expect("long turn");
-        let events = replay_log(dir.path());
+        let events = conversation_log(dir.path());
         let compactions: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -8329,6 +8451,7 @@ mod tests {
         let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
         let run = Runner {
             compact_at: Some(LIMIT),
+            context_window: None,
             counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
@@ -8351,7 +8474,7 @@ mod tests {
             .expect("turn 3");
 
         assert_eq!(provider.requests().len(), 3, "no compaction call was made");
-        assert!(compacted_event(&replay_log(dir.path())).is_none());
+        assert!(compacted_event(&conversation_log(dir.path())).is_none());
     }
 
     #[tokio::test]
@@ -8370,6 +8493,7 @@ mod tests {
         let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
         let run = Runner {
             compact_at: None,
+            context_window: None,
             counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
@@ -8381,7 +8505,7 @@ mod tests {
             .expect("turn");
 
         assert_eq!(provider.requests().len(), 1, "no compaction call was made");
-        assert!(compacted_event(&replay_log(dir.path())).is_none());
+        assert!(compacted_event(&conversation_log(dir.path())).is_none());
     }
 
     #[tokio::test]
@@ -8408,6 +8532,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            context_window: None,
             counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
@@ -8432,7 +8557,7 @@ mod tests {
 
         assert!(!reply.partial);
         assert!(
-            compacted_event(&replay_log(dir.path())).is_none(),
+            compacted_event(&conversation_log(dir.path())).is_none(),
             "an invalid summary writes nothing to the log"
         );
     }

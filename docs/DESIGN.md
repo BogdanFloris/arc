@@ -278,6 +278,8 @@ A long session outgrows its window. The answer is an event, not an in-memory con
 
 The cache miss after a compaction is inherent and paid once.
 
+**Session status.** The TUI shows a dim status line directly below the recorded model. Context is the last completed step's reported input tokens, never accumulated turn usage. `ContextMeasured` records that count, the configured window, and the compaction threshold; replay restores the reading. A fork starts unmeasured, and compaction invalidates the previous reading until another step completes. Unknown limits stay unknown. Codex also shows remaining account allowance for the backend's rolling windows. This is transient provider telemetry shared by credential, not session spend or durable state. Status requests use a short cache, bounded network waits, and explicit unknown or stale readings. The client refreshes the visible session independently of its turn stream; allowance failures never fail a turn. Reset times and observation age belong in `:status`, not the compact header. Credentials and raw account responses never enter the log.
+
 **The shell tool settles the open redaction question.** `bash` is the first tool that can read its own environment. arcd runs workspace tools with a scrubbed environment: no keys and no tokens. A result cannot contain credentials the process never received. Secret protection depends on what the tool can access, not on a regex applied afterwards.
 
 ## 5. Memory

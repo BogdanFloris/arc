@@ -234,6 +234,13 @@ async fn request(
         Some(client_frame::Msg::FetchHistory(fetch)) => {
             fetch_history(ws, reads, frame.request_id, &fetch.session_id).await
         }
+        Some(client_frame::Msg::FetchStatus(fetch)) => {
+            let msg = match session_status(reads, supervisor, &fetch.session_id).await {
+                Ok(status) => server_frame::Msg::SessionStatus(status),
+                Err(error) => error_frame("status_unavailable", &error),
+            };
+            flow(send_frame(ws, frame.request_id, msg).await)
+        }
         Some(client_frame::Msg::MemoryReviewList(list)) => {
             review_list(ws, reads, frame.request_id, list.since_micros).await
         }
@@ -423,6 +430,56 @@ async fn forward(
         )
         .await,
     )
+}
+
+#[tracing::instrument(name = "server.session_status", skip_all, fields(session_id))]
+async fn session_status(
+    reads: &Reader,
+    supervisor: &Supervisor,
+    session_id: &str,
+) -> anyhow::Result<arc_proto::v1::SessionStatus> {
+    let session = reads
+        .sessions()?
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let mut status = arc_proto::v1::SessionStatus {
+        session_id: session_id.to_owned(),
+        codex: session.provider == "codex",
+        ..Default::default()
+    };
+    if let Some((context, observed_at)) = reads.context_status(session_id)? {
+        status.context = Some(context);
+        status.context_observed_at = observed_at;
+    }
+    if status.codex {
+        if let Some(runner) = supervisor.status_runner(
+            SessionRole::try_from(session.role).unwrap_or_default(),
+            &session.provider,
+            &session.model,
+        ) {
+            if let Ok(Some(allowance)) = runner.provider.allowance().await {
+                status.allowance_observed_at = allowance.observed_at;
+                status.allowance_stale = allowance.stale;
+                status.allowance = allowance
+                    .primary
+                    .into_iter()
+                    .chain(allowance.secondary)
+                    .map(|window| arc_proto::v1::AllowanceWindow {
+                        remaining_percent: remaining_percent(window.remaining_percent),
+                        resets_at: window.resets_at_unix_seconds,
+                        window_seconds: window.window_seconds,
+                    })
+                    .collect();
+            }
+        }
+    }
+    Ok(status)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn remaining_percent(value: f64) -> u32 {
+    value.clamp(0.0, 100.0).floor() as u32
 }
 
 async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> ControlFlow<()> {
@@ -826,6 +883,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::SendMessage(_)) => "send_message",
         Some(client_frame::Msg::ListSessions(_)) => "list_sessions",
         Some(client_frame::Msg::FetchHistory(_)) => "fetch_history",
+        Some(client_frame::Msg::FetchStatus(_)) => "fetch_status",
         Some(client_frame::Msg::MemoryReviewList(_)) => "memory_review_list",
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
@@ -1057,6 +1115,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: None,
                 compact_at: None,
+                context_window: None,
                 counsel: false,
             };
             Self::with_seed(
@@ -1135,6 +1194,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
                 compact_at: None,
+                context_window: None,
                 counsel: false,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -1199,6 +1259,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
                 compact_at: None,
+                context_window: None,
                 counsel: false,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -1607,6 +1668,30 @@ mod tests {
             ]
         );
 
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn status_round_trips_the_latest_measurement_and_survives_client_reconnect() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+        send(&mut ws, 1, say("", "status")).await;
+        let (session_id, _, _) = turn(&mut ws, 1).await;
+        let url = format!("ws://{}", harness.addr);
+        let mut client = arc_core::client::Client::connect(&url).await.unwrap();
+        let first = client.fetch_status(&session_id).await.unwrap();
+        assert_eq!(
+            first.context.as_ref().unwrap().input_tokens,
+            usage().input_tokens
+        );
+        assert_eq!(first.context.as_ref().unwrap().context_window, None);
+        assert!(first.context_observed_at > 0);
+        assert!(!first.codex);
+        assert!(first.allowance.is_empty());
+        drop(client);
+        let mut client = arc_core::client::Client::connect(&url).await.unwrap();
+        assert_eq!(client.fetch_status(&session_id).await.unwrap(), first);
+        assert!(client.fetch_status("missing").await.is_err());
         harness.stop().await;
     }
 
@@ -2055,7 +2140,7 @@ mod tests {
                         name: "lookup".to_owned(),
                         arguments_json: "{}".to_owned(),
                     })),
-                    seq: 2,
+                    seq: 3,
                 },
                 HistoryEntry {
                     entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
@@ -2064,7 +2149,7 @@ mod tests {
                         truncated: false,
                         content: "found it".to_owned(),
                     })),
-                    seq: 3,
+                    seq: 4,
                 },
             ],
             "the projection→history path stamps every entry with its log seq"
@@ -3803,6 +3888,7 @@ mod tests {
             thinking: Thinking::Default,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let executor_runner = Runner {
@@ -3812,6 +3898,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         };
         let supervisor = Arc::new(

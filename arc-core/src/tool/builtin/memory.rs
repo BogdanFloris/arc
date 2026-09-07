@@ -633,14 +633,14 @@ mod tests {
             .expect("send");
 
         let events = replay_events(dir.path());
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 8);
         assert!(matches!(
-            session_ev(&events[2]),
+            session_ev(&events[3]),
             session_event::Event::ToolCallIssued(_)
         ));
 
-        let record = created_record(&events[3]);
-        assert_eq!(events[3].source, Source::Model as i32);
+        let record = created_record(&events[4]);
+        assert_eq!(events[4].source, Source::Model as i32);
         assert!(record.id.starts_with("mr-"), "{}", record.id);
         assert_eq!(record.namespace, "global", "namespace defaults to global");
         assert_eq!(record.status, memory_record::Status::Active as i32);
@@ -650,8 +650,8 @@ mod tests {
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
         assert!(provenance.entries[0].ts.is_some());
 
-        let session_event::Event::ToolResultRecorded(result) = session_ev(&events[4]) else {
-            panic!("expected the result after the write, got {:?}", events[4]);
+        let session_event::Event::ToolResultRecorded(result) = session_ev(&events[5]) else {
+            panic!("expected the result after the write, got {:?}", events[5]);
         };
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert_eq!(result.content, format!("Saved (id: {}).", record.id));
@@ -724,7 +724,7 @@ mod tests {
             .send_message(&run, None, "remember this", tx)
             .await
             .expect("send");
-        let id = created_record(&replay_events(dir.path())[3]).id.clone();
+        let id = created_record(&replay_events(dir.path())[4]).id.clone();
 
         let tool = MemoryRead::new(archive_at(&dir));
         let read = tool
@@ -776,17 +776,17 @@ mod tests {
             .expect("second send");
 
         let events = replay_events(dir.path());
-        let memory_event::Event::RecordSuperseded(superseded) = memory_ev(&events[4]) else {
+        let memory_event::Event::RecordSuperseded(superseded) = memory_ev(&events[5]) else {
             panic!(
                 "expected RecordSuperseded before the result, got {:?}",
-                events[4]
+                events[5]
             );
         };
         assert_eq!(superseded.superseded_id, "mr-old");
         let replacement = superseded.record.as_ref().expect("record");
         assert_ne!(replacement.id, "mr-old", "the replacement gets a fresh id");
-        let session_event::Event::ToolResultRecorded(result) = session_ev(&events[5]) else {
-            panic!("expected the result, got {:?}", events[5]);
+        let session_event::Event::ToolResultRecorded(result) = session_ev(&events[6]) else {
+            panic!("expected the result, got {:?}", events[6]);
         };
         assert_eq!(
             result.content,

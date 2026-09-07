@@ -313,10 +313,16 @@ impl ModelExtractor {
                 CompletionDelta::Done {
                     stop: Stop::EndTurn,
                     ..
+                }
+                | CompletionDelta::UnmeasuredDone {
+                    stop: Stop::EndTurn,
                 } => finished = true,
                 CompletionDelta::Done {
                     stop: Stop::ToolCalls,
                     ..
+                }
+                | CompletionDelta::UnmeasuredDone {
+                    stop: Stop::ToolCalls,
                 } => {
                     return Err(ExtractError(
                         "the model stopped for tool calls with no tools offered".to_owned(),
@@ -1225,7 +1231,7 @@ mod tests {
             outcome,
             Outcome::Consolidated {
                 session_id: reply.session_id.clone(),
-                through_seq: 2,
+                through_seq: 3,
                 records: 1,
                 records_created: 1,
                 records_superseded: 0,
@@ -1280,9 +1286,9 @@ mod tests {
         );
 
         let events = replay_events(dir.path());
-        assert_eq!(events.len(), 6);
-        let Some(event::Payload::Session(title_event)) = &events[3].payload else {
-            panic!("expected the title event, got {:?}", events[3]);
+        assert_eq!(events.len(), 7);
+        let Some(event::Payload::Session(title_event)) = &events[4].payload else {
+            panic!("expected the title event, got {:?}", events[4]);
         };
         let Some(session_event::Event::SessionTitled(titled)) = &title_event.event else {
             panic!("expected SessionTitled, got {title_event:?}");
@@ -1293,9 +1299,9 @@ mod tests {
             "quotes and whitespace stripped"
         );
 
-        assert_eq!(events[4].source, Source::System as i32);
-        let Some(event::Payload::Memory(memory)) = &events[4].payload else {
-            panic!("expected the record before the marker, got {:?}", events[4]);
+        assert_eq!(events[5].source, Source::System as i32);
+        let Some(event::Payload::Memory(memory)) = &events[5].payload else {
+            panic!("expected the record before the marker, got {:?}", events[5]);
         };
         let Some(memory_event::Event::RecordCreated(created)) = &memory.event else {
             panic!("expected RecordCreated, got {memory:?}");
@@ -1309,14 +1315,14 @@ mod tests {
         assert_eq!(provenance.entries.len(), 1);
         assert_eq!(provenance.entries[0].session_id, reply.session_id);
         assert!(provenance.entries[0].ts.is_some());
-        let Some(event::Payload::Session(session)) = &events[5].payload else {
-            panic!("expected the marker last, got {:?}", events[5]);
+        let Some(event::Payload::Session(session)) = &events[6].payload else {
+            panic!("expected the marker last, got {:?}", events[6]);
         };
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
         };
         assert_eq!(marker.prompt_version, "v4");
-        assert_eq!(marker.through_seq, 2);
+        assert_eq!(marker.through_seq, 3);
 
         let (tx, _rx) = channel();
         engine

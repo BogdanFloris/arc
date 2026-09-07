@@ -130,6 +130,8 @@ pub enum CompletionDelta {
     Grounding(String),
 
     Done { usage: Usage, stop: Stop },
+
+    UnmeasuredDone { stop: Stop },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +148,21 @@ pub struct Usage {
     pub output_tokens: u32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountAllowance {
+    pub observed_at: i64,
+    pub stale: bool,
+    pub primary: Option<AllowanceWindow>,
+    pub secondary: Option<AllowanceWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllowanceWindow {
+    pub remaining_percent: f64,
+    pub window_seconds: Option<u64>,
+    pub resets_at_unix_seconds: Option<i64>,
+}
+
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<CompletionDelta, Error>> + Send>>;
 
 pub trait Provider: Send + Sync + std::fmt::Debug {
@@ -155,6 +172,10 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     #[allow(clippy::unnecessary_literal_bound)]
     fn endpoint(&self) -> &str {
         ""
+    }
+
+    fn allowance(&self) -> BoxFuture<'_, Result<Option<AccountAllowance>, Error>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn complete(
@@ -332,7 +353,7 @@ mod tests {
         text: String,
         reasoning: String,
         calls: Vec<ToolCall>,
-        ending: Option<(Usage, Stop)>,
+        ending: Option<(Option<Usage>, Stop)>,
     }
 
     async fn drain<P: Provider>(
@@ -349,7 +370,12 @@ mod tests {
                 CompletionDelta::ServerCall { .. }
                 | CompletionDelta::ServerResponse { .. }
                 | CompletionDelta::Grounding(_) => {}
-                CompletionDelta::Done { usage, stop } => drained.ending = Some((usage, stop)),
+                CompletionDelta::Done { usage, stop } => {
+                    drained.ending = Some((Some(usage), stop));
+                }
+                CompletionDelta::UnmeasuredDone { stop } => {
+                    drained.ending = Some((None, stop));
+                }
             }
         }
         Ok(drained)
@@ -380,7 +406,7 @@ mod tests {
                 text: "hello, world".to_owned(),
                 reasoning: "thinking".to_owned(),
                 calls: Vec::new(),
-                ending: Some((usage, Stop::EndTurn)),
+                ending: Some((Some(usage), Stop::EndTurn)),
             }
         );
     }
@@ -406,7 +432,10 @@ mod tests {
 
         assert!(drained.text.is_empty());
         assert_eq!(drained.calls, [call]);
-        assert_eq!(drained.ending, Some((Usage::default(), Stop::ToolCalls)));
+        assert_eq!(
+            drained.ending,
+            Some((Some(Usage::default()), Stop::ToolCalls))
+        );
     }
 
     #[tokio::test]
@@ -463,7 +492,7 @@ mod tests {
             joined.expect("stream"),
             Drained {
                 text: "spawned".to_owned(),
-                ending: Some((usage, Stop::EndTurn)),
+                ending: Some((Some(usage), Stop::EndTurn)),
                 ..Drained::default()
             }
         );

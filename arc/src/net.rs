@@ -4,6 +4,46 @@ use tokio::sync::mpsc;
 
 use crate::app::{Command, NetEvent, ReviewEntry};
 
+pub async fn run_status(
+    url: String,
+    mut session: tokio::sync::watch::Receiver<Option<String>>,
+    events: mpsc::UnboundedSender<NetEvent>,
+) {
+    let mut client: Option<Client> = None;
+    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(30));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = session.changed() => if changed.is_err() { return; },
+            _ = refresh.tick() => {}
+        }
+        let Some(id) = session.borrow_and_update().clone() else {
+            continue;
+        };
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            if client.is_none() {
+                client = Some(Client::connect(&url).await?);
+            }
+            client.as_mut().expect("connected").fetch_status(&id).await
+        });
+        let result = tokio::select! {
+            result = fetch => result,
+            changed = session.changed() => {
+                if changed.is_err() { return; }
+                client = None;
+                session.mark_changed();
+                continue;
+            }
+        };
+        if let Ok(Ok(status)) = result {
+            let _ = events.send(NetEvent::SessionStatus(status));
+        } else {
+            client = None;
+            let _ = events.send(NetEvent::StatusUnavailable(id));
+        }
+    }
+}
+
 fn branch_label(branch: &arc_proto::v1::BranchPointer) -> String {
     if branch.title.is_empty() {
         branch.session_id.chars().take(8).collect()
@@ -654,6 +694,82 @@ mod tests {
         task.await.expect("metadata task");
         server.await.expect("server");
         assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn switching_sessions_interrupts_a_slow_status_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (session, receiver) = tokio::sync::watch::channel(Some("old".to_owned()));
+        let switch = session.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut old = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(matches!(expect_frame(&mut old).await.msg,
+                Some(client_frame::Msg::FetchStatus(request)) if request.session_id == "old"));
+            switch.send(Some("new".to_owned())).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut new = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = expect_frame(&mut new).await;
+            assert!(matches!(request.msg,
+                Some(client_frame::Msg::FetchStatus(request)) if request.session_id == "new"));
+            reply(
+                &mut new,
+                request.request_id,
+                server_frame::Msg::SessionStatus(arc_proto::v1::SessionStatus {
+                    session_id: "new".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        });
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_status(url, receiver, tx));
+        assert!(
+            matches!(next_event(&mut events).await, NetEvent::SessionStatus(status) if status.session_id == "new")
+        );
+        drop(session);
+        server.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_status_failure_is_separate_from_the_turn_and_retries_on_a_new_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (session, receiver) = tokio::sync::watch::channel(Some("s".to_owned()));
+        let server = tokio::spawn(async move {
+            for fail in [true, false] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = expect_frame(&mut ws).await;
+                let response = if fail {
+                    server_frame::Msg::Error(arc_proto::v1::Error {
+                        code: "busy".to_owned(),
+                        msg: "unavailable".to_owned(),
+                    })
+                } else {
+                    server_frame::Msg::SessionStatus(arc_proto::v1::SessionStatus {
+                        session_id: "s".to_owned(),
+                        ..Default::default()
+                    })
+                };
+                reply(&mut ws, request.request_id, response).await;
+            }
+        });
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_status(url, receiver, tx));
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::StatusUnavailable("s".to_owned())
+        );
+        session.send(Some("s".to_owned())).unwrap();
+        assert!(
+            matches!(next_event(&mut events).await, NetEvent::SessionStatus(status) if status.session_id == "s")
+        );
+        drop(session);
+        server.await.unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]

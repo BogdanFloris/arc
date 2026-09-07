@@ -108,6 +108,7 @@ async fn run(
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (control_commands, control_command_rx) = mpsc::unbounded_channel();
     let (metadata_commands, metadata_command_rx) = mpsc::unbounded_channel();
+    let (status_session, status_rx) = tokio::sync::watch::channel(None);
     let (event_tx, mut events) = mpsc::unbounded_channel();
     tokio::spawn(net::run(url.clone(), command_rx, event_tx.clone()));
     tokio::spawn(net::run_control(
@@ -115,6 +116,7 @@ async fn run(
         control_command_rx,
         event_tx.clone(),
     ));
+    tokio::spawn(net::run_status(url.clone(), status_rx, event_tx.clone()));
     tokio::spawn(net::run_metadata(url, metadata_command_rx, event_tx));
 
     let _ = commands.send(Command::List);
@@ -129,7 +131,15 @@ async fn run(
     let mut clock = tokio::time::interval(Duration::from_secs(1));
 
     while !app.quit {
+        status_session.send_if_modified(|id| {
+            if *id == app.session_id {
+                return false;
+            }
+            id.clone_from(&app.session_id);
+            true
+        });
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        let status_open = matches!(app.overlay, app::Overlay::SessionStatus);
 
         let command = tokio::select! {
             key = keys.next() => match key {
@@ -141,6 +151,11 @@ async fn run(
             },
             event = events.recv() => match event {
                 Some(event) => {
+                    if matches!(&event, NetEvent::End { .. } | NetEvent::Compacted { .. })
+                        || matches!(&event, NetEvent::SessionAppended { session_id } if app.session_id.as_ref() == Some(session_id))
+                    {
+                        let _ = status_session.send(app.session_id.clone());
+                    }
                     if needs_session_metadata(&app, &event) {
                         metadata_commands.send(()).expect("metadata task alive");
                     }
@@ -151,6 +166,9 @@ async fn run(
             _ = clock.tick(), if app.has_running_job() || app.status == Status::Streaming => None,
         };
 
+        if !status_open && matches!(app.overlay, app::Overlay::SessionStatus) {
+            let _ = status_session.send(app.session_id.clone());
+        }
         match command {
             Some(Command::Yank(text)) => yank(&text),
             Some(command @ (Command::CancelTurn { .. } | Command::SendLive { .. })) => {

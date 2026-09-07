@@ -1,3 +1,4 @@
+mod allowance;
 pub mod auth;
 mod stream;
 
@@ -57,6 +58,7 @@ pub struct Codex {
     endpoint: String,
     tokens: Tokens,
     http: reqwest::Client,
+    allowance_cache: tokio::sync::Mutex<allowance::Cache>,
 }
 
 impl std::fmt::Debug for Codex {
@@ -85,6 +87,7 @@ impl Codex {
         Ok(Self {
             endpoint,
             tokens: Tokens::open(secrets, credential, auth_endpoint)?,
+            allowance_cache: tokio::sync::Mutex::new(allowance::Cache::default()),
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
                 .build()
@@ -120,6 +123,10 @@ impl Provider for Codex {
 
     fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    fn allowance(&self) -> BoxFuture<'_, Result<Option<crate::provider::AccountAllowance>, Error>> {
+        Box::pin(async move { Codex::allowance(self).await.map(Some) })
     }
 
     #[tracing::instrument(

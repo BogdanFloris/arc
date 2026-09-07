@@ -42,10 +42,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let masthead_height = if app.transcript.is_empty() && transcript.height >= MASTHEAD_FLOOR {
+    let masthead_height = if app.session_id.is_none()
+        && app.transcript.is_empty()
+        && transcript.height >= MASTHEAD_FLOOR
+    {
         MASTHEAD
     } else {
-        3
+        4
     };
     let [masthead, body] =
         Layout::vertical([Constraint::Length(masthead_height), Constraint::Fill(1)])
@@ -66,6 +69,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Overlay::Projects(projects) => draw_projects(frame, frame.area(), projects),
         Overlay::Models(models) => draw_models(frame, frame.area(), models),
         Overlay::Help { .. } => draw_help(frame, app, frame.area()),
+        Overlay::SessionStatus => draw_status(frame, frame.area(), app),
         Overlay::None => {}
     }
 }
@@ -476,10 +480,186 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(vec![
             Line::from(heading),
             Line::styled(elide(&model, room), theme::DIM),
+            status_line(app, room),
             Line::styled("─".repeat(room), theme::DIM),
         ]),
         area,
     );
+}
+
+fn current_status(app: &App) -> Option<&arc_proto::v1::SessionStatus> {
+    app.session_id
+        .as_ref()
+        .and_then(|id| app.session_status.get(id))
+}
+
+fn allowance_label(window: &arc_proto::v1::AllowanceWindow) -> String {
+    match window.window_seconds {
+        Some(604_800) => "week".to_owned(),
+        Some(seconds) if seconds >= 3600 && seconds % 3600 == 0 => format!("{}h", seconds / 3600),
+        Some(seconds) => format!("{}m", seconds / 60),
+        None => "window".to_owned(),
+    }
+}
+
+fn allowance_stale(status: &arc_proto::v1::SessionStatus) -> bool {
+    status.allowance_stale
+        || chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(status.allowance_observed_at)
+            > 120
+}
+
+fn status_line(app: &App, room: usize) -> Line<'static> {
+    let status = current_status(app);
+    let context = status.and_then(|s| s.context.as_ref());
+    let text = match context {
+        Some(context) => format!(
+            "ctx {}/{}",
+            status_tokens(context.input_tokens),
+            context
+                .context_window
+                .map_or_else(|| "?".to_owned(), status_tokens)
+        ),
+        None => "ctx unmeasured".to_owned(),
+    };
+    let near_limit = context.is_some_and(|c| {
+        c.context_window
+            .is_some_and(|w| w > 0 && u64::from(c.input_tokens) * 10 >= u64::from(w) * 9)
+    });
+    let mut spans = vec![Span::styled(
+        text,
+        if near_limit { theme::ERROR } else { theme::DIM },
+    )];
+    let codex = status.is_some_and(|s| s.codex)
+        || app.session_id.as_ref().is_some_and(|id| {
+            app.sessions
+                .iter()
+                .any(|s| &s.id == id && s.provider == "codex")
+        });
+    if codex {
+        match status.filter(|s| !s.allowance.is_empty()) {
+            Some(status) => {
+                let stale = allowance_stale(status);
+                if stale {
+                    spans.push(Span::styled(" · stale", theme::DIM));
+                }
+                for window in &status.allowance {
+                    spans.push(Span::styled(
+                        format!(
+                            " · {} {}% left",
+                            allowance_label(window),
+                            window.remaining_percent
+                        ),
+                        if !stale && window.remaining_percent <= 10 {
+                            theme::ERROR
+                        } else {
+                            theme::DIM
+                        },
+                    ));
+                }
+            }
+            None => spans.push(Span::styled(" · Codex usage unknown", theme::DIM)),
+        }
+    }
+    let mut remaining = room;
+    for span in &mut spans {
+        if remaining == 0 {
+            span.content = "".into();
+        } else if span.width() > remaining {
+            span.content = elide(&span.content, remaining).into();
+        }
+        remaining = remaining.saturating_sub(span.width());
+    }
+    Line::from(spans)
+}
+
+fn draw_status(frame: &mut Frame, full: Rect, app: &App) {
+    let mut lines = vec![status_line(app, usize::MAX), Line::default()];
+    if let Some(status) = current_status(app) {
+        match &status.context {
+            Some(context) => {
+                let age = chrono::Utc::now()
+                    .timestamp()
+                    .saturating_sub(status.context_observed_at)
+                    .max(0);
+                lines.push(Line::from(format!(
+                    "Context: last reported prompt, measured {age}s ago"
+                )));
+                lines.push(Line::from(format!(
+                    "Compaction threshold: {}",
+                    context
+                        .compact_at
+                        .map_or_else(|| "not configured".to_owned(), status_tokens)
+                )));
+            }
+            None => lines.push(Line::from(
+                "Context: no measurement since creation or compaction",
+            )),
+        }
+        if status.codex {
+            lines.push(Line::default());
+            if status.allowance_observed_at > 0 {
+                let age = chrono::Utc::now()
+                    .timestamp()
+                    .saturating_sub(status.allowance_observed_at)
+                    .max(0);
+                lines.push(Line::from(format!(
+                    "Codex account allowance: observed {age}s ago"
+                )));
+            } else {
+                lines.push(Line::from("Codex account allowance: unavailable"));
+            }
+            for window in &status.allowance {
+                let reset = window
+                    .resets_at
+                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                    .map_or_else(
+                        || "unknown".to_owned(),
+                        |ts| {
+                            ts.with_timezone(&chrono::Local)
+                                .format("%a %d %b %H:%M %Z")
+                                .to_string()
+                        },
+                    );
+                lines.push(Line::from(format!(
+                    "{}: {}% left · resets {reset}",
+                    allowance_label(window),
+                    window.remaining_percent
+                )));
+            }
+            if allowance_stale(status) && !status.allowance.is_empty() {
+                lines.push(Line::from(
+                    "Stale: the last allowance refresh failed or is overdue",
+                ));
+            }
+        }
+    } else {
+        lines.push(Line::from("Waiting for session status"));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Context is not turn spend. Allowance is shared across sessions.",
+        theme::DIM,
+    ));
+    lines.push(Line::styled("Esc close", theme::DIM));
+    let area = popup(
+        frame,
+        full,
+        76,
+        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        "status",
+    );
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+fn status_tokens(tokens: u32) -> String {
+    format_tokens(u64::from(tokens))
+        .replace(".0k", "k")
+        .replace(".0M", "M")
 }
 
 fn draw_masthead(frame: &mut Frame, area: Rect, app: &App) {
@@ -1278,6 +1458,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":review           open the review pane",
             ":jobs             open the jobs pane",
             ":model            open the model picker",
+            ":status           context measurement and Codex allowance",
             ":code <project>   open a bound executor session, no dispatch",
             "                  without a project, open the project picker",
             ":fork             branch at the visual selection",
@@ -1599,7 +1780,7 @@ mod tests {
             assert_eq!(buffer[(2, 1)].fg, theme::DIM.fg.unwrap());
             assert!(
                 text.lines()
-                    .nth(2)
+                    .nth(3)
                     .unwrap()
                     .contains(&"─".repeat(usize::from(width - 4)))
             );
@@ -1617,6 +1798,107 @@ mod tests {
         assert!(plain_text(&rendered(&mut app)).contains("model not recorded"));
         app.on_net(NetEvent::Sessions(vec![]));
         assert!(plain_text(&rendered(&mut app)).contains("loading model…"));
+    }
+
+    #[test]
+    fn session_status_renders_below_the_model_and_details_show_resets() {
+        let mut app = conversation();
+        let mut info = session("status", "Codex context and usage status", "");
+        info.role = SessionRole::Executor as i32;
+        info.project = "arc".to_owned();
+        info.model = "gpt-5.5".to_owned();
+        info.provider = "codex".to_owned();
+        info.source = arc_proto::v1::Source::User as i32;
+        app.on_net(crate::app::NetEvent::Sessions(vec![info]));
+        app.session_id = Some("status".to_owned());
+        app.session_status.insert(
+            "status".to_owned(),
+            arc_proto::v1::SessionStatus {
+                session_id: "status".to_owned(),
+                codex: true,
+                context: Some(arc_proto::v1::ContextMeasured {
+                    session_id: "status".to_owned(),
+                    input_tokens: 84_000,
+                    context_window: Some(272_000),
+                    compact_at: Some(217_600),
+                }),
+                context_observed_at: chrono::Utc::now().timestamp(),
+                allowance_observed_at: chrono::Utc::now().timestamp(),
+                allowance: vec![
+                    arc_proto::v1::AllowanceWindow {
+                        remaining_percent: 72,
+                        resets_at: Some(1_900_000_000),
+                        window_seconds: Some(18_000),
+                    },
+                    arc_proto::v1::AllowanceWindow {
+                        remaining_percent: 41,
+                        resets_at: None,
+                        window_seconds: Some(604_800),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let buffer = rendered_at(&mut app, 100, 16);
+        let text = plain_text(&buffer);
+        assert!(
+            text.lines().nth(1).unwrap().contains("model: gpt-5.5"),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .nth(2)
+                .unwrap()
+                .contains("ctx 84k/272k · 5h 72% left · week 41% left"),
+            "{text}"
+        );
+        assert_eq!(buffer[(2, 2)].fg, theme::DIM.fg.unwrap());
+        println!("SESSION STATUS\n{text}");
+        app.mode = Mode::Cmd;
+        app.cmd = "status".to_owned();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.overlay, Overlay::SessionStatus);
+        let text = plain_text(&rendered_at(&mut app, 100, 24));
+        assert!(text.contains("last reported prompt"), "{text}");
+        assert!(text.contains("Compaction threshold: 217.6k"), "{text}");
+        assert!(text.contains("week: 41% left · resets unknown"), "{text}");
+        println!("STATUS DETAILS\n{text}");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+        let status = app.session_status.get_mut("status").unwrap();
+        status.context.as_mut().unwrap().input_tokens = 260_000;
+        status.allowance[0].remaining_percent = 5;
+        let buffer = rendered_at(&mut app, 100, 16);
+        assert_eq!(buffer[(2, 2)].fg, theme::ERROR.fg.unwrap());
+        app.session_status
+            .get_mut("status")
+            .unwrap()
+            .allowance_stale = true;
+        assert!(plain_text(&rendered_at(&mut app, 100, 16)).contains("· stale"));
+        let text = plain_text(&rendered_at(&mut app, 40, 12));
+        assert!(text.contains("ctx 260k/272k"), "{text}");
+        assert_eq!(
+            rendered_at(&mut app, 40, 12)[(2, 2)].fg,
+            theme::ERROR.fg.unwrap()
+        );
+    }
+
+    #[test]
+    fn status_unknown_is_not_zero_and_other_providers_have_no_allowance() {
+        let mut app = conversation();
+        let mut info = session("s", "Status", "");
+        info.provider = "codex".to_owned();
+        app.sessions.push(info);
+        app.session_id = Some("s".to_owned());
+        let text = plain_text(&rendered(&mut app));
+        assert!(
+            text.contains("ctx unmeasured · Codex usage unknown"),
+            "{text}"
+        );
+        app.sessions[0].provider = "gemini".to_owned();
+        let text = plain_text(&rendered(&mut app));
+        assert!(text.contains("ctx unmeasured"), "{text}");
+        assert!(!text.contains("Codex usage"), "{text}");
     }
 
     #[test]
@@ -2734,7 +3016,7 @@ mod tests {
         let text = plain_text(&rendered(&mut app));
         let active = text
             .lines()
-            .find(|line| line.contains("the other"))
+            .find(|line| line.contains("● the other"))
             .expect("the active session renders");
         assert!(active.contains("● the other"), "got: {active:?}");
         let inactive = text
@@ -2751,7 +3033,7 @@ mod tests {
         let text = plain_text(&rendered(&mut app));
         assert!(
             text.lines()
-                .find(|line| line.contains("the other"))
+                .find(|line| line.contains("● the other"))
                 .expect("tree mode still lists it")
                 .contains('●'),
             "the marker survives the view switch"
@@ -2789,7 +3071,7 @@ mod tests {
                 .expect("the glyph renders on the row")
         };
         let root_line = text.lines().find(|l| l.contains(" root")).unwrap();
-        let first_line = text.lines().find(|l| l.contains("first branch")).unwrap();
+        let first_line = text.lines().find(|l| l.contains("● first branch")).unwrap();
         let deep_line = text.lines().find(|l| l.contains("grandchild")).unwrap();
         let last_line = text.lines().find(|l| l.contains("last branch")).unwrap();
         let root_bullet = column(root_line, '○');

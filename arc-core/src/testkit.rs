@@ -130,6 +130,7 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
         thinking: Thinking::Default,
         system: Some("be terse".to_owned()),
         compact_at: None,
+        context_window: None,
         counsel: false,
     }
 }
@@ -601,7 +602,7 @@ mod tests {
         );
 
         let logged = replay_log(dir.path());
-        assert_eq!(logged.len(), 5);
+        assert_eq!(logged.len(), 7);
         let session_event::Event::SessionCreated(created) = &logged[0] else {
             panic!("expected SessionCreated first, got {:?}", logged[0]);
         };
@@ -611,18 +612,26 @@ mod tests {
             (user.role, user.content.as_str()),
             (Role::User as i32, "question")
         );
-        let issued_call = issued(&logged[2]);
+        assert!(matches!(
+            logged[2],
+            session_event::Event::ContextMeasured(_)
+        ));
+        let issued_call = issued(&logged[3]);
         assert_eq!(
             (issued_call.call_id.as_str(), issued_call.name.as_str()),
             ("c1", "lookup")
         );
-        let result = resulted(&logged[3]);
+        let result = resulted(&logged[4]);
         assert_eq!(
             (result.call_id.as_str(), result.content.as_str()),
             ("c1", "found it")
         );
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
-        let assistant = appended(&logged[4]);
+        assert!(matches!(
+            logged[5],
+            session_event::Event::ContextMeasured(_)
+        ));
+        let assistant = appended(&logged[6]);
         assert_eq!(
             (assistant.role, assistant.content.as_str()),
             (Role::Assistant as i32, "final text")
@@ -631,7 +640,7 @@ mod tests {
         let mut fresh = Projection::in_memory().expect("open projection");
         let segments = discover_segments(dir.path()).expect("discover");
         let stats = projection::replay(LogReader::new(segments), &mut fresh).expect("replay");
-        assert_eq!(stats.applied, 5);
+        assert_eq!(stats.applied, 7);
         let sessions = fresh.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, reply.session_id);

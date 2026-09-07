@@ -324,7 +324,7 @@ mod tests {
     const DONE_FRAME: &[u8] = b"data: [DONE]";
 
     #[tokio::test]
-    async fn a_sentinel_without_usage_reports_zero_counts() {
+    async fn a_sentinel_without_usage_reports_an_unmeasured_completion() {
         let body = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n",
@@ -334,8 +334,7 @@ mod tests {
             ok(vec![body.as_bytes().to_vec()]).await,
             [
                 text("hi"),
-                CompletionDelta::Done {
-                    usage: Usage::default(),
+                CompletionDelta::UnmeasuredDone {
                     stop: Stop::EndTurn,
                 },
             ]
@@ -375,8 +374,7 @@ mod tests {
 
         assert_eq!(
             ok(vec![body.as_bytes().to_vec()]).await,
-            [CompletionDelta::Done {
-                usage: Usage::default(),
+            [CompletionDelta::UnmeasuredDone {
                 stop: Stop::EndTurn,
             }]
         );
@@ -435,7 +433,9 @@ mod tests {
                 CompletionDelta::Text(chunk) => gathered.text.push_str(&chunk),
                 CompletionDelta::Reasoning(chunk) => gathered.reasoning.push_str(&chunk),
                 other @ CompletionDelta::ToolCall(_) => gathered.calls.push(other),
-                other @ CompletionDelta::Done { .. } => gathered.ending = Some(other),
+                other @ (CompletionDelta::Done { .. } | CompletionDelta::UnmeasuredDone { .. }) => {
+                    gathered.ending = Some(other);
+                }
                 CompletionDelta::ServerCall { .. }
                 | CompletionDelta::ServerResponse { .. }
                 | CompletionDelta::Grounding(_) => {}

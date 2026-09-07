@@ -63,6 +63,7 @@ pub(crate) mod testkit {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            context_window: None,
             counsel: false,
         }
     }

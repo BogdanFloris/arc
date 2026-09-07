@@ -178,6 +178,7 @@ impl<'a> Built<'a> {
                 thinking: Thinking::Default,
                 system,
                 compact_at: None,
+                context_window: None,
                 counsel: false,
             };
             return Ok(vec![(runner.model.clone(), runner)]);
@@ -229,6 +230,7 @@ impl<'a> Built<'a> {
             thinking,
             system,
             compact_at,
+            context_window: configured.context_window,
             counsel: configured.counsel,
         })
     }

@@ -216,6 +216,26 @@ impl Supervisor {
         &self.project_list
     }
 
+    pub(crate) fn status_runner(
+        &self,
+        role: SessionRole,
+        provider: &str,
+        model: &str,
+    ) -> Option<Runner> {
+        let mut matches = self
+            .shared
+            .menus
+            .get(&role)?
+            .iter()
+            .map(|(_, runner)| runner)
+            .filter(|runner| runner.provider.name() == provider && runner.model == model);
+        let runner = matches.next()?;
+        if matches.any(|other| !Arc::ptr_eq(&runner.provider, &other.provider)) {
+            return None;
+        }
+        Some(runner.clone())
+    }
+
     pub fn repair_restart_handbacks(&self) {
         let unfinished = match self.shared.engine.unfinished_jobs() {
             Ok(unfinished) => unfinished,
@@ -682,6 +702,18 @@ mod tests {
             .expect("selected");
         assert_eq!(selected.model, "second-model");
         assert_eq!(selected.system.as_deref(), Some("second prompt"));
+        assert_eq!(
+            supervisor
+                .status_runner(SessionRole::Concierge, "scripted", "first-model")
+                .expect("status follows the recorded model")
+                .model,
+            "first-model"
+        );
+        assert!(
+            supervisor
+                .status_runner(SessionRole::Concierge, "missing", "first-model")
+                .is_none()
+        );
         assert_eq!(
             supervisor
                 .role_runner(SessionRole::Executor)
@@ -1765,6 +1797,7 @@ mod tests {
                     thinking: Thinking::Default,
                     system: None,
                     compact_at: None,
+                    context_window: None,
                     counsel: false,
                 },
             ),

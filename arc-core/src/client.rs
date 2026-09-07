@@ -134,6 +134,26 @@ impl Client {
         }
     }
 
+    #[tracing::instrument(name = "client.fetch_status", skip_all, fields(session_id))]
+    pub async fn fetch_status(
+        &mut self,
+        session_id: &str,
+    ) -> Result<arc_proto::v1::SessionStatus, Error> {
+        let id = self
+            .send(client_frame::Msg::FetchStatus(arc_proto::v1::FetchStatus {
+                session_id: session_id.to_owned(),
+            }))
+            .await?;
+        match self.answer(id).await? {
+            server_frame::Msg::SessionStatus(status) => Ok(status),
+            server_frame::Msg::Error(error) => Err(Error::Server {
+                code: error.code,
+                msg: error.msg,
+            }),
+            other => Err(unexpected("SessionStatus", &other)),
+        }
+    }
+
     #[tracing::instrument(name = "client.fetch_history", skip_all, fields(session_id))]
     pub async fn fetch_history(&mut self, session_id: &str) -> Result<SessionHistory, Error> {
         let id = self
@@ -494,6 +514,7 @@ impl Turn<'_> {
             | server_frame::Msg::JobList(_)
             | server_frame::Msg::ProjectList(_)
             | server_frame::Msg::ModelList(_)
+            | server_frame::Msg::SessionStatus(_)
             | server_frame::Msg::Notification(_)) => {
                 return Err(unexpected("a turn frame", &other));
             }
@@ -505,6 +526,7 @@ impl Turn<'_> {
 fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
     let got = match got {
         server_frame::Msg::SessionList(_) => "SessionList",
+        server_frame::Msg::SessionStatus(_) => "SessionStatus",
         server_frame::Msg::MessageAccepted(_) => "MessageAccepted",
         server_frame::Msg::Delta(_) => "Delta",
         server_frame::Msg::StreamEnd(_) => "StreamEnd",

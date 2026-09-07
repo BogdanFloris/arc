@@ -68,8 +68,10 @@ pub enum Command {
     Yank(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NetEvent {
+    SessionStatus(arc_proto::v1::SessionStatus),
+    StatusUnavailable(String),
     Sessions(Vec<SessionInfo>),
     History {
         session_id: String,
@@ -261,6 +263,7 @@ pub enum Overlay {
     Jobs(Jobs),
     Projects(Projects),
     Models(Models),
+    SessionStatus,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,6 +290,7 @@ pub struct App {
     pending: Option<char>,
     pub session_id: Option<String>,
     pub sessions: Vec<SessionInfo>,
+    pub session_status: HashMap<String, arc_proto::v1::SessionStatus>,
     pub picker_tree: bool,
     pub overlay: Overlay,
     pub viewport_anchor: Option<(usize, usize)>,
@@ -413,6 +417,7 @@ impl App {
             pending: None,
             session_id: None,
             sessions: Vec::new(),
+            session_status: HashMap::new(),
             picker_tree: false,
             overlay: Overlay::None,
             viewport_anchor: None,
@@ -498,6 +503,7 @@ impl App {
             }
             Overlay::Projects(projects) => move_row(&mut projects.selected, projects.items.len()),
             Overlay::Models(models) => move_row(&mut models.selected, models.items.len()),
+            Overlay::SessionStatus => {}
             Overlay::Picker(_) => self.move_picker_selection(up),
             Overlay::None => {
                 self.scroll_back = if up {
@@ -566,6 +572,7 @@ impl App {
             Overlay::Projects(_) => return self.on_projects_key(key.code),
             Overlay::Models(_) => return self.on_models_key(key.code),
             Overlay::Picker(_) => return self.on_picker_key(key.code),
+            Overlay::SessionStatus => return None,
             Overlay::None | Overlay::Help { .. } => {}
         }
         if self.searching {
@@ -1087,6 +1094,7 @@ impl App {
                     "code" => return self.code_picker(),
                     "mode" => return self.switch_door(),
                     "help" => self.overlay = Overlay::Help { scroll: 0 },
+                    "status" => self.overlay = Overlay::SessionStatus,
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
                     cmd => match cmd.strip_prefix("code ") {
@@ -1889,10 +1897,28 @@ impl App {
 
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
         // any live event proves the socket is back; only another disconnect says otherwise
-        if self.status == Status::Disconnected && !matches!(event, NetEvent::Disconnected { .. }) {
+        if self.status == Status::Disconnected
+            && !matches!(
+                event,
+                NetEvent::Disconnected { .. }
+                    | NetEvent::SessionStatus(_)
+                    | NetEvent::StatusUnavailable(_)
+            )
+        {
             self.status = Status::Idle;
         }
         match event {
+            NetEvent::SessionStatus(status) => {
+                self.session_status
+                    .insert(status.session_id.clone(), status);
+                None
+            }
+            NetEvent::StatusUnavailable(id) => {
+                if let Some(status) = self.session_status.get_mut(&id) {
+                    status.allowance_stale = true;
+                }
+                None
+            }
             NetEvent::Sessions(sessions) => {
                 for session in &sessions {
                     self.record_session_meta(
