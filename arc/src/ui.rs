@@ -66,7 +66,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Overlay::Projects(projects) => draw_projects(frame, frame.area(), projects),
         Overlay::Models(models) => draw_models(frame, frame.area(), models),
         Overlay::Help { .. } => draw_help(frame, app, frame.area()),
-        Overlay::Inspection(_) => draw_inspection(frame, app, frame.area()),
         Overlay::None => {}
     }
 }
@@ -94,7 +93,9 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     if let Some(boundary) = app.visual_boundary().or_else(|| app.search_block()) {
-        bring_into_view(app, &bounds, boundary, lines.len(), height, max_back);
+        if app.details_held_focus != Some(boundary) {
+            bring_into_view(app, &bounds, boundary, lines.len(), height, max_back);
+        }
     }
 
     let end = lines.len() - app.scroll_back;
@@ -284,7 +285,7 @@ fn transcript_layout(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<(usize
                     ),
                 ]));
                 if *open && !content.is_empty() {
-                    push_capped(&mut out, content, width, theme::DIM);
+                    push_wrapped(&mut out, content, width, theme::DIM);
                 }
             }
             Block::Sources(sources) => {
@@ -338,26 +339,6 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: S
     }
 }
 
-// the tool already capped the text at its own output limit; this caps the
-// screen space an open result can take, independent of that
-const TOOL_CONTENT_CAP: usize = 40;
-
-fn push_capped(out: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
-    let mut wrapped = Vec::new();
-    push_wrapped(&mut wrapped, text, width, style);
-    if wrapped.len() > TOOL_CONTENT_CAP {
-        let cut = wrapped.len() - TOOL_CONTENT_CAP;
-        wrapped.truncate(TOOL_CONTENT_CAP);
-        out.extend(wrapped);
-        out.push(Line::styled(
-            format!("… {cut} more lines · o full output"),
-            theme::DIM,
-        ));
-    } else {
-        out.extend(wrapped);
-    }
-}
-
 fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
     let session = app
         .session_id
@@ -396,86 +377,6 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
             Line::styled("─".repeat(room), theme::DIM),
         ]),
         area,
-    );
-}
-
-fn draw_inspection(frame: &mut Frame, app: &mut App, full: Rect) {
-    let Overlay::Inspection(inspection) = &mut app.overlay else {
-        return;
-    };
-    let Some(block) = app
-        .transcript
-        .get(inspection.block)
-        .map(|entry| &entry.block)
-    else {
-        return;
-    };
-    let (title, content) = match block {
-        Block::Tool {
-            name,
-            args,
-            outcome,
-            content,
-            ..
-        } => {
-            let arguments = match serde_json::from_str::<serde_json::Value>(args) {
-                Ok(serde_json::Value::Object(fields)) => fields
-                    .iter()
-                    .map(|(key, value)| {
-                        format!(
-                            "{key}: {}",
-                            value
-                                .as_str()
-                                .map_or_else(|| value.to_string(), str::to_owned)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => args.clone(),
-            };
-            (
-                format!("{name} · {}", outcome.unwrap_or("running")),
-                format!("Arguments\n{arguments}\n\nOutput\n{content}"),
-            )
-        }
-        Block::Thought { text, .. } => ("thought".to_owned(), text.clone()),
-        Block::Handback { subject, body, .. } => (subject.clone(), body.clone()),
-        _ => return,
-    };
-    let area = popup(
-        frame,
-        full,
-        full.width.saturating_sub(4),
-        full.height.saturating_sub(4),
-        &title,
-    );
-    let [body, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-    let mut lines = Vec::new();
-    push_wrapped(&mut lines, &content, usize::from(body.width), theme::PLAIN);
-    let total = lines.len();
-    inspection.scroll = inspection
-        .scroll
-        .min(total.saturating_sub(usize::from(body.height)));
-    let start = inspection.scroll;
-    frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(start)
-                .take(usize::from(body.height))
-                .collect::<Vec<_>>(),
-        ),
-        body,
-    );
-    frame.render_widget(
-        Line::styled(
-            elide(
-                &format!("j/k scroll · g/G top/end · q close · {}/{total}", start + 1),
-                usize::from(footer.width),
-            ),
-            theme::DIM,
-        ),
-        footer,
     );
 }
 
@@ -518,6 +419,10 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     if !mode_word.is_empty() {
         left.push(mode_word.to_owned());
     }
+    left.push(format!(
+        "details {}",
+        if app.show_details { "on" } else { "off" }
+    ));
     left.push(app.open_door_label().unwrap_or_else(|| "chat".to_owned()));
     if app.review_pending > 0 {
         left.push(format!("review {}", app.review_pending));
@@ -548,8 +453,8 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
                 words.push(Span::styled(format!(" {code}"), theme::ERROR));
             } else {
                 let hint = match app.mode {
-                    Mode::Normal => " Tab chat/code · o inspect · ? help",
-                    Mode::Visual => " j/k select · Enter inspect · f fork · Esc back",
+                    Mode::Normal => " Tab chat/code · ? help",
+                    Mode::Visual => " j/k select · f fork · Esc back",
                     Mode::Insert => " Esc normal · Ctrl-P sessions",
                     Mode::Cmd => " :chat · :code · :help",
                 };
@@ -1215,10 +1120,8 @@ const HELP: &[(&str, &[&str])] = &[
             "tab               switch chat/code in normal mode",
             ":chat :code       concierge / project picker",
             "ctrl-p            find a session; / filters, enter opens the match",
-            "ctrl-o            fold the pointed or visible tool/thought",
+            "ctrl-o            toggle session details (off by default)",
             "v then j/k        point at messages, tools, or thoughts",
-            "o or visual enter full arguments and output; j/k scroll, G end",
-            "O                 expand/collapse all, retaining your place",
             ":compact          compact the current idle session",
             "M                 defaults for new sessions; open sessions stay pinned",
         ],
@@ -1243,7 +1146,7 @@ const HELP: &[(&str, &[&str])] = &[
             "R                 rewind: walk your messages; enter reforks before it, refills the input",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
-            "ctrl-o            fold one tool / thought / handback",
+            "ctrl-o            toggle all tools / thoughts / handbacks",
             "? J Q             help / jobs / review queue popups",
             "C                 pick a project; enter opens it like :code",
             "M                 pick a model per role; * marks the current one, the pick outlives restarts",
@@ -1790,9 +1693,9 @@ mod tests {
         assert!(text.contains("pinned-model"));
         assert!(text.contains("error"));
         println!("SESSION FRAME\n{text}");
-        app.on_key(key(KeyCode::Char('o')));
+        app.on_key(ctrl('o'));
         let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("/workspace/arc"));
+        assert!(text.contains("output line 1"));
         app.on_key(key(KeyCode::Char('G')));
         let text = plain_text(&rendered(&mut app));
         assert!(text.contains("output line 80"));
@@ -1804,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn folding_one_tool_preserves_the_top_visible_block() {
+    fn toggling_details_preserves_the_top_visible_block() {
         use crate::app::Block;
 
         let mut app = App::new();
@@ -1828,13 +1731,76 @@ mod tests {
         ));
         rendered(&mut app);
         assert_eq!(app.viewport_anchor, anchor);
+        app.on_key(ctrl('o'));
+        rendered(&mut app);
+        assert_eq!(app.viewport_anchor, anchor);
+        app.on_key(ctrl('o'));
         assert_eq!(
             app.transcript
                 .iter()
                 .filter(|entry| matches!(&entry.block, Block::Tool { open: true, .. }))
                 .count(),
-            1
+            40
         );
+    }
+
+    #[test]
+    fn toggling_details_in_visual_keeps_the_view_across_redraws() {
+        let mut app = App::new();
+        for n in 0..40 {
+            app.push_block(Block::Tool {
+                call_id: n.to_string(),
+                name: "read".to_owned(),
+                args: format!("file-{n}"),
+                outcome: Some("ok"),
+                content: "detail\n".repeat(12),
+                open: false,
+            });
+        }
+        app.on_key(key(KeyCode::Esc));
+        rendered(&mut app);
+        app.on_key(key(KeyCode::Char('v')));
+        rendered(&mut app);
+        let anchor = app.viewport_anchor;
+        let selected = app.visual_boundary();
+        app.on_key(ctrl('o'));
+        for _ in 0..2 {
+            rendered(&mut app);
+            assert_eq!(app.viewport_anchor, anchor);
+            assert_eq!(app.visual_boundary(), selected);
+        }
+        app.on_key(ctrl('o'));
+        rendered(&mut app);
+        assert_eq!(app.viewport_anchor, anchor);
+    }
+
+    #[test]
+    fn details_footer_and_streaming_blocks_render_together() {
+        use crate::app::NetEvent;
+
+        let mut app = App::new();
+        let collapsed = plain_text(&rendered_at(&mut app, 76, 16));
+        assert!(collapsed.contains("details off"));
+        app.on_key(ctrl('o'));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s1".to_owned(),
+        });
+        app.on_net(NetEvent::Reasoning("Checking the failing test".to_owned()));
+        app.on_net(NetEvent::ToolStarted {
+            call_id: "t1".to_owned(),
+            name: "bash".to_owned(),
+            arguments_json: r#"{"command":"just test"}"#.to_owned(),
+        });
+        let text = plain_text(&rendered_at(&mut app, 76, 16));
+        assert!(text.contains("details on"), "{text}");
+        assert!(text.contains("Checking the failing test"), "{text}");
+        assert!(text.contains("− bash just test · running"), "{text}");
+        println!("DETAILS STREAMING FRAME\n{text}");
+        app.on_key(ctrl('o'));
+        let text = plain_text(&rendered_at(&mut app, 76, 16));
+        assert!(text.contains("details off"), "{text}");
+        assert!(!text.contains("Checking the failing test"), "{text}");
+        println!("DETAILS COLLAPSED FRAME\n{text}");
     }
 
     fn reversed(text: &str, buffer: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -1938,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_and_an_open_tool_block_render_side_by_side() {
+    fn session_details_open_all_tool_blocks() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
         app.push_block(Block::You("run the tests".to_owned()));
@@ -1949,11 +1915,12 @@ mod tests {
             "bash -lc 'cargo test tool_result'\nrunning 3 tests\ntest a ... ok",
         ));
 
+        app.on_key(ctrl('o'));
         let text = plain_text(&rendered(&mut app));
         assert!(text.contains("bash cargo test · ok"), "both headers render");
         assert!(
-            !text.contains("42 passed"),
-            "the collapsed block's content stays hidden"
+            text.contains("42 passed"),
+            "every tool follows the session setting"
         );
         assert!(
             text.contains("running 3 tests") && text.contains("test a ... ok"),
@@ -1994,22 +1961,18 @@ mod tests {
     }
 
     #[test]
-    fn a_long_open_tool_result_is_capped_at_forty_lines_with_a_marker() {
+    fn expanded_tool_output_has_no_second_display_cap() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
         let content = (1..=45)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.push_block(tool_block(true, &content));
-
+        app.push_block(tool_block(false, &content));
+        app.on_key(ctrl('o'));
         let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("line 40"), "the cap keeps the first 40");
-        assert!(!text.contains("line 41"), "the rest is cut");
-        assert!(
-            text.contains("5 more lines"),
-            "the marker names how many were cut, got: {text}"
-        );
+        assert!(text.contains("line 45"), "{text}");
+        assert!(!text.contains("more lines"), "{text}");
     }
 
     #[test]

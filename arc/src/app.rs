@@ -249,12 +249,6 @@ pub enum Mode {
     Visual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Inspection {
-    pub block: usize,
-    pub scroll: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Overlay {
     #[default]
@@ -267,7 +261,6 @@ pub enum Overlay {
     Jobs(Jobs),
     Projects(Projects),
     Models(Models),
-    Inspection(Inspection),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -285,6 +278,8 @@ impl From<Block> for Entry {
 pub struct App {
     pub herdr_enabled: bool,
     pub transcript: Vec<Entry>,
+    pub show_details: bool,
+    session_details: HashMap<String, bool>,
     pub input: String,
     pub cursor: usize,
     pub mode: Mode,
@@ -296,6 +291,7 @@ pub struct App {
     pub overlay: Overlay,
     pub viewport_anchor: Option<(usize, usize)>,
     pub restore_anchor: bool,
+    pub details_held_focus: Option<usize>,
     pub visible_blocks: Vec<usize>,
     chat_return: Option<String>,
     code_return: Option<(Option<String>, String)>,
@@ -408,6 +404,8 @@ impl App {
         Self {
             herdr_enabled: false,
             transcript: Vec::new(),
+            show_details: false,
+            session_details: HashMap::new(),
             input: String::new(),
             cursor: 0,
             mode: Mode::Insert,
@@ -419,6 +417,7 @@ impl App {
             overlay: Overlay::None,
             viewport_anchor: None,
             restore_anchor: false,
+            details_held_focus: None,
             visible_blocks: Vec::new(),
             chat_return: None,
             code_return: None,
@@ -464,7 +463,8 @@ impl App {
         self.launch_dir = dir;
     }
 
-    pub(super) fn push_block(&mut self, block: Block) {
+    pub(super) fn push_block(&mut self, mut block: Block) {
+        set_details(&mut block, self.show_details);
         self.transcript.push(block.into());
     }
 
@@ -481,7 +481,7 @@ impl App {
             };
         };
         match &mut self.overlay {
-            Overlay::Help { scroll } | Overlay::Inspection(Inspection { scroll, .. }) => {
+            Overlay::Help { scroll } => {
                 *scroll = if up {
                     scroll.saturating_sub(lines)
                 } else {
@@ -510,6 +510,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
+        self.details_held_focus = None;
         self.untouched = false;
         self.yank_note = None;
         match key.code {
@@ -551,9 +552,7 @@ impl App {
                 _ => {}
             }
         }
-        if let Overlay::Help { scroll } | Overlay::Inspection(Inspection { scroll, .. }) =
-            &mut self.overlay
-        {
+        if let Overlay::Help { scroll } = &mut self.overlay {
             match key.code {
                 KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
                 KeyCode::Char('G') | KeyCode::End => *scroll = usize::MAX,
@@ -567,7 +566,7 @@ impl App {
             Overlay::Projects(_) => return self.on_projects_key(key.code),
             Overlay::Models(_) => return self.on_models_key(key.code),
             Overlay::Picker(_) => return self.on_picker_key(key.code),
-            Overlay::None | Overlay::Help { .. } | Overlay::Inspection(_) => {}
+            Overlay::None | Overlay::Help { .. } => {}
         }
         if self.searching {
             return self.on_search_key(key.code);
@@ -615,7 +614,7 @@ impl App {
             KeyCode::Char('d') if self.picker().is_some() => self.page_picker_selection(false),
             KeyCode::Char('u') => self.on_scroll(true, PAGE),
             KeyCode::Char('d') => self.on_scroll(false, PAGE),
-            KeyCode::Char('o') => self.toggle_current_block(),
+            KeyCode::Char('o') => self.toggle_open_blocks(),
             KeyCode::Char('t') if self.status != Status::Streaming => {
                 return self.back_session();
             }
@@ -736,8 +735,6 @@ impl App {
             KeyCode::Char('M') => return Some(self.open_models()),
             KeyCode::Char('C') => return self.code_picker(),
             KeyCode::Tab => return self.switch_door(),
-            KeyCode::Char('o') => self.inspect_current_block(),
-            KeyCode::Char('O') => self.toggle_open_blocks(),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
@@ -905,8 +902,6 @@ impl App {
             KeyCode::Char('y') => return self.yank_visual(),
             KeyCode::Char('f') => return self.fork_selected_visual(),
             KeyCode::Enter if self.visual_rewind => return self.rewind_fork(),
-            KeyCode::Enter | KeyCode::Char('o') => self.inspect_current_block(),
-            KeyCode::Char('O') => self.toggle_open_blocks(),
             // `visual_boundary()` reads `mode`, which Enter flips to Normal
             // before the typed command runs — stash the selection now
             KeyCode::Char(':') => {
@@ -1091,7 +1086,6 @@ impl App {
                     "chat" => return self.switch_chat(),
                     "code" => return self.code_picker(),
                     "mode" => return self.switch_door(),
-                    "tools" => self.inspect_current_block(),
                     "help" => self.overlay = Overlay::Help { scroll: 0 },
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
@@ -1339,27 +1333,6 @@ impl App {
                 .iter()
                 .rposition(|entry| foldable(&entry.block))
         })
-    }
-
-    fn toggle_current_block(&mut self) {
-        let Some(at) = self.current_foldable() else {
-            return;
-        };
-        self.restore_anchor = true;
-        match &mut self.transcript[at].block {
-            Block::Tool { open, .. }
-            | Block::Thought { open, .. }
-            | Block::Handback { open, .. } => *open = !*open,
-            _ => {}
-        }
-    }
-
-    fn inspect_current_block(&mut self) {
-        if let Some(block) = self.current_foldable() {
-            self.overlay = Overlay::Inspection(Inspection { block, scroll: 0 });
-        } else {
-            self.last_error = Some("No tool result or thought to inspect".to_owned());
-        }
     }
 
     fn open_projects(&mut self) -> Command {
@@ -1826,10 +1799,20 @@ impl App {
         if self.session_id != session_id {
             self.previous_session = self.session_id.clone();
         }
+        if let Some(current) = &self.session_id {
+            self.session_details
+                .insert(current.clone(), self.show_details);
+        }
+        self.show_details = session_id
+            .as_ref()
+            .and_then(|id| self.session_details.get(id))
+            .copied()
+            .unwrap_or(false);
         self.session_id.clone_from(&session_id);
         self.transcript.clear();
         self.viewport_anchor = None;
         self.restore_anchor = false;
+        self.details_held_focus = None;
         self.visible_blocks.clear();
         self.overlay = Overlay::None;
         self.scroll_back = 0;
@@ -1933,7 +1916,11 @@ impl App {
                 branches,
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
-                    let rebuilt = history_blocks(entries, &parent_session, fork_point, &branches);
+                    let mut rebuilt =
+                        history_blocks(entries, &parent_session, fork_point, &branches);
+                    for entry in &mut rebuilt {
+                        set_details(&mut entry.block, self.show_details);
+                    }
                     // append-only rebuilds keep the selection valid
                     let appended_only = rebuilt.len() >= self.transcript.len()
                         && rebuilt
@@ -2292,31 +2279,12 @@ impl App {
         since.map_or(0, |since| since.elapsed().as_secs()).max(1)
     }
 
-    // one "show the work" toggle for everything that hides output by
-    // default: thoughts, handbacks, and tool results together
     fn toggle_open_blocks(&mut self) {
         self.restore_anchor = true;
-        let any_open = self
-            .transcript
-            .iter()
-            .map(|entry| &entry.block)
-            .any(|block| {
-                matches!(
-                    block,
-                    Block::Thought { open: true, .. }
-                        | Block::Handback { open: true, .. }
-                        | Block::Tool { open: true, .. }
-                )
-            });
-        for block in self.transcript.iter_mut().map(|entry| &mut entry.block) {
-            match block {
-                Block::Thought { open, .. }
-                | Block::Handback { open, .. }
-                | Block::Tool { open, .. } => {
-                    *open = !any_open;
-                }
-                _ => {}
-            }
+        self.details_held_focus = self.visual_boundary().or_else(|| self.search_block());
+        self.show_details = !self.show_details;
+        for entry in &mut self.transcript {
+            set_details(&mut entry.block, self.show_details);
         }
     }
 
@@ -2514,6 +2482,15 @@ fn grounding_sources(grounding_json: &str) -> Vec<(String, String)> {
             .collect();
     }
     Vec::new()
+}
+
+fn set_details(block: &mut Block, details: bool) {
+    match block {
+        Block::Thought { open, .. } | Block::Handback { open, .. } | Block::Tool { open, .. } => {
+            *open = details;
+        }
+        _ => {}
+    }
 }
 
 fn foldable(block: &Block) -> bool {
@@ -3211,13 +3188,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_without_a_thought_is_a_no_op() {
+    fn ctrl_o_without_blocks_sets_the_preference() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
 
         assert_eq!(app.on_key(ctrl('o')), None);
         assert_eq!(app.block_contents(), [Block::You("hi".to_owned())]);
+        assert!(app.show_details);
     }
 
     #[test]
@@ -3259,7 +3237,72 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_o_toggles_every_thought_at_once() {
+    fn details_follow_new_blocks_history_and_session_switches() {
+        let mut app = App::new();
+        app.on_key(ctrl('o'));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s1".to_owned(),
+        });
+        for id in ["t1", "t2"] {
+            app.on_net(NetEvent::Reasoning("checking".to_owned()));
+            app.on_net(started(id, "bash"));
+            app.on_net(ended(id, ToolOutcome::Ok as i32, "done"));
+        }
+        app.push_block(Block::Handback {
+            subject: "job".to_owned(),
+            body: "done".to_owned(),
+            open: false,
+        });
+        for entry in app.transcript.iter().filter(|entry| foldable(&entry.block)) {
+            let mut expected = entry.block.clone();
+            set_details(&mut expected, true);
+            assert_eq!(entry.block, expected);
+        }
+        app.on_net(end(false));
+        app.start_session(Some("s2".to_owned()));
+        assert!(!app.show_details);
+        app.start_session(Some("s1".to_owned()));
+        assert!(app.show_details);
+        app.on_net(NetEvent::History {
+            session_id: "s1".to_owned(),
+            entries: vec![handback_entry(&format!(
+                "Job {JOB_ID} finished.\nall green"
+            ))],
+            parent_session: String::new(),
+            fork_point: 0,
+            branches: vec![],
+        });
+        assert!(matches!(
+            app.transcript[0].block,
+            Block::Handback { open: true, .. }
+        ));
+        app.mode = Mode::Visual;
+        app.on_key(ctrl('o'));
+        assert!(!app.show_details);
+        assert!(matches!(
+            app.transcript[0].block,
+            Block::Handback { open: false, .. }
+        ));
+        app.on_net(NetEvent::Reasoning("next".to_owned()));
+        assert!(matches!(
+            app.transcript.last().unwrap().block,
+            Block::Thought { open: false, .. }
+        ));
+        for mode in [Mode::Normal, Mode::Visual] {
+            app.mode = mode;
+            for c in ['o', 'O'] {
+                app.on_key(key(KeyCode::Char(c)));
+                assert!(!app.show_details);
+                assert_eq!(app.overlay, Overlay::None);
+            }
+        }
+        app.start_session(None);
+        assert!(!app.show_details);
+        assert!(!App::new().show_details);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_every_thought_at_once() {
         let mut app = App::new();
         typed(&mut app, "one");
         app.on_key(key(KeyCode::Enter));
@@ -3280,7 +3323,7 @@ mod tests {
         app.on_net(end(false));
 
         app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('O')));
+        app.on_key(ctrl('o'));
         for at in [1, 4] {
             assert!(
                 matches!(&app.transcript[at].block, Block::Thought { open: true, .. }),
@@ -3292,7 +3335,7 @@ mod tests {
             *open = false;
         }
         app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('O')));
+        app.on_key(ctrl('o'));
         for at in [1, 4] {
             assert!(
                 matches!(
@@ -6679,7 +6722,7 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_o_opens_thoughts_handbacks_and_tool_results_together() {
+    fn ctrl_o_opens_thoughts_handbacks_and_tool_results_together() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -6698,7 +6741,7 @@ mod tests {
         );
 
         app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('O')));
+        app.on_key(ctrl('o'));
         assert!(
             matches!(&app.transcript[1].block, Block::Thought { open: true, .. }),
             "ctrl-o opens the thought"
@@ -6713,7 +6756,7 @@ mod tests {
         );
 
         app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('O')));
+        app.on_key(ctrl('o'));
         assert!(matches!(
             &app.transcript[1].block,
             Block::Thought { open: false, .. }
