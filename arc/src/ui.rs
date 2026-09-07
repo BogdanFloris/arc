@@ -521,10 +521,6 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     if !mode_word.is_empty() {
         left.push(mode_word.to_owned());
     }
-    left.push(format!(
-        "details {}",
-        if app.show_details { "on" } else { "off" }
-    ));
     left.push(app.open_door_label().unwrap_or_else(|| "chat".to_owned()));
     if app.review_pending > 0 {
         left.push(format!("review {}", app.review_pending));
@@ -1248,7 +1244,7 @@ const HELP: &[(&str, &[&str])] = &[
             "R                 rewind: walk your messages; enter reforks before it, refills the input",
             "ctrl-t            back to the previous session",
             "ctrl-n            new session",
-            "ctrl-o            toggle all tools / thoughts / handbacks",
+            "ctrl-o            toggle all tools / thoughts",
             "? J Q             help / jobs / review queue popups",
             "C                 pick a project; enter opens it like :code",
             "M                 pick a model per role; * marks the current one, the pick outlives restarts",
@@ -1877,12 +1873,12 @@ mod tests {
     }
 
     #[test]
-    fn details_footer_and_streaming_blocks_render_together() {
+    fn details_expand_streaming_blocks_without_a_footer_indicator() {
         use crate::app::NetEvent;
 
         let mut app = App::new();
         let collapsed = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(collapsed.contains("details off"));
+        assert!(!collapsed.contains("details off"));
         app.on_key(ctrl('o'));
         app.on_net(NetEvent::Accepted {
             session_id: "s1".to_owned(),
@@ -1894,13 +1890,13 @@ mod tests {
             arguments_json: r#"{"command":"just test"}"#.to_owned(),
         });
         let text = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(text.contains("details on"), "{text}");
+        assert!(!text.contains("details on"), "{text}");
         assert!(text.contains("Checking the failing test"), "{text}");
         assert!(text.contains("− bash · running"), "{text}");
         println!("DETAILS STREAMING FRAME\n{text}");
         app.on_key(ctrl('o'));
         let text = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(text.contains("details off"), "{text}");
+        assert!(!text.contains("details off"), "{text}");
         assert!(!text.contains("Checking the failing test"), "{text}");
         println!("DETAILS COLLAPSED FRAME\n{text}");
     }

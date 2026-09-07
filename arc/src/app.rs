@@ -2486,7 +2486,7 @@ fn grounding_sources(grounding_json: &str) -> Vec<(String, String)> {
 
 fn set_details(block: &mut Block, details: bool) {
     match block {
-        Block::Thought { open, .. } | Block::Handback { open, .. } | Block::Tool { open, .. } => {
+        Block::Thought { open, .. } | Block::Tool { open, .. } => {
             *open = details;
         }
         _ => {}
@@ -3274,7 +3274,7 @@ mod tests {
         });
         assert!(matches!(
             app.transcript[0].block,
-            Block::Handback { open: true, .. }
+            Block::Handback { open: false, .. }
         ));
         app.mode = Mode::Visual;
         app.on_key(ctrl('o'));
@@ -6722,7 +6722,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_opens_thoughts_handbacks_and_tool_results_together() {
+    fn ctrl_o_opens_thoughts_and_tools_but_not_handbacks() {
         let mut app = App::new();
         typed(&mut app, "hi");
         app.on_key(key(KeyCode::Enter));
@@ -6751,8 +6751,11 @@ mod tests {
             "and the tool result"
         );
         assert!(
-            matches!(&app.transcript[4].block, Block::Handback { open: true, .. }),
-            "and the handback with it"
+            matches!(
+                &app.transcript[4].block,
+                Block::Handback { open: false, .. }
+            ),
+            "the handback stays collapsed"
         );
 
         app.on_key(key(KeyCode::Esc));
