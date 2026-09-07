@@ -1870,6 +1870,22 @@ impl App {
         Some(self.send(content))
     }
 
+    pub fn stop_escape_count(&self) -> Option<u8> {
+        if self.status != Status::Streaming
+            || self.session_id.is_none()
+            || self.overlay != Overlay::None
+            || self.searching
+        {
+            return None;
+        }
+        let count = match self.mode {
+            Mode::Insert => 2,
+            Mode::Normal => 1,
+            Mode::Cmd | Mode::Visual => return None,
+        };
+        Some(count + u8::from(self.pending.is_some()))
+    }
+
     fn cancel_turn(&mut self) -> Option<Command> {
         let session_id = self.session_id.clone()?;
         Some(Command::CancelTurn { session_id })

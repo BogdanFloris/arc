@@ -531,10 +531,10 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         Status::Streaming => {
             let seconds = app.turn_elapsed_seconds().unwrap_or(0);
             let tokens = format_tokens(app.streamed_tokens_estimate());
-            let stop = if matches!(app.overlay, Overlay::Help { .. }) {
-                ""
-            } else {
-                " · Esc Esc stop"
+            let stop = match app.stop_escape_count() {
+                Some(1) => " · Esc · stop".to_owned(),
+                Some(count) => format!(" · Esc ×{count} · stop"),
+                None => String::new(),
             };
             words.push(Span::styled(
                 format!(" streaming {seconds}s · ~{tokens} tok{stop}"),
@@ -1209,7 +1209,8 @@ const HELP: &[(&str, &[&str])] = &[
         "coding essentials",
         &[
             "enter             send; typing during work steers the next step",
-            "esc esc           stop a turn (from insert mode)",
+            "Esc · stop        normal mode; Esc ×2 · stop in insert",
+            "                  close overlays/search first; pending d/g adds one Esc",
             "tab               switch chat/code in normal mode",
             ":chat :code       concierge / project picker",
             "ctrl-p            find a session; / filters, enter opens the match",
@@ -1682,17 +1683,70 @@ mod tests {
     }
 
     #[test]
-    fn streaming_stop_guidance_appears_once_in_the_frame() {
+    fn streaming_stop_guidance_matches_the_escape_handler() {
+        use crate::app::Command;
+
+        let mut app = conversation();
+        app.session_id = Some("streaming-session".to_owned());
+        app.status = Status::Streaming;
+        app.on_key(key(KeyCode::Char('i')));
+        let text = plain_text(&rendered(&mut app));
+        assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
+        println!("STREAMING INSERT\n{text}");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        let text = plain_text(&rendered(&mut app));
+        assert_eq!(text.matches("Esc · stop").count(), 1, "{text}");
+        assert!(!text.contains("Esc ×2"), "{text}");
+        println!("STREAMING NORMAL\n{text}");
+        let cancel = Some(Command::CancelTurn {
+            session_id: "streaming-session".to_owned(),
+        });
+        assert_eq!(app.on_key(key(KeyCode::Esc)), cancel);
+        for pending in ['d', 'g'] {
+            app.on_key(key(KeyCode::Char(pending)));
+            let text = plain_text(&rendered(&mut app));
+            assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
+            println!("STREAMING PENDING {pending}\n{text}");
+            assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+            assert_eq!(app.stop_escape_count(), Some(1));
+            assert_eq!(app.on_key(key(KeyCode::Esc)), cancel);
+        }
+    }
+
+    #[test]
+    fn streaming_stop_guidance_is_hidden_when_escape_does_something_else() {
         let mut app = conversation();
         app.status = Status::Streaming;
-        let text = plain_text(&rendered(&mut app));
-        assert_eq!(text.matches("Esc Esc stop").count(), 1, "{text}");
-        println!("STREAMING\n{text}");
+        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
+        app.session_id = Some("streaming-session".to_owned());
+        for mode in [Mode::Cmd, Mode::Visual] {
+            app.mode = mode;
+            assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
+            assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+            assert_eq!(app.stop_escape_count(), Some(1));
+        }
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.stop_escape_count(), Some(1));
+        app.overlay = Overlay::Models(Models {
+            items: vec![],
+            selected: 0,
+            loaded: true,
+        });
+        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.stop_escape_count(), Some(1));
         app.overlay = Overlay::Help { scroll: 0 };
         let text = plain_text(&rendered(&mut app));
-        assert!(!text.contains("Esc Esc stop"), "{text}");
-        assert_eq!(text.matches("stop a turn").count(), 1, "{text}");
+        assert_eq!(text.matches("Esc · stop").count(), 1, "{text}");
+        assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
+        assert!(text.contains("pending d/g"), "{text}");
+        assert!(!text.lines().nth(28).unwrap().contains("· stop"), "{text}");
         println!("STREAMING HELP\n{text}");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        app.status = Status::Idle;
+        assert_eq!(app.stop_escape_count(), None);
     }
 
     #[test]
