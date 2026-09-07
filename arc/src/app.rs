@@ -1689,7 +1689,7 @@ impl App {
                     || !session.preview.is_empty()
                     || session.last_at.is_some()
             })
-            .filter(|session| show_all || !is_job_session(session))
+            .filter(|session| !is_job_session(session))
             .filter(|session| show_abandoned || !is_abandoned(session))
             .filter(|session| match open_project {
                 Some(project) if !show_all => session.project == project,
@@ -5197,7 +5197,7 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_hides_job_sessions_until_a_reveals_them() {
+    fn the_picker_hides_job_sessions_even_when_showing_all() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![
             session("conv"),
@@ -5215,7 +5215,7 @@ mod tests {
         );
 
         app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.picker_rows().len(), 2, "a reveals the job too");
+        assert_eq!(app.picker_rows().len(), 1, "all still excludes jobs");
 
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(app.picker_rows().len(), 1, "a toggles back off");
@@ -5242,8 +5242,8 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(
             app.picker_rows().len(),
-            2,
-            "a reveals the dispatched job alongside it"
+            1,
+            "all keeps the user-opened executor and excludes the dispatched job"
         );
     }
 
@@ -5295,10 +5295,11 @@ mod tests {
         normal(&mut app, "s");
 
         app.on_key(key(KeyCode::Char(' ')));
-        assert_eq!(app.picker_rows().len(), 2, "space reveals the job too");
+        assert!(app.picker().expect("open").show_all);
+        assert_eq!(app.picker_rows().len(), 1, "space does not reveal jobs");
 
         app.on_key(key(KeyCode::Char(' ')));
-        assert_eq!(app.picker_rows().len(), 1, "space toggles back off");
+        assert!(!app.picker().expect("open").show_all);
     }
 
     #[test]
@@ -5325,7 +5326,7 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_narrows_within_the_current_toggle_state() {
+    fn the_filter_never_includes_jobs() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![
             session_with("conv", "alpha talk", ""),
@@ -5349,8 +5350,8 @@ mod tests {
         typed(&mut app, "alpha");
         assert_eq!(
             app.picker_rows().len(),
-            2,
-            "with jobs shown, the filter matches both"
+            1,
+            "show-all lifts project scope but still excludes jobs"
         );
     }
 
@@ -6034,6 +6035,7 @@ mod tests {
             code_session("s-arc-1", "in arc", "arc"),
             code_session("s-scratch-1", "in scratch", "scratch"),
             session("s-concierge"),
+            job_session("s-job", "job in arc", SessionRole::Executor, "arc"),
         ]));
         normal(&mut app, ":code arc");
         app.on_key(key(KeyCode::Enter));
@@ -6053,6 +6055,11 @@ mod tests {
             all.contains(&"s-scratch-1"),
             "show-all lifts the project scope"
         );
+        assert!(
+            all.contains(&"s-concierge"),
+            "show-all includes chat conversations"
+        );
+        assert!(!all.contains(&"s-job"), "show-all still excludes jobs");
     }
 
     #[test]

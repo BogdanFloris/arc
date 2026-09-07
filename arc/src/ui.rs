@@ -939,7 +939,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     };
     let height = rows.len() + 1;
     let scope = if picker.show_all {
-        "all projects + jobs"
+        "all conversations"
     } else {
         app.open_project().unwrap_or("conversations")
     };
@@ -1928,12 +1928,19 @@ mod tests {
         app.on_net(NetEvent::Sessions(vec![one, two]));
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Char('a')));
         if let Overlay::Picker(picker) = &mut app.overlay {
             picker.selected = 1;
         }
         for width in [140, 40] {
             let buffer = rendered_at(&mut app, width, 16);
             let text = plain_text(&buffer);
+            if width == 140 {
+                assert!(
+                    text.contains("sessions · all conversations · recent"),
+                    "{text}"
+                );
+            }
             let rows: Vec<_> = text
                 .lines()
                 .enumerate()
