@@ -121,6 +121,7 @@ message ToolResultRecorded {
   string content = 5;
   bool truncated = 6;
   reserved 7;  // structured, non-text result content
+  repeated string changed_paths = 8;
 }
 
 message SessionConsolidated {
