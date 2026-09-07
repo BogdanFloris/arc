@@ -212,7 +212,8 @@ impl<'a> Payload<'a> {
                 include_usage: true,
             },
             tools: request.tools.iter().map(wire_tool).collect(),
-            seed: request.seed,
+            // DeepSeek accepts only nonnegative signed 64-bit seeds.
+            seed: request.seed.map(|seed| seed & i64::MAX as u64),
             reasoning_effort: reasoning_effort(request.thinking),
         })
     }
@@ -511,15 +512,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_set_seed_is_serialized() {
-        let mut req = request(None, &[(Role::User, "hi")]);
-        req.seed = Some(42);
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+    async fn seeds_are_mapped_into_the_nonnegative_signed_range() {
+        for (seed, expected) in [
+            (0, 0),
+            (42, 42),
+            (i64::MAX as u64, i64::MAX as u64),
+            (1_u64 << 63, 0),
+            ((1_u64 << 63) + 42, 42),
+            (u64::MAX, i64::MAX as u64),
+        ] {
+            for _ in 0..2 {
+                let mut req = request(None, &[(Role::User, "hi")]);
+                req.seed = Some(seed);
+                let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
 
-        let (_, requests) = complete_against(template, req).await;
+                let (_, requests) = complete_against(template, req).await;
 
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body["seed"], 42, "{body}");
+                let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+                assert_eq!(body["seed"], expected, "seed {seed}: {body}");
+            }
+        }
     }
 
     #[tokio::test]

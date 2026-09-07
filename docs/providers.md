@@ -57,6 +57,10 @@ header and identifies itself as `arc/<version>`. Turns, compaction, titles,
 extraction, and deduplication carry the source session's ID, stable across
 calls and restarts. Standalone probes must supply their own conversation ID.
 
+DeepSeek through Go accepts seeds in `[0, 2^63)`. The OpenAI-compatible
+provider masks off the top bit of ARC's unsigned seed at serialization,
+preserving valid values and keeping retries deterministic.
+
 ### Earlier stack and measurements
 
 The following records the earlier local-archivist setup and its measurements.
