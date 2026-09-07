@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let masthead_height = if app.transcript.is_empty() && transcript.height >= MASTHEAD_FLOOR {
         MASTHEAD
     } else {
-        1
+        3
     };
     let [masthead, body] =
         Layout::vertical([Constraint::Length(masthead_height), Constraint::Fill(1)])
@@ -373,20 +373,26 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
             })
         })
         .unwrap_or("New conversation");
-    let model = session
-        .map(|s| s.model.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("model unavailable");
+    let model = match session {
+        Some(session) if session.model.is_empty() => "model not recorded".to_owned(),
+        Some(session) => format!("model: {}", session.model),
+        None => "loading model…".to_owned(),
+    };
     let room = usize::from(area.width);
-    let model = elide(model, room / 3);
-    let title = elide(title, room.saturating_sub(model.chars().count() + 7));
-    let gap = room.saturating_sub(title.chars().count() + model.chars().count() + 6);
+    let door = elide(
+        &app.open_door_label().unwrap_or_else(|| "chat".to_owned()),
+        room / 3,
+    );
+    let title = elide(title, room.saturating_sub(door.chars().count() + 3));
     frame.render_widget(
-        Line::from(vec![
-            Span::styled("arc · ", theme::ACCENT),
-            Span::styled(title, theme::PLAIN),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(model, theme::DIM),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(door, theme::ACCENT),
+                Span::styled(" · ", theme::DIM),
+                Span::styled(title, theme::STRONG),
+            ]),
+            Line::styled(elide(&model, room), theme::DIM),
+            Line::styled("─".repeat(room), theme::DIM),
         ]),
         area,
     );
@@ -525,8 +531,13 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
         Status::Streaming => {
             let seconds = app.turn_elapsed_seconds().unwrap_or(0);
             let tokens = format_tokens(app.streamed_tokens_estimate());
+            let stop = if matches!(app.overlay, Overlay::Help { .. }) {
+                ""
+            } else {
+                " · Esc Esc stop"
+            };
             words.push(Span::styled(
-                format!(" streaming {seconds}s · ~{tokens} tok · Esc Esc stop"),
+                format!(" streaming {seconds}s · ~{tokens} tok{stop}"),
                 theme::DIM,
             ));
         }
@@ -758,7 +769,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     let inner = popup(
         frame,
         full,
-        64,
+        full.width.saturating_sub(8).clamp(64, 120),
         u16::try_from(height + 2).unwrap_or(u16::MAX),
         &title,
     );
@@ -789,27 +800,18 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     let width = area.width;
 
     let now = chrono::Utc::now();
-    let mut lines = Vec::new();
     let visible = area.height as usize;
     let start = picker.selected.saturating_sub(visible.saturating_sub(1));
     for row in start..height.min(start + visible) {
         let prefix = if row == picker.selected { " > " } else { "   " };
         let spans = match row.checked_sub(1).and_then(|i| rows.get(i)) {
             None => {
-                let style = if row == picker.selected {
-                    theme::ACCENT
-                } else {
-                    theme::DIM
-                };
+                let style = theme::PLAIN;
                 vec![Span::styled(format!("{prefix}new session"), style)]
             }
             Some((session, row_view)) => {
                 let job = crate::app::is_job_session(session);
-                let style = if row == picker.selected {
-                    theme::ACCENT
-                } else {
-                    theme::DIM
-                };
+                let style = theme::PLAIN;
                 let (connectors, lineage) = match row_view {
                     PickerRow::Flat(parent) => (
                         String::new(),
@@ -834,15 +836,29 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                         + 2
                         + TAG_WIDTH,
                 );
+                let metadata = if job {
+                    let role =
+                        SessionRole::try_from(session.role).unwrap_or(SessionRole::Unspecified);
+                    format!(
+                        " {}/{}",
+                        arc_core::provider::role_label(role),
+                        session.project
+                    )
+                } else {
+                    String::new()
+                };
+                let metadata = elide(&metadata, room / 2);
+                let title_room = room.saturating_sub(metadata.chars().count());
                 let mut spans = vec![
                     Span::styled(prefix.to_owned(), style),
                     Span::styled(connectors, theme::DIM),
                     Span::styled(bullet, if active { theme::ACCENT } else { theme::DIM }),
                     Span::styled(
-                        format!("{:<room$}", picker_label(session, room, job)),
+                        format!("{:<title_room$}", label(session, title_room)),
                         style,
                     ),
                 ];
+                spans.push(Span::styled(metadata, theme::DIM));
                 if !lineage.is_empty() {
                     spans.push(Span::styled(lineage, theme::DIM));
                 }
@@ -854,9 +870,19 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 spans
             }
         };
-        lines.push(Line::from(spans));
+        let style = if row == picker.selected {
+            Style::new().bg(ratatui::style::Color::Indexed(236))
+        } else {
+            theme::PLAIN
+        };
+        let row_area = Rect::new(
+            area.x,
+            area.y + u16::try_from(row - start).unwrap_or(u16::MAX),
+            width,
+            1,
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(style), row_area);
     }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn tree_prefix(flags: &[bool]) -> String {
@@ -883,20 +909,6 @@ fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
         Ok(Disposition::Abandoned) => 'x',
         Ok(Disposition::Unspecified) | Err(_) => '?',
     })
-}
-
-fn picker_label(session: &arc_proto::v1::SessionInfo, room: usize, job: bool) -> String {
-    if !job {
-        return label(session, room);
-    }
-    let role = SessionRole::try_from(session.role).unwrap_or(SessionRole::Unspecified);
-    let tag = format!(
-        " {}/{}",
-        arc_core::provider::role_label(role),
-        session.project
-    );
-    let base_room = room.saturating_sub(tag.chars().count());
-    format!("{}{tag}", label(session, base_room))
 }
 
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
@@ -1496,14 +1508,14 @@ fn last_active(session: &arc_proto::v1::SessionInfo, now: chrono::DateTime<chron
 #[cfg(test)]
 mod tests {
     use crate::app::{Entry, Overlay};
+    use crate::theme;
     use arc_proto::v1::{JobInfo, ModelChoice, SessionInfo, SessionRole, job_info};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
-    use super::{
-        disposition_tag, draw, job_label, label, last_active, picker_label, strip_label, wrap_input,
-    };
+    use super::{disposition_tag, draw, job_label, label, last_active, strip_label, wrap_input};
     use crate::app::{App, Block, Mode, Models, Search, Status};
 
     #[test]
@@ -1556,6 +1568,131 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| draw(frame, app)).expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn working_header_uses_the_door_and_recorded_model_at_both_widths() {
+        use crate::app::NetEvent;
+
+        let mut app = conversation();
+        let mut info = session(
+            "code",
+            "Repair adjacent long session titles in the navigation picker",
+            "",
+        );
+        info.role = SessionRole::Executor as i32;
+        info.source = arc_proto::v1::Source::User as i32;
+        info.project = "arc".to_owned();
+        info.model = "pinned-model".to_owned();
+        app.on_net(NetEvent::Sessions(vec![info.clone()]));
+        app.session_id = Some(info.id.clone());
+        for width in [120, 40] {
+            let buffer = rendered_at(&mut app, width, 12);
+            let text = plain_text(&buffer);
+            assert!(text.contains("code/arc · Repair"), "{text}");
+            assert!(text.contains("model: pinned-model"), "{text}");
+            assert!(buffer[(13, 0)].modifier.contains(Modifier::BOLD));
+            assert_eq!(buffer[(2, 0)].fg, theme::ACCENT.fg.unwrap());
+            assert_eq!(buffer[(2, 1)].fg, theme::DIM.fg.unwrap());
+            assert!(
+                text.lines()
+                    .nth(2)
+                    .unwrap()
+                    .contains(&"─".repeat(usize::from(width - 4)))
+            );
+            println!("HEADER {width}\n{text}");
+        }
+        info.model.clear();
+        app.on_net(NetEvent::Sessions(vec![info]));
+        assert!(plain_text(&rendered(&mut app)).contains("model not recorded"));
+        app.on_net(NetEvent::Sessions(vec![]));
+        assert!(plain_text(&rendered(&mut app)).contains("loading model…"));
+    }
+
+    #[test]
+    fn adjacent_long_picker_titles_have_readable_styles_and_full_row_selection() {
+        use crate::app::NetEvent;
+        use ratatui::style::Color;
+
+        let mut app = App::new();
+        let mut one = session(
+            "one",
+            "Repair parser boundary handling for adjacent long session titles",
+            "",
+        );
+        one.source = arc_proto::v1::Source::User as i32;
+        let mut two = session(
+            "two",
+            "Repair picker selection styling for adjacent long session titles",
+            "",
+        );
+        two.source = arc_proto::v1::Source::User as i32;
+        let at = Some(prost_types::Timestamp {
+            seconds: chrono::Utc::now().timestamp(),
+            nanos: 0,
+        });
+        one.last_at = at;
+        two.last_at = at;
+        app.on_net(NetEvent::Sessions(vec![one, two]));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+        if let Overlay::Picker(picker) = &mut app.overlay {
+            picker.selected = 1;
+        }
+        for width in [140, 40] {
+            let buffer = rendered_at(&mut app, width, 16);
+            let text = plain_text(&buffer);
+            let rows: Vec<_> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("○ Repair"))
+                .collect();
+            assert_eq!(rows.len(), 2, "{text}");
+            assert_eq!(rows[1].0, rows[0].0 + 1);
+            let popup_width = width.saturating_sub(8).clamp(64, 120).min(width - 4);
+            let left = (width - popup_width) / 2 + 1;
+            for (y, line) in rows {
+                let y = u16::try_from(y).expect("row");
+                let selected = line.contains('>');
+                assert!(line.contains("now"), "{line}");
+                let title_x = left + 5;
+                assert_eq!(buffer[(title_x, y)].fg, Color::Reset);
+                assert_eq!(
+                    buffer[(left + popup_width - 9, y)].fg,
+                    theme::DIM.fg.unwrap()
+                );
+                for x in left..left + popup_width - 2 {
+                    assert_eq!(
+                        buffer[(x, y)].bg,
+                        if selected {
+                            Color::Indexed(236)
+                        } else {
+                            Color::Reset
+                        }
+                    );
+                }
+                if width == 140 {
+                    assert!(line.contains("adjacent long session titles"), "{line}");
+                } else {
+                    assert!(line.contains('…'), "{line}");
+                }
+            }
+            println!("PICKER {width}\n{text}");
+        }
+    }
+
+    #[test]
+    fn streaming_stop_guidance_appears_once_in_the_frame() {
+        let mut app = conversation();
+        app.status = Status::Streaming;
+        let text = plain_text(&rendered(&mut app));
+        assert_eq!(text.matches("Esc Esc stop").count(), 1, "{text}");
+        println!("STREAMING\n{text}");
+        app.overlay = Overlay::Help { scroll: 0 };
+        let text = plain_text(&rendered(&mut app));
+        assert!(!text.contains("Esc Esc stop"), "{text}");
+        assert_eq!(text.matches("stop a turn").count(), 1, "{text}");
+        println!("STREAMING HELP\n{text}");
     }
 
     #[test]
@@ -2150,18 +2287,6 @@ mod tests {
         let mut session = session("s-01", "", "");
         session.project = "scratch".to_owned();
         assert_eq!(label(&session, 40), "(empty) · scratch");
-    }
-
-    #[test]
-    fn a_job_row_in_the_picker_keeps_its_title_and_gains_a_role_project_tag() {
-        let mut job = session("s-01", "Fix the flaky test", "");
-        job.role = SessionRole::Executor as i32;
-        job.project = "arc".to_owned();
-
-        assert_eq!(
-            picker_label(&job, 40, true),
-            "Fix the flaky test executor/arc"
-        );
     }
 
     #[test]
