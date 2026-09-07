@@ -55,10 +55,32 @@ pub async fn run(
     }
 }
 
-/// A second connection, for `CancelTurn` and `SendLive`: the main task in
-/// `run` is busy inside `send()` for the whole streaming turn, so a message
-/// or a cancel that has to interrupt it needs a socket of its own. Connects
-/// lazily, on first use.
+pub async fn run_metadata(
+    url: String,
+    mut requests: mpsc::UnboundedReceiver<()>,
+    events: mpsc::UnboundedSender<NetEvent>,
+) {
+    let mut client: Option<Client> = None;
+    while requests.recv().await.is_some() {
+        let result = async {
+            if client.is_none() {
+                client = Some(Client::connect(&url).await?);
+            }
+            client.as_mut().expect("connected").list_sessions().await
+        }
+        .await;
+        match result {
+            Ok(sessions) => {
+                let _ = events.send(NetEvent::Sessions(sessions));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "session metadata refresh failed");
+                client = None;
+            }
+        }
+    }
+}
+
 pub async fn run_control(
     url: String,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -559,6 +581,129 @@ mod tests {
             .await
             .expect("an event arrives within PATIENCE")
             .expect("the event channel stays open")
+    }
+
+    #[tokio::test]
+    async fn a_metadata_failure_does_not_end_the_turn_and_the_next_refresh_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            for fail in [true, false] {
+                let (stream, _) = listener.accept().await.expect("connection");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("handshake");
+                let request = expect_frame(&mut ws).await;
+                assert!(matches!(
+                    request.msg,
+                    Some(client_frame::Msg::ListSessions(_))
+                ));
+                let response = if fail {
+                    server_frame::Msg::Error(arc_proto::v1::Error {
+                        code: "busy".into(),
+                        msg: "retry later".into(),
+                    })
+                } else {
+                    server_frame::Msg::SessionList(SessionList { sessions: vec![] })
+                };
+                reply(&mut ws, request.request_id, response).await;
+            }
+        });
+        let (requests, receiver) = mpsc::unbounded_channel();
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_metadata(url, receiver, events_tx));
+        requests.send(()).expect("first refresh");
+        requests.send(()).expect("retry");
+        assert_eq!(next_event(&mut events).await, NetEvent::Sessions(vec![]));
+        drop(requests);
+        task.await.expect("metadata task");
+        server.await.expect("server");
+        assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_arrives_while_a_turn_is_still_streaming() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("address"));
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("turn connection");
+            let mut turn = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let request = expect_frame(&mut turn).await;
+            assert!(matches!(
+                request.msg,
+                Some(client_frame::Msg::SendMessage(_))
+            ));
+            reply(
+                &mut turn,
+                request.request_id,
+                server_frame::Msg::MessageAccepted(MessageAccepted {
+                    session_id: "new".into(),
+                }),
+            )
+            .await;
+            let (stream, _) = listener.accept().await.expect("metadata connection");
+            let mut metadata = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let list = expect_frame(&mut metadata).await;
+            assert!(matches!(list.msg, Some(client_frame::Msg::ListSessions(_))));
+            reply(
+                &mut metadata,
+                list.request_id,
+                server_frame::Msg::SessionList(SessionList {
+                    sessions: vec![arc_proto::v1::SessionInfo {
+                        id: "new".into(),
+                        provider: "codex".into(),
+                        model: "recorded".into(),
+                        ..Default::default()
+                    }],
+                }),
+            )
+            .await;
+            wait.await.expect("metadata received before turn ends");
+            reply(
+                &mut turn,
+                request.request_id,
+                server_frame::Msg::StreamEnd(StreamEnd {
+                    session_id: "new".into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        });
+        let (turn_commands, turn_rx) = mpsc::unbounded_channel();
+        let (metadata_commands, metadata_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let turn_task = tokio::spawn(run_control(url.clone(), turn_rx, events_tx.clone()));
+        let metadata_task = tokio::spawn(run_metadata(url, metadata_rx, events_tx));
+        turn_commands
+            .send(Command::SendLive {
+                session_id: "new".into(),
+                content: "hello".into(),
+            })
+            .expect("send");
+        assert!(matches!(
+            next_event(&mut events).await,
+            NetEvent::Accepted { .. }
+        ));
+        metadata_commands.send(()).expect("list");
+        let NetEvent::Sessions(sessions) = next_event(&mut events).await else {
+            panic!("metadata before end")
+        };
+        assert_eq!(sessions[0].model, "recorded");
+        release.send(()).expect("release turn");
+        assert!(matches!(
+            next_event(&mut events).await,
+            NetEvent::End { .. }
+        ));
+        server.await.expect("server");
+        drop(turn_commands);
+        drop(metadata_commands);
+        turn_task.await.expect("turn task");
+        metadata_task.await.expect("metadata task");
     }
 
     // a daemon restart looks like: the same address answers, but a fresh

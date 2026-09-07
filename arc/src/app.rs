@@ -1962,7 +1962,6 @@ impl App {
                 let first_stream = self.live_streams == 0;
                 self.live_streams += 1;
                 self.status = Status::Streaming;
-                let created = self.session_id.is_none();
                 self.session_id = Some(session_id);
                 if first_stream {
                     self.push_block(Block::Arc {
@@ -1973,7 +1972,7 @@ impl App {
                 if let Some(live) = self.pending_live.take() {
                     return Some(self.send(live));
                 }
-                created.then_some(Command::List)
+                None
             }
             NetEvent::Delta(text) => {
                 self.finalize_thinking();
@@ -3002,11 +3001,7 @@ mod tests {
         app.on_net(NetEvent::Delta("lo".to_owned()));
         let next = app.on_net(end(false));
 
-        assert_eq!(
-            refresh,
-            Some(Command::List),
-            "a new session refreshes the list"
-        );
+        assert_eq!(refresh, None);
         assert_eq!(next, None);
         assert_eq!(app.session_id.as_deref(), Some("s-1"));
         assert_eq!(app.status, Status::Idle);

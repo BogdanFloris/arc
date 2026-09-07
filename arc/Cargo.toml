@@ -17,6 +17,7 @@ ratatui.workspace = true
 serde_json.workspace = true
 textwrap.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 expect-test.workspace = true

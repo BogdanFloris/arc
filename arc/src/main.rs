@@ -29,7 +29,7 @@ use crossterm::event::{
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
-use crate::app::{App, Command, Mode, Status};
+use crate::app::{App, Command, Mode, NetEvent, Status};
 
 const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
 
@@ -106,9 +106,15 @@ async fn run(
 
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (control_commands, control_command_rx) = mpsc::unbounded_channel();
+    let (metadata_commands, metadata_command_rx) = mpsc::unbounded_channel();
     let (event_tx, mut events) = mpsc::unbounded_channel();
     tokio::spawn(net::run(url.clone(), command_rx, event_tx.clone()));
-    tokio::spawn(net::run_control(url, control_command_rx, event_tx));
+    tokio::spawn(net::run_control(
+        url.clone(),
+        control_command_rx,
+        event_tx.clone(),
+    ));
+    tokio::spawn(net::run_metadata(url, metadata_command_rx, event_tx));
 
     let _ = commands.send(Command::List);
 
@@ -132,7 +138,12 @@ async fn run(
                 None => break,
             },
             event = events.recv() => match event {
-                Some(event) => app.on_net(event),
+                Some(event) => {
+                    if needs_session_metadata(&app, &event) {
+                        metadata_commands.send(()).expect("metadata task alive");
+                    }
+                    app.on_net(event)
+                },
                 None => anyhow::bail!("the connection task died"),
             },
             _ = clock.tick(), if app.has_running_job() || app.status == Status::Streaming => None,
@@ -167,6 +178,16 @@ fn agent_state(status: Status) -> AgentState {
     }
 }
 
+fn needs_session_metadata(app: &App, event: &NetEvent) -> bool {
+    let (NetEvent::Accepted { session_id }
+    | NetEvent::SessionCreated { session_id }
+    | NetEvent::SessionForked { session_id }) = event
+    else {
+        return false;
+    };
+    !app.sessions.iter().any(|session| session.id == *session_id)
+}
+
 fn session_title(app: &App) -> &str {
     app.session_id
         .as_deref()
@@ -198,6 +219,40 @@ fn set_cursor_style(mode: Mode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_identity_events_refresh_only_missing_recorded_metadata() {
+        for event in [
+            NetEvent::Accepted {
+                session_id: "new".into(),
+            },
+            NetEvent::SessionCreated {
+                session_id: "new".into(),
+            },
+            NetEvent::SessionForked {
+                session_id: "new".into(),
+            },
+        ] {
+            let mut app = App::new();
+            assert!(needs_session_metadata(&app, &event));
+            app.on_net(event.clone());
+            assert!(needs_session_metadata(&app, &event));
+            app.on_net(NetEvent::Sessions(vec![arc_proto::v1::SessionInfo {
+                id: "new".into(),
+                provider: "recorded-provider".into(),
+                model: "recorded-model".into(),
+                ..Default::default()
+            }]));
+            assert!(!needs_session_metadata(&app, &event));
+            assert_eq!(app.sessions[0].model, "recorded-model");
+            app.sessions[0].model.clear();
+            assert!(!needs_session_metadata(&app, &event));
+        }
+        assert!(!needs_session_metadata(
+            &App::new(),
+            &NetEvent::Delta("text".into())
+        ));
+    }
 
     #[test]
     fn loopback_hosts_are_local() {
