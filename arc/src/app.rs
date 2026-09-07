@@ -283,6 +283,7 @@ impl From<Block> for Entry {
 }
 
 pub struct App {
+    pub herdr_enabled: bool,
     pub transcript: Vec<Entry>,
     pub input: String,
     pub cursor: usize,
@@ -405,6 +406,7 @@ impl App {
     }
     pub fn new() -> Self {
         Self {
+            herdr_enabled: false,
             transcript: Vec::new(),
             input: String::new(),
             cursor: 0,

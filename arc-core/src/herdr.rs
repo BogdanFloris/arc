@@ -81,6 +81,10 @@ impl Reporter {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
     pub fn state(&mut self, state: AgentState) {
         if self.tx.is_none() || self.state == Some(state) {
             return;

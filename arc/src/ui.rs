@@ -384,13 +384,14 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
         room / 3,
     );
     let title = elide(title, room.saturating_sub(door.chars().count() + 3));
+    let mut heading = vec![Span::styled(door, theme::ACCENT)];
+    if !app.herdr_enabled {
+        heading.push(Span::styled(" · ", theme::DIM));
+        heading.push(Span::styled(title, theme::STRONG));
+    }
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(door, theme::ACCENT),
-                Span::styled(" · ", theme::DIM),
-                Span::styled(title, theme::STRONG),
-            ]),
+            Line::from(heading),
             Line::styled(elide(&model, room), theme::DIM),
             Line::styled("─".repeat(room), theme::DIM),
         ]),
@@ -1602,6 +1603,13 @@ mod tests {
                     .contains(&"─".repeat(usize::from(width - 4)))
             );
             println!("HEADER {width}\n{text}");
+            app.herdr_enabled = true;
+            let text = plain_text(&rendered_at(&mut app, width, 12));
+            assert_eq!(text.lines().next().unwrap().trim(), "code/arc");
+            assert!(text.contains("model: pinned-model"), "{text}");
+            assert!(!text.contains("Repair"), "{text}");
+            println!("HERDR HEADER {width}\n{text}");
+            app.herdr_enabled = false;
         }
         info.model.clear();
         app.on_net(NetEvent::Sessions(vec![info]));

@@ -102,6 +102,7 @@ async fn run(
     herdr: &mut Reporter,
 ) -> Result<()> {
     let mut app = App::new();
+    app.herdr_enabled = herdr.is_enabled();
     app.set_launch_dir(launch_dir(&url));
 
     let (commands, command_rx) = mpsc::unbounded_channel();
