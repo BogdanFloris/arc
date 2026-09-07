@@ -46,7 +46,7 @@ impl Tool for ContinueJob {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Builtin
+        ToolSource::Jobs
     }
 
     fn execute(

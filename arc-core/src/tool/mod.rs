@@ -88,14 +88,16 @@ pub(crate) struct DispatchOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolSource {
     Builtin,
+    Jobs,
     Web,
     Workspace,
     Expert,
 }
 
 impl ToolSource {
-    pub const ALL: [ToolSource; 4] = [
+    pub const ALL: [ToolSource; 5] = [
         ToolSource::Builtin,
+        ToolSource::Jobs,
         ToolSource::Web,
         ToolSource::Workspace,
         ToolSource::Expert,

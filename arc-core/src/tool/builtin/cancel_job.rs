@@ -37,7 +37,7 @@ impl Tool for CancelJob {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Builtin
+        ToolSource::Jobs
     }
 
     fn execute(

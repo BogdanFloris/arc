@@ -142,6 +142,11 @@ pub struct RoleConfig {
     /// `[compaction] fraction` of this. Absent means the role never compacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+
+    /// Sessions on this model hold `consult_expert` (§6.2). Off by default:
+    /// a second mind is for models that need one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counsel: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -210,7 +215,8 @@ impl RoleConfig {
                     && self.endpoint.is_none()
                     && self.key.is_none()
                     && self.context_window.is_none()
-                    && self.thinking == Thinking::Default,
+                    && self.thinking == Thinking::Default
+                    && !self.counsel,
                 "role `{name}` lists choices, so it declares nothing else inline; the presets carry it"
             );
             for choice in &self.choices {
@@ -446,6 +452,22 @@ impl Config {
         }
         if let Some(counsel) = &self.roles.counsel {
             counsel.validate()?;
+        } else {
+            let wants_counsel = self
+                .models
+                .iter()
+                .map(|(name, preset)| (format!("models.{name}"), preset))
+                .chain(
+                    self.roles
+                        .configured()
+                        .map(|(name, role)| (format!("roles.{name}"), role)),
+                )
+                .find(|(_, config)| config.counsel);
+            if let Some((name, _)) = wants_counsel {
+                bail!(
+                    "`{name}` sets `counsel = true`, which needs `[roles.counsel]` to name the command"
+                );
+            }
         }
         for (name, project) in &self.projects {
             project.validate(name)?;
@@ -570,6 +592,7 @@ choices = ["hosted"]
                     key: Some("gemini".to_owned()),
                     thinking: Thinking::Low,
                     context_window: None,
+                    counsel: false,
                 }),
                 executor: Some(RoleConfig {
                     provider: Some(RoleProvider::OpenAiCompat),
@@ -579,6 +602,7 @@ choices = ["hosted"]
                     key: Some("opencode-go".to_owned()),
                     thinking: Thinking::Default,
                     context_window: Some(128_000),
+                    counsel: false,
                 }),
                 archivist: Some(RoleConfig {
                     provider: Some(RoleProvider::Local),
@@ -588,6 +612,7 @@ choices = ["hosted"]
                     key: None,
                     thinking: Thinking::Minimal,
                     context_window: None,
+                    counsel: false,
                 }),
                 counsel: Some(super::CounselConfig {
                     command: super::CounselCommand::Claude,
@@ -742,6 +767,68 @@ provider = "local"
         let err = toml::from_str::<Config>("[roles.executor]\nprovider = \"anthropic\"\n")
             .expect_err("an unconfigurable provider must not load");
         assert!(err.to_string().contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn counsel_is_a_preset_property_that_needs_the_counsel_role() {
+        let config = parse(
+            r#"
+[roles.executor]
+choices = ["flash", "sol"]
+
+[roles.counsel]
+command = "claude"
+model   = "opus"
+
+[models.flash]
+provider = "openai_compat"
+model    = "deepseek-v4-flash"
+endpoint = "https://opencode.example"
+counsel  = true
+
+[models.sol]
+provider = "codex"
+model    = "gpt-5.6-sol"
+key      = "codex"
+"#,
+        );
+        assert!(config.models["flash"].counsel);
+        assert!(
+            !config.models["sol"].counsel,
+            "off unless the preset says so"
+        );
+
+        let err = rejected(
+            r#"
+[roles.executor]
+provider = "openai_compat"
+model    = "deepseek-v4-flash"
+endpoint = "https://opencode.example"
+counsel  = true
+"#,
+        );
+        assert!(
+            err.contains("roles.executor") && err.contains("[roles.counsel]"),
+            "{err}"
+        );
+
+        let err = rejected(
+            r#"
+[roles.executor]
+choices = ["flash"]
+counsel = true
+
+[roles.counsel]
+command = "claude"
+model   = "opus"
+
+[models.flash]
+provider = "openai_compat"
+model    = "deepseek-v4-flash"
+endpoint = "https://opencode.example"
+"#,
+        );
+        assert!(err.contains("declares nothing else inline"), "{err}");
     }
 
     #[test]

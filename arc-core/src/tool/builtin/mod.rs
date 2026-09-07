@@ -73,10 +73,12 @@ mod tests {
                 "sessions_search",
             ]
         );
+        let sources: Vec<ToolSource> = tools.iter().map(|tool| tool.source()).collect();
+        assert_eq!(&sources[..3], [ToolSource::Jobs; 3]);
         assert!(
-            tools
+            sources[3..]
                 .iter()
-                .all(|tool| tool.source() == ToolSource::Builtin)
+                .all(|source| *source == ToolSource::Builtin)
         );
     }
 }

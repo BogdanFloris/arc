@@ -155,7 +155,7 @@ context_window = 272000
 
 Every workspace project also holds `apply_patch`, the edit grammar these models are trained on; the codex provider sends it as a custom grammar tool, other providers as a plain function.
 
-**Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory. First-party CLI, which is the sanctioned path.
+**Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory, by sessions whose model preset says `counsel = true`. First-party CLI, which is the sanctioned path.
 
 A coding job uses one `plan` and up to *N* `review` calls. Counsel use therefore scales with jobs and review rounds, not conversation. Each call is a short, read-only run over a few files. Measure its use before changing the design.
 

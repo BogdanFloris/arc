@@ -579,12 +579,7 @@ mod tests {
 
         let engine = engine_for_project(&dir, &root);
         let parent_id = engine
-            .create_bound_session(
-                &runner(&concierge_provider),
-                "arc",
-                SessionRole::Executor,
-                None,
-            )
+            .create_direct_session(&runner(&concierge_provider), "arc", SessionRole::Executor)
             .expect("create the parent durably");
         let child_id = child_session(&engine, &concierge_provider);
 
@@ -842,12 +837,7 @@ mod tests {
         );
 
         let parent_id = engine
-            .create_bound_session(
-                &runner(&concierge_provider),
-                "arc",
-                SessionRole::Concierge,
-                None,
-            )
+            .create_direct_session(&runner(&concierge_provider), "arc", SessionRole::Concierge)
             .expect("create the parent durably");
         let first_child = engine
             .create_bound_session(
@@ -945,12 +935,7 @@ mod tests {
         // a throwaway provider: session creation never drives it
         let bootstrap_provider = ScriptedProvider::scripted(vec![]);
         let parent_id = engine
-            .create_bound_session(
-                &runner(&bootstrap_provider),
-                "arc",
-                SessionRole::Concierge,
-                None,
-            )
+            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Concierge)
             .expect("create the parent durably");
         let first_child = engine
             .create_bound_session(

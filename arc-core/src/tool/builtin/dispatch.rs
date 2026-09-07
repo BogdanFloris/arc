@@ -138,7 +138,7 @@ impl Tool for Dispatch {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Builtin
+        ToolSource::Jobs
     }
 
     fn execute(

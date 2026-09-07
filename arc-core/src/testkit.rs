@@ -130,6 +130,7 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
         thinking: Thinking::Default,
         system: Some("be terse".to_owned()),
         compact_at: None,
+        counsel: false,
     }
 }
 

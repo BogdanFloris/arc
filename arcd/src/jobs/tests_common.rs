@@ -63,6 +63,7 @@ pub(crate) mod testkit {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         }
     }
 
@@ -74,7 +75,7 @@ pub(crate) mod testkit {
 
     pub(crate) fn parent_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
         engine
-            .create_bound_session(&runner(concierge), "arc", SessionRole::Concierge, None)
+            .create_direct_session(&runner(concierge), "arc", SessionRole::Concierge)
             .expect("create the parent durably")
     }
 

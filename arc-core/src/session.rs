@@ -57,6 +57,9 @@ pub struct Runner {
     /// The prompt-token count that triggers compaction (§4.4); `None` for a
     /// role with no configured `context_window`, which never compacts.
     pub compact_at: Option<u32>,
+    /// Whether sessions on this model hold `consult_expert` (§6.2): a
+    /// property of the model preset, not the role.
+    pub counsel: bool,
 }
 
 // never held across an .await: it fences a single append batch or
@@ -76,9 +79,6 @@ pub struct Engine {
     projects: BTreeMap<String, ProjectSpec>,
     // per role, in config order: the first is the default when nothing is selected
     role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
-    // `[roles.counsel]` presence, not per-project config (§6.2): concierge and
-    // executor hold `consult_expert` when true; archivist never does
-    expert_enabled: bool,
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -232,7 +232,6 @@ impl Engine {
             registry,
             projects: BTreeMap::new(),
             role_choices: BTreeMap::new(),
-            expert_enabled: false,
             turns: StdMutex::new(HashMap::new()),
             live_turns: StdMutex::new(HashMap::new()),
             notifier: None,
@@ -437,12 +436,6 @@ impl Engine {
     #[must_use]
     pub fn with_notifier(mut self, notifier: broadcast::Sender<Notification>) -> Self {
         self.notifier = Some(notifier);
-        self
-    }
-
-    #[must_use]
-    pub fn with_expert_enabled(mut self, enabled: bool) -> Self {
-        self.expert_enabled = enabled;
         self
     }
 
@@ -948,12 +941,18 @@ impl Engine {
         &self,
         session_id: &str,
         new_session: bool,
-        role: SessionRole,
+        runner: &Runner,
     ) -> Result<Vec<ToolSource>, Error> {
-        let project = if new_session {
-            None
+        let role = runner.role;
+        let (project, source) = if new_session {
+            (None, None)
         } else {
-            self.with_store(|store| store.projection().session_project(session_id))?
+            self.with_store(|store| -> Result<_, Error> {
+                Ok((
+                    store.projection().session_project(session_id)?,
+                    store.projection().session_source(session_id)?,
+                ))
+            })?
         };
         let mut sources = match project {
             None => vec![ToolSource::Builtin],
@@ -967,8 +966,12 @@ impl Engine {
                 }
             }
         };
-        // resolved by role, not project config (§6.2): archivist never holds it
-        if self.expert_enabled && matches!(role, SessionRole::Concierge | SessionRole::Executor) {
+        // a job never dispatches: work under a session the user opened is one level deep
+        if source != Some(Source::Model as i32) {
+            sources.push(ToolSource::Jobs);
+        }
+        // the model preset says (§6.2); the archivist never holds it
+        if runner.counsel && matches!(role, SessionRole::Concierge | SessionRole::Executor) {
             sources.push(ToolSource::Expert);
         }
         // web is a concierge capability, no config gate (2026-08-24)
@@ -1100,7 +1103,7 @@ impl Engine {
         if !new_session {
             self.enforce_pin(runner, &session_id)?;
         }
-        let sources = self.sources(&session_id, new_session, runner.role)?;
+        let sources = self.sources(&session_id, new_session, runner)?;
         let grants = self.grants(&session_id, new_session)?;
         let command_prefix = self.command_prefix(&session_id, new_session)?;
 
@@ -1187,7 +1190,7 @@ impl Engine {
         let turn = guard.lock().await;
 
         self.enforce_pin(runner, session_id)?;
-        let sources = self.sources(session_id, false, runner.role)?;
+        let sources = self.sources(session_id, false, runner)?;
         let grants = self.grants(session_id, false)?;
         let command_prefix = self.command_prefix(session_id, false)?;
 
@@ -4433,6 +4436,7 @@ mod tests {
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -4463,6 +4467,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
 
         let (tx, _rx) = channel();
@@ -4677,6 +4682,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -5024,6 +5030,7 @@ mod tests {
             thinking: Thinking::Minimal,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -5378,20 +5385,27 @@ mod tests {
         })
     }
 
-    fn engine_with_expert(dir: &TempDir, enabled: bool) -> Engine {
+    fn engine_with_expert(dir: &TempDir) -> Engine {
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
         let mut registry = Registry::new(512);
         registry.register(expert_tool());
-        Engine::new(Store::new(log, projection), registry).with_expert_enabled(enabled)
+        Engine::new(Store::new(log, projection), registry)
+    }
+
+    fn counsel_runner(provider: &Arc<ScriptedProvider>, role: SessionRole) -> Runner {
+        Runner {
+            counsel: true,
+            ..runner_with_role(provider, role)
+        }
     }
 
     #[tokio::test]
-    async fn concierge_holds_consult_expert_when_counsel_is_configured() {
+    async fn concierge_holds_consult_expert_when_its_model_has_counsel() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir, true);
-        let run = runner_with_role(&provider, SessionRole::Concierge);
+        let engine = engine_with_expert(&dir);
+        let run = counsel_runner(&provider, SessionRole::Concierge);
         let (tx, _rx) = channel();
 
         engine
@@ -5411,11 +5425,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_holds_consult_expert_when_counsel_is_configured() {
+    async fn executor_holds_consult_expert_when_its_model_has_counsel() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir, true);
-        let run = runner_with_role(&provider, SessionRole::Executor);
+        let engine = engine_with_expert(&dir);
+        let run = counsel_runner(&provider, SessionRole::Executor);
         let (tx, _rx) = channel();
 
         engine
@@ -5435,11 +5449,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archivist_never_holds_consult_expert_even_when_counsel_is_configured() {
+    async fn archivist_never_holds_consult_expert_even_when_its_model_has_counsel() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir, true);
-        let run = runner_with_role(&provider, SessionRole::Archivist);
+        let engine = engine_with_expert(&dir);
+        let run = counsel_runner(&provider, SessionRole::Archivist);
         let (tx, _rx) = channel();
 
         engine
@@ -5459,13 +5473,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nobody_holds_consult_expert_when_counsel_is_not_configured() {
+    async fn nobody_holds_consult_expert_when_the_model_has_no_counsel() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
-        let engine = engine_with_expert(&dir, false);
+        let engine = engine_with_expert(&dir);
 
         for role in [SessionRole::Concierge, SessionRole::Executor] {
             let run = runner_with_role(&provider, role);
+            assert!(!run.counsel);
             let (tx, _rx) = channel();
             engine
                 .send_message(&run, None, "hi", tx)
@@ -5480,6 +5495,59 @@ mod tests {
                 .all(|request| request.tools.iter().all(|def| def.name != "consult_expert")),
             "{:?}",
             requests.iter().map(|r| &r.tools).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_session_holds_the_job_tools_and_a_dispatched_job_never_does() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
+        let mut registry = Registry::new(512);
+        for name in ["dispatch", "continue_job", "cancel_job"] {
+            registry.register(Box::new(Canned {
+                name,
+                content: "",
+                ok: true,
+                source: ToolSource::Jobs,
+            }));
+        }
+        let (engine, _) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let run = runner_with_role(&provider, SessionRole::Executor);
+
+        let direct = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect("direct session");
+        let job = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("job session");
+        for session in [&direct, &job] {
+            let (tx, _rx) = channel();
+            engine
+                .send_message(&run, Some(session), "hi", tx)
+                .await
+                .expect("send");
+        }
+
+        let requests = provider.requests();
+        let names = |index: usize| -> Vec<String> {
+            requests[index]
+                .tools
+                .iter()
+                .map(|def| def.name.clone())
+                .collect()
+        };
+        assert_eq!(names(0), ["cancel_job", "continue_job", "dispatch"]);
+        assert!(
+            names(1).is_empty(),
+            "a job holds no job tools: {:?}",
+            names(1)
         );
     }
 
@@ -6501,6 +6569,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
         let child_engine = child_engine.with_projects(projects_with(
@@ -7247,6 +7316,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -7281,6 +7351,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -7311,6 +7382,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let (tx, _rx) = channel();
 
@@ -8094,6 +8166,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
 
@@ -8178,6 +8251,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
         let (tx, _rx) = channel();
@@ -8255,6 +8329,7 @@ mod tests {
         let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
         let run = Runner {
             compact_at: Some(LIMIT),
+            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
 
@@ -8295,6 +8370,7 @@ mod tests {
         let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
         let run = Runner {
             compact_at: None,
+            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
 
@@ -8332,6 +8408,7 @@ mod tests {
             engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
         let run = Runner {
             compact_at: Some(LIMIT),
+            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
 

@@ -178,6 +178,7 @@ impl<'a> Built<'a> {
                 thinking: Thinking::Default,
                 system,
                 compact_at: None,
+                counsel: false,
             };
             return Ok(vec![(runner.model.clone(), runner)]);
         };
@@ -228,6 +229,7 @@ impl<'a> Built<'a> {
             thinking,
             system,
             compact_at,
+            counsel: configured.counsel,
         })
     }
 
@@ -654,11 +656,16 @@ endpoint       = "https://opencode.example"
 key            = "opencode-go"
 thinking       = "low"
 context_window = 100000
+counsel        = true
 
 [models.sol]
 provider = "codex"
 model    = "gpt-5.6-sol"
 key      = "codex"
+
+[roles.counsel]
+command = "claude"
+model   = "opus"
 "#;
 
         let roles = with_secrets(config, dir.path(), &[("opencode-go", "sk-go")])
@@ -668,6 +675,11 @@ key      = "codex"
         assert_eq!(executor.model, "deepseek-v4-flash");
         assert_eq!(executor.thinking, arc_core::provider::Thinking::Low);
         assert_eq!(executor.compact_at, Some(80_000));
+        assert!(
+            executor.counsel,
+            "the preset's counsel flag rides on the runner"
+        );
+        assert!(!roles.concierge().counsel);
         let menu = roles.menus();
         assert_eq!(
             menu[&arc_proto::v1::SessionRole::Executor]

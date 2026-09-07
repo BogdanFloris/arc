@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_jobs_own_dispatch_spawns_and_runs_the_grandchild() {
+    async fn a_job_holds_no_dispatch_so_no_grandchild_is_ever_created() {
         let dispatch_args = serde_json::json!({
             "role": "executor",
             "project": "arc",
@@ -1040,10 +1040,7 @@ mod tests {
                 Ok(call("g1", 0, "dispatch", &dispatch_args)),
                 Ok(tool_stop()),
             ],
-            done_reply("parent job done"),
-            done_reply("grandchild done"),
-            // the grandchild's report reaches the job that dispatched it
-            done_reply("noted the grandchild"),
+            done_reply("did it myself"),
         ]);
 
         let mut registry = Registry::new(512);
@@ -1095,35 +1092,42 @@ mod tests {
         });
         supervisor.shutdown().await;
 
+        let requests = executor_provider.requests();
+        assert!(
+            requests[0].tools.iter().all(|def| def.name != "dispatch"),
+            "{:?}",
+            requests[0].tools
+        );
         let events = replay_log(dir.path());
-        let grandchild = events
+        let refused = events
             .iter()
             .find_map(|event| match event {
-                arc_proto::v1::session_event::Event::SessionCreated(created)
-                    if created.role == SessionRole::Executor as i32
-                        && created.session_id != child =>
+                arc_proto::v1::session_event::Event::ToolResultRecorded(result)
+                    if result.call_id == "g1" =>
                 {
-                    Some(created.session_id.clone())
+                    Some(result.clone())
                 }
                 _ => None,
             })
-            .expect("the job's own dispatch created a grandchild durably");
-
-        let ran: Vec<_> = events
+            .expect("the dispatch call got a result");
+        assert_eq!(refused.outcome, arc_proto::v1::ToolOutcome::Error as i32);
+        assert!(
+            refused.content.contains("not available in this session"),
+            "{}",
+            refused.content
+        );
+        let created = events
             .iter()
-            .filter_map(|event| match event {
-                arc_proto::v1::session_event::Event::MessageAppended(m)
-                    if m.session_id == grandchild =>
-                {
-                    Some(m.content.clone())
-                }
-                _ => None,
+            .filter(|event| {
+                matches!(
+                    event,
+                    arc_proto::v1::session_event::Event::SessionCreated(_)
+                )
             })
-            .collect();
+            .count();
         assert_eq!(
-            ran,
-            ["grandchild work", "grandchild done"],
-            "the grandchild actually ran, not just existed"
+            created, 2,
+            "the parent and the child: no grandchild session exists"
         );
     }
 
@@ -1178,13 +1182,8 @@ mod tests {
         );
 
         let child = engine
-            .create_bound_session(
-                &runner(&executor_provider),
-                "arc",
-                SessionRole::Executor,
-                None,
-            )
-            .expect("create the child durably");
+            .create_direct_session(&runner(&executor_provider), "arc", SessionRole::Executor)
+            .expect("create the direct session durably");
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1695,18 +1694,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_jobs_own_cancel_job_stops_a_live_sibling_and_its_handback_lands() {
+    async fn a_jobs_own_cancel_job_is_refused_and_the_sibling_keeps_running() {
         use arc_core::provider::{Provider, Thinking};
 
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        // the sibling: never notified, so it stays live until cancel_job stops it
+        // the sibling stays live until this test releases it
         let gate = Arc::new(tokio::sync::Notify::new());
         let archivist_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: Vec::new(),
-            notify: gate,
+            notify: Arc::clone(&gate),
             after: Vec::new(),
         }]);
 
@@ -1727,12 +1726,7 @@ mod tests {
 
         let bootstrap_provider = ScriptedProvider::scripted(vec![]);
         let parent_id = engine
-            .create_bound_session(
-                &runner(&bootstrap_provider),
-                "arc",
-                SessionRole::Concierge,
-                None,
-            )
+            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Concierge)
             .expect("create the parent durably");
         let sibling = engine
             .create_bound_session(
@@ -1771,6 +1765,7 @@ mod tests {
                     thinking: Thinking::Default,
                     system: None,
                     compact_at: None,
+                    counsel: false,
                 },
             ),
         ]);
@@ -1787,22 +1782,41 @@ mod tests {
         wait_for_message_count(dir.path(), &sibling, 1).await;
 
         supervisor.spawn(DispatchedJob {
-            session_id: canceller,
+            session_id: canceller.clone(),
             parent_session: parent_id.clone(),
             role: SessionRole::Executor,
             project: "arc".to_owned(),
             brief: "stop the sibling".to_owned(),
             budget: None,
         });
+        for _ in 0..400 {
+            if supervisor.list().iter().any(|job| {
+                job.session_id == canceller && job.state == job_info::State::Finished as i32
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            supervisor.list().iter().any(
+                |job| job.session_id == sibling && job.state == job_info::State::Running as i32
+            ),
+            "the sibling is still running: a job cannot cancel it"
+        );
+        gate.notify_one();
         supervisor.shutdown().await;
 
-        assert_eq!(
+        let requests = executor_provider.requests();
+        assert!(
+            requests[0].tools.iter().all(|def| def.name != "cancel_job"),
+            "{:?}",
+            requests[0].tools
+        );
+        assert!(
             child_user_messages(dir.path(), &parent_id)
                 .into_iter()
-                .filter(|(_, content)| content.contains("stopped: cancelled by the user"))
-                .count(),
-            1,
-            "the sibling's cancelled handback landed in the shared parent"
+                .all(|(_, content)| !content.contains("cancelled")),
+            "no cancelled handback reached the parent"
         );
     }
 }

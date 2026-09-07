@@ -1057,6 +1057,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: None,
                 compact_at: None,
+                counsel: false,
             };
             Self::with_seed(
                 script,
@@ -1134,6 +1135,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
                 compact_at: None,
+                counsel: false,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -1197,6 +1199,7 @@ mod tests {
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
                 compact_at: None,
+                counsel: false,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -3800,6 +3803,7 @@ mod tests {
             thinking: Thinking::Default,
             system: Some("be terse".to_owned()),
             compact_at: None,
+            counsel: false,
         };
         let executor_runner = Runner {
             role: SessionRole::Executor,
@@ -3808,6 +3812,7 @@ mod tests {
             thinking: Thinking::Default,
             system: None,
             compact_at: None,
+            counsel: false,
         };
         let supervisor = Arc::new(
             Supervisor::for_test(

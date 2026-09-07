@@ -141,7 +141,6 @@ impl Daemon {
         for tool in workspace::tools(Arc::new(Workspace::new())) {
             registry.register(tool);
         }
-        let expert_enabled = config.roles.counsel.is_some();
         if let Some(counsel) = &config.roles.counsel {
             let project_roots = config
                 .projects
@@ -165,8 +164,7 @@ impl Daemon {
         let engine = Engine::new(store, registry)
             .with_projects(projects)
             .with_role_choices(roles.choices())
-            .with_notifier(notifier.clone())
-            .with_expert_enabled(expert_enabled);
+            .with_notifier(notifier.clone());
 
         Ok(Self {
             config,

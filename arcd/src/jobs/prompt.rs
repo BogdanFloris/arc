@@ -19,6 +19,8 @@ fn direct_preamble(root: &Path) -> String {
     format!(
         "You are a coding agent inside ARC's harness, working interactively with \
          the user in {}. Be concise. Show file paths clearly.\n\n\
+         You do the work yourself. Dispatch only for work that should run beside you \
+         or after the user leaves. \
          When you hand off the whole task, end your reply; the handback arrives on its own. \
          When you delegate part of a task, continue independent work. Do not edit \
          the same files as a running child. \
@@ -192,10 +194,13 @@ mod tests {
 
         assert!(
             direct.contains(
-                "When you hand off the whole task, end your reply; the handback arrives on its own."
+                "You do the work yourself. Dispatch only for work that should run beside you \
+                 or after the user leaves. When you hand off the whole task, end your reply; \
+                 the handback arrives on its own."
             ),
             "{direct}"
         );
+        assert!(!job.contains("You do the work yourself"), "{job}");
         assert!(
             direct.contains("Briefs are self-contained: the child sees nothing of this session."),
             "{direct}"
