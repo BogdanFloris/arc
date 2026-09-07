@@ -233,7 +233,8 @@ mod tests {
             [(
                 Role::User,
                 format!(
-                    "Job {child_id} finished.\nall fixed\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                    "Job {child_id} finished.\nall fixed\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
+                    footprint = arc_core::footprint::report(Some(&[]), None)
                 )
             )],
             "the handback names the child and carries its final reply"
@@ -370,11 +371,13 @@ mod tests {
         assert_eq!(handbacks.len(), 1, "{handbacks:?}");
         assert!(
             handbacks[0].1.contains(
-                "changed nothing\nFootprint since this turn began, counted by the daemon: nothing in the project changed.\nFor follow-ups"
+                "changed nothing\nTurn footprint:\nConfirmed file operations by this turn (write/edit/apply_patch): none recorded"
             ),
             "the daemon's count sits between the report and the continue line: {:?}",
             handbacks[0]
         );
+        assert!(handbacks[0].1.contains("all writers; not job attribution"));
+        assert!(handbacks[0].1.contains("remain unattributed"));
     }
 
     #[tokio::test]
@@ -472,7 +475,8 @@ mod tests {
             [(
                 Role::User,
                 format!(
-                    "Job {child_id} finished.\n{NO_REPLY}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                    "Job {child_id} finished.\n{NO_REPLY}\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
+                    footprint = arc_core::footprint::report(Some(&[]), None)
                 )
             )],
             "an empty assistant reply reads the same as no reply at all"
@@ -521,7 +525,8 @@ mod tests {
                 (
                     Role::User,
                     format!(
-                        "Job {child_id} finished.\nall fixed\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing."
+                        "Job {child_id} finished.\nall fixed\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
+                        footprint = arc_core::footprint::report(Some(&[]), None)
                     )
                 ),
                 (Role::Assistant, "the job did X".to_owned()),

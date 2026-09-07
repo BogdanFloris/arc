@@ -141,11 +141,14 @@ impl Tool for Edit {
 
             self.workspace
                 .record_read(&ctx.session_id, &resolved, &updated_bytes);
-            ToolReply::ok(format!(
-                "Edited {} ({} bytes).",
-                resolved.display(),
-                updated_bytes.len()
-            ))
+            ToolReply {
+                changed_paths: vec![resolved.to_string_lossy().into_owned()],
+                ..ToolReply::ok(format!(
+                    "Edited {} ({} bytes).",
+                    resolved.display(),
+                    updated_bytes.len()
+                ))
+            }
         })
     }
 }
@@ -205,6 +208,10 @@ mod tests {
             )
             .await;
         assert!(first.ok, "{}", first.content);
+        assert_eq!(
+            first.changed_paths,
+            [path.canonicalize().unwrap().to_string_lossy()]
+        );
         assert_eq!(fs::read_to_string(&path).expect("read back"), "hello there");
 
         let second = edit_tool
@@ -214,6 +221,7 @@ mod tests {
             )
             .await;
         assert!(second.ok, "{}", second.content);
+        assert_eq!(second.changed_paths, first.changed_paths);
         assert_eq!(fs::read_to_string(&path).expect("read back"), "hi there");
     }
 

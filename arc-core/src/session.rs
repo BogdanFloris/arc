@@ -904,6 +904,23 @@ impl Engine {
         Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
     }
 
+    #[tracing::instrument(
+        name = "footprint.confirmed_paths",
+        skip_all,
+        fields(session_id, reply_seq)
+    )]
+    pub fn changed_paths_for_reply(
+        &self,
+        session_id: &str,
+        reply_seq: u64,
+    ) -> Result<Option<Vec<String>>, Error> {
+        Ok(self.with_store(|store| {
+            store
+                .projection()
+                .changed_paths_for_reply(session_id, reply_seq)
+        })?)
+    }
+
     pub fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
         Ok(self.with_store(|store| store.projection().session_project(session_id))?)
     }
@@ -1682,6 +1699,7 @@ impl Engine {
             };
             let DispatchOutcome {
                 content,
+                changed_paths,
                 ok,
                 truncated,
                 memory_events,
@@ -1730,6 +1748,7 @@ impl Engine {
                     outcome: outcome as i32,
                     content: content.clone(),
                     truncated,
+                    changed_paths,
                 }),
             )?;
             let _ = events
@@ -1761,6 +1780,7 @@ impl Engine {
                 self.record(
                     Source::System,
                     session_event::Event::ToolResultRecorded(ToolResultRecorded {
+                        changed_paths: Vec::new(),
                         session_id: session_id.to_owned(),
                         turn_id: turn_id.to_owned(),
                         call_id: call.id.clone(),
@@ -2649,6 +2669,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_writes_survive_capped_results_and_engine_replay() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("child.txt");
+        let mut registry = Registry::new(4);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "write-1",
+                    0,
+                    "write",
+                    &serde_json::json!({"path": path, "content": "child"}).to_string(),
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("done"),
+        ]);
+        let (engine, run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects_with(
+            "arc",
+            vec![ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        ));
+        let id = engine
+            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .unwrap();
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, Some(&id), "write", tx)
+            .await
+            .unwrap();
+        std::fs::write(root.join("external.txt"), "someone else").unwrap();
+        let paths = engine
+            .changed_paths_for_reply(&id, reply.seq)
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths, [path.canonicalize().unwrap().to_string_lossy()]);
+        let events = replay_log(dir.path());
+        assert!(events.iter().any(
+            |event| matches!(event, session_event::Event::ToolResultRecorded(result)
+            if result.truncated && result.changed_paths == paths)
+        ));
+        drop(engine);
+        let (reopened, _) = reopened_engine(&provider, &dir, Registry::new(4));
+        assert_eq!(
+            reopened.changed_paths_for_reply(&id, reply.seq).unwrap(),
+            Some(paths)
+        );
+    }
+
+    #[tokio::test]
     async fn context_records_each_measured_step_not_turn_totals_or_missing_usage() {
         let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
@@ -2746,6 +2821,7 @@ mod tests {
 
     fn seeded_result(call_id: &str, content: &str) -> session_event::Event {
         session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
+            changed_paths: Vec::new(),
             session_id: "s-01".to_owned(),
             turn_id: "t-01".to_owned(),
             call_id: call_id.to_owned(),
@@ -4085,6 +4161,7 @@ mod tests {
                 }),
                 seeded_call("c1", 0),
                 session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
+                    changed_paths: Vec::new(),
                     session_id: "s-01".to_owned(),
                     turn_id: "t-01".to_owned(),
                     call_id: "c1".to_owned(),
@@ -5029,6 +5106,7 @@ mod tests {
             > {
                 Box::pin(async move {
                     crate::tool::ToolReply {
+                        changed_paths: Vec::new(),
                         content: "Superseded mr-pref with mr-new.".to_owned(),
                         ok: true,
                         memory_events: vec![memory_event::Event::RecordSuperseded(
@@ -6667,8 +6745,16 @@ mod tests {
         assert!(result.content.contains(&child_id), "{}", result.content);
         assert!(result.content.contains("executor"), "{}", result.content);
         assert!(result.content.contains("arc"), "{}", result.content);
-        assert!(result.content.contains("summary will arrive here as a handback"));
-        assert!(result.content.contains("Do not call continue_job to ask for status"));
+        assert!(
+            result
+                .content
+                .contains("summary will arrive here as a handback")
+        );
+        assert!(
+            result
+                .content
+                .contains("Do not call continue_job to ask for status")
+        );
         assert!(!result.content.contains("End this reply"));
         assert!(!result.content.contains("wait"));
         assert!(
@@ -8061,6 +8147,7 @@ mod tests {
             {
                 Box::pin(async move {
                     ToolReply {
+                        changed_paths: Vec::new(),
                         content: "dispatching".to_owned(),
                         ok: true,
                         memory_events: Vec::new(),

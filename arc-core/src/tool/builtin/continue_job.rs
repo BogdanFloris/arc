@@ -74,6 +74,7 @@ impl Tool for ContinueJob {
                 );
             }
             ToolReply {
+                changed_paths: Vec::new(),
                 content: format!(
                     "Continuing job {}. Its reply arrives later as a handback; do not call \
                      continue_job again to fetch it.",

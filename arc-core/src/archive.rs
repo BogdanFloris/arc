@@ -735,6 +735,7 @@ mod tests {
 
     fn tool_answered(session: &str, content: &str) -> session_event::Event {
         session_event::Event::ToolResultRecorded(ToolResultRecorded {
+            changed_paths: Vec::new(),
             session_id: session.to_owned(),
             turn_id: "t-01".to_owned(),
             call_id: "c-01".to_owned(),

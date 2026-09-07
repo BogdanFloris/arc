@@ -87,18 +87,21 @@ impl Tool for ApplyPatch {
                 }
             }
 
-            let mut report = String::from("Applied the patch:");
+            let mut reply = ToolReply::ok("Applied the patch:".to_owned());
             for change in planned {
-                if let Err(reason) = self.commit(&change, &ctx.session_id) {
-                    return ToolReply::error(format!(
+                if let Err(reason) = self.commit(&change, &ctx.session_id, &mut reply.changed_paths)
+                {
+                    reply.ok = false;
+                    reply.content = format!(
                         "ERROR: {reason} Earlier hunks of this patch were already applied; \
                          read the files again before retrying."
-                    ));
+                    );
+                    return reply;
                 }
-                report.push('\n');
-                report.push_str(&change.line());
+                reply.content.push('\n');
+                reply.content.push_str(&change.line());
             }
-            ToolReply::ok(report)
+            reply
         })
     }
 }
@@ -200,14 +203,20 @@ impl ApplyPatch {
         }
     }
 
-    fn commit(&self, change: &Change, session_id: &str) -> Result<(), String> {
-        let write = |path: &Path, bytes: &[u8]| {
+    fn commit(
+        &self,
+        change: &Change,
+        session_id: &str,
+        changed_paths: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let mut write = |path: &Path, bytes: &[u8]| {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| format!("could not create {} ({error}).", parent.display()))?;
             }
             std::fs::write(path, bytes)
                 .map_err(|error| format!("could not write {} ({error}).", path.display()))?;
+            changed_paths.push(path.to_string_lossy().into_owned());
             self.workspace.record_read(session_id, path, bytes);
             Ok::<(), String>(())
         };
@@ -218,8 +227,12 @@ impl ApplyPatch {
                 moved_to: None,
                 content,
             } => write(path, content),
-            Change::Delete { path } => std::fs::remove_file(path)
-                .map_err(|error| format!("could not delete {} ({error}).", path.display())),
+            Change::Delete { path } => {
+                std::fs::remove_file(path)
+                    .map_err(|error| format!("could not delete {} ({error}).", path.display()))?;
+                changed_paths.push(path.to_string_lossy().into_owned());
+                Ok(())
+            }
             Change::Update {
                 path,
                 moved_to: Some(dest),
@@ -231,7 +244,9 @@ impl ApplyPatch {
                         "could not remove {} after moving it ({error}).",
                         path.display()
                     )
-                })
+                })?;
+                changed_paths.push(path.to_string_lossy().into_owned());
+                Ok(())
             }
         }
     }
@@ -693,6 +708,17 @@ mod tests {
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(
+            reply.changed_paths,
+            [
+                "sub/new.txt",
+                "keep.txt",
+                "moved.txt",
+                "old.txt",
+                "gone.txt"
+            ]
+            .map(|name| root.join(name).to_string_lossy().into_owned())
+        );
+        assert_eq!(
             fs::read_to_string(root.join("sub/new.txt")).unwrap(),
             "fresh\n"
         );
@@ -731,6 +757,38 @@ mod tests {
             "a patch counts as a fresh read: {}",
             again.content
         );
+    }
+
+    #[tokio::test]
+    async fn a_later_patch_failure_keeps_completed_file_operations() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+        let patch = "*** Begin Patch\n*** Add File: a\n+first\n*** Add File: a/child\n+second\n*** End Patch";
+        let reply = tool.execute(args(patch), ctx(root, Mode::ReadWrite)).await;
+        assert!(!reply.ok);
+        assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "first\n");
+        assert_eq!(reply.changed_paths, [root.join("a").to_string_lossy()]);
+    }
+
+    #[test]
+    fn a_failed_move_retains_the_destination_write() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("missing");
+        let destination = dir.path().join("destination");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+        let mut paths = Vec::new();
+        let result = tool.commit(
+            &super::Change::Update {
+                path: source,
+                moved_to: Some(destination.clone()),
+                content: b"saved\n".to_vec(),
+            },
+            "child",
+            &mut paths,
+        );
+        assert!(result.is_err());
+        assert_eq!(paths, [destination.to_string_lossy()]);
     }
 
     #[tokio::test]

@@ -62,6 +62,7 @@ pub(crate) fn close(orphans: &[OrphanCall], store: &mut Store) -> Result<(), Err
         let payload = event::Payload::Session(SessionEvent {
             event: Some(session_event::Event::ToolResultRecorded(
                 ToolResultRecorded {
+                    changed_paths: Vec::new(),
                     session_id: orphan.session_id.clone(),
                     turn_id: orphan.turn_id.clone(),
                     call_id: orphan.call_id.clone(),
@@ -133,6 +134,7 @@ mod tests {
         wrap(
             Source::System,
             session_event::Event::ToolResultRecorded(ToolResultRecorded {
+                changed_paths: Vec::new(),
                 session_id: session.to_owned(),
                 turn_id: turn.to_owned(),
                 call_id: call.to_owned(),

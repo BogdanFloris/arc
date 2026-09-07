@@ -108,6 +108,7 @@ fn tool_result_recorded_event() -> Event {
         payload: Some(event::Payload::Session(SessionEvent {
             event: Some(session_event::Event::ToolResultRecorded(
                 ToolResultRecorded {
+                    changed_paths: vec!["/project/changed.rs".to_owned()],
                     session_id: "s-01".to_string(),
                     turn_id: "t-01".to_string(),
                     call_id: "call-aa".to_string(),

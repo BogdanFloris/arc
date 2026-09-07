@@ -44,6 +44,7 @@ pub struct ContinueRequest {
 
 pub struct ToolReply {
     pub content: String,
+    pub changed_paths: Vec<String>,
     pub ok: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
     pub job_request: Option<JobRequest>,
@@ -55,6 +56,7 @@ impl ToolReply {
     pub fn ok(content: String) -> Self {
         Self {
             content,
+            changed_paths: Vec::new(),
             ok: true,
             memory_events: Vec::new(),
             job_request: None,
@@ -66,6 +68,7 @@ impl ToolReply {
     pub fn error(content: String) -> Self {
         Self {
             content,
+            changed_paths: Vec::new(),
             ok: false,
             memory_events: Vec::new(),
             job_request: None,
@@ -77,6 +80,7 @@ impl ToolReply {
 
 pub(crate) struct DispatchOutcome {
     pub content: String,
+    pub changed_paths: Vec<String>,
     pub ok: bool,
     pub truncated: bool,
     pub memory_events: Vec<arc_proto::v1::memory_event::Event>,
@@ -166,6 +170,7 @@ impl Registry {
             span.record("outcome", "unknown-tool");
             return DispatchOutcome {
                 content: format!("ERROR: Tool {name} is not available."),
+                changed_paths: Vec::new(),
                 ok: false,
                 truncated: false,
                 memory_events: Vec::new(),
@@ -178,6 +183,7 @@ impl Registry {
             span.record("outcome", "unheld-tool");
             return DispatchOutcome {
                 content: format!("ERROR: Tool {name} is not available in this session."),
+                changed_paths: Vec::new(),
                 ok: false,
                 truncated: false,
                 memory_events: Vec::new(),
@@ -191,6 +197,7 @@ impl Registry {
         let (content, truncated) = self.truncate(reply.content);
         DispatchOutcome {
             content,
+            changed_paths: reply.changed_paths,
             ok: reply.ok,
             truncated,
             memory_events: reply.memory_events,
@@ -224,6 +231,35 @@ mod tests {
         content: &'static str,
         ok: bool,
         source: ToolSource,
+    }
+
+    #[tokio::test]
+    async fn confirmed_paths_survive_the_tool_result_text_cap() {
+        use crate::tool::workspace::{Grant, Grants, Mode, Workspace, write::Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let mut registry = Registry::new(4);
+        registry.register(Box::new(Write::new(std::sync::Arc::new(Workspace::new()))));
+        let outcome = registry
+            .dispatch(
+                "write",
+                serde_json::json!({"path": path, "content": "a"}).to_string(),
+                TurnContext {
+                    session_id: "child".to_owned(),
+                    grants: Some(std::sync::Arc::new(
+                        Grants::new(vec![Grant::new(dir.path(), Mode::ReadWrite)]).unwrap(),
+                    )),
+                    ..Default::default()
+                },
+                &[ToolSource::Workspace],
+            )
+            .await;
+        assert!(outcome.ok);
+        assert!(outcome.truncated);
+        assert_eq!(
+            outcome.changed_paths,
+            [path.canonicalize().unwrap().to_string_lossy()]
+        );
     }
 
     impl Tool for Scripted {

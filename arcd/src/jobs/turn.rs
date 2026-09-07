@@ -143,7 +143,7 @@ pub(super) async fn run_task(
         // before any stop is acted on: the turn that crossed a budget still
         // reports what it did
         if dispatched {
-            let footprint = footprint_since(&shared, &job, mark).await;
+            let footprint = footprint_since(&shared, &job, mark, reply.seq).await;
             if !first && inbound.source == Source::User {
                 handback_user_reply(&shared, &job, footprint.as_deref());
             } else {
@@ -255,9 +255,24 @@ async fn footprint_since(
     shared: &Shared,
     job: &DispatchedJob,
     mark: Option<Mark>,
+    reply_seq: u64,
 ) -> Option<String> {
-    let project = shared.projects.get(&job.project)?;
-    footprint::since(&mark?, &project.root, &project.command_prefix).await
+    let observation = match (shared.projects.get(&job.project), mark) {
+        (Some(project), Some(mark)) => {
+            footprint::since(&mark, &project.root, &project.command_prefix).await
+        }
+        _ => None,
+    };
+    let confirmed = shared
+        .engine
+        .changed_paths_for_reply(&job.session_id, reply_seq)
+        .map_err(|error| tracing::warn!(%error, "could not read confirmed file operations"))
+        .ok()
+        .flatten();
+    Some(footprint::report(
+        confirmed.as_deref(),
+        observation.as_deref(),
+    ))
 }
 
 fn end_task(

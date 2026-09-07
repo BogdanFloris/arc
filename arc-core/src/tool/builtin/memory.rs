@@ -306,6 +306,7 @@ impl Tool for MemoryWrite {
             };
             let id = record.id.clone();
             ToolReply {
+                changed_paths: Vec::new(),
                 content: format!("Saved (id: {id})."),
                 ok: true,
                 memory_events: vec![memory_event::Event::RecordCreated(MemoryRecordCreated {
@@ -377,6 +378,7 @@ impl Tool for MemorySupersede {
             };
             let content = format!("Superseded {} with {}.", args.id, record.id);
             ToolReply {
+                changed_paths: Vec::new(),
                 content,
                 ok: true,
                 memory_events: vec![memory_event::Event::RecordSuperseded(

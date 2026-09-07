@@ -108,11 +108,14 @@ impl Tool for Write {
 
             self.workspace
                 .record_read(&ctx.session_id, &resolved, &bytes);
-            ToolReply::ok(format!(
-                "Wrote {} bytes to {}.",
-                bytes.len(),
-                resolved.display()
-            ))
+            ToolReply {
+                changed_paths: vec![resolved.to_string_lossy().into_owned()],
+                ..ToolReply::ok(format!(
+                    "Wrote {} bytes to {}.",
+                    bytes.len(),
+                    resolved.display()
+                ))
+            }
         })
     }
 }
@@ -170,6 +173,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).expect("read back"), "hello");
 
         let canonical = path.canonicalize().expect("canonicalize");
+        assert_eq!(reply.changed_paths, [canonical.to_string_lossy()]);
         assert!(ws.recorded_hash("s-1", &canonical).is_some());
     }
 
@@ -184,6 +188,7 @@ mod tests {
             .await;
 
         assert!(!reply.ok);
+        assert!(reply.changed_paths.is_empty());
         assert!(reply.content.contains("granted"), "{}", reply.content);
     }
 

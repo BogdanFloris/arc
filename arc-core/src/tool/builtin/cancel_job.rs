@@ -58,6 +58,7 @@ impl Tool for CancelJob {
                 return ToolReply::error("ERROR: session_id must not be empty.".to_owned());
             }
             ToolReply {
+                changed_paths: Vec::new(),
                 content: format!(
                     "Cancellation requested for {}; if it was running, its handback will \
                      confirm.",

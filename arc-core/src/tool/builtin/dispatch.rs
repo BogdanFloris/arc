@@ -188,6 +188,7 @@ impl Tool for Dispatch {
             // budgets are suspended while daily use calibrates; 5.5 stays dormant
             let budget: Option<Budget> = None;
             ToolReply {
+                changed_paths: Vec::new(),
                 content: format!("Dispatching {} into {project}.", role_label(role)),
                 ok: true,
                 memory_events: Vec::new(),

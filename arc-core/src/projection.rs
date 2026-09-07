@@ -27,13 +27,19 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 19;
+pub(crate) const SCHEMA_VERSION: u32 = 20;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 const SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS tool_changed_paths (
+    result_seq INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY (result_seq, path)
+);
+
 CREATE TABLE IF NOT EXISTS context_status (
     session_id TEXT PRIMARY KEY,
     input_tokens INTEGER NOT NULL,
@@ -613,6 +619,35 @@ impl Projection {
             Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn changed_paths_for_reply(
+        &self,
+        session_id: &str,
+        reply_seq: u64,
+    ) -> Result<Option<Vec<String>>, Error> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND seq = ?2 AND role = ?3)",
+            rusqlite::params![session_id, seq_param(reply_seq)?, Role::Assistant as i32],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT paths.path FROM tool_changed_paths paths
+             JOIN messages result ON result.seq = paths.result_seq
+             JOIN messages reply ON reply.session_id = result.session_id AND reply.turn_id = result.turn_id
+             WHERE reply.session_id = ?1 AND reply.seq = ?2 AND reply.role = ?3
+               AND result.seq <= reply.seq ORDER BY paths.path"
+        )?;
+        Ok(Some(
+            stmt.query_map(
+                rusqlite::params![session_id, seq_param(reply_seq)?, Role::Assistant as i32],
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?,
+        ))
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
@@ -1846,6 +1881,12 @@ fn insert_tool_result(
     event: &Event,
     result: &ToolResultRecorded,
 ) -> Result<(), Error> {
+    for path in &result.changed_paths {
+        tx.execute(
+            "INSERT OR IGNORE INTO tool_changed_paths (result_seq, path) VALUES (?1, ?2)",
+            rusqlite::params![seq_param(event.seq)?, path],
+        )?;
+    }
     tx.execute(
         "INSERT INTO messages
              (session_id, seq, kind, turn_id, content, call_id, outcome, truncated, ts)
@@ -2408,6 +2449,7 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::ToolResultRecorded(
                     ToolResultRecorded {
+                        changed_paths: Vec::new(),
                         session_id: "s-01".to_string(),
                         turn_id: "t-01".to_string(),
                         call_id: call_id.to_string(),
@@ -2472,10 +2514,94 @@ mod tests {
             "role_selections",
             "session_grants",
             "sessions",
+            "tool_changed_paths",
         ]
         .into_iter()
         .map(str::to_string)
         .collect()
+    }
+
+    #[test]
+    fn file_operations_replay_by_session_and_exact_turn_even_when_results_are_capped_or_failed() {
+        let result = |seq, session: &str, turn: &str, paths: &[&str]| Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ToolResultRecorded(
+                    ToolResultRecorded {
+                        session_id: session.to_owned(),
+                        turn_id: turn.to_owned(),
+                        call_id: format!("c{seq}"),
+                        outcome: ToolOutcome::Error as i32,
+                        content: "capped".to_owned(),
+                        truncated: true,
+                        changed_paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+                    },
+                )),
+            })),
+        };
+        let reply = |seq, session: &str, turn: &str| Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::Model as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::MessageAppended(MessageAppended {
+                    session_id: session.to_owned(),
+                    turn_id: turn.to_owned(),
+                    role: Role::Assistant as i32,
+                    content: "done".to_owned(),
+                    ..Default::default()
+                })),
+            })),
+        };
+        let events = [
+            result(1, "parent", "t", &["/parent.rs"]),
+            result(2, "child", "t", &["/child.rs", "/child.rs", "/deleted.rs"]),
+            reply(3, "child", "t"),
+            result(4, "child", "later", &["/later.rs"]),
+            reply(5, "child", "later"),
+            reply(6, "parent", "t"),
+        ];
+        for _ in 0..2 {
+            let mut projection = Projection::in_memory().unwrap();
+            for event in &events {
+                projection.apply(event).unwrap();
+            }
+            assert_eq!(
+                projection
+                    .changed_paths_for_reply("child", 3)
+                    .unwrap()
+                    .unwrap(),
+                ["/child.rs", "/deleted.rs"]
+            );
+            assert_eq!(
+                projection
+                    .changed_paths_for_reply("child", 5)
+                    .unwrap()
+                    .unwrap(),
+                ["/later.rs"]
+            );
+            assert_eq!(
+                projection
+                    .changed_paths_for_reply("parent", 6)
+                    .unwrap()
+                    .unwrap(),
+                ["/parent.rs"]
+            );
+            assert!(
+                projection
+                    .changed_paths_for_reply("parent", 3)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                projection
+                    .changed_paths_for_reply("child", 99)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     fn row_count(projection: &Projection, table: &str) -> i64 {
@@ -4825,6 +4951,7 @@ mod tests {
             payload: Some(event::Payload::Session(SessionEvent {
                 event: Some(session_event::Event::ToolResultRecorded(
                     ToolResultRecorded {
+                        changed_paths: Vec::new(),
                         session_id: session_id.to_string(),
                         turn_id: "t-01".to_string(),
                         call_id: format!("c-{seq}"),

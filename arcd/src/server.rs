@@ -2514,8 +2514,9 @@ mod tests {
         assert_eq!(
             handback.content,
             format!(
-                "Job {0} finished.\non it\nFor follow-ups about anything this job read or did, continue_job {0} keeps its context; a new dispatch starts from nothing.",
-                child.session_id
+                "Job {0} finished.\non it\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {0} keeps its context; a new dispatch starts from nothing.",
+                child.session_id,
+                footprint = arc_core::footprint::report(Some(&[]), None)
             ),
             "the handback names the child and carries its final reply"
         );

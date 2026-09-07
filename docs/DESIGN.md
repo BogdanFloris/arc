@@ -218,6 +218,8 @@ An earlier draft made the summary the dispatch call's own delayed `ToolResultRec
 
 Coding is the first job kind, not a privileged one. Its loop is deliberately small: send messages, run requested tools, append results, and stop when the model stops. ARC adds strict `edit`, durable events, and a per-job budget. Planning, review, retry policy, and similar workflow choices belong in prompts or configuration until repeated use proves they need machinery.
 
+**A footprint separates attribution from observation.** Successful file operations performed by `write`, `edit`, and `apply_patch` are recorded as canonical `changed_paths` on `ToolResultRecorded`, independently of capped result text. Completed operations survive a later patch failure. Replay projects these paths; the handback reads only the completed turn's records. This is evidence of this turn's operations, not exclusive authorship or a complete filesystem audit: Bash, external writers, and operations interrupted before a durable result remain unattributed. Repository snapshots are labeled workspace-wide observations, including changes by other writers. They never assign commits or diffs to a job. Neither section depends on the model's report.
+
 **Shared-workspace coordination belongs in the coding prompts.** Briefs assign disjoint files. Workspace-wide formatting is integration work, performed after other writers stop. A child reports formatting needed unless its brief explicitly assigns integration and confirms exclusive workspace access. Read-before-edit checks remain strict; formatting requires rereading affected files, not bypassing stale-read errors.
 
 ### 4.2 Workspaces
