@@ -117,6 +117,7 @@ async fn run(
     tokio::spawn(net::run_metadata(url, metadata_command_rx, event_tx));
 
     let _ = commands.send(Command::List);
+    let _ = metadata_commands.send(());
 
     let mut keys = EventStream::new();
     let mut cursor = Mode::Insert;
@@ -179,6 +180,9 @@ fn agent_state(status: Status) -> AgentState {
 }
 
 fn needs_session_metadata(app: &App, event: &NetEvent) -> bool {
+    if matches!(event, NetEvent::SessionAppended { .. }) {
+        return true;
+    }
     let (NetEvent::Accepted { session_id }
     | NetEvent::SessionCreated { session_id }
     | NetEvent::SessionForked { session_id }) = event
@@ -252,6 +256,24 @@ mod tests {
             &App::new(),
             &NetEvent::Delta("text".into())
         ));
+    }
+
+    #[test]
+    fn appended_events_refresh_existing_titles_and_unknown_sessions() {
+        let mut app = App::new();
+        app.sessions.push(arc_proto::v1::SessionInfo {
+            id: "known".into(),
+            title: "Previous title".into(),
+            ..Default::default()
+        });
+        for session_id in ["known", "unknown"] {
+            assert!(needs_session_metadata(
+                &app,
+                &NetEvent::SessionAppended {
+                    session_id: session_id.into(),
+                }
+            ));
+        }
     }
 
     #[test]
