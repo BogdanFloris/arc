@@ -35,6 +35,26 @@ message SessionInfo {
 
 message ListSessions {}
 
+message FetchStatus {
+  string session_id = 1;
+}
+
+message AllowanceWindow {
+  uint32 remaining_percent = 1;
+  optional int64 resets_at = 2;
+  optional uint64 window_seconds = 3;
+}
+
+message SessionStatus {
+  string session_id = 1;
+  ContextMeasured context = 2;
+  int64 context_observed_at = 3;
+  bool codex = 4;
+  repeated AllowanceWindow allowance = 5;
+  int64 allowance_observed_at = 6;
+  bool allowance_stale = 7;
+}
+
 message FetchHistory {
   string session_id = 1;
   reserved 2;
@@ -73,6 +93,7 @@ message ClientFrame {
     CompactSession compact_session = 26;
     SelectModel select_model = 27;
     ListModels list_models = 28;
+    FetchStatus fetch_status = 29;
   }
 }
 
@@ -385,5 +406,6 @@ message ServerFrame {
     Notification notification = 21;
     ProjectList project_list = 22;
     ModelList model_list = 23;
+    SessionStatus session_status = 24;
   }
 }

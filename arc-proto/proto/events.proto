@@ -139,6 +139,13 @@ message SessionCompacted {
   string model = 5;
 }
 
+message ContextMeasured {
+  string session_id = 1;
+  uint32 input_tokens = 2;
+  optional uint32 context_window = 3;
+  optional uint32 compact_at = 4;
+}
+
 message SessionEvent {
   oneof event {
     SessionCreated session_created = 1;
@@ -150,6 +157,7 @@ message SessionEvent {
     ServerCallRecorded server_call_recorded = 8;
     BranchMarked branch_marked = 9;
     SessionCompacted session_compacted = 10;
+    ContextMeasured context_measured = 11;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
 }
