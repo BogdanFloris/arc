@@ -204,6 +204,11 @@ impl Daemon {
 
         let mut namespaces = vec!["global".to_owned()];
         namespaces.extend(self.config.projects.keys().cloned());
+        let titles = title_task(
+            self.roles.archivist(),
+            Arc::clone(&self.engine),
+            Duration::from_secs(30),
+        );
         let consolidation = consolidation_task(
             self.config.consolidation,
             self.roles.archivist(),
@@ -257,6 +262,7 @@ impl Daemon {
         )
         .await;
 
+        titles.abort();
         if let Some(task) = consolidation {
             task.abort();
         }
@@ -265,6 +271,59 @@ impl Daemon {
         info!("stopped");
         Ok(())
     }
+}
+
+fn title_task(archivist: &Runner, engine: Arc<Engine>, timeout: Duration) -> JoinHandle<()> {
+    let extractor = ModelExtractor::new(
+        Arc::clone(&archivist.provider),
+        &archivist.model,
+        archivist.thinking,
+        timeout,
+        None,
+        Vec::new(),
+    );
+    spawn_titles(engine, extractor)
+}
+
+fn spawn_titles<E: Extractor + 'static>(engine: Arc<Engine>, extractor: E) -> JoinHandle<()> {
+    let mut completed = engine.completed_turns();
+    tokio::spawn(async move {
+        let mut titles = consolidation::Titles::default();
+        if let Err(error) = titles.run(&engine, &extractor).await {
+            warn!(%error, "title recovery failed");
+        }
+        loop {
+            let mut pending = HashSet::new();
+            let mut recover = false;
+            match completed.recv().await {
+                Ok(id) => {
+                    pending.insert(id);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => recover = true,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+            loop {
+                match completed.try_recv() {
+                    Ok(id) => {
+                        pending.insert(id);
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => recover = true,
+                    Err(_) => break,
+                }
+            }
+            if recover {
+                if let Err(error) = titles.run(&engine, &extractor).await {
+                    warn!(%error, "title recovery failed");
+                }
+            } else {
+                for session_id in pending {
+                    if let Err(error) = titles.run_session(&engine, &extractor, &session_id).await {
+                        warn!(%error, %session_id, "title generation failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 const CONSOLIDATION_TICK: Duration = Duration::from_secs(60);
@@ -603,6 +662,181 @@ mod tests {
         let sessions = daemon.engine.sessions().expect("sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s-01");
+    }
+
+    async fn wait_for_title(engine: &Engine, id: &str, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.session_title(id).expect("title").as_deref() == Some(expected) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background title");
+    }
+
+    async fn wait_for_requests(provider: &arc_core::testkit::ScriptedProvider, count: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while provider.requests().len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("title request");
+    }
+
+    #[tokio::test]
+    async fn completed_hosted_exchange_titles_in_background_and_keeps_memory_idle() {
+        use arc_core::provider::CompletionDelta;
+        use arc_core::testkit::{
+            ScriptedProvider, Step, channel, done_reply, engine, replay_events, runner,
+        };
+
+        let mut hosted = vec![Ok(CompletionDelta::ServerCall {
+            name: "web_search".to_owned(),
+            payload_json: "{}".to_owned(),
+        })];
+        hosted.extend(done_reply("found the fix"));
+        let provider = ScriptedProvider::scripted(vec![hosted]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (notifier, mut notifications) = broadcast::channel(32);
+        let engine = Arc::new(engine.with_notifier(notifier));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let title_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+            before: Vec::new(),
+            notify: Arc::clone(&release),
+            after: done_reply("Hosted search fix"),
+        }]);
+        let task = title_task(
+            &runner(&title_provider),
+            Arc::clone(&engine),
+            Duration::from_secs(3),
+        );
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "find the search fix", tx)
+            .await
+            .expect("turn ends without title");
+        wait_for_requests(&title_provider, 1).await;
+        assert_eq!(
+            engine.session_title(&reply.session_id).expect("title"),
+            None
+        );
+        assert_eq!(
+            consolidation::run_pass(&engine, &Scripted(Vec::new()), 0, "", &HashSet::new())
+                .await
+                .expect("idle gate"),
+            consolidation::Outcome::NothingDue
+        );
+        let events = replay_events(dir.path());
+        assert!(matches!(
+            &events.last().expect("hosted tail").payload,
+            Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::ServerCallRecorded(_))
+            }))
+        ));
+        while notifications.try_recv().is_ok() {}
+        release.notify_one();
+        wait_for_title(&engine, &reply.session_id, "Hosted search fix").await;
+        assert!(
+            matches!(notifications.try_recv().expect("saved title notification").event,
+            Some(notification::Event::SessionAppended(appended)) if appended.session_id == reply.session_id)
+        );
+        assert!(notifications.try_recv().is_err());
+        assert_eq!(title_provider.requests().len(), 1);
+        assert!(replay_events(dir.path()).iter().all(|event| matches!(&event.payload, Some(event::Payload::Session(session)) if !matches!(session.event, Some(session_event::Event::SessionConsolidated(_))))));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn title_worker_discards_stale_results_and_processes_the_new_completion() {
+        use arc_core::testkit::{ScriptedProvider, Step, channel, done_reply, engine, runner};
+        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Arc::new(engine);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let title_provider = ScriptedProvider::scripted_steps(vec![
+            Step::Gated {
+                before: Vec::new(),
+                notify: Arc::clone(&release),
+                after: done_reply("Stale"),
+            },
+            Step::Immediate(done_reply("Current")),
+        ]);
+        let task = title_task(
+            &runner(&title_provider),
+            Arc::clone(&engine),
+            Duration::from_secs(3),
+        );
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "first task", tx)
+            .await
+            .expect("first turn");
+        wait_for_requests(&title_provider, 1).await;
+        let (tx, _rx) = channel();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            engine.send_message(&run, Some(&reply.session_id), "new task", tx),
+        )
+        .await
+        .expect("title does not block turn")
+        .expect("second turn");
+        release.notify_one();
+        wait_for_title(&engine, &reply.session_id, "Current").await;
+        assert_eq!(title_provider.requests().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn title_worker_recovers_a_greeting_and_retries_on_a_new_exchange() {
+        use arc_core::testkit::{ScriptedProvider, channel, done_reply, engine, runner};
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("fixed")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let engine = Arc::new(engine);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("before worker start");
+        let title_provider =
+            ScriptedProvider::scripted(vec![done_reply(""), done_reply("Title refresh")]);
+        let task = title_task(
+            &runner(&title_provider),
+            Arc::clone(&engine),
+            Duration::from_secs(3),
+        );
+        wait_for_requests(&title_provider, 1).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            engine.session_title(&reply.session_id).expect("greeting"),
+            None
+        );
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&reply.session_id), "fix title refresh", tx)
+            .await
+            .expect("new exchange");
+        wait_for_title(&engine, &reply.session_id, "Title refresh").await;
+        assert_eq!(title_provider.requests().len(), 2);
+        task.abort();
+        let unused = ScriptedProvider::scripted(vec![]);
+        let task = title_task(
+            &runner(&unused),
+            Arc::clone(&engine),
+            Duration::from_secs(3),
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            unused.requests().is_empty(),
+            "saved titles survive worker restart"
+        );
+        task.abort();
     }
 
     #[tokio::test]

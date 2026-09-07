@@ -1,12 +1,11 @@
 pub mod extract;
 pub mod replay;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
-use arc_proto::v1::{Role, SessionRole, Source, memory_event};
+use arc_proto::v1::{SessionRole, Source, memory_event};
 
-use crate::projection::MessageRow;
 use crate::session::Engine;
 use crate::store;
 
@@ -137,8 +136,6 @@ async fn pass<E: Extractor>(
         return Ok(Outcome::NothingDue);
     };
 
-    title_if_due(engine, extractor, &snapshot).await?;
-
     // the store is not locked during extraction: it can take minutes
     let events = if extracts_user_facts(snapshot.source, snapshot.role) {
         extractor
@@ -185,50 +182,80 @@ async fn pass<E: Extractor>(
     })
 }
 
-#[tracing::instrument(name = "consolidation.title", skip_all, fields(session_id = %snapshot.session_id))]
-async fn title_if_due<E: Extractor>(
-    engine: &Engine,
-    extractor: &E,
-    snapshot: &SessionSnapshot,
-) -> Result<(), Error> {
-    if !eligible_for_title(engine, snapshot)? {
-        return Ok(());
-    }
-    let title = match extractor.title(snapshot).await {
-        Ok(title) => title,
-        Err(error) => {
-            tracing::warn!(
-                session_id = %snapshot.session_id,
-                %error,
-                "title generation failed; leaving the session untitled this pass"
-            );
-            None
+#[derive(Default)]
+pub struct Titles {
+    attempted: HashMap<String, String>,
+}
+
+impl Titles {
+    #[tracing::instrument(name = "session.titles", skip_all)]
+    pub async fn run<E: Extractor>(&mut self, engine: &Engine, extractor: &E) -> Result<(), Error> {
+        let sessions = engine
+            .with_store(|store| store.projection().untitled_sessions())
+            .map_err(store::Error::from)?;
+        for session_id in sessions {
+            self.run_session(engine, extractor, &session_id).await?;
         }
-    };
-    let Some(title) = title else {
-        return Ok(());
-    };
-    engine.with_store_mut(|store| store.commit_title(snapshot, &title))?;
-    Ok(())
-}
-
-fn eligible_for_title(engine: &Engine, snapshot: &SessionSnapshot) -> Result<bool, Error> {
-    if engine
-        .with_store(|store| store.session_title(&snapshot.session_id))?
-        .is_some()
-    {
-        return Ok(false);
+        Ok(())
     }
-    let has_user = snapshot.rows.iter().any(|row| is_role(row, Role::User));
-    let has_assistant = snapshot
-        .rows
-        .iter()
-        .any(|row| is_role(row, Role::Assistant));
-    Ok(has_user && has_assistant)
-}
 
-fn is_role(row: &MessageRow, role: Role) -> bool {
-    matches!(row, MessageRow::Message { role: r, .. } if *r == role as i32)
+    pub async fn run_session<E: Extractor>(
+        &mut self,
+        engine: &Engine,
+        extractor: &E,
+        session_id: &str,
+    ) -> Result<(), Error> {
+        let snapshot = {
+            let Ok(_guard) = engine.turn_guard(session_id).try_lock_owned() else {
+                return Ok(());
+            };
+            engine.with_store(|store| store.snapshot_for_title(session_id))?
+        };
+        let Some(snapshot) = snapshot else {
+            self.attempted.remove(session_id);
+            return Ok(());
+        };
+        let Some(input) = extract::title_prompt(&snapshot) else {
+            return Ok(());
+        };
+        if self.attempted.get(session_id) == Some(&input) {
+            return Ok(());
+        }
+        self.attempt(engine, extractor, &snapshot, input).await
+    }
+
+    #[tracing::instrument(name = "session.title", skip_all, fields(session_id = %snapshot.session_id))]
+    async fn attempt<E: Extractor>(
+        &mut self,
+        engine: &Engine,
+        extractor: &E,
+        snapshot: &SessionSnapshot,
+        input: String,
+    ) -> Result<(), Error> {
+        let title = match extractor.title(snapshot).await {
+            Ok(title) => title,
+            Err(error) => {
+                tracing::warn!(%error, "title generation failed");
+                None
+            }
+        };
+        let Ok(_guard) = engine.turn_guard(&snapshot.session_id).try_lock_owned() else {
+            return Ok(());
+        };
+        let current = engine
+            .with_store(|store| store.projection().latest_seq(&snapshot.session_id))
+            .map_err(store::Error::from)?;
+        if current != Some(snapshot.latest_seq) {
+            return Ok(());
+        }
+        self.attempted.insert(snapshot.session_id.clone(), input);
+        if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+            if engine.commit_title(snapshot, &title)? {
+                self.attempted.remove(&snapshot.session_id);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The gate is presence, not role. A source-less legacy session falls
@@ -271,7 +298,9 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, run_pass};
+    use super::{
+        ExtractError, Extractor, NoopExtractor, Outcome, SessionSnapshot, Titles, run_pass,
+    };
     use crate::projection::Projection;
     use crate::session::Engine;
     use crate::testkit::{
@@ -490,7 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_idle_untitled_session_is_titled_before_extraction() {
+    async fn a_completed_exchange_is_titled_before_the_idle_gate() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
@@ -500,24 +529,236 @@ mod tests {
             .await
             .expect("send");
 
-        let outcome = run_pass(
-            &engine,
-            &Titling(Some("Palette bikeshed".to_owned())),
-            ALL_IDLE,
-            "",
-            &HashSet::new(),
-        )
-        .await
-        .expect("pass");
-        assert!(
-            matches!(outcome, Outcome::Consolidated { .. }),
-            "{outcome:?}"
+        Titles::default()
+            .run(&engine, &Titling(Some("Palette bikeshed".to_owned())))
+            .await
+            .expect("title");
+        assert_eq!(
+            run_pass(&engine, &PanicsIfTitled, 0, "", &HashSet::new())
+                .await
+                .expect("idle gate"),
+            Outcome::NothingDue
         );
 
         let titled = titled_events(dir.path());
         assert_eq!(titled.len(), 1);
         assert_eq!(titled[0].session_id, reply.session_id);
         assert_eq!(titled[0].title, "Palette bikeshed");
+    }
+
+    #[tokio::test]
+    async fn a_greeting_retries_only_after_new_completed_input_even_if_consolidated() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("fixed")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("greeting");
+        let mut titles = Titles::default();
+        titles
+            .run(&engine, &Titling(None))
+            .await
+            .expect("blank title");
+        titles.run(&engine, &PanicsIfTitled).await.expect("dedup");
+        run_pass(&engine, &PanicsIfTitled, ALL_IDLE, "", &HashSet::new())
+            .await
+            .expect("consolidate");
+        titles
+            .run(&engine, &PanicsIfTitled)
+            .await
+            .expect("watermark is not input");
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&reply.session_id), "fix title refresh", tx)
+            .await
+            .expect("task");
+        titles
+            .run(&engine, &Titling(Some("Title refresh".to_owned())))
+            .await
+            .expect("retry");
+        assert_eq!(titled_events(dir.path())[0].title, "Title refresh");
+    }
+
+    struct AdvancesDuringTitle<'a> {
+        engine: &'a Engine,
+        runner: &'a crate::session::Runner,
+    }
+
+    impl Extractor for AdvancesDuringTitle<'_> {
+        async fn extract(
+            &self,
+            _: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            panic!("title generation must not extract");
+        }
+
+        async fn title(&self, snapshot: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            let (tx, _rx) = channel();
+            self.engine
+                .send_message(self.runner, Some(&snapshot.session_id), "new task", tx)
+                .await
+                .expect("turn is not blocked by title generation");
+            Ok(Some("Stale".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_title_racing_a_turn_is_discarded_and_retried() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "first task", tx)
+            .await
+            .expect("send");
+        let mut titles = Titles::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            titles.run(
+                &engine,
+                &AdvancesDuringTitle {
+                    engine: &engine,
+                    runner: &run,
+                },
+            ),
+        )
+        .await
+        .expect("not blocking turns")
+        .expect("raced");
+        assert!(titled_events(dir.path()).is_empty());
+        titles
+            .run(&engine, &Titling(Some("Current".to_owned())))
+            .await
+            .expect("retry");
+        assert_eq!(titled_events(dir.path())[0].title, "Current");
+    }
+
+    struct SimultaneousTitles(tokio::sync::Barrier);
+
+    impl Extractor for SimultaneousTitles {
+        async fn extract(
+            &self,
+            _: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            panic!("title generation must not extract");
+        }
+
+        async fn title(&self, _: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            self.0.wait().await;
+            Ok(Some("One winner".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_title_generations_append_only_one_winner() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, None, "fix titles", tx)
+            .await
+            .expect("send");
+        let extractor = SimultaneousTitles(tokio::sync::Barrier::new(2));
+        let mut first = Titles::default();
+        let mut second = Titles::default();
+        let (first, second) = tokio::join!(
+            first.run(&engine, &extractor),
+            second.run(&engine, &extractor)
+        );
+        first.expect("first generation");
+        second.expect("second generation");
+        assert_eq!(titled_events(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_and_live_exchanges_are_not_title_candidates() {
+        let provider = ScriptedProvider::scripted(vec![
+            vec![Ok(crate::provider::CompletionDelta::Text(
+                "partial".to_owned(),
+            ))],
+            done_reply("done"),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let mut completions = engine.completed_turns();
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "fix titles", tx)
+            .await
+            .expect("partial reply");
+        assert!(reply.partial);
+        assert!(completions.try_recv().is_err());
+        Titles::default()
+            .run(&engine, &PanicsIfTitled)
+            .await
+            .expect("partial skipped");
+        let (tx, _rx) = channel();
+        engine
+            .continue_session(&run, &reply.session_id, tx)
+            .await
+            .expect("finish");
+        assert_eq!(
+            completions.try_recv().expect("completion"),
+            reply.session_id
+        );
+        let guard = engine
+            .turn_guard(&reply.session_id)
+            .try_lock_owned()
+            .expect("completion released the guard");
+        Titles::default()
+            .run(&engine, &PanicsIfTitled)
+            .await
+            .expect("live skipped");
+        drop(guard);
+        Titles::default()
+            .run(&engine, &Titling(Some("Finished".to_owned())))
+            .await
+            .expect("finished title");
+        assert_eq!(titled_events(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_title_commits_notify_once_and_replay_preserves_the_pin() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
+        let engine = engine.with_notifier(notifier);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "fix titles", tx)
+            .await
+            .expect("send");
+        while notifications.try_recv().is_ok() {}
+        let before = engine.sessions().expect("sessions");
+        let snapshot = engine
+            .with_store(|store| store.snapshot_for_title(&reply.session_id))
+            .expect("snapshot")
+            .expect("eligible");
+        let (first, second) =
+            tokio::join!(async { engine.commit_title(&snapshot, "First") }, async {
+                engine.commit_title(&snapshot, "Second")
+            });
+        assert!(first.expect("first"));
+        assert!(!second.expect("second"));
+        assert!(
+            matches!(notifications.try_recv().expect("notification").event,
+            Some(arc_proto::v1::notification::Event::SessionAppended(appended)) if appended.session_id == reply.session_id)
+        );
+        assert!(notifications.try_recv().is_err());
+        let mut rebuilt = Projection::in_memory().expect("projection");
+        for event in replay_events(dir.path()) {
+            rebuilt.apply(&event).expect("apply");
+        }
+        let after = rebuilt.sessions().expect("sessions");
+        assert_eq!(after[0].title, "First");
+        assert_eq!(after[0].provider, before[0].provider);
+        assert_eq!(after[0].model, before[0].model);
+        assert_eq!(after[0].role, before[0].role);
     }
 
     #[tokio::test]
@@ -531,15 +772,10 @@ mod tests {
             .await
             .expect("send");
 
-        run_pass(
-            &engine,
-            &Titling(Some("First".to_owned())),
-            ALL_IDLE,
-            "",
-            &HashSet::new(),
-        )
-        .await
-        .expect("first pass titles it");
+        Titles::default()
+            .run(&engine, &Titling(Some("First".to_owned())))
+            .await
+            .expect("first title");
 
         let (tx, _rx) = channel();
         engine
@@ -547,9 +783,10 @@ mod tests {
             .await
             .expect("send more");
 
-        run_pass(&engine, &PanicsIfTitled, ALL_IDLE, "", &HashSet::new())
+        Titles::default()
+            .run(&engine, &PanicsIfTitled)
             .await
-            .expect("second pass");
+            .expect("retained");
 
         let titled = titled_events(dir.path());
         assert_eq!(
@@ -832,6 +1069,10 @@ mod tests {
             calls: Arc::clone(&calls),
             records: Vec::new(),
         };
+        Titles::default()
+            .run(&engine, &extractor)
+            .await
+            .expect("title");
         let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
             .await
             .expect("pass");

@@ -424,15 +424,10 @@ mod tests {
 
         assert_eq!(only_job(supervisor.list()).title, "", "not titled yet");
 
-        arc_core::consolidation::run_pass(
-            &engine,
-            &FixedTitle,
-            i64::MAX,
-            "",
-            &std::collections::HashSet::new(),
-        )
-        .await
-        .expect("pass");
+        arc_core::consolidation::Titles::default()
+            .run(&engine, &FixedTitle)
+            .await
+            .expect("title");
 
         assert_eq!(only_job(supervisor.list()).title, "Fix the failing test");
     }

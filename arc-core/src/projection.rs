@@ -757,6 +757,15 @@ impl Projection {
         Ok(u64::try_from(total).unwrap_or(0))
     }
 
+    pub(crate) fn untitled_sessions(&self) -> Result<Vec<String>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions WHERE title IS NULL OR title = '' ORDER BY started_at, id",
+        )?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
     pub(crate) fn due_for_consolidation(
         &self,
         idle_cutoff_micros: i64,

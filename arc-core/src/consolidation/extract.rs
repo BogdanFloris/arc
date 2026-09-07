@@ -560,7 +560,7 @@ impl Extractor for ModelExtractor {
     }
 }
 
-fn title_prompt(session: &SessionSnapshot) -> Option<String> {
+pub(super) fn title_prompt(session: &SessionSnapshot) -> Option<String> {
     let messages: Vec<(Role, &str)> = session
         .rows
         .iter()
@@ -1200,6 +1200,10 @@ mod tests {
             None,
             vec!["global".to_owned(), "arc".to_owned()],
         );
+        crate::consolidation::Titles::default()
+            .run(&engine, &extractor)
+            .await
+            .expect("titles");
         let outcome = run_pass(
             &engine,
             &extractor,
@@ -1353,6 +1357,10 @@ mod tests {
             None,
             vec!["global".to_owned(), "arc".to_owned()],
         );
+        crate::consolidation::Titles::default()
+            .run(&engine, &extractor)
+            .await
+            .expect("titles");
         let outcome = run_pass(
             &engine,
             &extractor,
@@ -1412,6 +1420,10 @@ mod tests {
             None,
             vec!["global".to_owned(), "arc".to_owned()],
         );
+        crate::consolidation::Titles::default()
+            .run(&engine, &extractor)
+            .await
+            .expect("titles");
         let outcome = run_pass(
             &engine,
             &extractor,

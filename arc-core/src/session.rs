@@ -84,6 +84,7 @@ pub struct Engine {
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     live_turns: StdMutex<HashMap<String, LiveTurn>>,
     notifier: Option<broadcast::Sender<Notification>>,
+    completed_turns: broadcast::Sender<String>,
 }
 
 /// A message queued into a session with a live turn, delivered at the
@@ -235,6 +236,7 @@ impl Engine {
             turns: StdMutex::new(HashMap::new()),
             live_turns: StdMutex::new(HashMap::new()),
             notifier: None,
+            completed_turns: broadcast::channel(256).0,
         }
     }
 
@@ -256,6 +258,22 @@ impl Engine {
     pub fn review_delete(&self, record_id: &str) -> Result<(), Error> {
         self.with_store_mut(|store| store.review_delete(record_id))?;
         self.notify_review_changed()
+    }
+
+    pub fn completed_turns(&self) -> broadcast::Receiver<String> {
+        self.completed_turns.subscribe()
+    }
+
+    pub(crate) fn commit_title(
+        &self,
+        snapshot: &crate::store::SessionSnapshot,
+        title: &str,
+    ) -> Result<bool, store::Error> {
+        let committed = self.with_store_mut(|store| store.commit_title(snapshot, title))?;
+        if committed {
+            self.notify_appended(snapshot.session_id.clone());
+        }
+        Ok(committed)
     }
 
     pub fn cancel_turn(&self, session_id: &str) -> bool {
@@ -295,7 +313,7 @@ impl Engine {
         }
     }
 
-    fn turn_guard(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn turn_guard(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut turns = self.turns.lock().expect("turns lock poisoned");
         Arc::clone(
             turns
@@ -1077,7 +1095,7 @@ impl Engine {
 
         // held for the whole turn: same-session turns serialize here
         let guard = self.turn_guard(&session_id);
-        let _turn = guard.lock().await;
+        let turn = guard.lock().await;
 
         if !new_session {
             self.enforce_pin(runner, &session_id)?;
@@ -1116,16 +1134,22 @@ impl Engine {
             }),
         )?;
 
-        self.drive_turn(
-            runner,
-            &session_id,
-            &turn_id,
-            &sources,
-            grants.as_ref(),
-            &command_prefix,
-            &events,
-        )
-        .await
+        let reply = self
+            .drive_turn(
+                runner,
+                &session_id,
+                &turn_id,
+                &sources,
+                grants.as_ref(),
+                &command_prefix,
+                &events,
+            )
+            .await;
+        drop(turn);
+        if reply.as_ref().is_ok_and(|reply| !reply.partial) {
+            let _ = self.completed_turns.send(session_id.clone());
+        }
+        reply
     }
 
     #[tracing::instrument(
@@ -1160,23 +1184,29 @@ impl Engine {
         // held for the whole turn: serializes against a user send_message
         // on this session through the same guard map
         let guard = self.turn_guard(session_id);
-        let _turn = guard.lock().await;
+        let turn = guard.lock().await;
 
         self.enforce_pin(runner, session_id)?;
         let sources = self.sources(session_id, false, runner.role)?;
         let grants = self.grants(session_id, false)?;
         let command_prefix = self.command_prefix(session_id, false)?;
 
-        self.drive_turn(
-            runner,
-            session_id,
-            &turn_id,
-            &sources,
-            grants.as_ref(),
-            &command_prefix,
-            &events,
-        )
-        .await
+        let reply = self
+            .drive_turn(
+                runner,
+                session_id,
+                &turn_id,
+                &sources,
+                grants.as_ref(),
+                &command_prefix,
+                &events,
+            )
+            .await;
+        drop(turn);
+        if reply.as_ref().is_ok_and(|reply| !reply.partial) {
+            let _ = self.completed_turns.send(session_id.to_owned());
+        }
+        reply
     }
 
     #[allow(clippy::too_many_arguments)]

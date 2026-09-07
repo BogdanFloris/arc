@@ -117,6 +117,38 @@ impl Store {
         }))
     }
 
+    pub(crate) fn snapshot_for_title(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionSnapshot>, Error> {
+        if self.session_title(session_id)?.is_some() {
+            return Ok(None);
+        }
+        let Some(latest_seq) = self.projection.latest_seq(session_id)? else {
+            return Ok(None);
+        };
+        let rows = self.projection.messages(session_id)?;
+        if !matches!(rows.iter().rev().find(|row| !matches!(row, MessageRow::ServerCall { .. })), Some(MessageRow::Message { role, partial: false, .. })
+            if *role == arc_proto::v1::Role::Assistant as i32)
+        {
+            return Ok(None);
+        }
+        Ok(Some(SessionSnapshot {
+            session_id: session_id.to_owned(),
+            rows,
+            latest_seq,
+            memory_index: Vec::new(),
+            role: self
+                .projection
+                .session_role(session_id)?
+                .unwrap_or_default(),
+            source: self
+                .projection
+                .session_source(session_id)?
+                .unwrap_or_default(),
+        }))
+    }
+
     pub(crate) fn commit_consolidation(
         &mut self,
         snapshot: &SessionSnapshot,
