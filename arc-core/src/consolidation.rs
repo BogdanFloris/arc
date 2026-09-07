@@ -194,7 +194,9 @@ impl Titles {
             .with_store(|store| store.projection().untitled_sessions())
             .map_err(store::Error::from)?;
         for session_id in sessions {
-            self.run_session(engine, extractor, &session_id).await?;
+            if let Err(error) = self.run_session(engine, extractor, &session_id).await {
+                tracing::warn!(%error, %session_id, "title generation failed");
+            }
         }
         Ok(())
     }
@@ -232,13 +234,13 @@ impl Titles {
         snapshot: &SessionSnapshot,
         input: String,
     ) -> Result<(), Error> {
-        let title = match extractor.title(snapshot).await {
-            Ok(title) => title,
-            Err(error) => {
-                tracing::warn!(%error, "title generation failed");
-                None
-            }
-        };
+        let title = extractor
+            .title(snapshot)
+            .await
+            .map_err(|source| Error::Extractor {
+                session_id: snapshot.session_id.clone(),
+                source,
+            })?;
         let Ok(_guard) = engine.turn_guard(&snapshot.session_id).try_lock_owned() else {
             return Ok(());
         };
@@ -634,6 +636,77 @@ mod tests {
             .await
             .expect("retry");
         assert_eq!(titled_events(dir.path())[0].title, "Current");
+    }
+
+    struct FailsFirstTitle(AtomicUsize);
+
+    impl Extractor for FailsFirstTitle {
+        async fn extract(
+            &self,
+            _: &SessionSnapshot,
+        ) -> Result<Vec<memory_event::Event>, ExtractError> {
+            panic!("title generation must not extract");
+        }
+
+        async fn title(&self, _: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ExtractError("temporary provider failure".to_owned()))
+            } else {
+                Ok(Some("Recovered title".to_owned()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_title_can_retry_unchanged_input() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("done")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message(&run, None, "fix titles", tx)
+            .await
+            .expect("send");
+        let extractor = FailsFirstTitle(AtomicUsize::new(0));
+        let mut titles = Titles::default();
+        assert!(matches!(
+            titles
+                .run_session(&engine, &extractor, &reply.session_id)
+                .await,
+            Err(super::Error::Extractor { .. })
+        ));
+        assert!(titled_events(dir.path()).is_empty());
+        titles
+            .run_session(&engine, &extractor, &reply.session_id)
+            .await
+            .expect("retry unchanged input");
+        assert_eq!(extractor.0.load(Ordering::SeqCst), 2);
+        assert_eq!(titled_events(dir.path())[0].title, "Recovered title");
+    }
+
+    #[tokio::test]
+    async fn recovery_continues_after_one_title_fails() {
+        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        for content in ["first task", "second task"] {
+            let (tx, _rx) = channel();
+            engine
+                .send_message(&run, None, content, tx)
+                .await
+                .expect("send");
+        }
+        let extractor = FailsFirstTitle(AtomicUsize::new(0));
+        let mut titles = Titles::default();
+        titles.run(&engine, &extractor).await.expect("recovery");
+        assert_eq!(extractor.0.load(Ordering::SeqCst), 2);
+        assert_eq!(titled_events(dir.path()).len(), 1);
+        titles
+            .run(&engine, &extractor)
+            .await
+            .expect("retry failed candidate");
+        assert_eq!(extractor.0.load(Ordering::SeqCst), 3);
+        assert_eq!(titled_events(dir.path()).len(), 2);
     }
 
     struct SimultaneousTitles(tokio::sync::Barrier);
