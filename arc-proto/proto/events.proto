@@ -23,6 +23,7 @@ enum SessionRole {
   SESSION_ROLE_CONCIERGE = 1;
   SESSION_ROLE_EXECUTOR = 2;
   SESSION_ROLE_ARCHIVIST = 3;
+  SESSION_ROLE_CODE = 4;
 }
 
 message Budget {
