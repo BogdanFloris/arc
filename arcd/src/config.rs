@@ -58,6 +58,9 @@ pub struct RolesConfig {
     pub concierge: Option<RoleConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<RoleConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<RoleConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +201,7 @@ impl RolesConfig {
     fn configured(&self) -> impl Iterator<Item = (&'static str, &RoleConfig)> {
         [
             ("concierge", self.concierge.as_ref()),
+            ("code", self.code.as_ref()),
             ("executor", self.executor.as_ref()),
             ("archivist", self.archivist.as_ref()),
         ]
@@ -407,6 +411,7 @@ impl Config {
     pub fn needs_sidecar(&self) -> bool {
         [
             self.roles.concierge.as_ref(),
+            self.roles.code.as_ref().or(self.roles.executor.as_ref()),
             self.roles.executor.as_ref(),
             self.roles.archivist.as_ref(),
         ]
@@ -517,6 +522,10 @@ choices = ["hosted"]
         .expect("config");
         config.validate().expect("valid");
         assert!(!config.needs_sidecar());
+        config.roles.code = Some(config.models["local"].clone());
+        assert!(config.needs_sidecar());
+        config.roles.code = None;
+        assert!(!config.needs_sidecar());
         config
             .roles
             .executor
@@ -584,6 +593,16 @@ choices = ["hosted"]
             },
             compaction: super::CompactionConfig { fraction: 0.7 },
             roles: RolesConfig {
+                code: Some(RoleConfig {
+                    provider: Some(RoleProvider::Codex),
+                    choices: Vec::new(),
+                    model: Some("gpt-6-astra".to_owned()),
+                    endpoint: None,
+                    key: Some("codex".to_owned()),
+                    thinking: Thinking::Medium,
+                    context_window: Some(128_000),
+                    counsel: false,
+                }),
                 concierge: Some(RoleConfig {
                     provider: Some(RoleProvider::Gemini),
                     choices: Vec::new(),

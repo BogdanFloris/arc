@@ -61,6 +61,7 @@ fn concierge_system(identity: Option<String>) -> String {
 #[derive(Debug)]
 pub struct Roles {
     concierge: Vec<(String, Runner)>,
+    code: Vec<(String, Runner)>,
     executor: Vec<(String, Runner)>,
     archivist: Vec<(String, Runner)>,
 }
@@ -86,6 +87,16 @@ impl Roles {
                 config,
                 None,
             )?,
+            code: built.role(
+                SessionRole::Code,
+                config
+                    .roles
+                    .code
+                    .as_ref()
+                    .or(config.roles.executor.as_ref()),
+                config,
+                None,
+            )?,
             archivist: built.role(
                 SessionRole::Archivist,
                 config.roles.archivist.as_ref(),
@@ -107,13 +118,19 @@ impl Roles {
         &self.archivist[0].1
     }
 
-    pub fn all(&self) -> [&Runner; 3] {
-        [self.concierge(), self.executor(), self.archivist()]
+    pub fn all(&self) -> [&Runner; 4] {
+        [
+            self.concierge(),
+            &self.code[0].1,
+            self.executor(),
+            self.archivist(),
+        ]
     }
 
     pub fn menus(&self) -> BTreeMap<SessionRole, Vec<(String, Runner)>> {
         BTreeMap::from([
             (SessionRole::Concierge, self.concierge.clone()),
+            (SessionRole::Code, self.code.clone()),
             (SessionRole::Executor, self.executor.clone()),
             (SessionRole::Archivist, self.archivist.clone()),
         ])
@@ -417,10 +434,41 @@ mod tests {
     }
 
     #[test]
+    fn code_has_its_own_menu_and_inherits_executor_only_when_omitted() {
+        use arc_proto::v1::SessionRole;
+
+        let worker = r#"
+[models.sol]
+provider = "local"
+model = "sol"
+[models.astra]
+provider = "local"
+model = "astra"
+[roles.executor]
+choices = ["sol", "astra"]
+"#;
+        let inherited = resolved(worker);
+        assert_eq!(
+            inherited.choices()[&SessionRole::Code],
+            inherited.choices()[&SessionRole::Executor]
+        );
+        assert_eq!(
+            inherited.menus()[&SessionRole::Code][0].1.role,
+            SessionRole::Code
+        );
+        let split = resolved(&format!(
+            "{worker}\n[roles.code]\nchoices = [\"astra\", \"sol\"]\n"
+        ));
+        assert_eq!(split.menus()[&SessionRole::Code][0].1.model, "astra");
+        assert_eq!(split.menus()[&SessionRole::Executor][0].1.model, "sol");
+        assert_eq!(split.all().len(), 4);
+    }
+
+    #[test]
     fn an_unconfigured_role_falls_back_to_the_sidecar() {
         let roles = resolved("");
 
-        for role in [roles.concierge(), roles.executor(), roles.archivist()] {
+        for role in roles.all() {
             assert_eq!(role.provider.name(), "local");
             assert_eq!(role.provider.endpoint(), SIDECAR);
             assert_eq!(role.model, Config::default().model());

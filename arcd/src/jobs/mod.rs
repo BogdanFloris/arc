@@ -421,14 +421,14 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
             SessionRole::Unspecified
         }
     };
-    let (SessionRole::Executor | SessionRole::Archivist) = role else {
+    let (SessionRole::Code | SessionRole::Executor | SessionRole::Archivist) = role else {
         return concierge_runner(shared);
     };
     let mut runner = match selected_runner(shared, role) {
         Some(runner) => runner,
         None => concierge_runner(shared)?,
     };
-    if role == SessionRole::Executor {
+    if matches!(role, SessionRole::Code | SessionRole::Executor) {
         if let Some(prompt) = direct_system_prompt_for(shared, session_id) {
             runner.system = Some(prompt);
         }
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_finishes_while_its_parent_is_busy_and_steering_survives() {
+    async fn an_executor_finishes_while_its_code_parent_is_busy_and_steering_survives() {
         let dispatch_args = serde_json::json!({
             "role": "executor",
             "project": "arc",
@@ -1178,7 +1178,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
         let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
+        let code_provider = ScriptedProvider::scripted_steps(vec![
             Step::Immediate(vec![
                 Ok(call("g1", 0, "dispatch", &dispatch_args)),
                 Ok(tool_stop()),
@@ -1191,9 +1191,18 @@ mod tests {
                     stop: Stop::EndTurn,
                 })],
             },
-            Step::Immediate(done_reply("grandchild done")),
             Step::Immediate(done_reply("checked report and correction")),
         ]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("grandchild done")]);
+        let code_runner = Runner {
+            role: SessionRole::Code,
+            model: "astra".to_owned(),
+            ..executor_runner(&code_provider)
+        };
+        let worker_runner = Runner {
+            model: "sol".to_owned(),
+            ..executor_runner(&executor_provider)
+        };
 
         let mut registry = Registry::new(512);
         registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
@@ -1203,22 +1212,35 @@ mod tests {
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
         let engine = Arc::new(
-            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
-                "arc".to_owned(),
-                ProjectSpec {
-                    sources: vec![ToolSource::Builtin],
-                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
-                    command_prefix: Vec::new(),
-                },
-            )])),
+            Engine::new(Store::new(log, projection), registry)
+                .with_projects(BTreeMap::from([(
+                    "arc".to_owned(),
+                    ProjectSpec {
+                        sources: vec![ToolSource::Builtin],
+                        grants: vec![Grant::new(&root, Mode::ReadWrite)],
+                        command_prefix: Vec::new(),
+                    },
+                )]))
+                .with_role_identities(BTreeMap::from([
+                    (
+                        SessionRole::Code,
+                        ("scripted".to_owned(), "astra".to_owned()),
+                    ),
+                    (
+                        SessionRole::Executor,
+                        ("scripted".to_owned(), "sol".to_owned()),
+                    ),
+                ])),
         );
 
         let child = engine
-            .create_direct_session(&runner(&executor_provider), "arc", SessionRole::Executor)
+            .create_direct_session(&code_runner, "arc", SessionRole::Code)
             .expect("create the direct session durably");
 
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
+        let runners = BTreeMap::from([
+            (SessionRole::Code, code_runner),
+            (SessionRole::Executor, worker_runner),
+        ]);
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         let _stream = supervisor
@@ -1250,9 +1272,18 @@ mod tests {
         ));
         notify.notify_one();
         supervisor.shutdown().await;
-        let requests = executor_provider.requests();
-        assert_eq!(requests.len(), 4, "no duplicate child or parent turn");
-        let final_context = format!("{:?}", requests[3].messages);
+        let requests = code_provider.requests();
+        assert_eq!(requests.len(), 3, "no duplicate parent turn");
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.role == SessionRole::Code && r.model == "astra")
+        );
+        let worker_requests = executor_provider.requests();
+        assert_eq!(worker_requests.len(), 1);
+        assert_eq!(worker_requests[0].role, SessionRole::Executor);
+        assert_eq!(worker_requests[0].model, "sol");
+        let final_context = format!("{:?}", requests[2].messages);
         assert!(final_context.contains("grandchild done"));
         assert!(final_context.contains("keep the API"));
 

@@ -1459,7 +1459,7 @@ const HELP: &[(&str, &[&str])] = &[
             ":jobs             open the jobs pane",
             ":model            open the model picker",
             ":status           context measurement and Codex allowance",
-            ":code <project>   open a bound executor session, no dispatch",
+            ":code <project>   open a bound code session, no dispatch",
             "                  without a project, open the project picker",
             ":fork             branch at the visual selection",
             ":help             this popup (j k scroll it)",
@@ -1718,12 +1718,14 @@ mod tests {
                 choice(SessionRole::Concierge, "astra", "gpt-6-astra", true),
                 choice(SessionRole::Executor, "sol", "gpt-5.6-sol", true),
                 choice(SessionRole::Executor, "glm-flash", "glm-5.3-flash", false),
+                choice(SessionRole::Code, "sol", "gpt-5.6-sol", true),
             ],
             selected: 2,
             loaded: true,
         });
 
         let text = plain_text(&rendered(&mut app));
+        println!("{text}");
 
         assert!(
             text.contains(" model "),
@@ -1740,6 +1742,10 @@ mod tests {
         assert!(
             text.contains(" > executor   glm-flash  codex glm-5.3-flash medium"),
             "the pointed row carries the cursor, not the mark:\n{text}"
+        );
+        assert!(
+            text.contains("   code      *sol        codex gpt-5.6-sol medium"),
+            "{text}"
         );
     }
 

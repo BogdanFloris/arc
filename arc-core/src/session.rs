@@ -30,7 +30,7 @@ const MAX_EXECUTOR_TOOL_STEPS: usize = 256;
 
 fn max_tool_steps(role: SessionRole) -> usize {
     match role {
-        SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
+        SessionRole::Code | SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
         _ => MAX_TOOL_STEPS,
     }
 }
@@ -989,7 +989,12 @@ impl Engine {
             sources.push(ToolSource::Jobs);
         }
         // the model preset says (§6.2); the archivist never holds it
-        if runner.counsel && matches!(role, SessionRole::Concierge | SessionRole::Executor) {
+        if runner.counsel
+            && matches!(
+                role,
+                SessionRole::Concierge | SessionRole::Code | SessionRole::Executor
+            )
+        {
             sources.push(ToolSource::Expert);
         }
         // web is a concierge capability, no config gate (2026-08-24)
@@ -5596,10 +5601,19 @@ mod tests {
 
     #[tokio::test]
     async fn executor_holds_consult_expert_when_its_model_has_counsel() {
+        coding_role_holds_counsel(SessionRole::Executor).await;
+    }
+
+    #[tokio::test]
+    async fn code_holds_consult_expert_when_its_model_has_counsel() {
+        coding_role_holds_counsel(SessionRole::Code).await;
+    }
+
+    async fn coding_role_holds_counsel(role: SessionRole) {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let engine = engine_with_expert(&dir);
-        let run = counsel_runner(&provider, SessionRole::Executor);
+        let run = counsel_runner(&provider, role);
         let (tx, _rx) = channel();
 
         engine
@@ -5850,6 +5864,129 @@ mod tests {
                     read_write: false,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn code_and_executor_selections_replay_independently_and_preserve_existing_pins() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let choices = || {
+            [SessionRole::Code, SessionRole::Executor]
+                .into_iter()
+                .map(|role| {
+                    (
+                        role,
+                        ["sol", "astra"]
+                            .into_iter()
+                            .map(|name| super::ModelChoice {
+                                name: name.to_owned(),
+                                provider: "scripted".to_owned(),
+                                model: name.to_owned(),
+                                thinking: Thinking::Default,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        let provider = ScriptedProvider::scripted(vec![done_reply("kept")]);
+        let (engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        let engine = engine
+            .with_projects(projects_with(
+                "arc",
+                vec![ToolSource::Builtin, ToolSource::Workspace],
+                vec![Grant::new(&root, Mode::ReadWrite)],
+            ))
+            .with_role_choices(choices());
+        let legacy = engine
+            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .expect("legacy direct session");
+        engine
+            .select_model(SessionRole::Code, "astra")
+            .expect("select code");
+        assert_eq!(
+            engine
+                .selected_choice(SessionRole::Executor)
+                .unwrap()
+                .as_deref(),
+            Some("sol")
+        );
+        let code = engine
+            .create_direct_session(&run, "arc", SessionRole::Code)
+            .expect("code");
+        let worker = engine
+            .create_bound_session(&run, "arc", SessionRole::Executor, None)
+            .expect("worker");
+        engine
+            .select_model(SessionRole::Executor, "astra")
+            .expect("select executor");
+        assert_eq!(
+            engine
+                .selected_choice(SessionRole::Code)
+                .unwrap()
+                .as_deref(),
+            Some("astra")
+        );
+        let code_run = Runner {
+            role: SessionRole::Code,
+            model: "astra".to_owned(),
+            ..run.clone()
+        };
+        let (tx, _rx) = channel();
+        let fork_point = engine
+            .send_message(&code_run, Some(&code), "Keep this context", tx)
+            .await
+            .expect("send")
+            .seq;
+        engine
+            .select_model(SessionRole::Code, "sol")
+            .expect("change code");
+        let fork = engine.fork_session(&code, fork_point).expect("fork code");
+        let events = conversation_log(dir.path());
+        for (id, role, model) in [
+            (&legacy, SessionRole::Executor, "sol"),
+            (&code, SessionRole::Code, "astra"),
+            (&worker, SessionRole::Executor, "sol"),
+            (&fork, SessionRole::Code, "sol"),
+        ] {
+            let created = events
+                .iter()
+                .find_map(|event| match event {
+                    session_event::Event::SessionCreated(created) if &created.session_id == id => {
+                        Some(created)
+                    }
+                    _ => None,
+                })
+                .expect("created");
+            assert_eq!(created.role, role as i32);
+            assert_eq!(created.model, model);
+        }
+        drop(engine);
+        let (reopened, _) = reopened_engine(&provider, &dir, Registry::new(512));
+        let reopened = reopened.with_role_choices(choices());
+        assert_eq!(
+            reopened
+                .selected_choice(SessionRole::Code)
+                .unwrap()
+                .as_deref(),
+            Some("sol")
+        );
+        assert_eq!(
+            reopened
+                .selected_choice(SessionRole::Executor)
+                .unwrap()
+                .as_deref(),
+            Some("astra")
+        );
+        assert_eq!(
+            reopened.session_role(&code).unwrap(),
+            Some(SessionRole::Code)
+        );
+        assert_eq!(
+            reopened.session_role(&legacy).unwrap(),
+            Some(SessionRole::Executor)
         );
     }
 

@@ -67,6 +67,7 @@ pub fn role_label(role: SessionRole) -> &'static str {
     match role {
         SessionRole::Unspecified => "unspecified",
         SessionRole::Concierge => "concierge",
+        SessionRole::Code => "code",
         SessionRole::Executor => "executor",
         SessionRole::Archivist => "archivist",
     }

@@ -642,11 +642,11 @@ async fn create_session(
     create: CreateSession,
 ) -> ControlFlow<()> {
     let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
-    let msg = if role != SessionRole::Executor {
+    let msg = if !matches!(role, SessionRole::Code | SessionRole::Executor) {
         error_frame(
             "unsupported_role",
             format!(
-                ":code opens an executor session only, not {}",
+                ":code opens a code session (or legacy executor), not {}",
                 role_label(role)
             ),
         )
@@ -659,7 +659,10 @@ async fn create_session(
             }
         }
     } else {
-        error_frame("no_runner", "no runner is configured for the executor role")
+        error_frame(
+            "no_runner",
+            format!("no runner is configured for the {} role", role_label(role)),
+        )
     };
     flow(send_frame(ws, request_id, msg).await)
 }
@@ -1122,7 +1125,16 @@ mod tests {
                 script,
                 registry,
                 Vec::new(),
-                BTreeMap::from([(SessionRole::Executor, executor_runner)]),
+                BTreeMap::from([
+                    (
+                        SessionRole::Code,
+                        Runner {
+                            role: SessionRole::Code,
+                            ..executor_runner.clone()
+                        },
+                    ),
+                    (SessionRole::Executor, executor_runner),
+                ]),
                 projects,
             )
             .await
@@ -3260,7 +3272,7 @@ mod tests {
         run_turn_to_end(&mut ws, 1).await;
         harness.drain_jobs().await;
 
-        let msg = create_session(&mut ws, 2, SessionRole::Executor, "arc").await;
+        let msg = create_session(&mut ws, 2, SessionRole::Code, "arc").await;
         let code_session_id = match msg {
             server_frame::Msg::MessageAccepted(accepted) => accepted.session_id,
             other => panic!("expected MessageAccepted, got {other:?}"),
@@ -3280,6 +3292,8 @@ mod tests {
 
         let requests = executor_provider.requests();
         assert_eq!(requests.len(), 2, "the job's turn, then the :code turn");
+        assert_eq!(requests[0].role, SessionRole::Executor);
+        assert_eq!(requests[1].role, SessionRole::Code);
         let job_system = requests[0]
             .system
             .clone()
@@ -3317,6 +3331,7 @@ mod tests {
             .iter()
             .find(|s| s.id == code_session_id)
             .expect("the :code session is listed");
+        assert_eq!(code_summary.role, SessionRole::Code as i32);
         assert_eq!(
             code_summary.dispatched_by, "",
             "a :code session is a root conversation, not a dispatched child"
@@ -3331,7 +3346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_refuses_a_non_executor_role() {
+    async fn create_session_refuses_a_non_coding_role() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
         let mut harness = Harness::with_executor_provider(
             Script::Echo,
@@ -3603,10 +3618,15 @@ mod tests {
             Some(server_frame::Msg::ModelList(list)) => list.choices,
             other => panic!("expected ModelList, got {other:?}"),
         };
-        assert_eq!(listed.len(), 1, "{listed:?}");
-        assert_eq!(listed[0].role, SessionRole::Executor as i32);
-        assert_eq!(listed[0].name, "test-model");
-        assert!(listed[0].selected, "the only choice is the pick");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        for role in [SessionRole::Code, SessionRole::Executor] {
+            let choice = listed
+                .iter()
+                .find(|c| c.role == role as i32)
+                .expect("role choice");
+            assert_eq!(choice.name, "test-model");
+            assert!(choice.selected, "the only choice is the pick");
+        }
 
         send(
             &mut ws,

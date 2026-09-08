@@ -1177,12 +1177,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_direct_executor_session_extracts() {
+        direct_session_extracts(SessionRole::Executor).await;
+    }
+
+    #[tokio::test]
+    async fn a_direct_code_session_extracts() {
+        direct_session_extracts(SessionRole::Code).await;
+    }
+
+    async fn direct_session_extracts(role: SessionRole) {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role_and_project(&provider, &dir, SessionRole::Executor);
-        // source User, as the :code door records it
+        let (engine, run) = engine_with_role_and_project(&provider, &dir, role);
         let session_id = engine
-            .create_direct_session(&run, "arc", SessionRole::Executor)
+            .create_direct_session(&run, "arc", role)
             .expect("create direct session");
         let (tx, _rx) = channel();
         engine

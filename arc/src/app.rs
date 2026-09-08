@@ -1122,7 +1122,7 @@ impl App {
             self.chat_draft = std::mem::take(&mut self.input);
         }
         let command = self.start_session(None);
-        self.pending_code = Some((SessionRole::Executor, project.to_owned()));
+        self.pending_code = Some((SessionRole::Code, project.to_owned()));
         self.code_return = Some((None, project.to_owned()));
         self.input = std::mem::take(&mut self.code_draft);
         self.cursor = self.input.len();
@@ -1270,7 +1270,10 @@ impl App {
                 self.session_id
                     .as_ref()
                     .and_then(|id| self.session_meta.get(id))
-                    .filter(|(role, _, _)| *role == SessionRole::Executor)
+                    .filter(|(role, _, source)| {
+                        *source == Source::User
+                            && matches!(role, SessionRole::Code | SessionRole::Executor)
+                    })
                     .map(|(_, project, _)| project.clone())
             })
     }
@@ -1307,7 +1310,7 @@ impl App {
         self.chat_draft = std::mem::take(&mut self.input);
         let command = self.start_session(session);
         if self.session_id.is_none() {
-            self.pending_code = Some((SessionRole::Executor, project));
+            self.pending_code = Some((SessionRole::Code, project));
         }
         self.input = std::mem::take(&mut self.code_draft);
         self.cursor = self.input.len();
@@ -1760,7 +1763,7 @@ impl App {
 
     pub fn open_door_label(&self) -> Option<String> {
         if self.session_id.is_none() {
-            if let Some((SessionRole::Executor, project)) = &self.pending_code {
+            if let Some((SessionRole::Code | SessionRole::Executor, project)) = &self.pending_code {
                 return Some(format!("code/{project}"));
             }
         }
@@ -1770,7 +1773,9 @@ impl App {
             .and_then(|id| self.session_meta.get(id))?;
         match (*source, *role) {
             (Source::Model, _) => Some(format!("job/{project}")),
-            (Source::User, SessionRole::Executor) => Some(format!("code/{project}")),
+            (Source::User, SessionRole::Code | SessionRole::Executor) => {
+                Some(format!("code/{project}"))
+            }
             _ => None,
         }
     }
@@ -1780,7 +1785,9 @@ impl App {
     pub fn open_project(&self) -> Option<&str> {
         if self.session_id.is_none() {
             return match &self.pending_code {
-                Some((SessionRole::Executor, project)) => Some(project.as_str()),
+                Some((SessionRole::Code | SessionRole::Executor, project)) => {
+                    Some(project.as_str())
+                }
                 _ => None,
             };
         }
@@ -1788,7 +1795,8 @@ impl App {
             .session_id
             .as_deref()
             .and_then(|id| self.session_meta.get(id))?;
-        (*source == Source::User && *role == SessionRole::Executor).then_some(project.as_str())
+        (*source == Source::User && matches!(role, SessionRole::Code | SessionRole::Executor))
+            .then_some(project.as_str())
     }
 
     fn back_session(&mut self) -> Option<Command> {
@@ -2151,10 +2159,14 @@ impl App {
             }
             NetEvent::ModelItems(items) => {
                 if let Some(models) = self.models_mut() {
-                    // land on the executor's pick: the one most often changed
                     models.selected = items
                         .iter()
-                        .position(|c| c.selected && c.role == SessionRole::Executor as i32)
+                        .position(|c| c.selected && c.role == SessionRole::Code as i32)
+                        .or_else(|| {
+                            items
+                                .iter()
+                                .position(|c| c.selected && c.role == SessionRole::Executor as i32)
+                        })
                         .or_else(|| items.iter().position(|c| c.selected))
                         .unwrap_or(0);
                     models.items = items;
@@ -2749,6 +2761,38 @@ mod tests {
         );
         assert_eq!(app.input, "keep the public API");
         assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+    }
+
+    #[test]
+    fn code_and_legacy_executor_doors_reopen_without_changing_role_or_pin() {
+        for role in [SessionRole::Code, SessionRole::Executor] {
+            let mut app = App::new();
+            let mut info = code_session("code", "development", "arc");
+            info.role = role as i32;
+            info.provider = "codex".to_owned();
+            info.model = "pinned-model".to_owned();
+            app.on_net(NetEvent::Sessions(vec![session("chat"), info.clone()]));
+            app.start_session(Some("chat".to_owned()));
+            app.start_session(Some("code".to_owned()));
+            assert_eq!(app.open_project(), Some("arc"));
+            assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+            assert_eq!(
+                app.switch_chat(),
+                Some(Command::History {
+                    session_id: "chat".to_owned()
+                })
+            );
+            assert_eq!(
+                app.switch_door(),
+                Some(Command::History {
+                    session_id: "code".to_owned()
+                })
+            );
+            assert!(app.pending_code.is_none());
+            assert_eq!(app.session_meta["code"].0, role);
+            assert_eq!(app.sessions.iter().find(|s| s.id == "code"), Some(&info));
+            assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
+        }
     }
 
     #[test]
@@ -5756,6 +5800,26 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_selects_code_independently_from_executor() {
+        let mut app = normal_app();
+        app.on_key(key(KeyCode::Char('M')));
+        app.on_net(NetEvent::ModelItems(vec![
+            choice(SessionRole::Executor, "sol", true),
+            choice(SessionRole::Code, "sol", true),
+            choice(SessionRole::Code, "astra", false),
+        ]));
+        assert_eq!(app.models_mut().unwrap().selected, 1);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::SelectModel {
+                role: SessionRole::Code,
+                choice: "astra".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn colon_model_opens_the_same_picker() {
         let mut app = normal_app();
         app.on_key(key(KeyCode::Char(':')));
@@ -5798,7 +5862,7 @@ mod tests {
         assert_eq!(
             command,
             Some(Command::CreateSession {
-                role: SessionRole::Executor,
+                role: SessionRole::Code,
                 project: "scratch".to_owned(),
             }),
             "from the pick on, this is exactly the :code flow"
@@ -5836,7 +5900,7 @@ mod tests {
         assert_eq!(
             command,
             Some(Command::CreateSession {
-                role: SessionRole::Executor,
+                role: SessionRole::Code,
                 project: "arc".to_owned(),
             }),
             "the first message is what opens the session"
@@ -6082,7 +6146,7 @@ mod tests {
         assert_eq!(
             command,
             Some(Command::CreateSession {
-                role: SessionRole::Executor,
+                role: SessionRole::Code,
                 project: "arc".to_owned(),
             }),
             "the first message after an auto-opened door is exactly the :code flow"

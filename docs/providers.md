@@ -163,6 +163,18 @@ thinking       = "medium"
 context_window = 272000
 ```
 
+Interactive development and workers select models independently. With `astra` and `sol` already declared under `[models]`, use:
+
+```toml
+[roles.code]
+choices = ["astra", "sol"]
+
+[roles.executor]
+choices = ["sol", "astra"]
+```
+
+The first choice is the default until `:model` records a selection for that role. New `:code` sessions use `code`; dispatch uses `executor`. If `roles.code` is omitted, it inherits the executor menu, not its recorded selection. Existing sessions keep their role and model pin, including older interactive executor sessions. Open a new `:code` session to use the new role; a fork keeps its parent's role.
+
 Every workspace project also holds `apply_patch`, the edit grammar these models are trained on; the codex provider sends it as a custom grammar tool, other providers as a plain function.
 
 **Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory, by sessions whose model preset says `counsel = true`. First-party CLI, which is the sanctioned path.
