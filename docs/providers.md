@@ -27,7 +27,7 @@ These roles are stable. The next section records the current model for each one.
 
 | Role | Carries | Selection criteria, in order |
 | --- | --- | --- |
-| **concierge** | Conversation, recall, job dispatch. Identity file + record index. | Latency, voice, vision, judgment. Volume is small. |
+| **chat** | Conversation, recall, job dispatch. Identity file + record index. | Latency, voice, vision, judgment. Volume is small. |
 | **executor** | Job execution. Almost all tokens. | Cost per completed task. Nothing else comes close. |
 | **counsel** | Plans, reviews, and unsticking. Read-only, bounded. | Capability. Called a few times per job, not per turn. |
 | **archivist** | Consolidation, extraction, and titling. | Extraction quality and cost; latency-insensitive. |
@@ -43,7 +43,7 @@ As configured on 2026-09-06:
 
 | Role | Default preset | Access |
 | --- | --- | --- |
-| concierge | astra | Codex |
+| chat | astra | Codex |
 | executor | sol | Codex |
 | counsel | fable | Claude CLI, read-only |
 | archivist | deepseek-flash | OpenCode Go |
@@ -68,7 +68,7 @@ It is historical evidence, not the current model configuration.
 
 | Role | Filled by | Access | Est. monthly |
 | --- | --- | --- | --- |
-| **concierge** | Gemini 3.6 Flash, thinking `minimal` (see below — 3.7 lacks `minimal`) | Direct API key | ~$10 |
+| **chat** | Gemini 3.6 Flash, thinking `minimal` (see below — 3.7 lacks `minimal`) | Direct API key | ~$10 |
 | **executor** | OpenCode Go — `deepseek-v4-flash` default; `glm-5.3-flash` in live use since 2026-08-28 | Go subscription | $10 (plan) |
 | ↳ escalation | DeepSeek V4 Pro first; GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
 | **counsel** | Opus via `claude -p`, read-only tools, for both `plan` and `review`. Degrades to Sonnet only under budget pressure | Claude Pro | $20 |
@@ -76,17 +76,17 @@ It is historical evidence, not the current model configuration.
 | **reserve** | Prepaid Zen credit for Go spillover | — | ~$10 |
 | | | | **~$50** |
 
-### Why the earlier concierge used Gemini
+### Why the earlier chat used Gemini
 
-Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not offer Claude or Gemini. The concierge uses a separate key for three reasons:
+Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not offer Claude or Gemini. The chat uses a separate key for three reasons:
 
 - **Cost isolation.** Go meters in dollars. Every conversational turn — and every camera frame, once vision is in the loop — competes with the coding budget.
 - **Latency.** Kimi K3, Go's most general model, runs at about 38 tokens/second and uses a thinking mode. Voice makes time to first audio the limiting constraint.
-- **Vision.** The concierge needs it for screenshots now and the pan-tilt camera later, and Google's spatial grounding is the strongest cheap option.
+- **Vision.** The chat needs it for screenshots now and the pan-tilt camera later, and Google's spatial grounding is the strongest cheap option.
 
-Keep thinking as low as the model allows on the concierge. It adds latency, and on Gemini it is also most of the bill.
+Keep thinking as low as the model allows on the chat. It adds latency, and on Gemini it is also most of the bill.
 
-Measured 2026-08-24. **`minimal` is the only level that stops thinking, and it is a model capability, not an API one** — 3.6, 3.5 and 3-flash-preview have it; 3.7 Flash and `gemini-flash-latest` answer `Thinking level MINIMAL is not supported for this model` on the native and OpenAI-compatible paths alike. That is why the concierge runs 3.6 rather than the newer 3.7.
+Measured 2026-08-24. **`minimal` is the only level that stops thinking, and it is a model capability, not an API one** — 3.6, 3.5 and 3-flash-preview have it; 3.7 Flash and `gemini-flash-latest` answer `Thinking level MINIMAL is not supported for this model` on the native and OpenAI-compatible paths alike. That is why the chat runs 3.6 rather than the newer 3.7.
 
 Five runs of one chat turn, output tokens: **3.6 on `minimal` gave 28–33**, 3.7 on `low` gave 31–337, 3.6 on `low` gave 334–410. `low` is a cap the model may use rather than a level it obeys, so it is bimodal and a single turn tells you nothing; `minimal` is flat and predictable, and it takes the thinking latency out of a role that will front a voice client. `none` is not `minimal`: it still thinks.
 
@@ -101,13 +101,13 @@ Per-turn usage became durable on 2026-08-27 (row 6.22), so these come from the p
 | Role | Turns | Input | Output | Latency avg / max |
 | --- | --- | --- | --- | --- |
 | executor (glm-5.3-flash, Go) | 28 | 13.4M | 211k | 244s / 1837s |
-| concierge (3.6 Flash, minimal) | 45 | 228k | 7.0k | 3.1s / 7.5s |
+| chat (3.6 Flash, minimal) | 45 | 228k | 7.0k | 3.1s / 7.5s |
 | archivist (Qwen3-8B, local) | 34 calls on 08-28 | 24.3k | 214 | — (spans only; not session turns) |
 
 What the numbers settle:
 
 - **The 96%-cache-reads assumption held.** Executor steps log ~99% `cached_tokens` on Go; the 13.4M input is overwhelmingly cache reads. Cached share is in spans and journal, not the projection — 7.3's durable accounting covers totals only.
-- **The concierge is noise in the budget.** 228k input over two heavy days extrapolates to ~3.5M/month — at Gemini Flash rates, low single-digit dollars. Latency is flat (7.5s worst), which is the property voice needs.
+- **The chat is noise in the budget.** 228k input over two heavy days extrapolates to ~3.5M/month — at Gemini Flash rates, low single-digit dollars. Latency is flat (7.5s worst), which is the property voice needs.
 - **The executor's monthly shape:** two heavy development days produced ~13.4M in / 211k out. The 19M-output/month planning figure above looks high by an order of magnitude for output; input volume, not output, is the metered mass — and it is almost all cached. Go's own dashboard is the dollar authority; this table is the token truth.
 - **The archivist is free in practice as well as in principle** — the section 8 gates cut its work to titling plus rare extraction.
 
@@ -185,7 +185,7 @@ A coding job uses one `plan` and up to *N* `review` calls. Counsel use therefore
 
 Sonnet is counsel's fallback. Enter it at roughly 70% of a window's allowance and return to Opus when the window resets. Spike 1.2 determines whether `claude -p` exposes the needed usage signal. Without one, remain on Opus until rate limited, then use Sonnet for the rest of the window.
 
-**Gemini direct key.** Metered per token, no plan. Cached input is 90% off the base rate, which matters because the concierge's prefix — identity file plus record index plus recent history — is the most stable prefix in the system.
+**Gemini direct key.** Metered per token, no plan. Cached input is 90% off the base rate, which matters because the chat's prefix — identity file plus record index plus recent history — is the most stable prefix in the system.
 
 ---
 
@@ -210,7 +210,7 @@ Revisit an option only when its reason changes.
 | Claude / Gemini consumer OAuth driven in-harness | ToS, revocation risk. Principle 2. Codex is the one exception, for the reasons recorded there. |
 | Antigravity gateway | Unpublished endpoint; removed after Phase 1. |
 | Native Claude Code replacement at the same cost | Cannot beat an ~8× subscription subsidy. The cost calculation above confirms it. |
-| DevPass (LLM Gateway) — $29/$79/$179, ~3× value, frontier models any-tool | The only option that solves the concierge and the executor together with frontier models, and still rejected: cheapest tier alone exceeds the budget, the multiple is half of Go's, and it is the flat-rate-reseller category whose economics are unexplained. Now rejected with a number rather than a feeling. |
+| DevPass (LLM Gateway) — $29/$79/$179, ~3× value, frontier models any-tool | The only option that solves the chat and the executor together with frontier models, and still rejected: cheapest tier alone exceeds the budget, the multiple is half of Go's, and it is the flat-rate-reseller category whose economics are unexplained. Now rejected with a number rather than a feeling. |
 | GLM Coding Plan (Z.ai) | Keys restricted to approved tools — the blocker for ARC specifically. Also loses the DeepSeek cost floor. |
 | Kimi Code plan via the Anthropic surface | The policy is documented but revocable. Do not depend on it. |
 | Other flat-rate resellers | Trust and quantization opacity. |
@@ -224,8 +224,8 @@ Revisit an option only when its reason changes.
 Review on events, not a schedule. Three triggers are already dated:
 
 - **2026-08-31 — DeepSeek zero-retention agreement expires.** This is the default `executor` model. Confirm the successor terms or move the default to GLM-5.3.
-- **2026-08-31 — Sonnet 5 introductory pricing ends** ($2/$10 → $3/$15). Only matters if the concierge moves to Sonnet.
-- **2027-01-01 — Gemini Flash prices double.** Re-price the concierge; Flash-Lite and Haiku 4.5 are the alternatives.
+- **2026-08-31 — Sonnet 5 introductory pricing ends** ($2/$10 → $3/$15). Only matters if the chat moves to Sonnet.
+- **2027-01-01 — Gemini Flash prices double.** Re-price the chat; Flash-Lite and Haiku 4.5 are the alternatives.
 
 Counsel rate-limiting is a trigger rather than a prediction: if a job ever stalls on it, retune the round bound and severity gate, or split counsel by mode, before moving anything else.
 
@@ -239,7 +239,7 @@ The implementation obligations that follow. These are Phase 3 work.
 
 - **Add a role label to every `CompletionRequest` and trace span.** One central label makes the estimates above replaceable with measurements.
 - **Session-pinned providers.** Role is chosen at session or job creation and does not change for its lifetime.
-- **Prefix stability for the concierge.** Identity file and record index render first and byte-identically; anything volatile goes after them. A timestamp near the front of the prompt silently costs the entire cache discount.
+- **Prefix stability for the chat.** Identity file and record index render first and byte-identically; anything volatile goes after them. A timestamp near the front of the prompt silently costs the entire cache discount.
 - **A failover chain that distinguishes credit exhaustion from rate limiting.** A 402 at Go's cap is not a retryable 429. Exhaustion falls through to spillover credit if enabled, then to the local model, and says so in the client.
 - **Per-job budgets**, declared at dispatch and enforced by arcd.
 - **The expert as an argv template** — command, working directory, timeout — with read-only enforcement a property of how it is invoked, and one template per mode (`plan`, `review`).
