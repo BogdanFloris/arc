@@ -43,6 +43,17 @@ const RUNNING_JOBS: &str = r"Running jobs:
   judgment call the expert leaves open to the user; never decide or drop it.
 - Hand the user conclusions, not transcripts.";
 
+pub(crate) const MEMORY: &str = r"Memory:
+- Save a fact when it will still hold next month and would otherwise be
+  explained again: where something lives, how a tool behaves here, what
+  the user decided and why.
+- Never save the work. What you read, built, changed, or committed is
+  already in the repo and the archive.
+- A fact the project's own AGENTS.md should carry belongs there, not
+  here. Memory is for projects that have no such file.
+- Search the project's namespace before assuming a convention. The index
+  carries titles and one line; memory_read has the rest.";
+
 // well under 2^32 tokens; the fractional token truncates harmlessly
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
@@ -51,8 +62,8 @@ fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
 
 fn chat_system(identity: Option<String>) -> String {
     match identity {
-        Some(identity) => format!("{}\n\n{RUNNING_JOBS}", identity.trim_end()),
-        None => RUNNING_JOBS.to_owned(),
+        Some(identity) => format!("{}\n\n{RUNNING_JOBS}\n\n{MEMORY}", identity.trim_end()),
+        None => format!("{RUNNING_JOBS}\n\n{MEMORY}"),
     }
 }
 
@@ -404,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_system_is_identity_then_jobs_doctrine_and_job_roles_get_none() {
+    fn the_chat_system_is_identity_then_jobs_then_memory_and_job_roles_get_none() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config: Config = toml::from_str("").expect("parses");
         let roles = Roles::resolve(
@@ -417,10 +428,10 @@ mod tests {
 
         let system = roles.chat().system.as_deref().expect("a system");
         assert!(system.starts_with("You are ARC."), "{system}");
-        assert!(
-            system.ends_with("conclusions, not transcripts."),
-            "{system}"
-        );
+        let jobs = system.find("conclusions, not transcripts.").expect("jobs");
+        let memory = system.find("Memory:").expect("memory");
+        assert!(jobs < memory, "{system}");
+        assert!(system.ends_with("memory_read has the rest."), "{system}");
         assert_eq!(roles.executor().system, None);
         assert_eq!(roles.archivist().system, None);
     }

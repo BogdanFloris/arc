@@ -36,8 +36,9 @@ fn direct_preamble(root: &Path) -> String {
          integration after all writers have stopped; children report formatting needed. \
          Briefs are self-contained: the child sees nothing of this session. \
          Check a handback against the workspace with your own tools before \
-         repeating it.\n\n{DEVELOPMENT_LOOP}",
-        root.display()
+         repeating it.\n\n{DEVELOPMENT_LOOP}\n\n{}",
+        root.display(),
+        crate::roles::MEMORY
     )
 }
 
@@ -235,6 +236,14 @@ mod tests {
         assert_ne!(job, direct);
         assert!(job.contains("non-interactively"));
         assert!(direct.contains("interactively with the user"));
+    }
+
+    #[test]
+    fn the_direct_door_carries_memory_doctrine_and_a_job_never_does() {
+        let root = Path::new("/project");
+
+        assert!(direct_preamble(root).contains("Never save the work."));
+        assert!(!job_preamble(root).contains("Memory:"));
     }
 
     #[test]

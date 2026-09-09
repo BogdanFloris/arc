@@ -257,16 +257,22 @@ impl Tool for MemoryWrite {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_owned(),
-            description: "Save a durable memory record the moment the user states a \
-                          preference, correction, or stable fact about themselves or their \
-                          world. Save it only if it would change future replies in similar \
+            description: "Save a durable memory record when the user states a \
+                          preference, correction, or stable fact about themselves, or when \
+                          you establish a fact about their world that will still hold next \
+                          month: where a toolchain lives, how a tool behaves in this \
+                          project, a convention the project follows. Save it only if it \
+                          would change future replies in similar \
                           situations — the best memory stops the user repeating themselves. \
                           SKIP: short-lived, random, redundant, or overly personal details; \
-                          task progress and anything the archive already answers; if it will \
+                          what you read, built, changed, or committed, which the repo and \
+                          the archive already hold; anything the project's own AGENTS.md \
+                          carries; if it will \
                           be stale in a week it does not belong. If the index already holds \
                           the fact, use memory_supersede or nothing. Phrase records as \
                           self-contained, present-tense declarative facts with names, not \
-                          pronouns (\"User prefers X\"), never as instructions. Save the \
+                          pronouns (\"User prefers X\", \"PlatformIO headers live outside \
+                          the project root\"), never as instructions. Save the \
                           fact at the scope it was stated: a preference voiced about one \
                           project is about that project, not a wider habit — widen only \
                           when the user says it holds everywhere. Dates absolute, proper \
