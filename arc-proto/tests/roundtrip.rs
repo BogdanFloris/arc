@@ -474,3 +474,14 @@ fn a_session_created_from_before_role_project_and_budget_still_decodes() {
     assert!(decoded.project.is_empty());
     assert!(decoded.budget.is_none());
 }
+
+#[test]
+fn the_original_chat_role_value_decodes_to_the_canonical_name() {
+    let decoded =
+        SessionCreated::decode(&[0x38, 0x01][..]).expect("decode the original binary role value");
+
+    assert_eq!(
+        SessionRole::try_from(decoded.role).expect("a known session role"),
+        SessionRole::Chat
+    );
+}

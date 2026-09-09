@@ -19,8 +19,11 @@ enum Role {
 }
 
 enum SessionRole {
+  option allow_alias = true;
+
   SESSION_ROLE_UNSPECIFIED = 0;
-  SESSION_ROLE_CONCIERGE = 1;
+  SESSION_ROLE_CHAT = 1;
+  SESSION_ROLE_CONCIERGE = 1 [deprecated = true];
   SESSION_ROLE_EXECUTOR = 2;
   SESSION_ROLE_ARCHIVIST = 3;
   SESSION_ROLE_CODE = 4;
