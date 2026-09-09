@@ -1,6 +1,6 @@
 use arc_proto::v1::{
     Budget, ClientFrame, Delta, Error, Event, HistoryEntry, HistoryMessage, HistoryToolCall,
-    HistoryToolResult, MarkBranch, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+    HistoryToolResult, ImageAttachment, MarkBranch, MemoryEvent, MemoryRecord, MemoryRecordCreated,
     MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated,
     MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewItems, MemoryReviewList,
     MessageAccepted, MessageAppended, Provenance, ProvenanceEntry, ReasoningDelta, Role,
@@ -76,6 +76,11 @@ fn message_appended_event() -> Event {
                 output_tokens: 34,
                 elapsed_ms: 5600,
                 grounding_json: String::new(),
+                attachments: vec![ImageAttachment {
+                    name: "screen.png".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    data: b"durable image bytes".to_vec(),
+                }],
             })),
         })),
     }
@@ -309,6 +314,11 @@ fn client_frame_send_message_round_trips() {
         msg: Some(client_frame::Msg::SendMessage(SendMessage {
             session_id: String::new(),
             content: "hello arc".to_string(),
+            attachments: vec![ImageAttachment {
+                name: "screen.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                data: b"wire image bytes".to_vec(),
+            }],
         })),
     });
 }

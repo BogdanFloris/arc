@@ -71,6 +71,12 @@ message BranchMarked {
   }
 }
 
+message ImageAttachment {
+  string name = 1;
+  string media_type = 2;
+  bytes data = 3;
+}
+
 message MessageAppended {
   string session_id = 1;
   Role role = 2;
@@ -84,6 +90,7 @@ message MessageAppended {
   // the provider's grounding metadata, verbatim; empty means ungrounded.
   // Citations render from here; keeping the blob is what keeps replay honest.
   string grounding_json = 9;
+  repeated ImageAttachment attachments = 10;
 }
 
 // A provider-side tool invocation (e.g. Gemini's google_search), arrived

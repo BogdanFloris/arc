@@ -8,6 +8,7 @@ import "events.proto";
 message SendMessage {
   string session_id = 1;
   string content = 2;
+  repeated ImageAttachment attachments = 3;
 }
 
 message SessionInfo {
