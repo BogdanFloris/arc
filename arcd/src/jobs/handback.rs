@@ -103,6 +103,7 @@ fn record_handback_with(
         Some(&job.parent_session),
         &content,
         Source::System,
+        Vec::new(),
         false,
     ) else {
         return;

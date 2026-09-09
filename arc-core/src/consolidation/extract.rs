@@ -1133,6 +1133,7 @@ mod tests {
                 output_tokens: 0,
                 elapsed_ms: 0,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             }],
             latest_seq: 1,
             memory_index,
@@ -1525,6 +1526,7 @@ mod tests {
                 output_tokens: 0,
                 elapsed_ms: 0,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             });
         }
         let prompt = title_prompt(&snapshot).expect("conversation");
@@ -1548,6 +1550,7 @@ mod tests {
             output_tokens: 0,
             elapsed_ms: 0,
             grounding_json: String::new(),
+            attachments: Vec::new(),
         });
         let prompt = title_prompt(&snapshot).expect("both roles present");
         assert!(prompt.starts_with("User: hi\nAssistant: "));
@@ -1692,6 +1695,7 @@ mod tests {
                 output_tokens: 0,
                 elapsed_ms: 0,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             },
             MessageRow::ToolCall {
                 call_id: "c1".to_owned(),

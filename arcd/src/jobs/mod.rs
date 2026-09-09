@@ -14,7 +14,7 @@ use arc_core::provider::role_label;
 use arc_core::session::{
     ContinuedJob, DispatchedJob, Engine, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
 };
-use arc_proto::v1::{JobInfo, Notification, ProjectInfo, SessionRole, Source};
+use arc_proto::v1::{ImageAttachment, JobInfo, Notification, ProjectInfo, SessionRole, Source};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -165,7 +165,25 @@ impl Supervisor {
         source: Source,
         attach: bool,
     ) -> Result<SendOutcome, SessionError> {
-        send_into(&self.shared, session_id, content, source, attach)
+        self.send_with_attachments(session_id, content, source, Vec::new(), attach)
+    }
+
+    pub fn send_with_attachments(
+        &self,
+        session_id: Option<&str>,
+        content: &str,
+        source: Source,
+        attachments: Vec<ImageAttachment>,
+        attach: bool,
+    ) -> Result<SendOutcome, SessionError> {
+        send_into(
+            &self.shared,
+            session_id,
+            content,
+            source,
+            attachments,
+            attach,
+        )
     }
 
     /// Dispatch and resume, for tests. A turn that dispatches routes its
@@ -284,10 +302,21 @@ fn send_into(
     session_id: Option<&str>,
     content: &str,
     source: Source,
+    mut attachments: Vec<ImageAttachment>,
     attach: bool,
 ) -> Result<SendOutcome, SessionError> {
-    if content.trim().is_empty() {
+    if content.trim().is_empty() && attachments.is_empty() {
         return Err(SessionError::EmptyMessage);
+    }
+    arc_core::attachment::validate(&mut attachments)?;
+    let runner = match session_id {
+        Some(session_id) => turn_runner(shared, session_id)?,
+        None => chat_runner(shared)?,
+    };
+    if !attachments.is_empty() && !runner.provider.supports_images() {
+        return Err(SessionError::AttachmentsUnsupported {
+            provider: runner.provider.name().to_owned(),
+        });
     }
     // a user message ends whatever chain of system-started turns was running
     if source == Source::User {
@@ -298,16 +327,15 @@ fn send_into(
 
     let mut live = shared.live.lock().expect("live");
     if let Some(session_id) = session_id {
-        if let Some(queued) = deliver_live(shared, &live, session_id, content, source) {
+        if let Some(queued) = deliver_live(shared, &live, session_id, content, source, &attachments)
+        {
             return Ok(queued);
         }
     }
 
-    let (session_id, runner) = if let Some(session_id) = session_id {
-        (session_id.to_owned(), turn_runner(shared, session_id)?)
-    } else {
-        let runner = chat_runner(shared)?;
-        (shared.engine.create_session(&runner)?, runner)
+    let session_id = match session_id {
+        Some(session_id) => session_id.to_owned(),
+        None => shared.engine.create_session(&runner)?,
     };
     if !autonomy_allows(shared, &session_id, content, source) {
         return Ok(SendOutcome::Queued { session_id });
@@ -330,6 +358,7 @@ fn send_into(
         },
         dispatched: false,
         source,
+        attachments,
         attached: events,
         spent_tokens: 0,
     };
@@ -349,9 +378,15 @@ fn deliver_live(
     session_id: &str,
     content: &str,
     source: Source,
+    attachments: &[ImageAttachment],
 ) -> Option<SendOutcome> {
     let session = live.get(session_id)?;
-    if shared.engine.queue_message(session_id, content, source) {
+    if shared.engine.queue_message_with_attachments(
+        session_id,
+        content,
+        source,
+        attachments.to_vec(),
+    ) {
         return Some(SendOutcome::Queued {
             session_id: session_id.to_owned(),
         });
@@ -366,6 +401,7 @@ fn deliver_live(
         .send(Inbound {
             content: content.to_owned(),
             source,
+            attachments: attachments.to_vec(),
         })
         .is_ok();
     if !sent {
@@ -509,6 +545,7 @@ fn spawn_job_checked(
         job,
         dispatched: true,
         source: Source::User,
+        attachments: Vec::new(),
         attached: None,
         spent_tokens: initial_spent_tokens,
     };
@@ -597,6 +634,7 @@ fn route_continue(shared: &Shared, cont: ContinuedJob) {
             &cont.session_id,
             &cont.message,
             Source::Model,
+            &[],
         )
         .is_some()
         {
@@ -719,6 +757,41 @@ mod tests {
                 .model,
             "second-model"
         );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_picture_does_not_create_a_session() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let mut chat_runner = runner(&provider);
+        chat_runner.provider = Arc::new(arc_core::provider::openai::OpenAiCompat::new(
+            "http://127.0.0.1",
+        ));
+        let log = Log::open(dir.path()).expect("open log");
+        let projection = Projection::in_memory().expect("open projection");
+        let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
+        let supervisor = Supervisor::for_test(
+            Arc::clone(&engine),
+            BTreeMap::from([(SessionRole::Chat, chat_runner)]),
+        );
+        let image = ImageAttachment {
+            name: "picture.png".to_owned(),
+            media_type: String::new(),
+            data: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+        };
+
+        let Err(error) =
+            supervisor.send_with_attachments(None, "", Source::User, vec![image], false)
+        else {
+            panic!("the provider has no image support");
+        };
+
+        assert!(matches!(
+            error,
+            SessionError::AttachmentsUnsupported { provider } if provider == "openai-compat"
+        ));
+        assert!(replay_log(dir.path()).is_empty());
         supervisor.shutdown().await;
     }
 

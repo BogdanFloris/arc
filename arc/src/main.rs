@@ -49,6 +49,7 @@ keys:
                  j/k scroll; ctrl-u/ctrl-d page; gg/G top/end
                  M model defaults; J jobs; Q review; ? help
   running turn   type to steer; esc esc stops from insert mode
+  attachments    :attach <path>; :attach clear
   any mode       pageup/pagedown scroll; ctrl-c quits";
 
 #[tokio::main]
@@ -171,7 +172,11 @@ async fn run(
         }
         match command {
             Some(Command::Yank(text)) => yank(&text),
-            Some(command @ (Command::CancelTurn { .. } | Command::SendLive { .. })) => {
+            Some(
+                command @ (Command::CancelTurn { .. }
+                | Command::SendLive { .. }
+                | Command::SendLiveAttachments { .. }),
+            ) => {
                 control_commands.send(command).expect("control task alive");
             }
             Some(command) => commands.send(command).expect("connection task alive"),

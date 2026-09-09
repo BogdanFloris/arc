@@ -61,6 +61,10 @@ impl Provider for ScriptedProvider {
         "scripted"
     }
 
+    fn supports_images(&self) -> bool {
+        true
+    }
+
     fn complete(
         &self,
         request: CompletionRequest,
@@ -114,6 +118,7 @@ pub fn done_reply(text: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
 pub fn turn(message: &Message) -> (Role, &str) {
     match message {
         Message::Text { role, content, .. } => (*role, content.as_str()),
+        Message::UserWithAttachments { content, .. } => (Role::User, content.as_str()),
         other => panic!("expected a text message, got {other:?}"),
     }
 }
@@ -659,6 +664,7 @@ mod tests {
                     output_tokens: 0,
                     elapsed_ms: 0,
                     grounding_json: String::new(),
+                    attachments: Vec::new(),
                 },
                 MessageRow::ToolCall {
                     call_id: "c1".to_owned(),
@@ -687,6 +693,7 @@ mod tests {
             output_tokens,
             elapsed_ms: _,
             grounding_json: _,
+            attachments: _,
         } = &rows[3]
         else {
             panic!("expected the final assistant message, got {:?}", rows[3]);

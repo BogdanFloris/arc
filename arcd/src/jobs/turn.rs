@@ -5,7 +5,7 @@ use arc_core::provider::Usage;
 use arc_core::session::{
     DispatchedJob, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
 };
-use arc_proto::v1::{Budget, Notification, ReasoningDelta, Source, notification};
+use arc_proto::v1::{Budget, ImageAttachment, Notification, ReasoningDelta, Source, notification};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -30,6 +30,7 @@ pub(super) struct Task {
     /// A session the user opened does neither.
     pub(super) dispatched: bool,
     pub(super) source: Source,
+    pub(super) attachments: Vec<ImageAttachment>,
     /// The connection that sent the first message, if it asked to watch.
     pub(super) attached: Option<mpsc::Sender<TurnEvent>>,
     pub(super) spent_tokens: u64,
@@ -66,6 +67,7 @@ pub(super) async fn run_task(
         job,
         dispatched,
         source,
+        attachments,
         mut attached,
         mut spent_tokens,
     } = task;
@@ -74,6 +76,7 @@ pub(super) async fn run_task(
     let mut inbound = Inbound {
         content: job.brief.clone(),
         source,
+        attachments,
     };
     let mut first = true;
 
@@ -451,11 +454,12 @@ async fn run_turn(
     channels: &mut Channels<'_>,
 ) -> TurnOutcome {
     let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
-    let send = shared.engine.send_message_from(
+    let send = shared.engine.send_message_from_with_attachments(
         runner,
         Some(session_id),
         &inbound.content,
         inbound.source,
+        inbound.attachments.clone(),
         events,
     );
     tokio::pin!(send);

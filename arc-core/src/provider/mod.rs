@@ -7,7 +7,7 @@ pub(crate) mod stream;
 
 use std::pin::Pin;
 
-use arc_proto::v1::{Role, SessionRole};
+use arc_proto::v1::{ImageAttachment, Role, SessionRole};
 use futures::Stream;
 use futures::future::BoxFuture;
 
@@ -89,6 +89,11 @@ pub enum Message {
         content: String,
         // DeepSeek requires this replayed on the next request; never logged
         reasoning: Option<String>,
+    },
+
+    UserWithAttachments {
+        content: String,
+        attachments: Vec<ImageAttachment>,
     },
 
     ToolCalls {
@@ -177,6 +182,10 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 
     fn allowance(&self) -> BoxFuture<'_, Result<Option<AccountAllowance>, Error>> {
         Box::pin(async { Ok(None) })
+    }
+
+    fn supports_images(&self) -> bool {
+        false
     }
 
     fn complete(

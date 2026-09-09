@@ -9,6 +9,7 @@
 )]
 
 pub mod archive;
+pub mod attachment;
 pub mod client;
 pub mod consolidation;
 pub mod footprint;

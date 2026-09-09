@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use arc_proto::v1::{
     CancelJob, CancelTurn, ClientFrame, CompactSession, CreateSession, DropSteers, FetchHistory,
-    ForkSession, JobInfo, ListJobs, ListModels, ListProjects, ListSessions, MarkBranch,
-    MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList, ModelChoice,
-    Notification, ProjectInfo, SelectModel, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionRole, Subscribe, branch_marked, client_frame, server_frame,
+    ForkSession, ImageAttachment, JobInfo, ListJobs, ListModels, ListProjects, ListSessions,
+    MarkBranch, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList,
+    ModelChoice, Notification, ProjectInfo, SelectModel, SendMessage, ServerFrame, SessionHistory,
+    SessionInfo, SessionRole, Subscribe, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -389,10 +389,22 @@ impl Client {
         session_id: Option<&str>,
         content: &str,
     ) -> Result<Turn<'_>, Error> {
+        self.send_message_with_attachments(session_id, content, Vec::new())
+            .await
+    }
+
+    #[tracing::instrument(name = "client.send_message", skip_all)]
+    pub async fn send_message_with_attachments(
+        &mut self,
+        session_id: Option<&str>,
+        content: &str,
+        attachments: Vec<ImageAttachment>,
+    ) -> Result<Turn<'_>, Error> {
         let request_id = self
             .send(client_frame::Msg::SendMessage(SendMessage {
                 session_id: session_id.unwrap_or_default().to_owned(),
                 content: content.to_owned(),
+                attachments,
             }))
             .await?;
         Ok(Turn {

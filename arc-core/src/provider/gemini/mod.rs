@@ -302,6 +302,11 @@ fn contents(messages: &[Message]) -> Result<Vec<Content<'_>>, Error> {
                     }],
                 });
             }
+            Message::UserWithAttachments { .. } => {
+                return Err(Error::InvalidRequest(
+                    "this provider does not support picture attachments".to_owned(),
+                ));
+            }
             Message::ToolCalls { calls, .. } => {
                 let mut parts = Vec::with_capacity(calls.len());
                 for call in calls {

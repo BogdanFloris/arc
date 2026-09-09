@@ -174,9 +174,23 @@ pub async fn run_control(
                 session_id,
                 content,
             } => match connected.send_message(Some(&session_id), &content).await {
-                Ok(turn) => drive_turn(turn, &events).await,
+                Ok(turn) => drive_turn(turn, &events, Vec::new()).await,
                 Err(error) => Err(error),
             },
+            Command::SendLiveAttachments {
+                session_id,
+                content,
+                attachments,
+            } => {
+                let tracked = attachments.clone();
+                match connected
+                    .send_message_with_attachments(Some(&session_id), &content, attachments)
+                    .await
+                {
+                    Ok(turn) => drive_turn(turn, &events, tracked).await,
+                    Err(error) => Err(error),
+                }
+            }
             _ => {
                 client = Some(connected);
                 continue;
@@ -264,6 +278,20 @@ async fn handle(
             session_id,
             content,
         } => send(&mut client, session_id.as_deref(), &content, events).await,
+        Command::SendAttachments {
+            session_id,
+            content,
+            attachments,
+        } => {
+            send_attachments(
+                &mut client,
+                session_id.as_deref(),
+                &content,
+                attachments,
+                events,
+            )
+            .await
+        }
         Command::ReviewList { since_micros } => {
             review_list(&mut client, since_micros, events).await
         }
@@ -299,7 +327,10 @@ async fn handle(
         }
         // main.rs writes the OSC 52 sequence itself; this never reaches the
         // socket, and CancelTurn/SendLive go to run_control's own connection
-        Command::CancelTurn { .. } | Command::SendLive { .. } | Command::Yank(_) => Ok(()),
+        Command::CancelTurn { .. }
+        | Command::SendLive { .. }
+        | Command::SendLiveAttachments { .. }
+        | Command::Yank(_) => Ok(()),
     };
     match result {
         Ok(()) => Some(client),
@@ -538,7 +569,21 @@ async fn send(
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
     let turn = client.send_message(session_id, content).await?;
-    drive_turn(turn, events).await
+    drive_turn(turn, events, Vec::new()).await
+}
+
+async fn send_attachments(
+    client: &mut Client,
+    session_id: Option<&str>,
+    content: &str,
+    attachments: Vec<arc_proto::v1::ImageAttachment>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<(), Error> {
+    let tracked = attachments.clone();
+    let turn = client
+        .send_message_with_attachments(session_id, content, attachments)
+        .await?;
+    drive_turn(turn, events, tracked).await
 }
 
 /// Drives a turn to completion, mapping each event to the app. Shared by the
@@ -547,8 +592,22 @@ async fn send(
 async fn drive_turn(
     mut turn: Turn<'_>,
     events: &mpsc::UnboundedSender<NetEvent>,
+    attachments: Vec<arc_proto::v1::ImageAttachment>,
 ) -> Result<(), Error> {
+    let mut accepted = false;
     while let Some(event) = turn.next().await? {
+        match &event {
+            TurnEvent::Accepted { .. } => {
+                accepted = true;
+                if !attachments.is_empty() {
+                    let _ = events.send(NetEvent::AttachmentsAccepted(attachments.clone()));
+                }
+            }
+            TurnEvent::Failed { .. } if !accepted && !attachments.is_empty() => {
+                let _ = events.send(NetEvent::AttachmentsFailed(attachments.clone()));
+            }
+            _ => {}
+        }
         let _ = events.send(map_turn_event(event));
     }
     Ok(())

@@ -248,6 +248,11 @@ fn wire_message(message: &Message, emit_reasoning: bool) -> Result<WireMessage<'
             content,
             reasoning,
         } => (role, content, reasoning),
+        Message::UserWithAttachments { .. } => {
+            return Err(Error::InvalidRequest(
+                "this provider does not support picture attachments".to_owned(),
+            ));
+        }
         Message::ToolCalls { calls, reasoning } => {
             return Ok(WireMessage::ToolCalls {
                 role: "assistant",

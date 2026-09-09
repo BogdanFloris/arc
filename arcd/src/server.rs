@@ -311,7 +311,18 @@ async fn send_message(
 ) -> ControlFlow<()> {
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
-    match supervisor.send(session_id, &send.content, Source::User, true) {
+    let result = if send.attachments.is_empty() {
+        supervisor.send(session_id, &send.content, Source::User, true)
+    } else {
+        supervisor.send_with_attachments(
+            session_id,
+            &send.content,
+            Source::User,
+            send.attachments,
+            true,
+        )
+    };
+    match result {
         Ok(SendOutcome::Started { session_id, events }) => {
             let Some(events) = events else {
                 return flow(
@@ -864,6 +875,8 @@ fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
 fn error_code(error: &SessionError) -> &'static str {
     match error {
         SessionError::EmptyMessage => "empty_message",
+        SessionError::Attachment(_) => "invalid_attachment",
+        SessionError::AttachmentsUnsupported { .. } => "unsupported_attachment",
         SessionError::NoRunner { .. } => "no_runner",
         SessionError::EmptyReply => "empty_reply",
         SessionError::Cancelled => "cancelled",
@@ -954,11 +967,11 @@ mod tests {
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
         CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, HistoryEntry,
-        HistoryMessage, HistoryToolCall, HistoryToolResult, ListJobs, ListModels, ListProjects,
-        ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryReviewAccept,
-        MemoryReviewDelete, MemoryReviewList, Notification, ProjectInfo, Role, SelectModel,
-        SessionCreated, SessionEvent, SessionRole, Subscribe, ToolOutcome, event, job_info,
-        memory_event, memory_record, notification, session_event,
+        HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment, ListJobs, ListModels,
+        ListProjects, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Notification, ProjectInfo, Role,
+        SelectModel, SessionCreated, SessionEvent, SessionRole, Subscribe, ToolOutcome, event,
+        job_info, memory_event, memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1004,6 +1017,10 @@ mod tests {
             "mock"
         }
 
+        fn supports_images(&self) -> bool {
+            true
+        }
+
         fn complete(
             &self,
             request: CompletionRequest,
@@ -1021,6 +1038,9 @@ mod tests {
                                     content,
                                     ..
                                 } => Some(content.clone()),
+                                Message::UserWithAttachments { content, .. } => {
+                                    Some(content.clone())
+                                }
                                 _ => None,
                             })
                             .unwrap_or_default();
@@ -1342,6 +1362,7 @@ mod tests {
         client_frame::Msg::SendMessage(SendMessage {
             session_id: session_id.to_owned(),
             content: content.to_owned(),
+            attachments: Vec::new(),
         })
     }
 
@@ -1501,6 +1522,45 @@ mod tests {
         assert!(!end.partial);
         assert!(!end.step_capped, "the turn finished on its own");
         assert!(!end.queued, "this connection streamed the turn it started");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn picture_bytes_cross_the_wire_and_history_shows_a_placeholder() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+        send(
+            &mut ws,
+            7,
+            client_frame::Msg::SendMessage(SendMessage {
+                session_id: String::new(),
+                content: "describe".to_owned(),
+                attachments: vec![ImageAttachment {
+                    name: "/tmp/screen.png".to_owned(),
+                    media_type: "ignored".to_owned(),
+                    data: b"\x89PNG\r\n\x1a\nwire bytes".to_vec(),
+                }],
+            }),
+        )
+        .await;
+        let (session_id, text, _) = turn(&mut ws, 7).await;
+        assert_eq!(text, "re: describe");
+
+        let request = &harness.provider.requests()[0];
+        assert!(matches!(
+            &request.messages[0],
+            Message::UserWithAttachments { attachments, .. }
+                if attachments[0].name == "screen.png"
+                    && attachments[0].media_type == "image/png"
+                    && attachments[0].data == b"\x89PNG\r\n\x1a\nwire bytes"
+        ));
+        let history = history(&mut ws, 8, &session_id).await;
+        let message = said(&history)
+            .into_iter()
+            .find(|(role, _)| *role == Role::User)
+            .expect("user message");
+        assert_eq!(message.1, "[image: screen.png]\ndescribe");
 
         harness.stop().await;
     }

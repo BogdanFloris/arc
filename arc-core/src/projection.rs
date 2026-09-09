@@ -4,12 +4,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use arc_proto::v1::{
     BranchMarked, Event, HistoryEntry, HistoryMessage, HistoryServerCall, HistoryToolCall,
-    HistoryToolResult, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
-    MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance,
-    ProvenanceEntry, Role, RoleEvent, RoleModelSelected, ServerCallRecorded, SessionCompacted,
-    SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled, Source,
-    ToolCallIssued, ToolResultRecorded, event, history_entry, memory_event, memory_record,
-    role_event, session_event,
+    HistoryToolResult, ImageAttachment, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+    MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated,
+    MessageAppended, Provenance, ProvenanceEntry, Role, RoleEvent, RoleModelSelected,
+    ServerCallRecorded, SessionCompacted, SessionConsolidated, SessionCreated, SessionEvent,
+    SessionRole, SessionTitled, Source, ToolCallIssued, ToolResultRecorded, event, history_entry,
+    memory_event, memory_record, role_event, session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -27,7 +27,7 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 20;
+pub(crate) const SCHEMA_VERSION: u32 = 21;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -88,6 +88,19 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
+
+CREATE TABLE IF NOT EXISTS message_attachments (
+    session_id  TEXT NOT NULL,
+    message_seq INTEGER NOT NULL,
+    position    INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    media_type  TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    PRIMARY KEY (message_seq, position)
+);
+
+CREATE INDEX IF NOT EXISTS message_attachments_by_session
+    ON message_attachments (session_id, message_seq, position);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
@@ -216,6 +229,7 @@ pub enum MessageRow {
         output_tokens: u32,
         elapsed_ms: u32,
         grounding_json: String,
+        attachments: Vec<ImageAttachment>,
     },
     ToolCall {
         call_id: String,
@@ -1253,6 +1267,26 @@ pub(crate) fn messages(conn: &Connection, session_id: &str) -> Result<Vec<Messag
 }
 
 fn messages_with_seq(conn: &Connection, session_id: &str) -> Result<Vec<(u64, MessageRow)>, Error> {
+    let mut attachment_stmt = conn.prepare(
+        "SELECT message_seq, name, media_type, data
+         FROM message_attachments WHERE session_id = ?1 ORDER BY message_seq, position",
+    )?;
+    let attachment_rows = attachment_stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            ImageAttachment {
+                name: row.get(1)?,
+                media_type: row.get(2)?,
+                data: row.get(3)?,
+            },
+        ))
+    })?;
+    let mut attachments: std::collections::HashMap<i64, Vec<ImageAttachment>> =
+        std::collections::HashMap::new();
+    for row in attachment_rows {
+        let (seq, attachment) = row?;
+        attachments.entry(seq).or_default().push(attachment);
+    }
     let mut stmt = conn.prepare(
         "SELECT seq, kind, role, content, partial, turn_id,
                 call_id, call_index, name, arguments_json, outcome, truncated,
@@ -1274,6 +1308,9 @@ fn messages_with_seq(conn: &Connection, session_id: &str) -> Result<Vec<(u64, Me
                 output_tokens: nonneg_u32(row.get::<_, Option<i64>>(15)?),
                 elapsed_ms: nonneg_u32(row.get::<_, Option<i64>>(16)?),
                 grounding_json: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+                attachments: attachments
+                    .remove(&row.get::<_, i64>(0)?)
+                    .unwrap_or_default(),
             },
             KIND_TOOL_CALL => MessageRow::ToolCall {
                 call_id: row.get(6)?,
@@ -1389,6 +1426,7 @@ fn summary_row(summary: String) -> MessageRow {
         output_tokens: 0,
         elapsed_ms: 0,
         grounding_json: String::new(),
+        attachments: Vec::new(),
     }
 }
 
@@ -1554,10 +1592,11 @@ pub(crate) fn history_entry(row: MessageRow) -> HistoryEntry {
             output_tokens,
             elapsed_ms,
             grounding_json,
+            attachments,
             ..
         } => history_entry::Entry::Message(HistoryMessage {
             role,
-            content,
+            content: crate::attachment::display_text(&content, &attachments),
             partial,
             source,
             input_tokens,
@@ -1800,6 +1839,21 @@ fn insert_message(
             empty_as_null(&appended.grounding_json),
         ],
     )?;
+    for (position, attachment) in appended.attachments.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO message_attachments
+                 (session_id, message_seq, position, name, media_type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &appended.session_id,
+                seq_param(event.seq)?,
+                i64::try_from(position).unwrap_or(i64::MAX),
+                &attachment.name,
+                &attachment.media_type,
+                &attachment.data,
+            ],
+        )?;
+    }
     index_content(tx, event.seq, &appended.content)
 }
 
@@ -2272,12 +2326,12 @@ mod tests {
     use std::path::Path;
 
     use arc_proto::v1::{
-        BranchMarked, Event, MemoryEvent, MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted,
-        MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry,
-        Role, ServerCallRecorded, SessionCompacted, SessionConsolidated, SessionCreated,
-        SessionEvent, SessionRole, SessionTitled, Source, ToolCallIssued, ToolOutcome,
-        ToolResultRecorded, WorkspaceGrant, event, history_entry, memory_event, memory_record,
-        session_event,
+        BranchMarked, Event, ImageAttachment, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+        MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended,
+        Provenance, ProvenanceEntry, Role, ServerCallRecorded, SessionCompacted,
+        SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled, Source,
+        ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event, history_entry,
+        memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
     use rusqlite::{Connection, OptionalExtension};
@@ -2504,6 +2558,7 @@ mod tests {
             "memory_fts_docsize",
             "memory_fts_idx",
             "memory_records",
+            "message_attachments",
             "messages",
             "messages_fts",
             "messages_fts_config",
@@ -2954,6 +3009,7 @@ mod tests {
                     output_tokens: 0,
                     elapsed_ms: 0,
                     grounding_json: String::new(),
+                    attachments: Vec::new(),
                 },
                 MessageRow::ToolCall {
                     call_id: "c-a".to_string(),
@@ -3007,6 +3063,7 @@ mod tests {
                 output_tokens: 0,
                 elapsed_ms: 0,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             }
         );
         assert_eq!(
@@ -3055,6 +3112,7 @@ mod tests {
                 output_tokens: 0,
                 elapsed_ms: 0,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             },
             "a zero-usage event leaves zeros"
         );
@@ -3070,6 +3128,7 @@ mod tests {
                 output_tokens: 140,
                 elapsed_ms: 1500,
                 grounding_json: String::new(),
+                attachments: Vec::new(),
             },
             "the event's usage lands in the columns"
         );
@@ -3450,6 +3509,7 @@ mod tests {
             output_tokens: 0,
             elapsed_ms: 0,
             grounding_json: String::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -3464,7 +3524,51 @@ mod tests {
             output_tokens: 0,
             elapsed_ms: 0,
             grounding_json: String::new(),
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_fork_after_compaction_keeps_uncompacted_picture_bytes() {
+        let mut projection = Projection::in_memory().expect("open");
+        projection.apply(&session_created(0)).expect("root");
+        projection.apply(&message_appended(1, "old")).expect("old");
+        let mut image = message_appended(2, "inspect this");
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::MessageAppended(message)),
+        })) = &mut image.payload
+        {
+            message.attachments.push(ImageAttachment {
+                name: "screen.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                data: b"\x89PNG\r\n\x1a\nstable".to_vec(),
+            });
+        }
+        projection.apply(&image).expect("image");
+        projection
+            .apply(&session_compacted(3, "s-01", 1, "summary"))
+            .expect("compact");
+        projection
+            .apply(&message_appended(4, "after"))
+            .expect("after");
+        projection
+            .apply(&fork_created(5, "s-child", "s-01", 4))
+            .expect("child");
+
+        let rows = projection.lineage_messages("s-child").expect("lineage");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], summary_row("summary"));
+        let MessageRow::Message { attachments, .. } = &rows[1] else {
+            panic!("picture is a message");
+        };
+        assert_eq!(attachments[0].name, "screen.png");
+        assert_eq!(attachments[0].data, b"\x89PNG\r\n\x1a\nstable");
+        let history = super::history_entry(rows[1].clone());
+        let Some(history_entry::Entry::Message(message)) = history.entry else {
+            panic!("picture is visible in history");
+        };
+        assert_eq!(message.content, "[image: screen.png]\ninspect this");
     }
 
     #[test]

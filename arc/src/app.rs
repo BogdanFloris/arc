@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
-    HistoryEntry, HistoryMessage, JobInfo, ModelChoice, ProjectInfo, Role, SessionInfo,
-    SessionRole, Source, ToolOutcome, branch_marked, history_entry, job_info,
+    HistoryEntry, HistoryMessage, ImageAttachment, JobInfo, ModelChoice, ProjectInfo, Role,
+    SessionInfo, SessionRole, Source, ToolOutcome, branch_marked, history_entry, job_info,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -24,6 +24,16 @@ pub enum Command {
     SendLive {
         session_id: String,
         content: String,
+    },
+    SendAttachments {
+        session_id: Option<String>,
+        content: String,
+        attachments: Vec<ImageAttachment>,
+    },
+    SendLiveAttachments {
+        session_id: String,
+        content: String,
+        attachments: Vec<ImageAttachment>,
     },
     ReviewList {
         since_micros: i64,
@@ -83,6 +93,8 @@ pub enum NetEvent {
     Accepted {
         session_id: String,
     },
+    AttachmentsAccepted(Vec<ImageAttachment>),
+    AttachmentsFailed(Vec<ImageAttachment>),
     Delta(String),
     Reasoning(String),
     ToolStarted {
@@ -313,7 +325,9 @@ pub struct App {
     /// A message typed while streaming but before the session id is known
     /// (the first message of a brand-new session): sent as `Send` once an
     /// `Accepted` names the session, the way `pending_first` already works.
-    pending_live: Option<String>,
+    pending_live: Option<(String, Vec<ImageAttachment>)>,
+    pending_attachments: Vec<ImageAttachment>,
+    sending_attachments: VecDeque<Vec<ImageAttachment>>,
     thinking_since: Option<Instant>,
     turn_started: Option<Instant>,
     streamed_chars: usize,
@@ -333,7 +347,7 @@ pub struct App {
     pending_rewind_text: Option<String>,
     session_meta: HashMap<String, (SessionRole, String, Source)>,
     pending_code: Option<(SessionRole, String)>,
-    pending_first: Option<String>,
+    pending_first: Option<(String, Vec<ImageAttachment>)>,
     pub review_pending: u32,
     launch_dir: Option<PathBuf>,
     seeded_projects: Vec<ProjectInfo>,
@@ -404,6 +418,10 @@ impl App {
             _ => None,
         }
     }
+
+    pub fn pending_attachments(&self) -> &[ImageAttachment] {
+        &self.pending_attachments
+    }
     pub fn new() -> Self {
         Self {
             herdr_enabled: false,
@@ -435,6 +453,8 @@ impl App {
             yank_note: None,
             live_streams: 0,
             pending_live: None,
+            pending_attachments: Vec::new(),
+            sending_attachments: VecDeque::new(),
             thinking_since: None,
             turn_started: None,
             streamed_chars: 0,
@@ -1097,11 +1117,16 @@ impl App {
                     "status" => self.overlay = Overlay::SessionStatus,
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
+                    "attach clear" => self.clear_attachments(),
                     cmd => match cmd.strip_prefix("code ") {
                         Some(project) => return self.open_code(project.trim()),
-                        None => {
-                            self.last_error = Some(format!("Unknown command :{cmd}; use :help"));
-                        }
+                        None => match cmd.strip_prefix("attach ") {
+                            Some(path) => self.attach(path.trim()),
+                            None => {
+                                self.last_error =
+                                    Some(format!("Unknown command :{cmd}; use :help"));
+                            }
+                        },
                     },
                 }
             }
@@ -1164,6 +1189,39 @@ impl App {
             return None;
         };
         Some(Command::CompactSession { session_id })
+    }
+
+    fn attach(&mut self, path: &str) {
+        if path.is_empty() {
+            self.last_error = Some("attach: provide an image path".to_owned());
+            return;
+        }
+        match arc_core::attachment::load(Path::new(path)) {
+            Ok(attachment) => {
+                self.pending_attachments.push(attachment);
+                if let Err(error) = arc_core::attachment::validate(&mut self.pending_attachments) {
+                    self.pending_attachments.pop();
+                    self.last_error = Some(format!("attach: {error}"));
+                    return;
+                }
+                self.last_error = None;
+                self.yank_note = self
+                    .pending_attachments
+                    .last()
+                    .map(|attachment| format!("attached {}", attachment.name));
+            }
+            Err(error) => self.last_error = Some(format!("attach: {error}")),
+        }
+    }
+
+    fn clear_attachments(&mut self) {
+        let count = self.pending_attachments.len();
+        self.pending_attachments.clear();
+        self.yank_note = Some(if count == 0 {
+            "no pending images".to_owned()
+        } else {
+            format!("cleared {count} image attachment(s)")
+        });
     }
 
     fn fork_selected_visual(&mut self) -> Option<Command> {
@@ -1812,6 +1870,7 @@ impl App {
         }
         self.pending_code = None;
         self.pending_first = None;
+        self.pending_attachments.clear();
         if self.session_id != session_id {
             self.previous_session = self.session_id.clone();
         }
@@ -1842,33 +1901,46 @@ impl App {
 
     fn submit(&mut self) -> Option<Command> {
         let content = self.input.trim().to_owned();
-        if content.is_empty() {
+        if content.is_empty() && self.pending_attachments.is_empty() {
             return None;
         }
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        let shown = arc_core::attachment::display_text(&content, &attachments);
         self.input.clear();
         self.cursor = 0;
         self.scroll_back = 0;
-        self.push_block(Block::You(content.clone()));
+        self.push_block(Block::You(shown));
         if self.status == Status::Streaming {
             if let Some(session_id) = self.session_id.clone() {
-                return Some(Command::SendLive {
-                    session_id,
-                    content,
+                if !attachments.is_empty() {
+                    self.sending_attachments.push_back(attachments.clone());
+                }
+                return Some(if attachments.is_empty() {
+                    Command::SendLive {
+                        session_id,
+                        content,
+                    }
+                } else {
+                    Command::SendLiveAttachments {
+                        session_id,
+                        content,
+                        attachments,
+                    }
                 });
             }
             // the first message of a brand-new session: no session id to
             // steer into yet, so hold it for the accept that names one
-            self.pending_live = Some(content);
+            self.pending_live = Some((content, attachments));
             return None;
         }
         if self.session_id.is_none() {
             if let Some((role, project)) = self.pending_code.clone() {
                 self.status = Status::Streaming;
-                self.pending_first = Some(content);
+                self.pending_first = Some((content, attachments));
                 return Some(Command::CreateSession { role, project });
             }
         }
-        Some(self.send(content))
+        Some(self.send_with_attachments(content, attachments))
     }
 
     pub fn stop_escape_count(&self) -> Option<u8> {
@@ -1892,14 +1964,29 @@ impl App {
         Some(Command::CancelTurn { session_id })
     }
 
-    fn send(&mut self, content: String) -> Command {
+    fn send_with_attachments(
+        &mut self,
+        content: String,
+        attachments: Vec<ImageAttachment>,
+    ) -> Command {
         self.status = Status::Streaming;
         self.last_error = None;
         self.turn_started = Some(Instant::now());
         self.streamed_chars = 0;
-        Command::Send {
-            session_id: self.session_id.clone(),
-            content,
+        if !attachments.is_empty() {
+            self.sending_attachments.push_back(attachments.clone());
+        }
+        if attachments.is_empty() {
+            Command::Send {
+                session_id: self.session_id.clone(),
+                content,
+            }
+        } else {
+            Command::SendAttachments {
+                session_id: self.session_id.clone(),
+                content,
+                attachments,
+            }
         }
     }
 
@@ -2008,8 +2095,18 @@ impl App {
                         partial: false,
                     });
                 }
-                if let Some(live) = self.pending_live.take() {
-                    return Some(self.send(live));
+                if let Some((content, attachments)) = self.pending_live.take() {
+                    return Some(self.send_with_attachments(content, attachments));
+                }
+                None
+            }
+            NetEvent::AttachmentsAccepted(attachments) => {
+                self.remove_sending_attachments(&attachments);
+                None
+            }
+            NetEvent::AttachmentsFailed(attachments) => {
+                if let Some(mut attachments) = self.remove_sending_attachments(&attachments) {
+                    self.pending_attachments.append(&mut attachments);
                 }
                 None
             }
@@ -2126,7 +2223,13 @@ impl App {
             }
             NetEvent::Failed { code, msg } => {
                 self.live_streams = self.live_streams.saturating_sub(1);
-                self.pending_first = None;
+                if let Some((content, mut attachments)) = self.pending_first.take() {
+                    if self.input.is_empty() {
+                        self.input = content;
+                        self.cursor = self.input.len();
+                    }
+                    self.pending_attachments.append(&mut attachments);
+                }
                 self.pending_rewind_text = None;
                 self.finalize_thinking();
                 self.pop_empty_reply();
@@ -2241,8 +2344,8 @@ impl App {
                         .insert(session_id.clone(), (role, project, Source::User));
                 }
                 self.session_id = Some(session_id);
-                let first = self.pending_first.take()?;
-                Some(self.send(first))
+                let (content, attachments) = self.pending_first.take()?;
+                Some(self.send_with_attachments(content, attachments))
             }
             NetEvent::SessionForked { session_id } => {
                 let command = self.start_session(Some(session_id));
@@ -2258,6 +2361,9 @@ impl App {
                 Some(Command::History { session_id })
             }
             NetEvent::Disconnected { reason } => {
+                for mut attachments in self.sending_attachments.drain(..) {
+                    self.pending_attachments.append(&mut attachments);
+                }
                 self.turn_started = None;
                 self.live_streams = 0;
                 self.last_error = Some("disconnected".to_owned());
@@ -2269,6 +2375,17 @@ impl App {
                 None
             }
         }
+    }
+
+    fn remove_sending_attachments(
+        &mut self,
+        attachments: &[ImageAttachment],
+    ) -> Option<Vec<ImageAttachment>> {
+        let position = self
+            .sending_attachments
+            .iter()
+            .position(|sending| sending == attachments)?;
+        self.sending_attachments.remove(position)
     }
 
     fn turn_over(&mut self) {
@@ -4447,6 +4564,116 @@ mod tests {
         normal(&mut app, ":q");
         app.on_key(key(KeyCode::Enter));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn attach_queues_image_bytes_for_the_next_message_and_clear_discards_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("screen.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nbody").unwrap();
+        let mut app = App::new();
+
+        normal(&mut app, &format!(":attach {}", path.display()));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.pending_attachments.len(), 1);
+        assert_eq!(app.pending_attachments[0].name, "screen.png");
+
+        app.mode = Mode::Insert;
+        typed(&mut app, "what is this?");
+        let command = app.on_key(key(KeyCode::Enter));
+        let Some(Command::SendAttachments {
+            content,
+            attachments,
+            ..
+        }) = command
+        else {
+            panic!("the next message carries the picture");
+        };
+        assert_eq!(content, "what is this?");
+        assert_eq!(attachments[0].data, b"\x89PNG\r\n\x1a\nbody");
+        assert_eq!(
+            app.block_contents(),
+            [Block::You("[image: screen.png]\nwhat is this?".to_owned())]
+        );
+        assert!(app.pending_attachments.is_empty());
+
+        app.on_net(NetEvent::AttachmentsFailed(attachments));
+        app.on_net(NetEvent::Failed {
+            code: "unsupported_attachment".to_owned(),
+            msg: "not supported".to_owned(),
+        });
+        assert_eq!(app.pending_attachments.len(), 1);
+        normal(&mut app, ":attach clear");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_attachment_does_not_replace_an_existing_pending_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("good.webp");
+        std::fs::write(&image, b"RIFFxxxxWEBPbody").unwrap();
+        let text = dir.path().join("not-image.txt");
+        std::fs::write(&text, b"hello").unwrap();
+        let mut app = App::new();
+
+        normal(&mut app, &format!(":attach {}", image.display()));
+        app.on_key(key(KeyCode::Enter));
+        normal(&mut app, &format!(":attach {}", text.display()));
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.pending_attachments.len(), 1);
+        assert_eq!(app.pending_attachments[0].name, "good.webp");
+        assert!(app.last_error.as_deref().unwrap().contains("unsupported"));
+    }
+
+    #[test]
+    fn each_send_restores_only_its_own_attachments_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.png");
+        std::fs::write(&first, b"\x89PNG\r\n\x1a\nfirst").unwrap();
+        std::fs::write(&second, b"\x89PNG\r\n\x1a\nsecond").unwrap();
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+
+        normal(&mut app, &format!(":attach {}", first.display()));
+        app.on_key(key(KeyCode::Enter));
+        app.mode = Mode::Insert;
+        typed(&mut app, "first");
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::SendAttachments { .. })
+        ));
+
+        normal(&mut app, &format!(":attach {}", second.display()));
+        app.on_key(key(KeyCode::Enter));
+        app.mode = Mode::Insert;
+        typed(&mut app, "second");
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::SendLiveAttachments { .. })
+        ));
+        let first_sent = app.sending_attachments[0].clone();
+        let second_sent = app.sending_attachments[1].clone();
+
+        app.on_net(NetEvent::AttachmentsFailed(second_sent));
+        app.on_net(NetEvent::Failed {
+            code: "bad_attachment".to_owned(),
+            msg: "rejected".to_owned(),
+        });
+        app.on_net(NetEvent::AttachmentsAccepted(first_sent));
+        app.on_net(NetEvent::Accepted {
+            session_id: "s-1".to_owned(),
+        });
+
+        assert_eq!(
+            app.pending_attachments
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second.png"]
+        );
     }
 
     #[test]

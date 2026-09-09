@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use arc_proto::v1::{
-    BranchMarked, Budget, MemoryEvent, MessageAppended, ModelChoice as WireModelChoice, ModelList,
-    Notification, ReviewChanged, Role, RoleEvent, RoleModelSelected, ServerCallRecorded,
-    SessionAppended, SessionCompacted, SessionCreated, SessionEvent, SessionRole, Source,
-    ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, branch_marked,
+    BranchMarked, Budget, ImageAttachment, MemoryEvent, MessageAppended,
+    ModelChoice as WireModelChoice, ModelList, Notification, ReviewChanged, Role, RoleEvent,
+    RoleModelSelected, ServerCallRecorded, SessionAppended, SessionCompacted, SessionCreated,
+    SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
+    WorkspaceGrant, branch_marked,
 };
 use arc_proto::v1::{event, memory_event, notification, role_event, session_event};
 use futures::StreamExt as _;
@@ -94,6 +95,7 @@ pub struct Engine {
 pub struct Inbound {
     pub content: String,
     pub source: Source,
+    pub attachments: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +174,12 @@ pub enum Error {
 
     #[error("refusing to send an empty message")]
     EmptyMessage,
+
+    #[error("image attachment: {0}")]
+    Attachment(#[from] crate::attachment::Error),
+
+    #[error("the {provider} provider does not support picture attachments")]
+    AttachmentsUnsupported { provider: String },
 
     #[error("no runner is configured for the {role} role")]
     NoRunner { role: String },
@@ -300,6 +308,16 @@ impl Engine {
     /// step boundary. Returns whether a turn was live and accepted it; a
     /// caller sees `false` when it must start a turn itself instead.
     pub fn queue_message(&self, session_id: &str, content: &str, source: Source) -> bool {
+        self.queue_message_with_attachments(session_id, content, source, Vec::new())
+    }
+
+    pub fn queue_message_with_attachments(
+        &self,
+        session_id: &str,
+        content: &str,
+        source: Source,
+        attachments: Vec<ImageAttachment>,
+    ) -> bool {
         let live = self.live_turns.lock().expect("live turns lock poisoned");
         match live.get(session_id) {
             Some(turn) => turn
@@ -307,6 +325,7 @@ impl Engine {
                 .send(Inbound {
                     content: content.to_owned(),
                     source,
+                    attachments,
                 })
                 .is_ok(),
             None => false,
@@ -1104,8 +1123,34 @@ impl Engine {
         source: Source,
         events: mpsc::Sender<EngineEvent>,
     ) -> Result<Reply, Error> {
-        if content.trim().is_empty() {
+        self.send_message_from_with_attachments(
+            runner,
+            session_id,
+            content,
+            source,
+            Vec::new(),
+            events,
+        )
+        .await
+    }
+
+    pub async fn send_message_from_with_attachments(
+        &self,
+        runner: &Runner,
+        session_id: Option<&str>,
+        content: &str,
+        source: Source,
+        mut attachments: Vec<ImageAttachment>,
+        events: mpsc::Sender<EngineEvent>,
+    ) -> Result<Reply, Error> {
+        if content.trim().is_empty() && attachments.is_empty() {
             return Err(Error::EmptyMessage);
+        }
+        crate::attachment::validate(&mut attachments)?;
+        if !attachments.is_empty() && !runner.provider.supports_images() {
+            return Err(Error::AttachmentsUnsupported {
+                provider: runner.provider.name().to_owned(),
+            });
         }
         let span = tracing::Span::current();
         let (session_id, new_session) = match session_id {
@@ -1153,6 +1198,7 @@ impl Engine {
                 content: content.to_owned(),
                 partial: false,
                 turn_id: turn_id.clone(),
+                attachments,
                 ..Default::default()
             }),
         )?;
@@ -1969,14 +2015,22 @@ impl Engine {
                     content: inbound.content.clone(),
                     partial: false,
                     turn_id: turn_id.to_owned(),
+                    attachments: inbound.attachments.clone(),
                     ..Default::default()
                 }),
             )?;
-            transcript.push(Message::Text {
-                role: Role::User,
-                content: inbound.content,
-                reasoning: None,
-            });
+            if inbound.attachments.is_empty() {
+                transcript.push(Message::Text {
+                    role: Role::User,
+                    content: inbound.content,
+                    reasoning: None,
+                });
+            } else {
+                transcript.push(Message::UserWithAttachments {
+                    content: inbound.content,
+                    attachments: inbound.attachments,
+                });
+            }
             tracing::info!(
                 session_id,
                 source = ?inbound.source,
@@ -2011,6 +2065,7 @@ impl Engine {
                 output_tokens: usage.output_tokens,
                 elapsed_ms,
                 grounding_json,
+                attachments: Vec::new(),
             }),
         )
     }
@@ -2434,13 +2489,25 @@ fn rebuild_transcript(rows: &[MessageRow]) -> Vec<Message> {
     let mut i = 0;
     while i < rows.len() {
         match &rows[i] {
-            MessageRow::Message { role, content, .. } => {
+            MessageRow::Message {
+                role,
+                content,
+                attachments,
+                ..
+            } => {
                 if let Ok(mapped @ (Role::User | Role::Assistant)) = Role::try_from(*role) {
-                    messages.push(Message::Text {
-                        role: mapped,
-                        content: content.clone(),
-                        reasoning: None,
-                    });
+                    if mapped == Role::User && !attachments.is_empty() {
+                        messages.push(Message::UserWithAttachments {
+                            content: content.clone(),
+                            attachments: attachments.clone(),
+                        });
+                    } else {
+                        messages.push(Message::Text {
+                            role: mapped,
+                            content: content.clone(),
+                            reasoning: None,
+                        });
+                    }
                 } else {
                     tracing::warn!(role, "skipping history message with an unmappable role");
                 }
@@ -2636,9 +2703,9 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, MemoryRecord,
-        MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome,
-        history_entry, memory_event, memory_record, session_event,
+        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment,
+        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source,
+        ToolOutcome, history_entry, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -2668,6 +2735,23 @@ mod tests {
             .into_iter()
             .filter(|event| !matches!(event, session_event::Event::ContextMeasured(_)))
             .collect()
+    }
+
+    #[derive(Debug)]
+    struct TextOnlyProvider;
+
+    impl Provider for TextOnlyProvider {
+        fn name(&self) -> &'static str {
+            "text-only"
+        }
+
+        fn complete(
+            &self,
+            _request: crate::provider::CompletionRequest,
+        ) -> futures::future::BoxFuture<'_, Result<crate::provider::CompletionStream, ProviderError>>
+        {
+            Box::pin(async { panic!("an unsupported picture must not reach the provider") })
+        }
     }
 
     #[tokio::test]
@@ -2780,6 +2864,102 @@ mod tests {
         assert_eq!(measurements[1].input_tokens, 84_000);
         assert_eq!(measurements[1].context_window, Some(272_000));
         assert_eq!(measurements[1].compact_at, Some(217_600));
+    }
+
+    #[tokio::test]
+    async fn picture_bytes_survive_replay_and_return_to_the_provider() {
+        let dir = TempDir::new().unwrap();
+        let first = ScriptedProvider::scripted(vec![done_reply("a diagram")]);
+        let (engine, run) = engine(&first, &dir);
+        let image = ImageAttachment {
+            name: "diagram.png".to_owned(),
+            media_type: String::new(),
+            data: b"\x89PNG\r\n\x1a\nstable bytes".to_vec(),
+        };
+        let (tx, _rx) = channel();
+        let reply = engine
+            .send_message_from_with_attachments(
+                &run,
+                None,
+                "describe it",
+                Source::User,
+                vec![image.clone()],
+                tx,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &first.requests()[0].messages[0],
+            Message::UserWithAttachments { content, attachments }
+                if content == "describe it"
+                    && attachments[0].media_type == "image/png"
+                    && attachments[0].data == image.data
+        ));
+        drop(engine);
+
+        let second = ScriptedProvider::scripted(vec![done_reply("still a diagram")]);
+        let (reopened, reopened_run) = reopened_engine(&second, &dir, Registry::new(4));
+        let (tx, _rx) = channel();
+        reopened
+            .send_message(&reopened_run, Some(&reply.session_id), "again", tx)
+            .await
+            .unwrap();
+
+        let requests = second.requests();
+        assert!(matches!(
+            &requests[0].messages[0],
+            Message::UserWithAttachments { content, attachments }
+                if content == "describe it"
+                    && attachments[0].name == "diagram.png"
+                    && attachments[0].data == image.data
+        ));
+        let history = reopened.transcript(&reply.session_id).unwrap();
+        let Some(history_entry::Entry::Message(message)) = &history[0].entry else {
+            panic!("expected the durable user message");
+        };
+        assert_eq!(message.content, "[image: diagram.png]\ndescribe it");
+    }
+
+    #[tokio::test]
+    async fn a_text_only_provider_refuses_pictures_before_appending() {
+        let dir = TempDir::new().unwrap();
+        let log = Log::open(dir.path()).unwrap();
+        let projection = Projection::in_memory().unwrap();
+        let engine = Engine::new(Store::new(log, projection), Registry::new(4));
+        let run = Runner {
+            role: SessionRole::Chat,
+            provider: Arc::new(TextOnlyProvider),
+            model: "text-only".to_owned(),
+            thinking: Thinking::Default,
+            system: None,
+            compact_at: None,
+            context_window: None,
+            counsel: false,
+        };
+        let (tx, _rx) = channel();
+
+        let error = engine
+            .send_message_from_with_attachments(
+                &run,
+                None,
+                "look",
+                Source::User,
+                vec![ImageAttachment {
+                    name: "screen.png".to_owned(),
+                    media_type: String::new(),
+                    data: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+                }],
+                tx,
+            )
+            .await
+            .expect_err("text-only provider");
+
+        assert!(matches!(
+            error,
+            Error::AttachmentsUnsupported { provider } if provider == "text-only"
+        ));
+        assert!(replay_log(dir.path()).is_empty());
     }
 
     fn seeded_session() -> session_event::Event {
@@ -8649,7 +8829,7 @@ mod tests {
                     Message::ToolResult { call_id, .. } => {
                         assert!(open.remove(call_id.as_str()), "result without call");
                     }
-                    Message::Text { .. } => {}
+                    Message::Text { .. } | Message::UserWithAttachments { .. } => {}
                 }
             }
             assert!(open.is_empty(), "call without result");

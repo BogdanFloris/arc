@@ -2,6 +2,7 @@ mod allowance;
 pub mod auth;
 mod stream;
 
+use base64::Engine as _;
 use futures::future::BoxFuture;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Serialize;
@@ -129,6 +130,10 @@ impl Provider for Codex {
         Box::pin(async move { Codex::allowance(self).await.map(Some) })
     }
 
+    fn supports_images(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(
         level = "info",
         name = "codex.complete",
@@ -196,7 +201,7 @@ struct Reasoning {
 enum Item<'a> {
     User {
         role: &'static str,
-        content: [InputText<'a>; 1],
+        content: Vec<InputContent<'a>>,
     },
 
     Assistant {
@@ -241,10 +246,13 @@ enum Item<'a> {
 }
 
 #[derive(Serialize)]
-struct InputText<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: &'a str,
+#[serde(tag = "type")]
+enum InputContent<'a> {
+    #[serde(rename = "input_text")]
+    Text { text: &'a str },
+
+    #[serde(rename = "input_image")]
+    Image { image_url: String },
 }
 
 #[derive(Serialize)]
@@ -369,10 +377,7 @@ fn items<'a>(
         Message::Text { role, content, .. } => match role {
             Role::User => out.push(Item::User {
                 role: "user",
-                content: [InputText {
-                    kind: "input_text",
-                    text: content,
-                }],
+                content: vec![InputContent::Text { text: content }],
             }),
             Role::Assistant => out.push(Item::Assistant {
                 kind: "message",
@@ -395,6 +400,26 @@ fn items<'a>(
                 ));
             }
         },
+        Message::UserWithAttachments {
+            content,
+            attachments,
+        } => {
+            let mut parts = Vec::with_capacity(attachments.len() + 1);
+            if !content.is_empty() {
+                parts.push(InputContent::Text { text: content });
+            }
+            parts.extend(attachments.iter().map(|attachment| InputContent::Image {
+                image_url: format!(
+                    "data:{};base64,{}",
+                    attachment.media_type,
+                    base64::engine::general_purpose::STANDARD.encode(&attachment.data)
+                ),
+            }));
+            out.push(Item::User {
+                role: "user",
+                content: parts,
+            });
+        }
         Message::ToolCalls { calls, .. } => {
             if let Some(replayed) = calls
                 .iter()
@@ -618,6 +643,36 @@ mod tests {
             body.get("reasoning"),
             None,
             "default thinking sends no reasoning: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn picture_bytes_go_out_as_responses_input_image_data_urls_without_detail() {
+        let mut req = request(None, &[]);
+        req.messages.push(Message::UserWithAttachments {
+            content: "what is this?".to_owned(),
+            attachments: vec![arc_proto::v1::ImageAttachment {
+                name: "screen.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                data: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+            }],
+        });
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+
+        let (_, requests) = complete_against(template, req).await;
+
+        assert_eq!(
+            body(&requests)["input"],
+            json!([{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is this?"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,iVBORw0KGgpib2R5"
+                    }
+                ]
+            }])
         );
     }
 

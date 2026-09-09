@@ -831,12 +831,35 @@ fn input_height(app: &App, frame: Rect) -> u16 {
     let chars: Vec<char> = prefix.chars().chain(text.chars()).collect();
     let count = chars.len();
     let (rows, cursor_row, _) = wrap_input(&chars, count, width);
-    let needed = rows.len().max(cursor_row + 1);
+    let needed = rows
+        .len()
+        .max(cursor_row + 1)
+        .saturating_add(app.pending_attachments().len());
     let rows = u16::try_from(needed).unwrap_or(u16::MAX);
     rows.min(INPUT_ROWS_CAP).min(frame.height / 3).max(1)
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
+    let attachment_rows = u16::try_from(app.pending_attachments().len())
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(1));
+    for (row, attachment) in (0..attachment_rows).zip(app.pending_attachments()) {
+        frame.render_widget(
+            Line::styled(
+                elide(
+                    &format!("[image: {}]", attachment.name),
+                    area.width as usize,
+                ),
+                theme::DIM,
+            ),
+            Rect::new(area.x, area.y + row, area.width, 1),
+        );
+    }
+    let area = Rect {
+        y: area.y + attachment_rows,
+        height: area.height.saturating_sub(attachment_rows),
+        ..area
+    };
     let filtering = app.picker().is_some_and(|picker| picker.filtering);
     let (prefix, prefix_style, text, style, cursor) = if app.mode == Mode::Cmd {
         (":", theme::PLAIN, &app.cmd, theme::PLAIN, app.cmd.len())
@@ -1401,6 +1424,8 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-o            toggle session details (off by default)",
             "v then j/k        point at messages, tools, or thoughts",
             ":compact          compact the current idle session",
+            ":attach <path>    attach a local image to the next message",
+            ":attach clear     discard pending images",
             "M                 defaults for new sessions; open sessions stay pinned",
         ],
     ),
@@ -1459,6 +1484,8 @@ const HELP: &[(&str, &[&str])] = &[
             ":jobs             open the jobs pane",
             ":model            open the model picker",
             ":status           context measurement and Codex allowance",
+            ":attach <path>    attach PNG, JPEG, or WebP to the next message",
+            ":attach clear     discard pending images",
             ":code <project>   open a bound code session, no dispatch",
             "                  without a project, open the project picker",
             ":fork             branch at the visual selection",
@@ -2305,6 +2332,23 @@ mod tests {
         for c in text.chars() {
             app.on_key(key(crossterm::event::KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn a_pending_picture_renders_as_a_text_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nbody").unwrap();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Esc));
+        typed(&mut app, &format!(":attach {}", path.display()));
+        app.on_key(key(KeyCode::Enter));
+
+        let text = plain_text(&rendered(&mut app));
+        println!("{text}");
+
+        assert!(text.contains("[image: layout.png]"), "{text}");
+        assert!(!text.contains(&path.display().to_string()), "{text}");
     }
 
     fn conversation() -> App {
