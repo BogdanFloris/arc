@@ -49,7 +49,7 @@ fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
     (f64::from(context_window) * f64::from(fraction)) as u32
 }
 
-fn concierge_system(identity: Option<String>) -> String {
+fn chat_system(identity: Option<String>) -> String {
     match identity {
         Some(identity) => format!("{}\n\n{RUNNING_JOBS}", identity.trim_end()),
         None => RUNNING_JOBS.to_owned(),
@@ -60,7 +60,7 @@ fn concierge_system(identity: Option<String>) -> String {
 /// The first is the default; the engine's recorded selection picks among them.
 #[derive(Debug)]
 pub struct Roles {
-    concierge: Vec<(String, Runner)>,
+    chat: Vec<(String, Runner)>,
     code: Vec<(String, Runner)>,
     executor: Vec<(String, Runner)>,
     archivist: Vec<(String, Runner)>,
@@ -75,11 +75,11 @@ impl Roles {
     ) -> Result<Self> {
         let mut built = Built::new(sidecar_endpoint, secrets);
         Ok(Self {
-            concierge: built.role(
-                SessionRole::Concierge,
-                config.roles.concierge.as_ref(),
+            chat: built.role(
+                SessionRole::Chat,
+                config.roles.chat.as_ref(),
                 config,
-                Some(concierge_system(identity)),
+                Some(chat_system(identity)),
             )?,
             executor: built.role(
                 SessionRole::Executor,
@@ -106,8 +106,8 @@ impl Roles {
         })
     }
 
-    pub fn concierge(&self) -> &Runner {
-        &self.concierge[0].1
+    pub fn chat(&self) -> &Runner {
+        &self.chat[0].1
     }
 
     pub fn executor(&self) -> &Runner {
@@ -120,7 +120,7 @@ impl Roles {
 
     pub fn all(&self) -> [&Runner; 4] {
         [
-            self.concierge(),
+            self.chat(),
             &self.code[0].1,
             self.executor(),
             self.archivist(),
@@ -129,7 +129,7 @@ impl Roles {
 
     pub fn menus(&self) -> BTreeMap<SessionRole, Vec<(String, Runner)>> {
         BTreeMap::from([
-            (SessionRole::Concierge, self.concierge.clone()),
+            (SessionRole::Chat, self.chat.clone()),
             (SessionRole::Code, self.code.clone()),
             (SessionRole::Executor, self.executor.clone()),
             (SessionRole::Archivist, self.archivist.clone()),
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn the_concierge_system_is_identity_then_jobs_doctrine_and_job_roles_get_none() {
+    fn the_chat_system_is_identity_then_jobs_doctrine_and_job_roles_get_none() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config: Config = toml::from_str("").expect("parses");
         let roles = Roles::resolve(
@@ -415,7 +415,7 @@ mod tests {
         )
         .expect("resolves");
 
-        let system = roles.concierge().system.as_deref().expect("a system");
+        let system = roles.chat().system.as_deref().expect("a system");
         assert!(system.starts_with("You are ARC."), "{system}");
         assert!(
             system.ends_with("conclusions, not transcripts."),
@@ -426,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn no_identity_file_still_gives_the_concierge_the_jobs_doctrine() {
+    fn no_identity_file_still_gives_the_chat_the_jobs_doctrine() {
         let roles = resolved("");
 
-        let system = roles.concierge().system.as_deref().expect("a system");
+        let system = roles.chat().system.as_deref().expect("a system");
         assert!(system.starts_with("Running jobs:"), "{system}");
     }
 
@@ -491,7 +491,7 @@ context_window = 100000
 
         assert_eq!(roles.executor().compact_at, Some(50_000));
         assert_eq!(
-            roles.concierge().compact_at,
+            roles.chat().compact_at,
             None,
             "an unconfigured role never compacts"
         );
@@ -501,7 +501,7 @@ context_window = 100000
     fn each_role_resolves_to_its_own_provider_and_model() {
         let roles = resolved(
             r#"
-[roles.concierge]
+[roles.chat]
 provider = "openai_compat"
 model    = "deepseek-v4-flash"
 endpoint = "http://127.0.0.1:4096"
@@ -516,9 +516,9 @@ provider = "local"
 "#,
         );
 
-        assert_eq!(roles.concierge().model, "deepseek-v4-flash");
+        assert_eq!(roles.chat().model, "deepseek-v4-flash");
         assert_eq!(roles.executor().model, "deepseek-v4-pro");
-        assert_eq!(roles.concierge().provider.name(), "openai-compat");
+        assert_eq!(roles.chat().provider.name(), "openai-compat");
         assert_eq!(roles.archivist().provider.name(), "local");
         assert_eq!(roles.archivist().model, Config::default().model());
     }
@@ -527,7 +527,7 @@ provider = "local"
     fn roles_on_one_endpoint_share_one_provider() {
         let roles = resolved(
             r#"
-[roles.concierge]
+[roles.chat]
 provider = "openai_compat"
 model    = "deepseek-v4-flash"
 endpoint = "http://127.0.0.1:4096"
@@ -540,11 +540,11 @@ endpoint = "http://127.0.0.1:4096"
         );
 
         assert!(
-            std::sync::Arc::ptr_eq(&roles.concierge().provider, &roles.executor().provider),
+            std::sync::Arc::ptr_eq(&roles.chat().provider, &roles.executor().provider),
             "one endpoint, one client"
         );
         assert!(
-            !std::sync::Arc::ptr_eq(&roles.concierge().provider, &roles.archivist().provider),
+            !std::sync::Arc::ptr_eq(&roles.chat().provider, &roles.archivist().provider),
             "the sidecar is a different endpoint"
         );
     }
@@ -582,7 +582,7 @@ key      = "opencode-go"
         let dir = tempfile::tempdir().expect("temp dir");
         let roles = with_secrets(
             r#"
-[roles.concierge]
+[roles.chat]
 provider = "openai_compat"
 model    = "grok-4.5"
 endpoint = "https://shared.example/v1"
@@ -600,7 +600,7 @@ key      = "work"
         .expect("resolves");
 
         assert!(
-            !std::sync::Arc::ptr_eq(&roles.concierge().provider, &roles.executor().provider),
+            !std::sync::Arc::ptr_eq(&roles.chat().provider, &roles.executor().provider),
             "same endpoint, different keys: they must not share a client"
         );
     }
@@ -634,7 +634,7 @@ key      = "opencode-go"
         let dir = tempfile::tempdir().expect("temp dir");
         let roles = with_secrets(
             r#"
-[roles.concierge]
+[roles.chat]
 provider = "gemini"
 model    = "gemini-3.7-flash"
 key      = "gemini"
@@ -644,11 +644,11 @@ key      = "gemini"
         )
         .expect("resolves");
 
-        let concierge = roles.concierge();
-        assert_eq!(concierge.provider.name(), "gemini");
-        assert_eq!(concierge.model, "gemini-3.7-flash");
+        let chat = roles.chat();
+        assert_eq!(chat.provider.name(), "gemini");
+        assert_eq!(chat.model, "gemini-3.7-flash");
         assert_eq!(
-            concierge.provider.endpoint(),
+            chat.provider.endpoint(),
             arc_core::provider::gemini::DEFAULT_ENDPOINT
         );
     }
@@ -729,7 +729,7 @@ model   = "opus"
             executor.counsel,
             "the preset's counsel flag rides on the runner"
         );
-        assert!(!roles.concierge().counsel);
+        assert!(!roles.chat().counsel);
         let menu = roles.menus();
         assert_eq!(
             menu[&arc_proto::v1::SessionRole::Executor]
@@ -740,7 +740,7 @@ model   = "opus"
             "the unavailable choice is left off the menu"
         );
         assert_eq!(
-            roles.choices()[&arc_proto::v1::SessionRole::Concierge][0].name,
+            roles.choices()[&arc_proto::v1::SessionRole::Chat][0].name,
             Config::default().model(),
             "a role without choices is a one-entry menu named by its model"
         );
@@ -756,7 +756,7 @@ model   = "opus"
         let dir = tempfile::tempdir().expect("temp dir");
 
         let err = with_secrets(
-            "[roles.concierge]\nprovider = \"gemini\"\nmodel = \"flash\"\nkey = \"gemini\"\n",
+            "[roles.chat]\nprovider = \"gemini\"\nmodel = \"flash\"\nkey = \"gemini\"\n",
             dir.path(),
             &[],
         )
@@ -764,7 +764,7 @@ model   = "opus"
 
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("concierge") && chain.contains("gemini"),
+            chain.contains("chat") && chain.contains("gemini"),
             "{chain}"
         );
     }

@@ -1396,7 +1396,7 @@ const HELP: &[(&str, &[&str])] = &[
             "Esc · stop        normal mode; Esc ×2 · stop in insert",
             "                  close overlays/search first; pending d/g adds one Esc",
             "tab               switch chat/code in normal mode",
-            ":chat :code       concierge / project picker",
+            ":chat :code       chat / project picker",
             "ctrl-p            find a session; / filters, enter opens the match",
             "ctrl-o            toggle session details (off by default)",
             "v then j/k        point at messages, tools, or thoughts",
@@ -1715,7 +1715,7 @@ mod tests {
         };
         app.overlay = Overlay::Models(Models {
             items: vec![
-                choice(SessionRole::Concierge, "astra", "gpt-6-astra", true),
+                choice(SessionRole::Chat, "astra", "gpt-6-astra", true),
                 choice(SessionRole::Executor, "sol", "gpt-5.6-sol", true),
                 choice(SessionRole::Executor, "glm-flash", "glm-5.3-flash", false),
                 choice(SessionRole::Code, "sol", "gpt-5.6-sol", true),
@@ -1732,7 +1732,7 @@ mod tests {
             "the popup is titled model:\n{text}"
         );
         assert!(
-            text.contains("   concierge *astra      codex gpt-6-astra medium"),
+            text.contains("   chat      *astra      codex gpt-6-astra medium"),
             "{text}"
         );
         assert!(

@@ -1160,7 +1160,7 @@ mod tests {
             let provider = MockProvider::new(script);
             let (notifier, _receiver) = broadcast::channel(256);
             // mirrors daemon.rs: a dispatched job records the role's own
-            // runner, not the dispatching concierge's
+            // runner, not the dispatching chat's
             let role_identities = job_runners
                 .iter()
                 .map(|(role, runner)| {
@@ -1200,7 +1200,7 @@ mod tests {
                     .with_role_identities(role_identities),
             );
             let runner = Runner {
-                role: SessionRole::Concierge,
+                role: SessionRole::Chat,
                 provider: Arc::clone(&provider) as Arc<dyn Provider>,
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
@@ -1222,7 +1222,7 @@ mod tests {
                     // mirrors daemon.rs: identity rides the supervisor for
                     // direct executor turns, never for dispatched jobs
                     .with_identity(Some(TEST_IDENTITY.to_owned()))
-                    .with_concierge(runner)
+                    .with_chat(runner)
                     .with_project_list(project_list),
             );
 
@@ -1250,10 +1250,7 @@ mod tests {
             }
         }
 
-        async fn with_concierge_provider(
-            concierge_provider: Arc<dyn Provider>,
-            registry: Registry,
-        ) -> Self {
+        async fn with_chat_provider(chat_provider: Arc<dyn Provider>, registry: Registry) -> Self {
             let dir = TempDir::new().expect("temp dir");
             let log = Log::open(dir.path()).expect("open log");
             let index = dir.path().join("index.db");
@@ -1265,8 +1262,8 @@ mod tests {
                 Engine::new(Store::new(log, projection), registry).with_notifier(notifier.clone()),
             );
             let runner = Runner {
-                role: SessionRole::Concierge,
-                provider: concierge_provider,
+                role: SessionRole::Chat,
+                provider: chat_provider,
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
                 system: Some("be terse".to_owned()),
@@ -1278,7 +1275,7 @@ mod tests {
             let supervisor = Arc::new(
                 Supervisor::for_test(Arc::clone(&engine), BTreeMap::new())
                     .with_notifier(notifier.clone())
-                    .with_concierge(runner),
+                    .with_chat(runner),
             );
 
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1511,7 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_into_a_live_turn_is_queued_and_answered_inside_it() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![
+        let chat_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
                 before: vec![Ok(CompletionDelta::Text("first".to_owned()))],
                 notify: Arc::clone(&gate),
@@ -1529,8 +1526,7 @@ mod tests {
             ]),
         ]) as Arc<dyn Provider>;
 
-        let mut harness =
-            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut harness = Harness::with_chat_provider(chat_provider, Registry::new(512)).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "hello")).await;
@@ -1598,7 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_dropped_mid_turn_never_stops_the_turn() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+        let chat_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
             notify: Arc::clone(&gate),
             after: vec![
@@ -1610,8 +1606,7 @@ mod tests {
             ],
         }]) as Arc<dyn Provider>;
 
-        let mut harness =
-            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut harness = Harness::with_chat_provider(chat_provider, Registry::new(512)).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "hello")).await;
@@ -2031,7 +2026,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_step_capped_turn_marks_the_stream_end() {
-        // the concierge's step cap: mirrors arc-core's MAX_TOOL_STEPS
+        // the chat's step cap: mirrors arc-core's MAX_TOOL_STEPS
         let mut script: VecDeque<Vec<Result<CompletionDelta, ProviderError>>> = (0..8)
             .map(|step| {
                 vec![
@@ -2415,7 +2410,7 @@ mod tests {
             "budget_minutes": 0,
         })
         .to_string();
-        let concierge_script = Script::Canned(VecDeque::from([
+        let chat_script = Script::Canned(VecDeque::from([
             vec![
                 Ok(CompletionDelta::ToolCall(ToolCall {
                     id: "d1".to_owned(),
@@ -2472,7 +2467,7 @@ mod tests {
         )]);
 
         let mut harness =
-            Harness::with_executor(concierge_script, registry, executor_script, projects).await;
+            Harness::with_executor(chat_script, registry, executor_script, projects).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "start a job")).await;
@@ -2552,7 +2547,7 @@ mod tests {
             "budget_minutes": 0,
         })
         .to_string();
-        let concierge_script = Script::Canned(VecDeque::from([
+        let chat_script = Script::Canned(VecDeque::from([
             vec![
                 Ok(CompletionDelta::ToolCall(ToolCall {
                     id: "d1".to_owned(),
@@ -2594,14 +2589,8 @@ mod tests {
         )]);
 
         // no runner maps to archivist here: the supervisor has nothing to run the job with
-        let mut harness = Harness::with_seed(
-            concierge_script,
-            registry,
-            Vec::new(),
-            BTreeMap::new(),
-            projects,
-        )
-        .await;
+        let mut harness =
+            Harness::with_seed(chat_script, registry, Vec::new(), BTreeMap::new(), projects).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "start a job")).await;
@@ -2651,7 +2640,7 @@ mod tests {
         }
     }
 
-    fn dispatching_concierge(brief: &str) -> Script {
+    fn dispatching_chat(brief: &str) -> Script {
         Script::Canned(VecDeque::from([
             vec![
                 Ok(CompletionDelta::ToolCall(dispatch_call(brief))),
@@ -2679,7 +2668,7 @@ mod tests {
     }
 
     /// Drains a turn to its `StreamEnd`, discarding everything else: the
-    /// dispatching concierge's turn also emits tool-call frames, which
+    /// dispatching chat's turn also emits tool-call frames, which
     /// `turn` (built for plain prose turns) would mistake for the close.
     async fn run_turn_to_end(ws: &mut Client, request_id: u64) {
         loop {
@@ -2768,7 +2757,7 @@ mod tests {
         ]) as Arc<dyn Provider>;
 
         let mut harness = Harness::with_executor_provider(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_provider,
             projects,
@@ -2827,7 +2816,7 @@ mod tests {
         assert_eq!(
             harness.provider.requests().len(),
             3,
-            "the steer never reached the concierge: its own turn, then the handback turn"
+            "the steer never reached the chat: its own turn, then the handback turn"
         );
 
         harness.stop().await;
@@ -2846,7 +2835,7 @@ mod tests {
         }]) as Arc<dyn Provider>;
 
         let mut harness = Harness::with_executor_provider(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_provider,
             projects,
@@ -2925,9 +2914,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_turn_on_a_live_concierge_turn_ends_it_as_a_partial_reply() {
+    async fn cancel_turn_on_a_live_chat_turn_ends_it_as_a_partial_reply() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+        let chat_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
             notify: Arc::clone(&gate),
             after: vec![Ok(CompletionDelta::Done {
@@ -2936,8 +2925,7 @@ mod tests {
             })],
         }]) as Arc<dyn Provider>;
 
-        let mut harness =
-            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut harness = Harness::with_chat_provider(chat_provider, Registry::new(512)).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "hello")).await;
@@ -3022,7 +3010,7 @@ mod tests {
     #[tokio::test]
     async fn compact_session_refuses_a_live_turn() {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
+        let chat_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
             notify: Arc::clone(&gate),
             after: vec![Ok(CompletionDelta::Done {
@@ -3031,8 +3019,7 @@ mod tests {
             })],
         }]) as Arc<dyn Provider>;
 
-        let mut harness =
-            Harness::with_concierge_provider(concierge_provider, Registry::new(512)).await;
+        let mut harness = Harness::with_chat_provider(chat_provider, Registry::new(512)).await;
         let mut ws = harness.connect().await;
 
         send(&mut ws, 1, say("", "hello")).await;
@@ -3108,7 +3095,7 @@ mod tests {
         }]) as Arc<dyn Provider>;
 
         let mut harness = Harness::with_executor_provider(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_provider,
             projects,
@@ -3201,7 +3188,7 @@ mod tests {
         ]));
 
         let mut harness = Harness::with_executor(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_script,
             projects,
@@ -3260,7 +3247,7 @@ mod tests {
         let executor_provider =
             ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("hi there")]);
         let mut harness = Harness::with_executor_provider(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             Arc::clone(&executor_provider) as Arc<dyn Provider>,
             projects,
@@ -3357,7 +3344,7 @@ mod tests {
         .await;
         let mut ws = harness.connect().await;
 
-        let msg = create_session(&mut ws, 1, SessionRole::Concierge, "arc").await;
+        let msg = create_session(&mut ws, 1, SessionRole::Chat, "arc").await;
 
         assert_eq!(failed(msg).code, "unsupported_role");
 
@@ -3702,7 +3689,7 @@ mod tests {
         ]]));
 
         let mut harness = Harness::with_executor(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_script,
             projects,
@@ -3748,7 +3735,7 @@ mod tests {
             }),
         ]]));
         let mut harness = Harness::with_executor(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_script,
             projects,
@@ -3818,7 +3805,7 @@ mod tests {
             }),
         ]]));
         let mut harness = Harness::with_executor(
-            dispatching_concierge("fix the failing test"),
+            dispatching_chat("fix the failing test"),
             registry,
             executor_script,
             projects,
@@ -3850,7 +3837,7 @@ mod tests {
     }
 
     /// The hard interleave guarantee: a notification must never land between
-    /// two frames of the same streaming reply. A concierge turn is gated
+    /// two frames of the same streaming reply. A chat turn is gated
     /// mid-stream on this connection while a job finishes independently (its
     /// notifications queue up unread, since this connection's task is deep
     /// inside `request`, not back at the `select!` that reads them); only
@@ -3869,11 +3856,11 @@ mod tests {
 
         let (notifier, _receiver) = broadcast::channel(256);
 
-        let concierge_gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![
+        let chat_gate = Arc::new(tokio::sync::Notify::new());
+        let chat_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
                 before: vec![Ok(CompletionDelta::Text("part one ".to_owned()))],
-                notify: Arc::clone(&concierge_gate),
+                notify: Arc::clone(&chat_gate),
                 after: vec![
                     Ok(CompletionDelta::Text("part two".to_owned())),
                     Ok(CompletionDelta::Done {
@@ -3902,9 +3889,9 @@ mod tests {
                 )]))
                 .with_notifier(notifier.clone()),
         );
-        let concierge_runner = Runner {
-            role: SessionRole::Concierge,
-            provider: concierge_provider,
+        let chat_runner = Runner {
+            role: SessionRole::Chat,
+            provider: chat_provider,
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
             system: Some("be terse".to_owned()),
@@ -3928,7 +3915,7 @@ mod tests {
                 BTreeMap::from([(SessionRole::Executor, executor_runner)]),
             )
             .with_notifier(notifier.clone())
-            .with_concierge(concierge_runner),
+            .with_chat(chat_runner),
         );
 
         let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -3987,7 +3974,7 @@ mod tests {
 
         // only now release the gate: the turn's remaining frames must still
         // arrive with no notification spliced in between
-        concierge_gate.notify_one();
+        chat_gate.notify_one();
 
         let second_delta = next_frame(&mut ws).await;
         assert_eq!(second_delta.request_id, 2, "no push interleaves mid-turn");

@@ -54,8 +54,8 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RolesConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concierge: Option<RoleConfig>,
+    #[serde(alias = "concierge", skip_serializing_if = "Option::is_none")]
+    pub chat: Option<RoleConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<RoleConfig>,
@@ -200,7 +200,7 @@ impl ToolSource {
 impl RolesConfig {
     fn configured(&self) -> impl Iterator<Item = (&'static str, &RoleConfig)> {
         [
-            ("concierge", self.concierge.as_ref()),
+            ("chat", self.chat.as_ref()),
             ("code", self.code.as_ref()),
             ("executor", self.executor.as_ref()),
             ("archivist", self.archivist.as_ref()),
@@ -410,7 +410,7 @@ impl Default for LlamaConfig {
 impl Config {
     pub fn needs_sidecar(&self) -> bool {
         [
-            self.roles.concierge.as_ref(),
+            self.roles.chat.as_ref(),
             self.roles.code.as_ref().or(self.roles.executor.as_ref()),
             self.roles.executor.as_ref(),
             self.roles.archivist.as_ref(),
@@ -511,7 +511,7 @@ model = "test"
 key = "test"
 [models.local]
 provider = "local"
-[roles.concierge]
+[roles.chat]
 choices = ["hosted"]
 [roles.executor]
 choices = ["hosted"]
@@ -603,7 +603,7 @@ choices = ["hosted"]
                     context_window: Some(128_000),
                     counsel: false,
                 }),
-                concierge: Some(RoleConfig {
+                chat: Some(RoleConfig {
                     provider: Some(RoleProvider::Gemini),
                     choices: Vec::new(),
                     model: Some("gemini-3.7-flash".to_owned()),
@@ -680,7 +680,7 @@ choices = ["hosted"]
     fn each_role_resolves_to_a_provider_and_a_model() {
         let config = parse(
             r#"
-[roles.concierge]
+[roles.chat]
 provider = "gemini"
 model    = "gemini-3.7-flash"
 key      = "gemini"
@@ -695,14 +695,28 @@ provider = "local"
 "#,
         );
 
-        let concierge = config.roles.concierge.expect("concierge is configured");
-        assert_eq!(concierge.provider, Some(RoleProvider::Gemini));
-        assert_eq!(concierge.model.as_deref(), Some("gemini-3.7-flash"));
+        let chat = config.roles.chat.expect("chat is configured");
+        assert_eq!(chat.provider, Some(RoleProvider::Gemini));
+        assert_eq!(chat.model.as_deref(), Some("gemini-3.7-flash"));
         let executor = config.roles.executor.expect("executor is configured");
         assert_eq!(executor.endpoint.as_deref(), Some("http://127.0.0.1:4096"));
         let archivist = config.roles.archivist.expect("archivist is configured");
         assert_eq!(archivist.provider, Some(RoleProvider::Local));
         assert_eq!(archivist.model, None, "the sidecar names its own model");
+    }
+
+    #[test]
+    fn the_legacy_conversation_role_key_parses_and_serializes_as_chat() {
+        let legacy_name = ["con", "cierge"].concat();
+        let config = parse(&format!("[roles.{legacy_name}]\nprovider = \"local\"\n"));
+
+        assert!(config.roles.chat.is_some());
+        let serialized = toml::to_string(&config).expect("serializes");
+        assert!(serialized.contains("[roles.chat]"), "{serialized}");
+        assert!(
+            !serialized.contains(&format!("[roles.{legacy_name}]")),
+            "{serialized}"
+        );
     }
 
     #[test]
@@ -935,14 +949,14 @@ provider = "local"
 
     #[test]
     fn a_hosted_role_without_a_model_is_rejected() {
-        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\nkey = \"gemini\"\n");
-        assert!(err.contains("concierge") && err.contains("model"), "{err}");
+        let err = rejected("[roles.chat]\nprovider = \"gemini\"\nkey = \"gemini\"\n");
+        assert!(err.contains("chat") && err.contains("model"), "{err}");
     }
 
     #[test]
     fn a_gemini_role_without_a_key_is_rejected() {
-        let err = rejected("[roles.concierge]\nprovider = \"gemini\"\nmodel = \"flash\"\n");
-        assert!(err.contains("concierge") && err.contains("key"), "{err}");
+        let err = rejected("[roles.chat]\nprovider = \"gemini\"\nmodel = \"flash\"\n");
+        assert!(err.contains("chat") && err.contains("key"), "{err}");
     }
 
     #[test]

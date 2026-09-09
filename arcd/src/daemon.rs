@@ -1098,12 +1098,7 @@ mod tests {
 
         let session_id = daemon
             .engine
-            .create_bound_session(
-                daemon.roles.concierge(),
-                "arc",
-                SessionRole::Concierge,
-                None,
-            )
+            .create_bound_session(daemon.roles.chat(), "arc", SessionRole::Chat, None)
             .expect("create a bound session");
 
         let log = Log::open(&log_dir).expect("reopen log");

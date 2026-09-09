@@ -53,7 +53,7 @@ pub(crate) mod testkit {
         }
     }
 
-    // "test-model": matches what a bootstrap/concierge runner's own identity
+    // "test-model": matches what a bootstrap/chat runner's own identity
     // records for a child, since these engines never configure role_identities
     pub(crate) fn executor_runner(provider: &Arc<ScriptedProvider>) -> Runner {
         Runner {
@@ -68,15 +68,15 @@ pub(crate) mod testkit {
         }
     }
 
-    pub(crate) fn child_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
+    pub(crate) fn child_session(engine: &Engine, chat: &Arc<ScriptedProvider>) -> String {
         engine
-            .create_bound_session(&runner(concierge), "arc", SessionRole::Executor, None)
+            .create_bound_session(&runner(chat), "arc", SessionRole::Executor, None)
             .expect("create the child durably, as dispatch already does")
     }
 
-    pub(crate) fn parent_session(engine: &Engine, concierge: &Arc<ScriptedProvider>) -> String {
+    pub(crate) fn parent_session(engine: &Engine, chat: &Arc<ScriptedProvider>) -> String {
         engine
-            .create_direct_session(&runner(concierge), "arc", SessionRole::Concierge)
+            .create_direct_session(&runner(chat), "arc", SessionRole::Chat)
             .expect("create the parent durably")
     }
 

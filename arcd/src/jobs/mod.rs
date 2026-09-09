@@ -124,10 +124,10 @@ impl Supervisor {
     }
 
     #[cfg(test)]
-    pub fn with_concierge(mut self, runner: Runner) -> Self {
+    pub fn with_chat(mut self, runner: Runner) -> Self {
         self.shared
             .menus
-            .insert(SessionRole::Concierge, vec![(runner.model.clone(), runner)]);
+            .insert(SessionRole::Chat, vec![(runner.model.clone(), runner)]);
         self
     }
 
@@ -202,14 +202,14 @@ impl Supervisor {
     }
 
     /// What a new session of this role would run under: the role's own
-    /// runner, or the concierge's when the role has none configured.
+    /// runner, or the chat's when the role has none configured.
     pub(crate) fn turn_runner(&self, session_id: &str) -> Result<Runner, SessionError> {
         turn_runner(&self.shared, session_id)
     }
 
     pub(crate) fn role_runner(&self, role: SessionRole) -> Option<Runner> {
         selected_runner(&self.shared, role)
-            .or_else(|| selected_runner(&self.shared, SessionRole::Concierge))
+            .or_else(|| selected_runner(&self.shared, SessionRole::Chat))
     }
 
     pub(crate) fn project_list(&self) -> &[ProjectInfo] {
@@ -306,7 +306,7 @@ fn send_into(
     let (session_id, runner) = if let Some(session_id) = session_id {
         (session_id.to_owned(), turn_runner(shared, session_id)?)
     } else {
-        let runner = concierge_runner(shared)?;
+        let runner = chat_runner(shared)?;
         (shared.engine.create_session(&runner)?, runner)
     };
     if !autonomy_allows(shared, &session_id, content, source) {
@@ -405,9 +405,9 @@ fn selected_runner(shared: &Shared, role: SessionRole) -> Option<Runner> {
         .map(|(_, runner)| runner.clone())
 }
 
-fn concierge_runner(shared: &Shared) -> Result<Runner, SessionError> {
-    selected_runner(shared, SessionRole::Concierge).ok_or_else(|| SessionError::NoRunner {
-        role: role_label(SessionRole::Concierge).to_owned(),
+fn chat_runner(shared: &Shared) -> Result<Runner, SessionError> {
+    selected_runner(shared, SessionRole::Chat).ok_or_else(|| SessionError::NoRunner {
+        role: role_label(SessionRole::Chat).to_owned(),
     })
 }
 
@@ -417,16 +417,16 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
     let role = match shared.engine.session_role(session_id) {
         Ok(role) => role.unwrap_or(SessionRole::Unspecified),
         Err(error) => {
-            warn!(session_id, %error, "could not read the session's role; serving it as a concierge");
+            warn!(session_id, %error, "could not read the session's role; serving it as a chat");
             SessionRole::Unspecified
         }
     };
     let (SessionRole::Code | SessionRole::Executor | SessionRole::Archivist) = role else {
-        return concierge_runner(shared);
+        return chat_runner(shared);
     };
     let mut runner = match selected_runner(shared, role) {
         Some(runner) => runner,
-        None => concierge_runner(shared)?,
+        None => chat_runner(shared)?,
     };
     if matches!(role, SessionRole::Code | SessionRole::Executor) {
         if let Some(prompt) = direct_system_prompt_for(shared, session_id) {
@@ -681,43 +681,41 @@ mod tests {
                 ),
                 Registry::new(512),
             )
-            .with_role_choices(BTreeMap::from([(SessionRole::Concierge, choices)])),
+            .with_role_choices(BTreeMap::from([(SessionRole::Chat, choices)])),
         );
         let supervisor = Supervisor::new(
             Arc::clone(&engine),
-            BTreeMap::from([(SessionRole::Concierge, menu)]),
+            BTreeMap::from([(SessionRole::Chat, menu)]),
         );
         assert_eq!(
             supervisor
-                .role_runner(SessionRole::Concierge)
+                .role_runner(SessionRole::Chat)
                 .expect("default")
                 .model,
             "first-model"
         );
         engine
-            .select_model(SessionRole::Concierge, "second")
+            .select_model(SessionRole::Chat, "second")
             .expect("select");
-        let selected = supervisor
-            .role_runner(SessionRole::Concierge)
-            .expect("selected");
+        let selected = supervisor.role_runner(SessionRole::Chat).expect("selected");
         assert_eq!(selected.model, "second-model");
         assert_eq!(selected.system.as_deref(), Some("second prompt"));
         assert_eq!(
             supervisor
-                .status_runner(SessionRole::Concierge, "scripted", "first-model")
+                .status_runner(SessionRole::Chat, "scripted", "first-model")
                 .expect("status follows the recorded model")
                 .model,
             "first-model"
         );
         assert!(
             supervisor
-                .status_runner(SessionRole::Concierge, "missing", "first-model")
+                .status_runner(SessionRole::Chat, "missing", "first-model")
                 .is_none()
         );
         assert_eq!(
             supervisor
                 .role_runner(SessionRole::Executor)
-                .expect("concierge fallback")
+                .expect("chat fallback")
                 .model,
             "second-model"
         );
@@ -735,7 +733,7 @@ mod tests {
         supervisor.spawn(DispatchedJob {
             session_id: "s-ghost".to_owned(),
             parent_session: "s-parent".to_owned(),
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             project: "arc".to_owned(),
             brief: "never runs".to_owned(),
             budget: None,
@@ -751,7 +749,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
 
         let log = Log::open(dir.path()).expect("open log");
@@ -770,12 +768,7 @@ mod tests {
         );
 
         let child_id = engine
-            .create_bound_session(
-                &runner(&concierge_provider),
-                "arc",
-                SessionRole::Executor,
-                None,
-            )
+            .create_bound_session(&runner(&chat_provider), "arc", SessionRole::Executor, None)
             .expect("create the child durably, as dispatch already does");
 
         let runners =
@@ -861,7 +854,7 @@ mod tests {
         seed_log(
             &dir,
             vec![
-                seeded_session("s-parent", SessionRole::Concierge, ""),
+                seeded_session("s-parent", SessionRole::Chat, ""),
                 seeded_session("s-child", SessionRole::Executor, "s-parent"),
                 seeded_message("s-child", Role::User, "fix the bug"),
                 seeded_message("s-child", Role::Assistant, "half done"),
@@ -898,7 +891,7 @@ mod tests {
         seed_log(
             &dir,
             vec![
-                seeded_session("s-parent", SessionRole::Concierge, ""),
+                seeded_session("s-parent", SessionRole::Chat, ""),
                 seeded_session("s-child", SessionRole::Executor, "s-parent"),
                 seeded_message("s-child", Role::User, "fix the bug"),
                 seeded_message("s-child", Role::Assistant, "all done"),
@@ -945,7 +938,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -960,7 +953,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1001,7 +994,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -1016,7 +1009,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1094,12 +1087,7 @@ mod tests {
         );
 
         let parent_id = engine
-            .create_bound_session(
-                &runner(&executor_provider),
-                "arc",
-                SessionRole::Concierge,
-                None,
-            )
+            .create_bound_session(&runner(&executor_provider), "arc", SessionRole::Chat, None)
             .expect("create the parent durably");
         let child = engine
             .create_bound_session(
@@ -1325,7 +1313,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -1340,7 +1328,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1396,13 +1384,13 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider =
             ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("linted too")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1470,14 +1458,14 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider =
             ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("linted too")]);
 
         let (notifier, mut notifications) = broadcast::channel(64);
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1579,12 +1567,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Panics]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1626,7 +1614,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         // never notified: the turn stalls until the cancel drops it
         let gate = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
@@ -1636,8 +1624,8 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1685,7 +1673,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let gate = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: Vec::new(),
@@ -1694,7 +1682,7 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1731,11 +1719,11 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1791,7 +1779,7 @@ mod tests {
 
         let bootstrap_provider = ScriptedProvider::scripted(vec![]);
         let parent_id = engine
-            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Concierge)
+            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Chat)
             .expect("create the parent durably");
         let sibling = engine
             .create_bound_session(

@@ -268,7 +268,7 @@ fn extracts_user_facts(source: i32, role: i32) -> bool {
         Ok(Source::Model) => false,
         _ => matches!(
             SessionRole::try_from(role),
-            Ok(SessionRole::Unspecified | SessionRole::Concierge)
+            Ok(SessionRole::Unspecified | SessionRole::Chat)
         ),
     }
 }
@@ -1251,10 +1251,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_concierge_session_still_extracts() {
+    async fn a_chat_session_still_extracts() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Chat);
         let (tx, _rx) = channel();
         engine
             .send_message(&run, None, "hi", tx)
@@ -1280,10 +1280,10 @@ mod tests {
     #[tokio::test]
     async fn a_real_branch_extracts_its_own_rows_and_a_real_executor_branch_never_extracts() {
         use arc_proto::v1::branch_marked::Disposition;
-        // concierge: a REAL branch is due and mines like any main line
+        // chat: a REAL branch is due and mines like any main line
         let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Chat);
         let (tx, _rx) = channel();
         let first = engine
             .send_message(&run, None, "hi", tx)

@@ -378,7 +378,7 @@ mod tests {
     fn request(messages: Vec<Message>) -> CompletionRequest {
         CompletionRequest {
             model: "gemini-3.6-flash".to_owned(),
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             thinking: Thinking::Minimal,
             system: Some("Be terse.".to_owned()),
             messages,

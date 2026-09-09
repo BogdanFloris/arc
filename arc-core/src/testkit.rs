@@ -119,7 +119,7 @@ pub fn turn(message: &Message) -> (Role, &str) {
 }
 
 pub fn runner(provider: &Arc<ScriptedProvider>) -> Runner {
-    runner_with_role(provider, SessionRole::Concierge)
+    runner_with_role(provider, SessionRole::Chat)
 }
 
 pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> Runner {

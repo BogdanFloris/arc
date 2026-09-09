@@ -785,7 +785,7 @@ mod tests {
 
         let mut client = Client::connect(&url).await.expect("connect");
         let err = client
-            .create_session(SessionRole::Concierge, "arc")
+            .create_session(SessionRole::Chat, "arc")
             .await
             .expect_err("a non-executor role is refused");
 

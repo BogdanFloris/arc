@@ -2647,9 +2647,7 @@ mod tests {
             Some("astra")
         );
         assert_eq!(
-            projection
-                .role_selection(SessionRole::Concierge)
-                .expect("query"),
+            projection.role_selection(SessionRole::Chat).expect("query"),
             None,
             "a selection is per role"
         );

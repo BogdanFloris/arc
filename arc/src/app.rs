@@ -1781,7 +1781,7 @@ impl App {
     }
 
     /// The project a code door — pending or already open — is bound to.
-    /// `None` for the concierge, where the picker stays unscoped.
+    /// `None` for the chat, where the picker stays unscoped.
     pub fn open_project(&self) -> Option<&str> {
         if self.session_id.is_none() {
             return match &self.pending_code {
@@ -5772,7 +5772,7 @@ mod tests {
         assert!(!app.models_mut().expect("picker is open").loaded);
 
         app.on_net(NetEvent::ModelItems(vec![
-            choice(SessionRole::Concierge, "astra", true),
+            choice(SessionRole::Chat, "astra", true),
             choice(SessionRole::Executor, "sol", true),
             choice(SessionRole::Executor, "glm-flash", false),
         ]));
@@ -5946,7 +5946,7 @@ mod tests {
     // start_session(None) is the same path a pending door abandons through
     // (see above); this proves it holds for an already-created code session too
     #[test]
-    fn ctrl_n_from_an_open_code_session_opens_a_concierge() {
+    fn ctrl_n_from_an_open_code_session_opens_a_chat() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![code_session(
             "s-code", "", "scratch",
@@ -5960,7 +5960,7 @@ mod tests {
         assert_eq!(
             app.open_door_label(),
             None,
-            "ctrl-n from an open code session opens the concierge"
+            "ctrl-n from an open code session opens the chat"
         );
     }
 
@@ -5970,7 +5970,7 @@ mod tests {
         app.on_net(NetEvent::Sessions(vec![
             code_session("s-code", "", "scratch"),
             job_session("s-job", "", SessionRole::Executor, "arc"),
-            session("s-concierge"),
+            session("s-chat"),
         ]));
 
         app.start_session(Some("s-code".to_owned()));
@@ -5979,11 +5979,11 @@ mod tests {
         app.start_session(Some("s-job".to_owned()));
         assert_eq!(app.open_door_label().as_deref(), Some("job/arc"));
 
-        app.start_session(Some("s-concierge".to_owned()));
+        app.start_session(Some("s-chat".to_owned()));
         assert_eq!(
             app.open_door_label(),
             None,
-            "a concierge conversation is the default door, unlabelled"
+            "a chat conversation is the default door, unlabelled"
         );
     }
 
@@ -6098,7 +6098,7 @@ mod tests {
         app.on_net(NetEvent::Sessions(vec![
             code_session("s-arc-1", "in arc", "arc"),
             code_session("s-scratch-1", "in scratch", "scratch"),
-            session("s-concierge"),
+            session("s-chat"),
             job_session("s-job", "job in arc", SessionRole::Executor, "arc"),
         ]));
         normal(&mut app, ":code arc");
@@ -6120,7 +6120,7 @@ mod tests {
             "show-all lifts the project scope"
         );
         assert!(
-            all.contains(&"s-concierge"),
+            all.contains(&"s-chat"),
             "show-all includes chat conversations"
         );
         assert!(!all.contains(&"s-job"), "show-all still excludes jobs");

@@ -15,7 +15,7 @@ const DEFAULT_CREDENTIAL: &str = "codex";
 /// role, or `codex` when no role is on codex yet.
 pub fn credential_name(config: &Config) -> &str {
     [
-        config.roles.concierge.as_ref(),
+        config.roles.chat.as_ref(),
         config.roles.code.as_ref(),
         config.roles.executor.as_ref(),
         config.roles.archivist.as_ref(),

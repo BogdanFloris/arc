@@ -602,7 +602,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![
             Ok(CompletionDelta::Reasoning("weighing".to_owned())),
             Ok(CompletionDelta::Reasoning(" options".to_owned())),
@@ -615,7 +615,7 @@ mod tests {
 
         let (notifier, mut notifications) = broadcast::channel(64);
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -651,7 +651,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: Vec::new(),
@@ -660,7 +660,7 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -698,7 +698,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
@@ -710,7 +710,7 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -757,7 +757,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -772,7 +772,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -814,7 +814,7 @@ mod tests {
 
         tokio::time::pause();
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("first".to_owned()))],
@@ -826,7 +826,7 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -881,7 +881,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -896,7 +896,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -946,7 +946,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         // never notified: the stream never yields anything at all
         let gate = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
@@ -956,8 +956,8 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1000,7 +1000,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let gate1 = Arc::new(tokio::sync::Notify::new());
         let gate2 = Arc::new(tokio::sync::Notify::new());
         // two silent gaps, each under JOB_SILENCE_TIMEOUT but summing well
@@ -1034,7 +1034,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);

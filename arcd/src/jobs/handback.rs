@@ -207,12 +207,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -247,14 +247,14 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
             ProviderError::InvalidRequest("boom".to_owned()),
         )]]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -286,12 +286,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -345,12 +345,12 @@ mod tests {
             .expect("jj runs");
         assert!(init.success());
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("changed nothing")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -386,7 +386,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -401,8 +401,8 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -446,15 +446,15 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![Ok(CompletionDelta::Done {
             usage: usage(),
             stop: Stop::EndTurn,
         })]]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -492,22 +492,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clean_finish_triggers_a_concierge_turn_that_reacts_to_the_handback() {
+    async fn a_clean_finish_triggers_a_chat_turn_that_reacts_to_the_handback() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![done_reply("the job did X")]);
+        let chat_provider = ScriptedProvider::scripted(vec![done_reply("the job did X")]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -531,29 +531,29 @@ mod tests {
                 ),
                 (Role::Assistant, "the job did X".to_owned()),
             ],
-            "the handback lands, then the concierge's own turn reacts to it"
+            "the handback lands, then the chat's own turn reacts to it"
         );
     }
 
     #[tokio::test]
-    async fn a_failed_jobs_handback_also_triggers_a_concierge_turn() {
+    async fn a_failed_jobs_handback_also_triggers_a_chat_turn() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![done_reply("noted the failure")]);
+        let chat_provider = ScriptedProvider::scripted(vec![done_reply("noted the failure")]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
             ProviderError::InvalidRequest("boom".to_owned()),
         )]]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id,
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(
             last_assistant(dir.path(), &parent_id),
             Some("noted the failure".to_owned()),
-            "a failed job's handback gets a concierge turn too"
+            "a failed job's handback gets a chat turn too"
         );
     }
 
@@ -578,20 +578,20 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]); // must never be called
+        let chat_provider = ScriptedProvider::scripted(vec![]); // must never be called
         let executor_provider =
             ScriptedProvider::scripted(vec![done_reply("done"), done_reply("the parent reacts")]);
 
         let engine = engine_for_project(&dir, &root);
         let parent_id = engine
-            .create_direct_session(&runner(&concierge_provider), "arc", SessionRole::Executor)
+            .create_direct_session(&runner(&chat_provider), "arc", SessionRole::Executor)
             .expect("create the parent durably");
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id,
@@ -606,11 +606,11 @@ mod tests {
         assert_eq!(
             last_assistant(dir.path(), &parent_id),
             Some("the parent reacts".to_owned()),
-            "a code session reads its children's reports like the concierge does"
+            "a code session reads its children's reports like the chat does"
         );
         assert!(
-            concierge_provider.requests().is_empty(),
-            "the parent's own role runs its turn, not the concierge"
+            chat_provider.requests().is_empty(),
+            "the parent's own role runs its turn, not the chat"
         );
     }
 
@@ -633,7 +633,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
         let notify = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted_steps(vec![
+        let chat_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
                 before: vec![Ok(CompletionDelta::Text("reacting".to_owned()))],
                 notify: Arc::clone(&notify),
@@ -647,13 +647,13 @@ mod tests {
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("job done")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -663,7 +663,7 @@ mod tests {
             brief: "fix the failing test".to_owned(),
             budget: None,
         });
-        wait_for_requests(&concierge_provider, 1).await;
+        wait_for_requests(&chat_provider, 1).await;
 
         // exactly what a second child finishing would send
         let second = supervisor
@@ -704,7 +704,7 @@ mod tests {
             messages[0].1
         );
         assert_eq!(
-            concierge_provider.requests().len(),
+            chat_provider.requests().len(),
             2,
             "one turn, two completions: the second report joined it at a step boundary"
         );
@@ -716,17 +716,17 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]); // must never be called
+        let chat_provider = ScriptedProvider::scripted(vec![]); // must never be called
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
         for _ in 0..MAX_HANDBACK_TURNS {
             assert!(supervisor.shared.autonomy.claim(&parent_id));
         }
@@ -744,10 +744,10 @@ mod tests {
         assert_eq!(
             child_user_messages(dir.path(), &parent_id).len(),
             1,
-            "only the handback landed; the capped concierge turn never ran"
+            "only the handback landed; the capped chat turn never ran"
         );
         assert!(
-            concierge_provider.requests().is_empty(),
+            chat_provider.requests().is_empty(),
             "the capped provider was never called"
         );
     }
@@ -758,18 +758,17 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider =
-            ScriptedProvider::scripted(vec![done_reply("the concierge reacts")]);
+        let chat_provider = ScriptedProvider::scripted(vec![done_reply("the chat reacts")]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
 
         let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &concierge_provider);
-        let child_id = child_session(&engine, &concierge_provider);
+        let parent_id = parent_session(&engine, &chat_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
         for _ in 0..MAX_HANDBACK_TURNS {
             assert!(supervisor.shared.autonomy.claim(&parent_id));
         }
@@ -788,7 +787,7 @@ mod tests {
 
         assert_eq!(
             last_assistant(dir.path(), &parent_id),
-            Some("the concierge reacts".to_owned()),
+            Some("the chat reacts".to_owned()),
             "resetting the counter let the handback turn run again"
         );
     }
@@ -809,7 +808,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![
+        let chat_provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call("d2", 0, "dispatch", &dispatch_args)),
                 Ok(tool_stop()),
@@ -842,21 +841,16 @@ mod tests {
         );
 
         let parent_id = engine
-            .create_direct_session(&runner(&concierge_provider), "arc", SessionRole::Concierge)
+            .create_direct_session(&runner(&chat_provider), "arc", SessionRole::Chat)
             .expect("create the parent durably");
         let first_child = engine
-            .create_bound_session(
-                &runner(&concierge_provider),
-                "arc",
-                SessionRole::Executor,
-                None,
-            )
+            .create_bound_session(&runner(&chat_provider), "arc", SessionRole::Executor, None)
             .expect("create the first child durably");
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: first_child.clone(),
@@ -940,7 +934,7 @@ mod tests {
         // a throwaway provider: session creation never drives it
         let bootstrap_provider = ScriptedProvider::scripted(vec![]);
         let parent_id = engine
-            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Concierge)
+            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Chat)
             .expect("create the parent durably");
         let first_child = engine
             .create_bound_session(
@@ -951,7 +945,7 @@ mod tests {
             )
             .expect("create the first child durably");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![
+        let chat_provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call(
                     "c2",
@@ -973,8 +967,8 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners)
-            .with_concierge(runner(&concierge_provider));
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
 
         supervisor.spawn(DispatchedJob {
             session_id: first_child.clone(),
@@ -999,7 +993,7 @@ mod tests {
         assert_eq!(
             last_assistant(dir.path(), &parent_id),
             Some("noted".to_owned()),
-            "the resumed job's own handback drove one more concierge turn"
+            "the resumed job's own handback drove one more chat turn"
         );
     }
 }

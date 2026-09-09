@@ -312,7 +312,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let first_gate = Arc::new(tokio::sync::Notify::new());
         let second_gate = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
@@ -335,7 +335,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -402,11 +402,11 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -440,11 +440,11 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -483,11 +483,11 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -521,7 +521,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let gate = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("still working".to_owned()))],
@@ -533,7 +533,7 @@ mod tests {
         }]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -566,13 +566,13 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
             ProviderError::InvalidRequest("boom".to_owned()),
         )]]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -599,11 +599,11 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -638,7 +638,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider =
             ScriptedProvider::scripted((0..SPAWNED).map(|_| done_reply("ok")).collect());
 
@@ -648,7 +648,7 @@ mod tests {
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
         for i in 0..SPAWNED {
-            let child_id = child_session(&engine, &concierge_provider);
+            let child_id = child_session(&engine, &chat_provider);
             supervisor.spawn(DispatchedJob {
                 session_id: child_id,
                 parent_session: "s-parent".to_owned(),
@@ -680,12 +680,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
         let (notifier, mut notifications) = broadcast::channel(16);
 
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -713,12 +713,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
         let (notifier, mut notifications) = broadcast::channel(16);
 
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -747,14 +747,14 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
             ProviderError::InvalidRequest("boom".to_owned()),
         )]]);
         let (notifier, mut notifications) = broadcast::channel(16);
 
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -783,12 +783,12 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
         let (notifier, mut notifications) = broadcast::channel(16);
 
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -825,7 +825,7 @@ mod tests {
 
         // two issued calls in one round: Started hits for both land before
         // either tool runs, so the pushes count 1 then 2
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![
             vec![
                 Ok(call("c1", 0, "lookup", "{}")),
@@ -853,7 +853,7 @@ mod tests {
             )]))
             .with_notifier(notifier.clone()),
         );
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -898,7 +898,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
         let tool_gate = Arc::new(tokio::sync::Notify::new());
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Immediate(vec![Ok(call("c1", 0, "slow_tool", "{}")), Ok(tool_stop())]),
             Step::Immediate(done_reply("done after the slow tool")),
@@ -923,7 +923,7 @@ mod tests {
                 )]))
                 .with_notifier(notifier.clone()),
         );
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -976,7 +976,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -991,7 +991,7 @@ mod tests {
         ]);
 
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -1031,7 +1031,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
             before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
@@ -1044,7 +1044,7 @@ mod tests {
         let (notifier, mut notifications) = broadcast::channel(16);
 
         let engine = engine_for_project_notified(&dir, &root, notifier.clone());
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);

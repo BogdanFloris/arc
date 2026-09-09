@@ -52,7 +52,7 @@ pub struct Runner {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub thinking: Thinking,
-    /// The concierge's identity file, or a job's spawn-built preamble.
+    /// The chat's identity file, or a job's spawn-built preamble.
     pub system: Option<String>,
     /// The prompt-token count that triggers compaction (§4.4); `None` for a
     /// role with no configured `context_window`, which never compacts.
@@ -992,13 +992,13 @@ impl Engine {
         if runner.counsel
             && matches!(
                 role,
-                SessionRole::Concierge | SessionRole::Code | SessionRole::Executor
+                SessionRole::Chat | SessionRole::Code | SessionRole::Executor
             )
         {
             sources.push(ToolSource::Expert);
         }
-        // web is a concierge capability, no config gate (2026-08-24)
-        if role == SessionRole::Concierge {
+        // web is a chat capability, no config gate (2026-08-24)
+        if role == SessionRole::Chat {
             sources.push(ToolSource::Web);
         }
         Ok(sources)
@@ -2241,7 +2241,7 @@ impl Engine {
                 store.projection().session_started_at(session_id)?,
             ))
         })?;
-        let start_date = (runner.role == SessionRole::Concierge)
+        let start_date = (runner.role == SessionRole::Chat)
             .then(|| started_at.and_then(start_date_line))
             .flatten();
         let system = Self::system_prompt(
@@ -2702,7 +2702,7 @@ mod tests {
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
         let id = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .unwrap();
         let (tx, _rx) = channel();
         let reply = engine
@@ -2961,7 +2961,7 @@ mod tests {
         assert_eq!(created.session_id, reply.session_id);
         assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
-        assert_eq!(created.role, SessionRole::Concierge as i32);
+        assert_eq!(created.role, SessionRole::Chat as i32);
 
         let user = appended(&events[1]);
         assert_eq!(
@@ -3116,12 +3116,12 @@ mod tests {
         let err = engine
             .send_message(&run, Some("s-01"), "continue", tx)
             .await
-            .expect_err("a concierge engine must refuse an executor session");
+            .expect_err("a chat engine must refuse an executor session");
 
         assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
         let msg = err.to_string();
         assert!(
-            msg.contains("executor") && msg.contains("concierge"),
+            msg.contains("executor") && msg.contains("chat"),
             "the refusal names both roles: {msg}"
         );
         assert_eq!(
@@ -4420,7 +4420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_executor_turn_runs_past_the_concierge_step_cap() {
+    async fn an_executor_turn_runs_past_the_chat_step_cap() {
         let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS + 4)
             .map(|step| {
                 vec![
@@ -4600,7 +4600,7 @@ mod tests {
         let projection = Projection::in_memory().expect("open projection");
         let engine = Engine::new(Store::new(log, projection), Registry::new(512));
         let run = Runner {
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             provider: Arc::clone(&provider) as Arc<dyn Provider>,
             model: "test-model".to_owned(),
             thinking: Thinking::Minimal,
@@ -4848,7 +4848,7 @@ mod tests {
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let engine = Engine::new(Store::new(log, projection), Registry::new(512));
         let run = Runner {
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             provider: Arc::clone(&provider) as Arc<dyn Provider>,
             model: "test-model".to_owned(),
             thinking: Thinking::Default,
@@ -5198,7 +5198,7 @@ mod tests {
         crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
         let engine = Engine::new(Store::new(log, projection), Registry::new(512));
         let run = Runner {
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             provider: Arc::clone(&provider) as Arc<dyn Provider>,
             model: "test-model".to_owned(),
             thinking: Thinking::Minimal,
@@ -5576,11 +5576,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concierge_holds_consult_expert_when_its_model_has_counsel() {
+    async fn chat_holds_consult_expert_when_its_model_has_counsel() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let engine = engine_with_expert(&dir);
-        let run = counsel_runner(&provider, SessionRole::Concierge);
+        let run = counsel_runner(&provider, SessionRole::Chat);
         let (tx, _rx) = channel();
 
         engine
@@ -5662,7 +5662,7 @@ mod tests {
         let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
         let engine = engine_with_expert(&dir);
 
-        for role in [SessionRole::Concierge, SessionRole::Executor] {
+        for role in [SessionRole::Chat, SessionRole::Executor] {
             let run = runner_with_role(&provider, role);
             assert!(!run.counsel);
             let (tx, _rx) = channel();
@@ -5736,10 +5736,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_concierge_session_asks_the_provider_for_web_grounding() {
+    async fn a_chat_session_asks_the_provider_for_web_grounding() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Concierge);
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Chat);
         let (tx, _rx) = channel();
 
         engine
@@ -5747,7 +5747,7 @@ mod tests {
             .await
             .expect("send");
 
-        assert!(provider.requests()[0].web, "concierge is a web capability");
+        assert!(provider.requests()[0].web, "chat is a web capability");
     }
 
     #[tokio::test]
@@ -5832,7 +5832,7 @@ mod tests {
         ));
 
         let session_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect("create a bound session");
 
         let events = conversation_log(dir.path());
@@ -5841,7 +5841,7 @@ mod tests {
         };
         assert_eq!(created.session_id, session_id);
         assert_eq!(created.project, "arc");
-        assert_eq!(created.role, SessionRole::Concierge as i32);
+        assert_eq!(created.role, SessionRole::Chat as i32);
         assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
         assert_eq!(
@@ -6112,7 +6112,7 @@ mod tests {
         let (engine, run) = engine(&provider, &dir);
 
         let err = engine
-            .create_bound_session(&run, "ghost", SessionRole::Concierge, None)
+            .create_bound_session(&run, "ghost", SessionRole::Chat, None)
             .expect_err("an unconfigured project must be refused");
 
         assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
@@ -6137,7 +6137,7 @@ mod tests {
         ));
 
         let err = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect_err("a missing root must fail at creation");
 
         assert!(matches!(err, Error::Grants { ref project, .. } if project == "arc"));
@@ -6313,7 +6313,7 @@ mod tests {
         ));
 
         let session_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect("create a bound session");
         let (tx, _rx) = channel();
         engine
@@ -6350,7 +6350,7 @@ mod tests {
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
         let session_id = creating_engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect("create a bound session");
         drop(creating_engine);
 
@@ -6699,12 +6699,12 @@ mod tests {
             .fork_session(&reply.session_id, reply.seq)
             .expect("fork_session");
 
-        let concierge_run = runner(&provider);
+        let chat_run = runner(&provider);
         let (tx, _rx) = channel();
         let err = engine
-            .send_message(&concierge_run, Some(&fork_id), "continue", tx)
+            .send_message(&chat_run, Some(&fork_id), "continue", tx)
             .await
-            .expect_err("a concierge engine must refuse an executor branch");
+            .expect_err("a chat engine must refuse an executor branch");
         assert!(matches!(err, Error::RoleMismatch { .. }));
 
         let (tx, _rx) = channel();
@@ -7508,8 +7508,8 @@ mod tests {
             vec![ToolSource::Builtin],
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
-        let other_concierge = engine
-            .create_bound_session(&bootstrap_run, "arc", SessionRole::Concierge, None)
+        let other_chat = engine
+            .create_bound_session(&bootstrap_run, "arc", SessionRole::Chat, None)
             .expect("create a non-job session durably");
 
         let provider = ScriptedProvider::scripted(vec![
@@ -7518,7 +7518,7 @@ mod tests {
                     "c1",
                     0,
                     "continue_job",
-                    &continue_job_args(&other_concierge, "keep going"),
+                    &continue_job_args(&other_chat, "keep going"),
                 )),
                 Ok(tool_stop()),
             ],
@@ -7536,7 +7536,7 @@ mod tests {
         let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("concierge"), "{}", result.content);
+        assert!(result.content.contains("chat"), "{}", result.content);
         assert!(result.content.contains("not a job"), "{}", result.content);
     }
 
@@ -7888,7 +7888,7 @@ mod tests {
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
         let parent_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect("create the parent");
         let child_id = engine
             .create_bound_session_with_intent(
@@ -7933,7 +7933,7 @@ mod tests {
             vec![Grant::new(&root, Mode::ReadWrite)],
         ));
         let parent_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Concierge, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .expect("create the parent");
         let child_id = engine
             .create_bound_session(&run, "arc", SessionRole::Executor, None)
@@ -8020,10 +8020,8 @@ mod tests {
     #[tokio::test]
     async fn continue_session_runs_a_scripted_turn_over_the_existing_transcript_without_a_user_message()
      {
-        let provider = ScriptedProvider::scripted(vec![
-            done_reply("first"),
-            done_reply("the concierge reacts"),
-        ]);
+        let provider =
+            ScriptedProvider::scripted(vec![done_reply("first"), done_reply("the chat reacts")]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, run) = engine(&provider, &dir);
         let (tx, _rx) = channel();
@@ -8049,14 +8047,14 @@ mod tests {
         );
         let last = appended(&events[3]);
         assert_eq!(last.role, Role::Assistant as i32);
-        assert_eq!(last.content, "the concierge reacts");
+        assert_eq!(last.content, "the chat reacts");
 
         assert_eq!(
             ignoring_elapsed(engine.transcript(&reply.session_id).expect("transcript")),
             [
                 prose_entry(Role::User as i32, "hi", false),
                 assistant_entry_with_usage("first", 3, 5),
-                assistant_entry_with_usage("the concierge reacts", 3, 5),
+                assistant_entry_with_usage("the chat reacts", 3, 5),
             ],
             "no user message was appended for the handback turn"
         );
@@ -8067,7 +8065,7 @@ mod tests {
                 EngineEvent::Accepted {
                     session_id: reply.session_id.clone()
                 },
-                EngineEvent::Delta("the concierge reacts".to_owned()),
+                EngineEvent::Delta("the chat reacts".to_owned()),
             ]
         );
     }
@@ -8133,7 +8131,7 @@ mod tests {
         let err = engine
             .continue_session(&run, "s-01", tx)
             .await
-            .expect_err("a concierge engine must refuse an executor session");
+            .expect_err("a chat engine must refuse an executor session");
 
         assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
         assert_eq!(
@@ -8159,7 +8157,7 @@ mod tests {
                     stop: Stop::EndTurn,
                 })],
             },
-            Step::Immediate(done_reply("the concierge reacts")),
+            Step::Immediate(done_reply("the chat reacts")),
         ]);
         let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let engine = Arc::new(engine);
@@ -8217,7 +8215,7 @@ mod tests {
             continued_msg.turn_id, turn_id,
             "continue_session ran in its own turn, after the guard released"
         );
-        assert_eq!(continued_msg.content, "the concierge reacts");
+        assert_eq!(continued_msg.content, "the chat reacts");
         assert_eq!(sent.session_id, "s-01");
         assert_eq!(continued.session_id, "s-01");
     }

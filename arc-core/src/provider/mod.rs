@@ -66,7 +66,7 @@ impl Thinking {
 pub fn role_label(role: SessionRole) -> &'static str {
     match role {
         SessionRole::Unspecified => "unspecified",
-        SessionRole::Concierge => "concierge",
+        SessionRole::Chat => "chat",
         SessionRole::Code => "code",
         SessionRole::Executor => "executor",
         SessionRole::Archivist => "archivist",
@@ -334,7 +334,7 @@ mod tests {
     fn request() -> CompletionRequest {
         CompletionRequest {
             model: "test-model".to_owned(),
-            role: SessionRole::Concierge,
+            role: SessionRole::Chat,
             system: Some("be terse".to_owned()),
             messages: vec![Message::Text {
                 role: Role::User,

@@ -97,10 +97,10 @@ mod tests {
         )
         .expect("write AGENTS.md");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -134,10 +134,10 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
@@ -274,7 +274,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir proj");
         std::fs::write(root.join("AGENTS.md"), "Keep commits small.\n").expect("write AGENTS.md");
 
-        let concierge_provider = ScriptedProvider::scripted(vec![]);
+        let chat_provider = ScriptedProvider::scripted(vec![]);
         let notify = Arc::new(tokio::sync::Notify::new());
         let executor_provider = ScriptedProvider::scripted_steps(vec![
             Step::Gated {
@@ -288,7 +288,7 @@ mod tests {
             Step::Immediate(done_reply("steer reply")),
         ]);
         let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &concierge_provider);
+        let child_id = child_session(&engine, &chat_provider);
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
