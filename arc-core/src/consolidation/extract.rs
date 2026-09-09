@@ -644,10 +644,10 @@ fn sanitize_title(text: &str) -> Option<String> {
         .trim()
         .trim_matches(|c: char| c == '"' || c == '\'')
         .trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().count() > TITLE_OUTPUT_CAP {
         return None;
     }
-    Some(cap_chars(trimmed, TITLE_OUTPUT_CAP))
+    Some(trimmed.to_owned())
 }
 
 fn render_input(
@@ -1052,9 +1052,9 @@ mod tests {
 
     use super::{
         KNOWN_VERSIONS, ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4,
-        PROMPT_VERSION_V1, PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4, TITLE_PROMPT,
-        TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates, normalize, render_input, sanitize_title,
-        snippet, title_prompt, tokenize, windowed,
+        PROMPT_VERSION_V1, PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4,
+        TITLE_OUTPUT_CAP, TITLE_PROMPT, TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates,
+        normalize, render_input, sanitize_title, snippet, title_prompt, tokenize, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -1485,10 +1485,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_title_caps_at_sixty_chars() {
+    fn sanitize_title_rejects_a_reply_past_sixty_chars() {
         let long = "word ".repeat(20);
-        let title = sanitize_title(&long).expect("non-empty");
-        assert_eq!(title.chars().count(), 60);
+        assert_eq!(sanitize_title(&long), None, "a run-on reply is not a title");
+
+        let exact: String = "a".repeat(TITLE_OUTPUT_CAP);
+        assert_eq!(sanitize_title(&exact), Some(exact));
+
+        assert_eq!(
+            sanitize_title("Session picker keyboard navigation"),
+            Some("Session picker keyboard navigation".to_owned())
+        );
     }
 
     #[test]
