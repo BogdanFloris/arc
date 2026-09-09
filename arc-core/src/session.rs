@@ -825,7 +825,7 @@ impl Engine {
     }
 
     /// The text a finished job hands its parent: the summary, the daemon's
-    /// footprint, and how to follow up (§4.1). Delivering it is the
+    /// footprint, and how to follow up. Delivering it is the
     /// caller's, as an ordinary message into the parent session.
     pub fn compose_handback(
         &self,
@@ -984,11 +984,9 @@ impl Engine {
                 }
             }
         };
-        // a job never dispatches: work under a session the user opened is one level deep
         if source != Some(Source::Model as i32) {
             sources.push(ToolSource::Jobs);
         }
-        // the model preset says (§6.2); the archivist never holds it
         if runner.counsel
             && matches!(
                 role,
@@ -997,8 +995,7 @@ impl Engine {
         {
             sources.push(ToolSource::Expert);
         }
-        // web is a chat capability, no config gate (2026-08-24)
-        if role == SessionRole::Chat {
+        if matches!(role, SessionRole::Chat | SessionRole::Code) {
             sources.push(ToolSource::Web);
         }
         Ok(sources)
@@ -2019,7 +2016,7 @@ impl Engine {
     }
 
     /// Replaces the session's transcript through a cutoff seq with one
-    /// summary the runner's own model writes (§4.4). Returns whether a
+    /// summary the runner's own model writes. Returns whether a
     /// `SessionCompacted` event was appended; `false` covers every reason it
     /// wasn't — nothing to compact, a provider error, a summary that failed
     /// validation — and the turn (or the hand-triggered `:compact`) is meant
@@ -2283,7 +2280,7 @@ pub const COMPACTION_PROMPT_VERSION: &str = "v1";
 
 pub const COMPACTION_PROMPT_V1: &str = r#"You are ARC's compaction pass. A conversation has outgrown its context
 window; your summary replaces everything before it, and the rest of the
-conversation continues verbatim after it. Whatever you leave out is gone.
+conversation continues after it. Whatever you leave out is gone.
 
 Read the conversation that follows and answer with a summary under
 exactly these headings, in this order:
@@ -2300,11 +2297,11 @@ What is still unresolved: outstanding questions, next steps, anything
 started but not closed.
 
 Facts to keep
-File paths, commands, decisions, and errors seen — the specifics a
+File paths, commands, decisions, and errors seen, the specifics a
 continuation needs and would otherwise have to rediscover.
 
-Summarize tool output; never quote it verbatim. Do not write a section
-for the user's own words — that is appended separately, exactly as
+Summarize tool output; never quote it. Do not write a section
+for the user's own words, is appended separately, exactly as
 written. Start your reply with the "Goal" heading and nothing before it."#;
 
 const COMPACTION_GOAL_HEADING: &str = "Goal";
@@ -5748,6 +5745,21 @@ mod tests {
             .expect("send");
 
         assert!(provider.requests()[0].web, "chat is a web capability");
+    }
+
+    #[tokio::test]
+    async fn a_code_session_asks_the_provider_for_web_grounding() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Code);
+        let (tx, _rx) = channel();
+
+        engine
+            .send_message(&run, None, "hi", tx)
+            .await
+            .expect("send");
+
+        assert!(provider.requests()[0].web, "code searches as chat does");
     }
 
     #[tokio::test]
