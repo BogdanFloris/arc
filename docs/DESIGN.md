@@ -476,14 +476,37 @@ Session titles name the concrete task or topic, using bounded opening and recent
 Clients:
 
 - `arc` (TUI): first client, exercises everything — tree navigation, streaming, tool visibility, job status. Should use UDS when local, WebSocket when not.
-- `arc-voice`: a thin pipeline — wake word, local ASR, text over this socket, reply text, local TTS. No model logic. Stages sit behind traits like providers do: openWakeWord or Porcupine for the wake word, whisper.cpp for ASR with Silero VAD in front for endpointing, Kokoro for TTS streamed sentence-by-sentence so the first sentence speaks while the model writes the third. Cloud stage backends can slot in later without touching the architecture.
+- `arc-voice`: a thin audio client — microphone, speaker, local wake detection, mute and activation controls. Voice backend adapters live in `arc-core`, composed by `arcd`, which retains provider credentials. The client owns no reasoning, tools, or durable conversation state. Phase 4 adds the audio and control protocol in `arc-proto`; the current text protocol is not assumed to carry full-duplex audio unchanged.
 - Mobile: same protocol over Tailscale. Last, after the protocol has been stable under two other clients.
 
-**Speech-to-speech APIs are rejected.** They would own the conversation loop, while the chat holds memory tools and job dispatch. Handing the loop to a vendor means replumbing those tools through its protocol, and the log stops being where the conversation happens. That breaks invariants 1 and 2, not merely §7's client-agnosticism. Text on the wire is the only shape that keeps the log authoritative and voice provider-independent.
+### 7.1 Replaceable voice backends
 
-**Voice degrades rather than failing.** With a hosted chat, a dropped network breaks talking, not just coding. Falling back to the local provider (§6.1) is a Phase 4 exit requirement, with the degraded state visible or audible.
+**Decided 2026-09-11: prefer natural, full-duplex conversation without giving the voice backend authority over ARC.** This replaces the blanket rejection of speech-to-speech APIs. A vendor connection may hold transient audio state; it must not become the source of truth for the conversation. This is Phase 4 design intent, not implemented behaviour or work to start during Phase 3.7.
 
-ARC's speaking voice is designed separately from its writing voice (§5.1) and is not a stock persona. Phase 4 ships on a stock Kokoro voice named in config; the real voice is chosen later by living with three or four candidates for a day each rather than by demo impressiveness, then pinned under `data/` as clip, engine, version, **and stage config** — rate, pitch, and sentence-split thresholds shape perceived character as much as timbre, and they are the part that silently drifts across engine upgrades.
+The boundary is:
+
+```text
+arc-voice: local wake word, microphone, speaker, mute controls
+    ↕ audio and control events
+arcd / arc-core: replaceable voice backend adapter
+    ↔ cloud or local full-duplex speech backend
+    ↕ backend requests, answers, corrections, spoken-text events
+ARC session: reasoning, memory, tools, job dispatch
+    ↕
+project jobs
+```
+
+**ARC owns decisions and execution.** The voice backend handles listening, speaking, conversational timing, and interruptions. It may acknowledge a request and pass it to the ARC session; it cannot independently execute workspace tools, write memory, or promise an action ARC has not accepted. Voice starts in the unbound conversation (§4.2). The existing runner owns work and routes corrections to the relevant session or job. Interrupting playback does not cancel work; cancellation is a separate request.
+
+**The log remains authoritative.** Backend requests, answers, corrections, and the voice backend's own conversational wording must be represented durably, not reconstructed from a vendor's retained session. The backend's answer is not a substitute for the words spoken to the user. Phase 4 must define how generated text, played speech, and interrupted speech are distinguished before choosing the event schema. Do not claim playback accounting from a transcript alone. Audio retention is a separate, unresolved policy; it is not required merely to keep a text history. Reopening an audio connection restores context from ARC, not from vendor-only history. Replacing a voice backend does not swap the pinned reasoning provider of an ARC session (§6).
+
+**Activation is local and closed by default.** In the waiting state only local wake detection runs; no microphone audio is sent to a cloud backend. A wake word or button opens a conversation, with an audible or visible cue. While active, follow-ups and interruptions need no repeated wake word. An explicit stop-listening request, button, or inactivity timeout closes the audio connection and returns to local wake detection. Muting disables capture. Timeout length and an explicit extended-conversation mode remain prototype choices, not fixed defaults. Closing audio neither closes the durable session nor stops its jobs. A job handback must not reopen the microphone.
+
+**Prototype before committing to a provider.** GPT-Live-1 is the first cloud candidate, not an architectural dependency or a verified integration. Test one end-to-end slice: start a job by voice, interrupt and correct it while it runs, close and reopen audio, then verify that job state, spoken response, and durable history agree. Check delegation fidelity, playback accounting, reconnect behaviour, latency, and actual billing before adopting it. Benchmark a local full-duplex candidate against the same tasks and measure its resource use on Erebor; local parity and real-time performance are not assumed. If the full-duplex approach cannot keep actions and history aligned, retain the simpler pipeline rather than relax the invariants.
+
+**Voice degrades rather than failing.** Keep local ASR → ARC session → local TTS as the simpler fallback, not a second equally polished voice implementation. The starting candidates are whisper.cpp with Silero VAD for input and Kokoro for speech, behind replaceable stage interfaces. When the network is unavailable, the fallback uses the local reasoning provider (§6.1), with the degraded state visible or audible. This remains a Phase 4 exit requirement; it must respect session provider pinning rather than silently swap an existing session's model.
+
+ARC's speaking voice is designed separately from its writing voice (§5.1). Prototype voices are configuration choices, not a commitment to a stock persona. Choose the eventual voice by living with candidates rather than by demo impressiveness. Record its backend, voice identifier, version, and available speech settings; local voice assets live under `data/`.
 
 ## 8. Observability: Perfetto
 
@@ -527,7 +550,7 @@ Each phase ends in something used daily. No phase starts until the previous one 
 
 **Phase 3.7 — Direct door.** The executor becomes the development session: one turn runner for every session, messages landing mid-turn, tool results on screen, compaction as an event, the door chosen by where the client opened, memory gated on presence. Exit criterion: a week of development in `:code` sessions, with the chat used for talk and for away-from-keyboard dispatch only, and compaction having fired on real work without a visible loss.
 
-**Phase 4 — Voice + remote.** `arc-voice` per §7 — wake word, local ASR, text on the wire, local TTS — the daemon reached from a phone over Tailscale (the mobile client can start as the TUI over SSH), and rustic backup automated. Exit criteria: a restore drill rather than a backup existing, and voice degrading to the local provider when the network is gone.
+**Phase 4 — Voice + remote.** `arc-voice` and replaceable voice backends per §7.1: prototype cloud full-duplex speech against ARC's durable session boundary, evaluate a local candidate, and retain a simpler local ASR/TTS fallback. Reach the daemon from a phone over Tailscale (the mobile client can start as the TUI over SSH), and automate rustic backup. Exit criteria: the voice correction/reconnect test in §7.1 passes, a restore drill succeeds, and voice degrades to a local path when the network is gone without silently changing a session's pinned provider.
 
 **Phase 5 — Devices.** The first device MCP server (ESP32 pan-tilt) as a source in §4.3's registry, device-tool safety conventions designed against the first real actuator, then the arm. A wake-word room satellite, if one appears, is a §7 *client* and not a device — same board, different integration path, and conflating them would put a special case in the device layer. sqlite-vec embeddings land here, or earlier only if Phase 2–4 usage shows FTS falling short.
 
@@ -538,7 +561,7 @@ Deferred on purpose. Decide when the phase forces it.
 - **Consolidation triggering:** idle timeout vs explicit session close vs continuous. The v1 placeholder is a configurable idle timeout, so the pass has something to hang on. Traces judge it. (Phase 2.)
 - ~~**Model routing.**~~ **Decided.** Configuration assigns static roles; there is no runtime difficulty classifier, and every trace span records its role. Two questions remain: whether roles need task-specific labels (for example, consolidation and titling may need different timeouts and concurrency), and whether the chat can dispatch reliably enough or needs a stronger model just for dispatch. Phase 3 traces should answer both.
 - ~~**Compaction and the log.**~~ **Decided 2026-09-03**, as section 4.4: a `SessionCompacted` event the transcript builder honours on replay, triggered by measured prompt tokens against a configured window. What remains open is the fraction and the summary prompt, which the first real compactions tune.
-- **Voice stage placement.** With the chat hosted, the GPU is free during a voice turn — the sidecar is asleep and consolidation only runs on idle sessions. The Phase 4 plan's "whisper on CPU so the GPU stays free" constraint may no longer apply, which would allow a larger ASR model or GPU-side TTS for faster first audio. Measure in Phase 4 rather than inheriting the assumption. (Phase 4.)
+- **Voice integration and local resource use.** Resolve §7.1's playback accounting, audio retention, backend delegation, activation timeout, and provider-pinned offline fallback before implementation. Measure full-duplex and fallback latency, VRAM use, and contention on Erebor rather than assume local parity or reserve the GPU for a particular stage. (Phase 4.)
 - **Identity edits in the log.** Revisit if hand-editing becomes a bottleneck.
 - **Embeddings model for sqlite-vec,** local or API. (Phase 4/5.)
 - **Multi-machine beyond backup/restore** (log sync). (Post-v1.)
