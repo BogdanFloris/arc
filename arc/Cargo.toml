@@ -23,6 +23,7 @@ tracing.workspace = true
 expect-test.workspace = true
 prost.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 
 [lints]

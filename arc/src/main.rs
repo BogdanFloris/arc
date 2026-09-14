@@ -127,9 +127,7 @@ async fn run(
     let mut cursor = Mode::Insert;
     set_cursor_style(cursor);
 
-    // a ticking clock display is a legitimate timer; it only runs while a
-    // running job is on the strip or a turn streams, never data polling
-    let mut clock = tokio::time::interval(Duration::from_secs(1));
+    let mut clock = display_clock();
 
     while !app.quit {
         status_session.send_if_modified(|id| {
@@ -193,6 +191,13 @@ async fn run(
     Ok(())
 }
 
+fn display_clock() -> tokio::time::Interval {
+    let mut clock = tokio::time::interval(Duration::from_secs(1));
+    // Idle time must not become a backlog of redraws.
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    clock
+}
+
 // arc never says done: herdr derives it from working→idle and clears it on
 // pane focus, which is also what makes its finished-turn notification fire
 fn agent_state(status: Status) -> AgentState {
@@ -247,6 +252,25 @@ fn set_cursor_style(mode: Mode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn display_clock_skips_idle_days_without_bursting() {
+        use futures::FutureExt as _;
+
+        let mut clock = display_clock();
+        clock.tick().await;
+        for idle in [
+            Duration::from_secs(3 * 24 * 60 * 60),
+            Duration::from_secs(60),
+        ] {
+            tokio::time::advance(idle).await;
+            assert!(clock.tick().now_or_never().is_some());
+            assert!(clock.tick().now_or_never().is_none());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(clock.tick().now_or_never().is_some());
+            assert!(clock.tick().now_or_never().is_none());
+        }
+    }
 
     #[test]
     fn session_identity_events_refresh_only_missing_recorded_metadata() {
