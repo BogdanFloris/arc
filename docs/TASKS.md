@@ -48,3 +48,4 @@ Not tasks until evidence arrives: whether the continue-vs-dispatch and cancelled
 
 - **Voice (Phase 4)** — waits on this phase's week, as it waited on the last.
 - **A sandboxed worker, devices (Phase 5), embeddings** — unchanged.
+- **Jev experiments** — revisit when Bogdan gets early access. ARC triage/ranking and robot behaviour-selection ideas are in [ideas-jev.md](ideas-jev.md); no integration planned yet.
