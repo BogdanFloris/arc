@@ -55,6 +55,7 @@ fn session_created_event() -> Event {
                     },
                 ],
                 dispatched_by: "s-parent".to_string(),
+                choice: "gemini-pro".to_owned(),
             })),
         })),
     }

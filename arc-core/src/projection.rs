@@ -27,7 +27,7 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 21;
+pub(crate) const SCHEMA_VERSION: u32 = 22;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     role           INTEGER NOT NULL DEFAULT 0,
     provider       TEXT,
     model          TEXT,
+    choice         TEXT,
     source         INTEGER NOT NULL DEFAULT 0,
     disposition    INTEGER
 );
@@ -613,6 +614,18 @@ impl Projection {
         Ok(row.map(|(provider, model)| (provider.unwrap_or_default(), model.unwrap_or_default())))
     }
 
+    pub(crate) fn session_choice(&self, session_id: &str) -> Result<Option<String>, Error> {
+        let choice: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT choice FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(choice.flatten().filter(|choice| !choice.is_empty()))
+    }
+
     pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
         let title: Option<String> = self
             .conn
@@ -1095,7 +1108,7 @@ const REBUILD_TABLES: &[TableSpec] = &[
         table: "sessions",
         key_columns: 1,
         select: "SELECT id, parent_session, fork_point, dispatched_by, project, title, \
-                 started_at, consolidated_through, role, provider, model, source, disposition \
+                 started_at, consolidated_through, role, provider, model, choice, source, disposition \
                  FROM sessions ORDER BY id",
     },
     TableSpec {
@@ -1732,8 +1745,8 @@ fn insert_session(
     tx.execute(
         "INSERT INTO sessions
              (id, parent_session, fork_point, dispatched_by, project, title, started_at,
-              role, provider, model, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              role, provider, model, choice, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         (
             &created.session_id,
             (!created.parent_session.is_empty()).then_some(&created.parent_session),
@@ -1745,6 +1758,7 @@ fn insert_session(
             created.role,
             (!created.provider.is_empty()).then_some(&created.provider),
             (!created.model.is_empty()).then_some(&created.model),
+            (!created.choice.is_empty()).then_some(&created.choice),
             event.source,
         ),
     )?;
@@ -2453,6 +2467,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 })),
             })),
         }
@@ -2707,6 +2722,40 @@ mod tests {
             "a selection is per role"
         );
         assert_eq!(projection.last_seq().expect("seq"), Some(2));
+    }
+
+    #[test]
+    fn session_choices_replay_without_changing_pinned_identity() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut log = Log::open(dir.path()).expect("open log");
+        log.append(session_created_as(0, "legacy", "", None))
+            .expect("append legacy");
+        let mut recorded = session_created_as(1, "recorded", "", None);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = recorded.payload.as_mut()
+        {
+            created.choice = "sol".to_owned();
+        }
+        log.append(recorded).expect("append recorded");
+        drop(log);
+
+        for _ in 0..2 {
+            let mut projection = Projection::in_memory().expect("open");
+            let log = Log::open(dir.path()).expect("reopen log");
+            replay(log.reader().expect("reader"), &mut projection).expect("replay");
+
+            assert_eq!(projection.session_choice("missing").expect("choice"), None);
+            assert_eq!(projection.session_choice("legacy").expect("choice"), None);
+            assert_eq!(
+                projection.session_choice("recorded").expect("choice"),
+                Some("sol".to_owned())
+            );
+            assert_eq!(
+                projection.session_identity("recorded").expect("identity"),
+                Some(("gemini".to_owned(), "gemini-3-pro".to_owned()))
+            );
+        }
     }
 
     #[test]
@@ -3938,6 +3987,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 })),
             })),
         }

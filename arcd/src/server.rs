@@ -653,16 +653,25 @@ async fn create_session(
     create: CreateSession,
 ) -> ControlFlow<()> {
     let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
-    let msg = if !matches!(role, SessionRole::Code | SessionRole::Executor) {
+    let msg = if !matches!(
+        role,
+        SessionRole::Chat | SessionRole::Code | SessionRole::Executor
+    ) {
         error_frame(
             "unsupported_role",
-            format!(
-                ":code opens a code session (or legacy executor), not {}",
-                role_label(role)
-            ),
+            format!("cannot directly open a {} session", role_label(role)),
         )
     } else if let Some(runner) = supervisor.role_runner(role) {
-        match engine.create_direct_session(&runner, &create.project, role) {
+        let result = if role == SessionRole::Chat && create.project.is_empty() {
+            engine.create_session_with_choice(&runner, &create.choice)
+        } else if role == SessionRole::Chat {
+            Err(SessionError::UnknownProject {
+                project: create.project.clone(),
+            })
+        } else {
+            engine.create_direct_session_with_choice(&runner, &create.project, role, &create.choice)
+        };
+        match result {
             Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
             Err(error) => {
                 warn!(%error, code = error_code(&error), "create_session failed");
@@ -684,7 +693,8 @@ async fn fork_session(
     request_id: u64,
     fork: ForkSession,
 ) -> ControlFlow<()> {
-    let msg = match engine.fork_session(&fork.session_id, fork.fork_point) {
+    let msg = match engine.fork_session_with_choice(&fork.session_id, fork.fork_point, &fork.choice)
+    {
         Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
         Err(error) => {
             warn!(%error, code = error_code(&error), "fork_session failed");
@@ -882,6 +892,8 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::Cancelled => "cancelled",
         SessionError::RoleMismatch { .. } => "role_mismatch",
         SessionError::ModelMismatch { .. } => "model_mismatch",
+        SessionError::MissingChoice { .. } => "missing_choice",
+        SessionError::AmbiguousChoice { .. } => "ambiguous_choice",
         SessionError::Provider(_) => "provider",
         SessionError::UnknownProject { .. } => "unknown_project",
         SessionError::UnknownChoice { .. } => "unknown_choice",
@@ -1498,6 +1510,7 @@ mod tests {
             client_frame::Msg::CreateSession(CreateSession {
                 role: role as i32,
                 project: project.to_owned(),
+                choice: String::new(),
             }),
         )
         .await;
@@ -1925,6 +1938,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 })),
             })),
         };
@@ -3393,7 +3407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_refuses_a_non_coding_role() {
+    async fn create_session_refuses_a_project_for_chat() {
         let (registry, _project_dir, projects) = dispatch_registry_and_projects();
         let mut harness = Harness::with_executor_provider(
             Script::Echo,
@@ -3406,7 +3420,38 @@ mod tests {
 
         let msg = create_session(&mut ws, 1, SessionRole::Chat, "arc").await;
 
-        assert_eq!(failed(msg).code, "unsupported_role");
+        assert_eq!(failed(msg).code, "unknown_project");
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn create_chat_session_rejects_unknown_choice_and_accepts_a_turn() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::CreateSession(CreateSession {
+                role: SessionRole::Chat as i32,
+                project: String::new(),
+                choice: "unconfigured".to_owned(),
+            }),
+        )
+        .await;
+        let response = next_frame(&mut ws).await;
+        assert_eq!(failed(response.msg.expect("error")).code, "unknown_choice");
+
+        let created = create_session(&mut ws, 2, SessionRole::Chat, "").await;
+        let id = match created {
+            server_frame::Msg::MessageAccepted(accepted) => accepted.session_id,
+            other => panic!("expected session id, got {other:?}"),
+        };
+        send(&mut ws, 3, say(&id, "hello")).await;
+        let (served, reply, _) = turn(&mut ws, 3).await;
+        assert_eq!(served, id);
+        assert_eq!(reply, "re: hello");
 
         harness.stop().await;
     }
@@ -3443,6 +3488,7 @@ mod tests {
             client_frame::Msg::ForkSession(ForkSession {
                 session_id: session_id.clone(),
                 fork_point,
+                choice: String::new(),
             }),
         )
         .await;
@@ -3475,6 +3521,7 @@ mod tests {
             client_frame::Msg::ForkSession(ForkSession {
                 session_id: "ghost".to_owned(),
                 fork_point: 1,
+                choice: String::new(),
             }),
         )
         .await;
@@ -3509,6 +3556,7 @@ mod tests {
             client_frame::Msg::ForkSession(ForkSession {
                 session_id: session_id.clone(),
                 fork_point,
+                choice: String::new(),
             }),
         )
         .await;
@@ -3540,6 +3588,7 @@ mod tests {
             client_frame::Msg::ForkSession(ForkSession {
                 session_id: session_id.clone(),
                 fork_point,
+                choice: String::new(),
             }),
         )
         .await;
@@ -4014,8 +4063,18 @@ mod tests {
 
         // the turn is now stalled server-side; run a whole job to completion
         // (including its handback) while it stays that way
+        let job_id = engine
+            .create_bound_session(
+                &supervisor
+                    .role_runner(SessionRole::Executor)
+                    .expect("runner"),
+                "arc",
+                SessionRole::Executor,
+                None,
+            )
+            .expect("durable job");
         supervisor.spawn(arc_core::session::DispatchedJob {
-            session_id: "s-job".to_owned(),
+            session_id: job_id,
             parent_session: "s-parent".to_owned(),
             role: SessionRole::Executor,
             project: "arc".to_owned(),

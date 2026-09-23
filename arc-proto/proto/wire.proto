@@ -136,12 +136,12 @@ message CancelTurn {
   string session_id = 1;
 }
 
-// Creates a bound session directly — the TUI's :code door. No dispatch,
-// no budget; the project's grants are recorded at creation and the reply
-// is a MessageAccepted naming the new session.
+// Creates a direct session. Chat is unbound; code is bound to a project.
+// Empty choice takes the role default.
 message CreateSession {
   SessionRole role = 1;
   string project = 2;
+  string choice = 3;
 }
 
 // Asks for the configured projects `:code` (and `dispatch`) may bind to,
@@ -166,6 +166,8 @@ message ProjectList {
 message ForkSession {
   string session_id = 1;
   uint64 fork_point = 2;
+  // empty takes the role default
+  string choice = 3;
 }
 
 // Marks a fork's standing (row 2.4): REAL counts it toward consolidation,

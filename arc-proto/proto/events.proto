@@ -55,6 +55,8 @@ message SessionCreated {
   repeated WorkspaceGrant grants = 10;
   // the dispatching parent, set only for a job session's own creation
   string dispatched_by = 11;
+  // the configured preset picked for this session; empty in older events
+  string choice = 12;
 }
 
 // A branch's standing, latest wins on replay: unmarked is scratch and never

@@ -311,13 +311,16 @@ async fn handle(
         Command::DropSteers { session_id } => {
             verdict(client.drop_steers(&session_id).await, events)
         }
-        Command::CreateSession { role, project } => {
-            create_session(&mut client, role, &project, events).await
-        }
+        Command::CreateSession {
+            role,
+            project,
+            choice,
+        } => create_session(&mut client, role, &project, &choice, events).await,
         Command::ForkSession {
             session_id,
             fork_point,
-        } => fork_session(&mut client, &session_id, fork_point, events).await,
+            choice,
+        } => fork_session(&mut client, &session_id, fork_point, &choice, events).await,
         Command::MarkBranch {
             session_id,
             disposition,
@@ -478,9 +481,13 @@ async fn create_session(
     client: &mut Client,
     role: arc_proto::v1::SessionRole,
     project: &str,
+    choice: &str,
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
-    match client.create_session(role, project).await {
+    match client
+        .create_session_with_choice(role, project, choice)
+        .await
+    {
         Ok(session_id) => {
             let _ = events.send(NetEvent::SessionCreated { session_id });
             Ok(())
@@ -497,9 +504,13 @@ async fn fork_session(
     client: &mut Client,
     session_id: &str,
     fork_point: u64,
+    choice: &str,
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
-    match client.fork_session(session_id, fork_point).await {
+    match client
+        .fork_session_with_choice(session_id, fork_point, choice)
+        .await
+    {
         Ok(session_id) => {
             let _ = events.send(NetEvent::SessionForked { session_id });
             Ok(())

@@ -63,10 +63,12 @@ pub enum Command {
     CreateSession {
         role: SessionRole,
         project: String,
+        choice: String,
     },
     ForkSession {
         session_id: String,
         fork_point: u64,
+        choice: String,
     },
     MarkBranch {
         session_id: String,
@@ -190,6 +192,9 @@ pub struct Models {
     pub items: Vec<ModelChoice>,
     pub selected: usize,
     pub loaded: bool,
+    pub default: bool,
+    pub role: SessionRole,
+    pub recorded_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +353,8 @@ pub struct App {
     session_meta: HashMap<String, (SessionRole, String, Source)>,
     pending_code: Option<(SessionRole, String)>,
     pending_first: Option<(String, Vec<ImageAttachment>)>,
+    pending_model_creation: Option<(SessionRole, String)>,
+    pending_model_fork: Option<(SessionRole, String)>,
     pub review_pending: u32,
     launch_dir: Option<PathBuf>,
     seeded_projects: Vec<ProjectInfo>,
@@ -475,6 +482,8 @@ impl App {
             session_meta: HashMap::new(),
             pending_code: None,
             pending_first: None,
+            pending_model_creation: None,
+            pending_model_fork: None,
             review_pending: 0,
             launch_dir: None,
             seeded_projects: Vec::new(),
@@ -759,7 +768,7 @@ impl App {
             KeyCode::Char('?') => self.overlay = Overlay::Help { scroll: 0 },
             KeyCode::Char('J') => return Some(self.open_jobs()),
             KeyCode::Char('Q') => return Some(self.open_review()),
-            KeyCode::Char('M') => return Some(self.open_models()),
+            KeyCode::Char('M') => return self.open_models(false),
             KeyCode::Char('C') => return self.code_picker(),
             KeyCode::Tab => return self.switch_door(),
             KeyCode::Char('y') if self.status != Status::Streaming => {
@@ -1109,7 +1118,8 @@ impl App {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
                     "jobs" => return Some(self.open_jobs()),
-                    "model" => return Some(self.open_models()),
+                    "model" => return self.open_models(false),
+                    "model-default" => return self.open_models(true),
                     "chat" => return self.switch_chat(),
                     "code" => return self.code_picker(),
                     "mode" => return self.switch_door(),
@@ -1175,6 +1185,7 @@ impl App {
             Some(Command::ForkSession {
                 session_id,
                 fork_point,
+                choice: String::new(),
             })
         } else {
             self.last_error =
@@ -1255,6 +1266,7 @@ impl App {
         Some(Command::ForkSession {
             session_id,
             fork_point,
+            choice: String::new(),
         })
     }
 
@@ -1413,13 +1425,54 @@ impl App {
         Command::ListProjects
     }
 
-    fn open_models(&mut self) -> Command {
+    fn open_models(&mut self, default: bool) -> Option<Command> {
+        if !default && !self.can_switch_door() {
+            return None;
+        }
+        if !default && (self.pending_model_creation.is_some() || self.pending_model_fork.is_some())
+        {
+            self.last_error = Some("Wait for the model switch to finish".to_owned());
+            return None;
+        }
+        if !default
+            && self.session_id.is_some()
+            && self
+                .session_id
+                .as_deref()
+                .is_some_and(|id| !self.session_meta.contains_key(id))
+        {
+            self.last_error = Some("Session metadata unavailable; retry after refresh".to_owned());
+            return None;
+        }
+        let role = self
+            .pending_code
+            .as_ref()
+            .map(|(role, _)| *role)
+            .or_else(|| {
+                self.session_id
+                    .as_deref()
+                    .and_then(|id| self.session_meta.get(id))
+                    .map(|(role, _, _)| *role)
+            })
+            .unwrap_or(SessionRole::Chat);
+        if !default && role == SessionRole::Unspecified {
+            self.last_error = Some("Session role unknown; cannot choose a model".to_owned());
+            return None;
+        }
+        let recorded_model = self
+            .session_id
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
+            .map(|session| session.model.clone());
         self.overlay = Overlay::Models(Models {
             items: Vec::new(),
             selected: 0,
             loaded: false,
+            default,
+            role,
+            recorded_model,
         });
-        Command::ListModels
+        Some(Command::ListModels)
     }
 
     fn on_models_key(&mut self, code: KeyCode) -> Option<Command> {
@@ -1428,12 +1481,62 @@ impl App {
         }
         let models = self.models_mut()?;
         let choice = models.items.get(models.selected)?;
-        let command = Command::SelectModel {
-            role: SessionRole::try_from(choice.role).unwrap_or(SessionRole::Unspecified),
-            choice: choice.name.clone(),
-        };
+        let role = SessionRole::try_from(choice.role).unwrap_or(SessionRole::Unspecified);
+        let name = choice.name.clone();
+        let default = models.default;
         self.overlay = Overlay::None;
-        Some(command)
+        if default {
+            return Some(Command::SelectModel { role, choice: name });
+        }
+        if let Some(session_id) = self.session_id.clone() {
+            let Some((role, project, source)) = self.session_meta.get(&session_id).cloned() else {
+                self.last_error =
+                    Some("Session metadata unavailable; retry after refresh".to_owned());
+                return None;
+            };
+            let fork_point = self.transcript.iter().rev().find_map(|entry| {
+                matches!(entry.block, Block::You(_) | Block::Arc { .. })
+                    .then_some(entry.seq)
+                    .flatten()
+            });
+            if let Some(fork_point) = fork_point {
+                self.pending_model_fork = Some((role, project));
+                return Some(Command::ForkSession {
+                    session_id,
+                    fork_point,
+                    choice: name,
+                });
+            }
+            if source == Source::Model {
+                self.last_error =
+                    Some("Job session has no message to fork; choose another session".to_owned());
+                return None;
+            }
+            if self.transcript.iter().any(|entry| {
+                entry.seq.is_some()
+                    || matches!(&entry.block, Block::Note(text) if text == "loading")
+            }) {
+                self.last_error =
+                    Some("No durable message to fork; retry after history loads".to_owned());
+                return None;
+            }
+            self.pending_model_creation = Some((role, project.clone()));
+            return Some(Command::CreateSession {
+                role,
+                project,
+                choice: name,
+            });
+        }
+        let (role, project) = self
+            .pending_code
+            .clone()
+            .unwrap_or((SessionRole::Chat, String::new()));
+        self.pending_model_creation = Some((role, project.clone()));
+        Some(Command::CreateSession {
+            role,
+            project,
+            choice: name,
+        })
     }
 
     fn on_projects_key(&mut self, code: KeyCode) -> Option<Command> {
@@ -1900,6 +2003,10 @@ impl App {
     }
 
     fn submit(&mut self) -> Option<Command> {
+        if self.pending_model_creation.is_some() || self.pending_model_fork.is_some() {
+            self.last_error = Some("Wait for the model switch to finish".to_owned());
+            return None;
+        }
         let content = self.input.trim().to_owned();
         if content.is_empty() && self.pending_attachments.is_empty() {
             return None;
@@ -1937,7 +2044,11 @@ impl App {
             if let Some((role, project)) = self.pending_code.clone() {
                 self.status = Status::Streaming;
                 self.pending_first = Some((content, attachments));
-                return Some(Command::CreateSession { role, project });
+                return Some(Command::CreateSession {
+                    role,
+                    project,
+                    choice: String::new(),
+                });
             }
         }
         Some(self.send_with_attachments(content, attachments))
@@ -2222,6 +2333,8 @@ impl App {
                 None
             }
             NetEvent::Failed { code, msg } => {
+                self.pending_model_creation = None;
+                self.pending_model_fork = None;
                 self.live_streams = self.live_streams.saturating_sub(1);
                 if let Some((content, mut attachments)) = self.pending_first.take() {
                     if self.input.is_empty() {
@@ -2262,16 +2375,24 @@ impl App {
             }
             NetEvent::ModelItems(items) => {
                 if let Some(models) = self.models_mut() {
-                    models.selected = items
-                        .iter()
-                        .position(|c| c.selected && c.role == SessionRole::Code as i32)
-                        .or_else(|| {
-                            items
-                                .iter()
-                                .position(|c| c.selected && c.role == SessionRole::Executor as i32)
-                        })
-                        .or_else(|| items.iter().position(|c| c.selected))
-                        .unwrap_or(0);
+                    let items: Vec<_> = items
+                        .into_iter()
+                        .filter(|c| models.default || c.role == models.role as i32)
+                        .collect();
+                    models.selected = if models.default {
+                        items
+                            .iter()
+                            .position(|c| c.selected && c.role == SessionRole::Code as i32)
+                            .or_else(|| {
+                                items.iter().position(|c| {
+                                    c.selected && c.role == SessionRole::Executor as i32
+                                })
+                            })
+                            .or_else(|| items.iter().position(|c| c.selected))
+                    } else {
+                        items.iter().position(|c| c.selected)
+                    }
+                    .unwrap_or(0);
                     models.items = items;
                     models.loaded = true;
                 }
@@ -2339,6 +2460,14 @@ impl App {
                 None
             }
             NetEvent::SessionCreated { session_id } => {
+                if let Some((role, project)) = self.pending_model_creation.take() {
+                    self.session_meta
+                        .insert(session_id.clone(), (role, project, Source::User));
+                    let attachments = std::mem::take(&mut self.pending_attachments);
+                    let command = self.start_session(Some(session_id));
+                    self.pending_attachments = attachments;
+                    return command;
+                }
                 if let Some((role, project)) = self.pending_code.take() {
                     self.session_meta
                         .insert(session_id.clone(), (role, project, Source::User));
@@ -2348,7 +2477,13 @@ impl App {
                 Some(self.send_with_attachments(content, attachments))
             }
             NetEvent::SessionForked { session_id } => {
+                if let Some((role, project)) = self.pending_model_fork.take() {
+                    self.session_meta
+                        .insert(session_id.clone(), (role, project, Source::User));
+                }
+                let attachments = std::mem::take(&mut self.pending_attachments);
                 let command = self.start_session(Some(session_id));
+                self.pending_attachments = attachments;
                 if let Some(text) = self.pending_rewind_text.take() {
                     self.input = text;
                     self.cursor = self.input.len();
@@ -2361,6 +2496,8 @@ impl App {
                 Some(Command::History { session_id })
             }
             NetEvent::Disconnected { reason } => {
+                self.pending_model_creation = None;
+                self.pending_model_fork = None;
                 for mut attachments in self.sending_attachments.drain(..) {
                     self.pending_attachments.append(&mut attachments);
                 }
@@ -3010,7 +3147,7 @@ mod tests {
         let mut app = App::new();
         app.input = "draft".to_owned();
         app.cursor = app.input.len();
-        app.open_models();
+        app.open_models(false);
         let overlay = app.overlay.clone();
         for code in ['p', 'n', 'j', 'o', 't'] {
             assert_eq!(app.on_key(ctrl(code)), None);
@@ -5991,7 +6128,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_m_opens_the_model_picker_and_enter_selects_the_pointed_choice() {
+    fn shift_m_opens_the_contextual_model_picker() {
         let mut app = normal_app();
 
         let command = app.on_key(key(KeyCode::Char('M')));
@@ -6001,12 +6138,12 @@ mod tests {
         app.on_net(NetEvent::ModelItems(vec![
             choice(SessionRole::Chat, "astra", true),
             choice(SessionRole::Executor, "sol", true),
-            choice(SessionRole::Executor, "glm-flash", false),
+            choice(SessionRole::Chat, "glm-flash", false),
         ]));
         assert_eq!(
             app.models_mut().unwrap().selected,
-            1,
-            "the cursor lands on the executor's current pick"
+            0,
+            "the cursor lands on the chat role default"
         );
 
         app.on_key(key(KeyCode::Char('j')));
@@ -6014,8 +6151,9 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(Command::SelectModel {
-                role: SessionRole::Executor,
+            Some(Command::CreateSession {
+                role: SessionRole::Chat,
+                project: String::new(),
                 choice: "glm-flash".to_owned(),
             })
         );
@@ -6027,9 +6165,11 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_selects_code_independently_from_executor() {
+    fn model_default_picker_selects_code_independently_from_executor() {
         let mut app = normal_app();
-        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Char(':')));
+        typed(&mut app, "model-default");
+        app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::ModelItems(vec![
             choice(SessionRole::Executor, "sol", true),
             choice(SessionRole::Code, "sol", true),
@@ -6054,6 +6194,180 @@ mod tests {
         let command = app.on_key(key(KeyCode::Enter));
         assert_eq!(command, Some(Command::ListModels));
         assert!(app.models_mut().is_some());
+    }
+
+    #[test]
+    fn choosing_for_a_pending_code_door_keeps_the_draft_and_attachments() {
+        let mut app = normal_app();
+        app.pending_code = Some((SessionRole::Code, "arc".to_owned()));
+        app.input = "unfinished".to_owned();
+        app.cursor = app.input.len();
+        app.pending_attachments.push(ImageAttachment {
+            name: "plot.png".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('M'))),
+            Some(Command::ListModels)
+        );
+        app.on_net(NetEvent::ModelItems(vec![
+            choice(SessionRole::Chat, "chat", true),
+            choice(SessionRole::Code, "fast", false),
+        ]));
+        assert_eq!(app.models_mut().unwrap().items.len(), 1);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::CreateSession {
+                role: SessionRole::Code,
+                project: "arc".to_owned(),
+                choice: "fast".to_owned(),
+            })
+        );
+        assert_eq!(
+            app.on_net(NetEvent::SessionCreated {
+                session_id: "new".to_owned()
+            }),
+            Some(Command::History {
+                session_id: "new".to_owned()
+            })
+        );
+        assert_eq!(app.input, "unfinished");
+        assert_eq!(app.pending_attachments().len(), 1);
+        assert_eq!(
+            app.session_meta["new"],
+            (SessionRole::Code, "arc".to_owned(), Source::User)
+        );
+    }
+
+    #[test]
+    fn choosing_for_a_nonempty_session_forks_at_its_latest_message() {
+        let mut app = normal_app();
+        app.session_id = Some("old".to_owned());
+        app.session_meta.insert(
+            "old".to_owned(),
+            (SessionRole::Executor, "arc".to_owned(), Source::Model),
+        );
+        app.transcript = vec![
+            Entry {
+                block: Block::You("hello".to_owned()),
+                seq: Some(3),
+            },
+            Entry {
+                block: Block::Tool {
+                    call_id: "x".to_owned(),
+                    name: "read".to_owned(),
+                    args: String::new(),
+                    outcome: Some("ok"),
+                    content: String::new(),
+                    open: false,
+                },
+                seq: Some(5),
+            },
+            Entry {
+                block: Block::Arc {
+                    text: "reply".to_owned(),
+                    partial: false,
+                },
+                seq: Some(7),
+            },
+            Entry {
+                block: Block::Cost {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    seconds: 0.1,
+                },
+                seq: None,
+            },
+        ];
+        app.input = "still typing".to_owned();
+        app.cursor = app.input.len();
+        app.pending_attachments.push(ImageAttachment {
+            name: "draft.png".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('M'))),
+            Some(Command::ListModels)
+        );
+        app.on_net(NetEvent::ModelItems(vec![
+            choice(SessionRole::Chat, "other", true),
+            choice(SessionRole::Executor, "fast", false),
+        ]));
+        assert_eq!(app.models_mut().unwrap().items.len(), 1);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::ForkSession {
+                session_id: "old".to_owned(),
+                fork_point: 7,
+                choice: "fast".to_owned(),
+            })
+        );
+        assert_eq!(
+            app.on_net(NetEvent::SessionForked {
+                session_id: "branch".to_owned()
+            }),
+            Some(Command::History {
+                session_id: "branch".to_owned()
+            })
+        );
+        assert_eq!(app.input, "still typing");
+        assert_eq!(app.pending_attachments().len(), 1);
+        assert_eq!(app.session_meta["branch"].0, SessionRole::Executor);
+    }
+
+    #[test]
+    fn choosing_for_an_empty_code_session_creates_a_new_bound_session() {
+        let mut app = normal_app();
+        app.session_id = Some("empty".to_owned());
+        app.session_meta.insert(
+            "empty".to_owned(),
+            (SessionRole::Code, "arc".to_owned(), Source::User),
+        );
+        app.on_key(key(KeyCode::Char('M')));
+        app.on_net(NetEvent::ModelItems(vec![choice(
+            SessionRole::Code,
+            "deep",
+            false,
+        )]));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::CreateSession {
+                role: SessionRole::Code,
+                project: "arc".to_owned(),
+                choice: "deep".to_owned(),
+            })
+        );
+        assert_eq!(app.session_id.as_deref(), Some("empty"));
+    }
+
+    #[test]
+    fn model_switch_refuses_streaming_and_empty_job_sessions() {
+        let mut app = normal_app();
+        app.status = Status::Streaming;
+        assert_eq!(app.on_key(key(KeyCode::Char('M'))), None);
+        assert!(app.models_mut().is_none());
+        app.status = Status::Idle;
+        app.session_id = Some("job".to_owned());
+        app.session_meta.insert(
+            "job".to_owned(),
+            (SessionRole::Executor, "arc".to_owned(), Source::Model),
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('M'))),
+            Some(Command::ListModels)
+        );
+        app.on_net(NetEvent::ModelItems(vec![choice(
+            SessionRole::Executor,
+            "fast",
+            false,
+        )]));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert!(
+            app.last_error
+                .as_ref()
+                .unwrap()
+                .contains("no message to fork")
+        );
     }
 
     #[test]
@@ -6091,6 +6405,7 @@ mod tests {
             Some(Command::CreateSession {
                 role: SessionRole::Code,
                 project: "scratch".to_owned(),
+                choice: String::new(),
             }),
             "from the pick on, this is exactly the :code flow"
         );
@@ -6129,6 +6444,7 @@ mod tests {
             Some(Command::CreateSession {
                 role: SessionRole::Code,
                 project: "arc".to_owned(),
+                choice: String::new(),
             }),
             "the first message is what opens the session"
         );
@@ -6375,6 +6691,7 @@ mod tests {
             Some(Command::CreateSession {
                 role: SessionRole::Code,
                 project: "arc".to_owned(),
+                choice: String::new(),
             }),
             "the first message after an auto-opened door is exactly the :code flow"
         );
@@ -7481,6 +7798,7 @@ mod tests {
             Some(Command::ForkSession {
                 session_id: "s-1".to_owned(),
                 fork_point: 4,
+                choice: String::new(),
             })
         );
         assert_eq!(app.mode, Mode::Normal, "the command consumes the selection");
@@ -7543,6 +7861,7 @@ mod tests {
             Some(Command::ForkSession {
                 session_id: "s-1".to_owned(),
                 fork_point: 4,
+                choice: String::new(),
             })
         );
         assert_eq!(app.mode, Mode::Normal, "the key consumes the selection");
@@ -7608,6 +7927,7 @@ mod tests {
             Some(Command::ForkSession {
                 session_id: "s-1".to_owned(),
                 fork_point: 2,
+                choice: String::new(),
             }),
             "forks at the preceding reply's seq, excluding the chosen message"
         );

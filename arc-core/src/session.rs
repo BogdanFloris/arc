@@ -192,8 +192,8 @@ pub enum Error {
     },
 
     #[error(
-        "session {session_id} was recorded on {pinned}; the {role} now runs {serving}. \
-         Fork it to continue under {serving}, or dispatch a fresh job."
+        "session {session_id} was recorded on {pinned}; the {role} turn tried {serving}. \
+         Use its recorded model, or fork to switch."
     )]
     ModelMismatch {
         session_id: String,
@@ -213,6 +213,16 @@ pub enum Error {
 
     #[error("`{choice}` is not one of the {role} role's model choices")]
     UnknownChoice { role: String, choice: String },
+
+    #[error("session {session_id} needs its recorded model choice {choice}; restore it or fork")]
+    MissingChoice { session_id: String, choice: String },
+
+    #[error("session {session_id} has ambiguous old model {provider}/{model}; fork it")]
+    AmbiguousChoice {
+        session_id: String,
+        provider: String,
+        model: String,
+    },
 
     #[error("project {project}: could not resolve its granted roots: {source}")]
     Grants {
@@ -399,10 +409,19 @@ impl Engine {
             .cloned())
     }
 
-    fn role_identity(&self, role: SessionRole) -> Result<Option<(String, String)>, Error> {
-        Ok(self
-            .current_choice(role)?
-            .map(|choice| (choice.provider, choice.model)))
+    fn choice_for(&self, role: SessionRole, choice: &str) -> Result<Option<ModelChoice>, Error> {
+        if choice.is_empty() {
+            return self.current_choice(role);
+        }
+        self.role_choices
+            .get(&role)
+            .and_then(|menu| menu.iter().find(|entry| entry.name == choice))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| Error::UnknownChoice {
+                role: provider::role_label(role).to_owned(),
+                choice: choice.to_owned(),
+            })
     }
 
     /// Every role's menu with its current pick marked, in wire shape.
@@ -480,12 +499,22 @@ impl Engine {
             Intent::Implement,
             None,
             Source::Model,
+            "",
         )
     }
 
     /// An unbound session with no message yet: what `send_message_from`
     /// records for itself when it is handed no session id.
     pub fn create_session(&self, runner: &Runner) -> Result<String, Error> {
+        self.create_session_with_choice(runner, "")
+    }
+
+    pub fn create_session_with_choice(
+        &self,
+        runner: &Runner,
+        choice: &str,
+    ) -> Result<String, Error> {
+        let selected = self.choice_for(runner.role, choice)?;
         let session_id = uuid::Uuid::new_v4().to_string();
         self.record(
             Source::User,
@@ -494,13 +523,19 @@ impl Engine {
                 parent_session: String::new(),
                 fork_point: 0,
                 title: String::new(),
-                provider: runner.provider.name().to_owned(),
-                model: runner.model.clone(),
+                provider: selected.as_ref().map_or_else(
+                    || runner.provider.name().to_owned(),
+                    |pick| pick.provider.clone(),
+                ),
+                model: selected
+                    .as_ref()
+                    .map_or_else(|| runner.model.clone(), |pick| pick.model.clone()),
                 role: runner.role as i32,
                 project: String::new(),
                 budget: None,
                 grants: Vec::new(),
                 dispatched_by: String::new(),
+                choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
         Ok(session_id)
@@ -512,6 +547,16 @@ impl Engine {
         project: &str,
         role: SessionRole,
     ) -> Result<String, Error> {
+        self.create_direct_session_with_choice(runner, project, role, "")
+    }
+
+    pub fn create_direct_session_with_choice(
+        &self,
+        runner: &Runner,
+        project: &str,
+        role: SessionRole,
+        choice: &str,
+    ) -> Result<String, Error> {
         self.create_bound_session_with_intent(
             runner,
             project,
@@ -520,6 +565,7 @@ impl Engine {
             Intent::Implement,
             None,
             Source::User,
+            choice,
         )
     }
 
@@ -539,6 +585,7 @@ impl Engine {
         intent: Intent,
         dispatched_by: Option<&str>,
         source: Source,
+        choice: &str,
     ) -> Result<String, Error> {
         let spec = self
             .projects
@@ -561,9 +608,11 @@ impl Engine {
 
         let session_id = uuid::Uuid::new_v4().to_string();
         tracing::Span::current().record("session_id", session_id.as_str());
-        let (provider, model) = self
-            .role_identity(role)?
-            .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
+        let selected = self.choice_for(role, choice)?;
+        let (provider, model) = selected.as_ref().map_or_else(
+            || (runner.provider.name().to_owned(), runner.model.clone()),
+            |pick| (pick.provider.clone(), pick.model.clone()),
+        );
         self.record(
             source,
             session_event::Event::SessionCreated(SessionCreated {
@@ -585,12 +634,22 @@ impl Engine {
                     })
                     .collect(),
                 dispatched_by: dispatched_by.unwrap_or_default().to_owned(),
+                choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
         Ok(session_id)
     }
 
     pub fn fork_session(&self, parent_id: &str, fork_point: u64) -> Result<String, Error> {
+        self.fork_session_with_choice(parent_id, fork_point, "")
+    }
+
+    pub fn fork_session_with_choice(
+        &self,
+        parent_id: &str,
+        fork_point: u64,
+        choice: &str,
+    ) -> Result<String, Error> {
         self.with_store(|store| store.projection().session_role(parent_id))?
             .ok_or_else(|| Error::UnknownSession {
                 session_id: parent_id.to_owned(),
@@ -621,11 +680,12 @@ impl Engine {
             .ok_or_else(|| Error::UnknownSession {
                 session_id: parent_id.to_owned(),
             })?;
-        // a fork is the door past the pin: it runs under the role's model today
-        let (provider, model) = match self
-            .role_identity(SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified))?
-        {
-            Some(current) => current,
+        let selected = self.choice_for(
+            SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified),
+            choice,
+        )?;
+        let (provider, model) = match &selected {
+            Some(pick) => (pick.provider.clone(), pick.model.clone()),
             None => self
                 .with_store(|store| store.projection().session_identity(parent_id))?
                 .unwrap_or_default(),
@@ -653,6 +713,7 @@ impl Engine {
                     .map(|(root, read_write)| WorkspaceGrant { root, read_write })
                     .collect(),
                 dispatched_by: String::new(),
+                choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
         Ok(session_id)
@@ -732,6 +793,7 @@ impl Engine {
             intent,
             Some(parent_session),
             Source::Model,
+            "",
         ) {
             Ok(child_id) => (
                 ToolOutcome::Ok,
@@ -788,7 +850,7 @@ impl Engine {
 
     fn continue_job(
         &self,
-        runner: &Runner,
+        _runner: &Runner,
         parent_session: &str,
         request: ContinueRequest,
     ) -> (ToolOutcome, String, Option<ContinuedJob>) {
@@ -818,8 +880,36 @@ impl Engine {
                 None,
             );
         };
-        if let Some(error) = self.identity_mismatch(runner, role, &request.session_id) {
-            return (ToolOutcome::Error, format!("ERROR: {error}"), None);
+        let recorded_choice = match self.session_choice(&request.session_id) {
+            Ok(choice) => choice,
+            Err(error) => return (ToolOutcome::Error, format!("ERROR: {error}"), None),
+        };
+        if let Some(choice) = recorded_choice {
+            let selected = self
+                .role_choices
+                .get(&role)
+                .and_then(|menu| menu.iter().find(|entry| entry.name == choice));
+            if let Some(selected) = selected {
+                if let Ok(Some((provider, model))) = self.session_identity(&request.session_id) {
+                    if (provider.as_str(), model.as_str())
+                        != (selected.provider.as_str(), selected.model.as_str())
+                    {
+                        let error = Error::ModelMismatch {
+                            session_id: request.session_id,
+                            pinned: identity_label(&provider, &model),
+                            role: provider::role_label(role).to_owned(),
+                            serving: identity_label(&selected.provider, &selected.model),
+                        };
+                        return (ToolOutcome::Error, format!("ERROR: {error}"), None);
+                    }
+                }
+            } else {
+                let error = Error::MissingChoice {
+                    session_id: request.session_id,
+                    choice,
+                };
+                return (ToolOutcome::Error, format!("ERROR: {error}"), None);
+            }
         }
         let project = self
             .with_store(|store| store.projection().session_project(&request.session_id))
@@ -1187,6 +1277,17 @@ impl Engine {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: self
+                        .role_choices
+                        .get(&runner.role)
+                        .and_then(|menu| {
+                            menu.iter().find(|choice| {
+                                choice.provider == runner.provider.name()
+                                    && choice.model == runner.model
+                                    && choice.thinking == runner.thinking
+                            })
+                        })
+                        .map_or_else(String::new, |choice| choice.name.clone()),
                 }),
             )?;
         }
@@ -1871,18 +1972,13 @@ impl Engine {
             }
             Some(_) | None => {}
         }
-        match self.identity_mismatch(runner, runner.role, session_id) {
+        match self.identity_mismatch(runner, session_id) {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    fn identity_mismatch(
-        &self,
-        runner: &Runner,
-        role: SessionRole,
-        session_id: &str,
-    ) -> Option<Error> {
+    fn identity_mismatch(&self, runner: &Runner, session_id: &str) -> Option<Error> {
         let recorded = self
             .with_store(|store| store.projection().session_identity(session_id))
             .ok()
@@ -1890,18 +1986,14 @@ impl Engine {
         if recorded.0.is_empty() && recorded.1.is_empty() {
             return None;
         }
-        let current = self
-            .role_identity(role)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| (runner.provider.name().to_owned(), runner.model.clone()));
+        let current = (runner.provider.name().to_owned(), runner.model.clone());
         if recorded == current {
             return None;
         }
         Some(Error::ModelMismatch {
             session_id: session_id.to_owned(),
             pinned: identity_label(&recorded.0, &recorded.1),
-            role: provider::role_label(role).to_owned(),
+            role: provider::role_label(runner.role).to_owned(),
             serving: identity_label(&current.0, &current.1),
         })
     }
@@ -1929,6 +2021,14 @@ impl Engine {
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
         Ok(self.with_store(|store| store.projection().sessions())?)
+    }
+
+    pub fn session_choice(&self, session_id: &str) -> Result<Option<String>, Error> {
+        Ok(self.with_store(|store| store.projection().session_choice(session_id))?)
+    }
+
+    pub fn session_identity(&self, session_id: &str) -> Result<Option<(String, String)>, Error> {
+        Ok(self.with_store(|store| store.projection().session_identity(session_id))?)
     }
 
     pub fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
@@ -2975,6 +3075,7 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: String::new(),
+            choice: String::new(),
         })
     }
 
@@ -3086,6 +3187,7 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: String::new(),
+            choice: String::new(),
         })
     }
 
@@ -3282,6 +3384,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -3826,6 +3929,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 }),
             )
             .expect("record");
@@ -6262,6 +6366,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_fork_choice_records_its_own_pin_without_changing_the_default() {
+        let provider = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let choices = ["first", "second"]
+            .into_iter()
+            .map(|name| super::ModelChoice {
+                name: name.to_owned(),
+                provider: "scripted".to_owned(),
+                model: name.to_owned(),
+                thinking: Thinking::Default,
+            })
+            .collect();
+        let engine = engine.with_role_choices(BTreeMap::from([(SessionRole::Chat, choices)]));
+        let parent = engine.create_session(&run).expect("parent");
+        let fork_point = engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: parent.clone(),
+                    role: Role::User as i32,
+                    content: "context".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .expect("message");
+        let fork = engine
+            .fork_session_with_choice(&parent, fork_point, "second")
+            .expect("fork");
+        assert_eq!(
+            engine
+                .selected_choice(SessionRole::Chat)
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            engine.session_choice(&fork).unwrap().as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            engine.session_identity(&fork).unwrap(),
+            Some(("scripted".to_owned(), "second".to_owned()))
+        );
+        let err = engine
+            .fork_session_with_choice(&parent, fork_point, "missing")
+            .expect_err("unknown choice");
+        assert!(matches!(err, Error::UnknownChoice { .. }));
+    }
+
+    #[tokio::test]
     async fn create_bound_session_with_role_identities_set_records_the_childs_own_provider_and_model()
      {
         let dir = TempDir::new().expect("temp dir");
@@ -6591,7 +6746,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
 
-        let creating_provider = ScriptedProvider::scripted(vec![done_reply("first")]);
+        let creating_provider = ScriptedProvider::scripted(vec![]);
         let (creating_engine, _run) =
             engine_with_tools(&creating_provider, &dir, Registry::new(512));
         let creating_engine = creating_engine
@@ -6608,11 +6763,17 @@ mod tests {
         let parent_id = creating_engine
             .create_bound_session(&creating_run, "arc", SessionRole::Executor, None)
             .expect("create a bound session");
-        let (tx, _rx) = channel();
-        let reply = creating_engine
-            .send_message(&creating_run, Some(&parent_id), "hi", tx)
-            .await
-            .expect("send");
+        let fork_point = creating_engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: parent_id.clone(),
+                    role: Role::User as i32,
+                    content: "hi".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .expect("message");
         drop(creating_engine);
 
         // reconfigured before the fork: a changed root and a different executor identity
@@ -6631,7 +6792,7 @@ mod tests {
         )]));
 
         let fork_id = engine
-            .fork_session(&parent_id, reply.seq)
+            .fork_session(&parent_id, fork_point)
             .expect("fork_session");
 
         assert_ne!(fork_id, parent_id);
@@ -6644,7 +6805,7 @@ mod tests {
         };
         assert_eq!(created.session_id, fork_id);
         assert_eq!(created.parent_session, parent_id);
-        assert_eq!(created.fork_point, reply.seq);
+        assert_eq!(created.fork_point, fork_point);
         assert_eq!(created.role, SessionRole::Executor as i32);
         assert_eq!(created.project, "arc");
         assert_eq!(
@@ -7745,6 +7906,7 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: String::new(),
+            choice: String::new(),
         })
     }
 
@@ -7766,11 +7928,12 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: String::new(),
+            choice: String::new(),
         })
     }
 
     #[tokio::test]
-    async fn continue_job_refuses_when_the_recorded_model_no_longer_matches_the_role() {
+    async fn continue_job_keeps_its_recorded_model_when_the_role_default_changes() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -7784,19 +7947,25 @@ mod tests {
                 vec![ToolSource::Builtin],
                 vec![Grant::new(&root, Mode::ReadWrite)],
             ))
-            .with_role_identities(BTreeMap::from([(
+            .with_role_choices(BTreeMap::from([(
                 SessionRole::Executor,
-                ("scripted".to_owned(), "model-a".to_owned()),
+                ["model-a", "model-b"]
+                    .into_iter()
+                    .map(|name| super::ModelChoice {
+                        name: name.to_owned(),
+                        provider: "scripted".to_owned(),
+                        model: name.to_owned(),
+                        thinking: Thinking::Default,
+                    })
+                    .collect(),
             )]));
         let child_id = engine
             .create_bound_session(&bootstrap_run, "arc", SessionRole::Executor, None)
             .expect("create the child durably, recorded on model-a");
 
-        // config changed since: the executor role now runs a different model
-        let engine = engine.with_role_identities(BTreeMap::from([(
-            SessionRole::Executor,
-            ("scripted".to_owned(), "model-b".to_owned()),
-        )]));
+        engine
+            .select_model(SessionRole::Executor, "model-b")
+            .expect("change default, keep the old preset configured");
 
         let provider = ScriptedProvider::scripted(vec![
             vec![
@@ -7816,19 +7985,20 @@ mod tests {
         let reply = engine
             .send_message(&run, None, "continue it", tx)
             .await
-            .expect("a refused continue_job fails the call, not the turn");
+            .expect("the continue request completes");
 
         assert!(
-            reply.continues.is_empty(),
-            "the mismatch refuses the resume"
+            reply.continues.len() == 1,
+            "the session's recorded model, not the changed default, governs the resume"
         );
         let events = conversation_log(dir.path());
         let result = tool_result(&events);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("model-a"), "{}", result.content);
-        assert!(result.content.contains("model-b"), "{}", result.content);
-        assert!(result.content.contains("executor"), "{}", result.content);
-        assert!(result.content.contains("fresh job"), "{}", result.content);
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert!(
+            result.content.contains("Continuing job"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -8091,6 +8261,7 @@ mod tests {
                 Intent::Analyze,
                 Some(&parent_id),
                 Source::Model,
+                "",
             )
             .expect("create an analyze child");
 
@@ -8312,6 +8483,7 @@ mod tests {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    choice: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],

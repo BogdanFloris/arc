@@ -447,22 +447,56 @@ fn chat_runner(shared: &Shared) -> Result<Runner, SessionError> {
     })
 }
 
-/// The runner a session the user (or a handback) writes into runs under,
-/// fixed for the task's lifetime so its prompt prefix stays byte-stable.
 fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError> {
-    let role = match shared.engine.session_role(session_id) {
-        Ok(role) => role.unwrap_or(SessionRole::Unspecified),
-        Err(error) => {
-            warn!(session_id, %error, "could not read the session's role; serving it as a chat");
-            SessionRole::Unspecified
-        }
-    };
-    let (SessionRole::Code | SessionRole::Executor | SessionRole::Archivist) = role else {
+    let Some(role) = shared.engine.session_role(session_id)? else {
         return chat_runner(shared);
     };
-    let mut runner = match selected_runner(shared, role) {
-        Some(runner) => runner,
-        None => chat_runner(shared)?,
+    if role == SessionRole::Unspecified {
+        return chat_runner(shared);
+    }
+    let choice = shared.engine.session_choice(session_id)?;
+    let identity = shared.engine.session_identity(session_id)?;
+    let menu = shared.menus.get(&role).or_else(|| {
+        (choice.is_none())
+            .then(|| shared.menus.get(&SessionRole::Chat))
+            .flatten()
+    });
+    let mut runner = if let Some(choice) = choice {
+        menu.and_then(|menu| menu.iter().find(|(name, _)| name == &choice))
+            .map(|(_, runner)| runner.clone())
+            .ok_or_else(|| SessionError::MissingChoice {
+                session_id: session_id.to_owned(),
+                choice,
+            })?
+    } else if let Some((provider, model)) = identity {
+        if provider.is_empty() && model.is_empty() {
+            selected_runner(shared, role)
+                .or_else(|| selected_runner(shared, SessionRole::Chat))
+                .ok_or_else(|| SessionError::NoRunner {
+                    role: role_label(role).to_owned(),
+                })?
+        } else {
+            let mut matches = menu
+                .into_iter()
+                .flat_map(|menu| menu.iter())
+                .filter(|(_, runner)| runner.provider.name() == provider && runner.model == model);
+            let runner = matches.next().map(|(_, runner)| runner.clone());
+            if matches.next().is_some() {
+                return Err(SessionError::AmbiguousChoice {
+                    session_id: session_id.to_owned(),
+                    provider,
+                    model,
+                });
+            }
+            runner.ok_or_else(|| SessionError::MissingChoice {
+                session_id: session_id.to_owned(),
+                choice: format!("{provider}/{model}"),
+            })?
+        }
+    } else {
+        return Err(SessionError::UnknownSession {
+            session_id: session_id.to_owned(),
+        });
     };
     if matches!(role, SessionRole::Code | SessionRole::Executor) {
         if let Some(prompt) = direct_system_prompt_for(shared, session_id) {
@@ -520,13 +554,12 @@ fn spawn_job_checked(
     guard_absent: bool,
     initial_spent_tokens: u64,
 ) -> bool {
-    let Some(mut runner) = selected_runner(shared, job.role) else {
-        warn!(
-            session_id = %job.session_id,
-            role = role_label(job.role),
-            "dispatched job names a role with no runner; skipping"
-        );
-        return false;
+    let mut runner = match turn_runner(shared, &job.session_id) {
+        Ok(runner) => runner,
+        Err(error) => {
+            warn!(session_id = %job.session_id, %error, "job cannot use its recorded model");
+            return false;
+        }
     };
     if let Some(project) = shared.projects.get(&job.project) {
         runner.system = Some(job_system_prompt(&project.root));
@@ -673,11 +706,11 @@ mod tests {
 
     use arc_core::log::Log;
     use arc_core::projection::Projection;
-    use arc_core::provider::{CompletionDelta, Stop};
+    use arc_core::provider::{CompletionDelta, Stop, Thinking};
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, Step, appended, call, done_reply, replay_log, runner, seed_log,
+        ScriptedProvider, Step, appended, call, channel, done_reply, replay_log, runner, seed_log,
         tool_stop, usage,
     };
     use arc_core::tool::workspace::{Grant, Mode};
@@ -757,6 +790,155 @@ mod tests {
                 .model,
             "second-model"
         );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_sessions_keep_distinct_presets_after_the_role_default_changes() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![done_reply("still first")]);
+        let mut first = runner(&provider);
+        first.model = "first-model".to_owned();
+        let mut second = first.clone();
+        second.model = "second-model".to_owned();
+        let menu = vec![
+            ("first".to_owned(), first.clone()),
+            ("second".to_owned(), second),
+        ];
+        let choices = menu
+            .iter()
+            .map(|(name, runner)| arc_core::session::ModelChoice {
+                name: name.clone(),
+                provider: runner.provider.name().to_owned(),
+                model: runner.model.clone(),
+                thinking: runner.thinking,
+            })
+            .collect();
+        let engine = Arc::new(
+            Engine::new(
+                Store::new(
+                    Log::open(dir.path()).expect("log"),
+                    Projection::in_memory().expect("projection"),
+                ),
+                Registry::new(512),
+            )
+            .with_role_choices(BTreeMap::from([(SessionRole::Chat, choices)])),
+        );
+        let supervisor = Supervisor::new(
+            Arc::clone(&engine),
+            BTreeMap::from([(SessionRole::Chat, menu)]),
+        );
+        let first_id = engine.create_session(&first).expect("first session");
+        engine
+            .select_model(SessionRole::Chat, "second")
+            .expect("change default");
+        let second_id = engine.create_session(&first).expect("second session");
+        assert_eq!(
+            supervisor.turn_runner(&first_id).expect("first pin").model,
+            "first-model"
+        );
+        assert_eq!(
+            supervisor
+                .turn_runner(&second_id)
+                .expect("second pin")
+                .model,
+            "second-model"
+        );
+        let third_id = engine
+            .create_session_with_choice(&first, "first")
+            .expect("explicit first");
+        assert_eq!(
+            engine
+                .selected_choice(SessionRole::Chat)
+                .unwrap()
+                .as_deref(),
+            Some("second"),
+            "choosing for one session leaves the default alone"
+        );
+        assert_eq!(
+            supervisor.turn_runner(&third_id).expect("third pin").model,
+            "first-model"
+        );
+        let (tx, _rx) = channel();
+        engine
+            .send_message(
+                &supervisor.turn_runner(&first_id).expect("first runner"),
+                Some(&first_id),
+                "keep working",
+                tx,
+            )
+            .await
+            .expect("first session remains continuable");
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_recorded_preset_never_falls_back_to_the_new_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let first = runner(&provider);
+        let engine = Arc::new(
+            Engine::new(
+                Store::new(
+                    Log::open(dir.path()).expect("log"),
+                    Projection::in_memory().expect("projection"),
+                ),
+                Registry::new(512),
+            )
+            .with_role_choices(BTreeMap::from([(
+                SessionRole::Chat,
+                vec![arc_core::session::ModelChoice {
+                    name: "old".to_owned(),
+                    provider: first.provider.name().to_owned(),
+                    model: first.model.clone(),
+                    thinking: first.thinking,
+                }],
+            )])),
+        );
+        let session_id = engine
+            .create_session_with_choice(&first, "old")
+            .expect("session");
+        let supervisor = Supervisor::new(
+            Arc::clone(&engine),
+            BTreeMap::from([(SessionRole::Chat, vec![("new".to_owned(), first)])]),
+        );
+        assert!(
+            matches!(
+                supervisor.turn_runner(&session_id),
+                Err(SessionError::MissingChoice { .. })
+            ),
+            "a removed preset must not silently run another"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_pin_refuses_ambiguous_thinking_presets() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let first = runner(&provider);
+        let session = Engine::new(
+            Store::new(
+                Log::open(dir.path()).expect("log"),
+                Projection::in_memory().expect("projection"),
+            ),
+            Registry::new(512),
+        );
+        let id = session.create_session(&first).expect("legacy session");
+        let engine = Arc::new(session);
+        let mut high = first.clone();
+        high.thinking = Thinking::High;
+        let supervisor = Supervisor::new(
+            Arc::clone(&engine),
+            BTreeMap::from([(
+                SessionRole::Chat,
+                vec![("default".to_owned(), first), ("high".to_owned(), high)],
+            )]),
+        );
+        assert!(matches!(
+            supervisor.turn_runner(&id),
+            Err(SessionError::AmbiguousChoice { .. })
+        ));
         supervisor.shutdown().await;
     }
 
@@ -895,6 +1077,7 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: dispatched_by.to_owned(),
+            choice: String::new(),
         })
     }
 

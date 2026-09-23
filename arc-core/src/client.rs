@@ -309,10 +309,25 @@ impl Client {
         role: SessionRole,
         project: &str,
     ) -> Result<String, Error> {
+        self.create_session_with_choice(role, project, "").await
+    }
+
+    #[tracing::instrument(
+        name = "client.create_session_with_choice",
+        skip_all,
+        fields(project, choice)
+    )]
+    pub async fn create_session_with_choice(
+        &mut self,
+        role: SessionRole,
+        project: &str,
+        choice: &str,
+    ) -> Result<String, Error> {
         let id = self
             .send(client_frame::Msg::CreateSession(CreateSession {
                 role: role as i32,
                 project: project.to_owned(),
+                choice: choice.to_owned(),
             }))
             .await?;
         match self.answer(id).await? {
@@ -331,10 +346,26 @@ impl Client {
         session_id: &str,
         fork_point: u64,
     ) -> Result<String, Error> {
+        self.fork_session_with_choice(session_id, fork_point, "")
+            .await
+    }
+
+    #[tracing::instrument(
+        name = "client.fork_session_with_choice",
+        skip_all,
+        fields(session_id, choice)
+    )]
+    pub async fn fork_session_with_choice(
+        &mut self,
+        session_id: &str,
+        fork_point: u64,
+        choice: &str,
+    ) -> Result<String, Error> {
         let id = self
             .send(client_frame::Msg::ForkSession(ForkSession {
                 session_id: session_id.to_owned(),
                 fork_point,
+                choice: choice.to_owned(),
             }))
             .await?;
         match self.answer(id).await? {

@@ -1356,14 +1356,23 @@ fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects)
 
 fn draw_models(frame: &mut Frame, full: Rect, models: &crate::app::Models) {
     let rows = models.items.len().max(1);
-    let area = menu_area(
-        frame,
-        full,
-        78,
-        rows,
-        "model",
-        "Enter sets default for new sessions and forks · q close",
-    );
+    let role = arc_core::provider::role_label(models.role);
+    let title = if models.default {
+        "role defaults".to_owned()
+    } else {
+        format!("{role} session model")
+    };
+    let hint = if models.default {
+        "Enter changes role default · * default · q close".to_owned()
+    } else {
+        let pinned = models
+            .recorded_model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+            .unwrap_or("not recorded");
+        format!("Current: {pinned} · Enter new/fork · * role default · q close")
+    };
+    let area = menu_area(frame, full, 78, rows, &title, &hint);
 
     let mut lines = Vec::new();
     if models.items.is_empty() {
@@ -1452,7 +1461,7 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-o            toggle all tools / thoughts",
             "? J Q             help / jobs / review queue popups",
             "C                 pick a project; enter opens it like :code",
-            "M                 pick a model per role; * marks the current one, the pick outlives restarts",
+            "M                 pick a model for a new session or fork; * marks the role default",
             "ctrl-c            quit",
             ":                 command mode",
         ],
@@ -1482,7 +1491,8 @@ const HELP: &[(&str, &[&str])] = &[
             ":q :q! :qa :quit  quit",
             ":review           open the review pane",
             ":jobs             open the jobs pane",
-            ":model            open the model picker",
+            ":model            open the session model picker",
+            ":model-default    change a role's default model",
             ":status           context measurement and Codex allowance",
             ":attach <path>    attach PNG, JPEG, or WebP to the next message",
             ":attach clear     discard pending images",
@@ -1730,7 +1740,7 @@ mod tests {
     use crate::app::{App, Block, Mode, Models, Search, Status};
 
     #[test]
-    fn the_model_picker_lists_each_roles_choices_and_marks_the_current_one() {
+    fn the_default_picker_lists_each_roles_choices_and_marks_the_defaults() {
         let mut app = App::new();
         let choice = |role: SessionRole, name: &str, model: &str, selected: bool| ModelChoice {
             role: role as i32,
@@ -1749,14 +1759,17 @@ mod tests {
             ],
             selected: 2,
             loaded: true,
+            default: true,
+            role: SessionRole::Chat,
+            recorded_model: None,
         });
 
         let text = plain_text(&rendered(&mut app));
         println!("{text}");
 
         assert!(
-            text.contains(" model "),
-            "the popup is titled model:\n{text}"
+            text.contains(" role defaults "),
+            "the popup is titled role defaults:\n{text}"
         );
         assert!(
             text.contains("   chat      *astra      codex gpt-6-astra medium"),
@@ -1774,6 +1787,43 @@ mod tests {
             text.contains("   code      *sol        codex gpt-5.6-sol medium"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn session_model_picker_shows_the_pin_without_marking_it_as_default() {
+        let mut app = App::new();
+        app.overlay = Overlay::Models(Models {
+            items: vec![
+                ModelChoice {
+                    role: SessionRole::Code as i32,
+                    name: "fast".to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "model-fast".to_owned(),
+                    thinking: "medium".to_owned(),
+                    selected: true,
+                },
+                ModelChoice {
+                    role: SessionRole::Code as i32,
+                    name: "deep".to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "model-deep".to_owned(),
+                    thinking: "high".to_owned(),
+                    selected: false,
+                },
+            ],
+            selected: 1,
+            loaded: true,
+            default: false,
+            role: SessionRole::Code,
+            recorded_model: Some("model-deep".to_owned()),
+        });
+        let text = plain_text(&rendered(&mut app));
+        println!("SESSION MODEL PICKER\n{text}");
+        assert!(text.contains("code session model"), "{text}");
+        assert!(text.contains("Current: model-deep"), "{text}");
+        assert!(text.contains("*fast"), "{text}");
+        assert!(text.contains(" deep"), "{text}");
+        assert!(!text.contains("*deep"), "{text}");
     }
 
     fn rendered(app: &mut App) -> ratatui::buffer::Buffer {
@@ -2064,6 +2114,9 @@ mod tests {
             items: vec![],
             selected: 0,
             loaded: true,
+            default: false,
+            role: SessionRole::Chat,
+            recorded_model: None,
         });
         assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);

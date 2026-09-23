@@ -225,6 +225,7 @@ mod tests {
             budget: None,
             grants: Vec::new(),
             dispatched_by: String::new(),
+            choice: String::new(),
         })
     }
 
