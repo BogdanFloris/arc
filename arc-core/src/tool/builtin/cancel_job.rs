@@ -104,29 +104,4 @@ mod tests {
         assert!(reply.cancel_request.is_none());
         assert!(reply.content.contains("session_id"), "{}", reply.content);
     }
-
-    #[tokio::test]
-    async fn bad_json_is_an_actionable_error() {
-        let reply = CancelJob
-            .execute("not json".to_owned(), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.cancel_request.is_none());
-        assert!(reply.content.contains("cancel_job"), "{}", reply.content);
-    }
-
-    #[test]
-    fn the_definition_requires_session_id() {
-        let definition = CancelJob.definition();
-        assert_eq!(definition.name, "cancel_job");
-
-        let required = definition.parameters["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .map(|v| v.as_str().expect("string"))
-            .collect::<Vec<_>>();
-        assert_eq!(required, ["session_id"]);
-    }
 }

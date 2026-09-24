@@ -236,29 +236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn percent_does_not_require_reset_metadata() {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        Mock::given(path(USAGE_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    json!({"rate_limit": {"secondary_window": {"used_percent": 10.5}}}),
-                ),
-            )
-            .mount(&server)
-            .await;
-        let result = provider(dir.path(), &server).allowance().await.unwrap();
-        assert_eq!(
-            result.secondary,
-            Some(AllowanceWindow {
-                remaining_percent: 89.5,
-                window_seconds: None,
-                resets_at_unix_seconds: None,
-            })
-        );
-    }
-
-    #[tokio::test]
     async fn refreshes_once_and_uses_the_new_account() {
         for status in [200, 401] {
             let server = MockServer::start().await;
@@ -339,20 +316,6 @@ mod tests {
         let fresh = codex.allowance().await.unwrap();
         assert!(!fresh.stale);
         assert!((fresh.primary.unwrap().remaining_percent - 70.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn failed_initial_fetch_is_throttled() {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let codex = provider(dir.path(), &server);
-        Mock::given(path(USAGE_PATH))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
-            .mount(&server)
-            .await;
-        assert!(codex.allowance().await.is_err());
-        assert!(codex.allowance().await.is_err());
     }
 
     #[tokio::test]

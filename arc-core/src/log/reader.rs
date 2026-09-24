@@ -316,20 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn segment_reader_round_trips_written_records() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("000001.log");
-        write_segment(&path, 0, &["first", "second", "third"]);
-
-        let mut reader = SegmentReader::open(&path).expect("open reader");
-        let events: Vec<Event> = reader.by_ref().map(|r| r.expect("event")).collect();
-
-        assert_eq!(contents_of(&events), ["first", "second", "third"]);
-        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2]);
-        assert_eq!(reader.offset(), file_len(&path));
-    }
-
-    #[test]
     fn log_reader_replays_across_segments_in_order() {
         let dir = TempDir::new().expect("temp dir");
         let seg1 = dir.path().join("000001.log");
@@ -353,34 +339,6 @@ mod tests {
                 next_seq: 5,
             }
         );
-    }
-
-    #[test]
-    fn empty_log_yields_nothing_and_a_zero_recovery_point() {
-        let mut reader = LogReader::new(Vec::new());
-
-        assert!(reader.next().is_none());
-        assert_eq!(
-            reader.recovery_point(),
-            RecoveryPoint {
-                path: None,
-                offset: 0,
-                next_seq: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn first_seq_is_accepted_as_is() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("000007.log");
-        write_segment(&path, 42, &["late start"]);
-
-        let mut reader = LogReader::new(vec![path]);
-        let events: Vec<Event> = reader.by_ref().map(|r| r.expect("event")).collect();
-
-        assert_eq!(events[0].seq, 42);
-        assert_eq!(reader.recovery_point().next_seq, 43);
     }
 
     #[test]

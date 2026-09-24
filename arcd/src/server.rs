@@ -9,11 +9,11 @@ use arc_core::provider::role_label;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, CreateSession, Delta, Error as WireError, ForkSession, JobList, MarkBranch,
-    MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ProjectList,
-    ReasoningDelta, ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo,
-    SessionList, SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked,
-    client_frame, server_frame,
+    ClientFrame, CreateSession, Delta, Error as WireError, JobList, MemoryReviewItem,
+    MemoryReviewItems, MessageAccepted, Notification, ProjectList, ReasoningDelta,
+    ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList,
+    SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked, client_frame,
+    server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -48,7 +48,6 @@ pub async fn serve(
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    // reap finished connections so the set can't grow forever
                     while connections.try_join_next().is_some() {}
                     connections.spawn(connection(
                         stream,
@@ -156,10 +155,6 @@ async fn connection(
                     }
                 }
             }
-            // only ever polled between requests: `request` above runs a
-            // whole reply (however many frames it writes) to completion
-            // before this arm is reachable again, so a push can never land
-            // mid-turn on the wire
             received = next_notification(&mut subscription) => {
                 let sub = subscription.as_ref().expect("resolves only once subscribed");
                 if !push_notification(&mut ws, sub.request_id, received).await {
@@ -224,83 +219,107 @@ async fn request(
     subscription: &mut Option<Subscription>,
     frame: ClientFrame,
 ) -> ControlFlow<()> {
-    match frame.msg {
+    let reply = match frame.msg {
         Some(client_frame::Msg::SendMessage(send)) => {
-            send_message(ws, supervisor, frame.request_id, send).await
+            return send_message(ws, supervisor, frame.request_id, send).await;
         }
-        Some(client_frame::Msg::ListSessions(_)) => {
-            list_sessions(ws, reads, frame.request_id).await
-        }
-        Some(client_frame::Msg::FetchHistory(fetch)) => {
-            fetch_history(ws, reads, frame.request_id, &fetch.session_id).await
-        }
-        Some(client_frame::Msg::FetchStatus(fetch)) => {
-            let msg = match session_status(reads, supervisor, &fetch.session_id).await {
+        Some(client_frame::Msg::ListSessions(_)) => reads
+            .sessions()
+            .map(|sessions| {
+                server_frame::Msg::SessionList(SessionList {
+                    sessions: sessions.iter().map(session_info).collect(),
+                })
+            })
+            .map_err(SessionError::from),
+        Some(client_frame::Msg::FetchHistory(fetch)) => session_history(reads, &fetch.session_id)
+            .map(server_frame::Msg::SessionHistory)
+            .map_err(SessionError::from),
+        Some(client_frame::Msg::FetchStatus(fetch)) => Ok(
+            match session_status(reads, supervisor, &fetch.session_id).await {
                 Ok(status) => server_frame::Msg::SessionStatus(status),
                 Err(error) => error_frame("status_unavailable", &error),
-            };
-            flow(send_frame(ws, frame.request_id, msg).await)
-        }
-        Some(client_frame::Msg::MemoryReviewList(list)) => {
-            review_list(ws, reads, frame.request_id, list.since_micros).await
-        }
-        Some(client_frame::Msg::MemoryReviewAccept(accept)) => {
-            review_accept(ws, engine, frame.request_id, &accept.record_id).await
-        }
-        Some(client_frame::Msg::MemoryReviewDelete(delete)) => {
-            review_delete(ws, engine, frame.request_id, &delete.record_id).await
-        }
-        Some(client_frame::Msg::ListJobs(_)) => list_jobs(ws, supervisor, frame.request_id).await,
+            },
+        ),
+        Some(client_frame::Msg::MemoryReviewList(list)) => reads
+            .review_items(list.since_micros)
+            .map(|items| {
+                server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
+                    items: items.into_iter().map(review_item).collect(),
+                })
+            })
+            .map_err(SessionError::from),
+        Some(client_frame::Msg::MemoryReviewAccept(accept)) => engine
+            .review_accept(&accept.record_id)
+            .map(|()| accepted(String::new())),
+        Some(client_frame::Msg::MemoryReviewDelete(delete)) => engine
+            .review_delete(&delete.record_id)
+            .map(|()| accepted(String::new())),
+        Some(client_frame::Msg::ListJobs(_)) => Ok(server_frame::Msg::JobList(JobList {
+            jobs: supervisor.list(),
+        })),
         Some(client_frame::Msg::ListProjects(_)) => {
-            list_projects(ws, supervisor, frame.request_id).await
+            Ok(server_frame::Msg::ProjectList(ProjectList {
+                projects: supervisor.project_list().to_vec(),
+            }))
         }
-        Some(client_frame::Msg::ListModels(_)) => list_models(ws, engine, frame.request_id).await,
+        Some(client_frame::Msg::ListModels(_)) => {
+            engine.model_list().map(server_frame::Msg::ModelList)
+        }
         Some(client_frame::Msg::SelectModel(select)) => {
-            select_model(ws, engine, frame.request_id, select.role, &select.choice).await
+            let role = SessionRole::try_from(select.role).unwrap_or_default();
+            engine
+                .select_model(role, &select.choice)
+                .and_then(|()| engine.model_list())
+                .map(server_frame::Msg::ModelList)
         }
-        Some(client_frame::Msg::CancelJob(cancel)) => {
-            cancel_job(ws, supervisor, frame.request_id, &cancel.session_id).await
-        }
-        Some(client_frame::Msg::DropSteers(drop)) => {
-            drop_steers(ws, supervisor, frame.request_id, &drop.session_id).await
-        }
+        Some(client_frame::Msg::CancelJob(cancel)) => Ok(job_control(
+            &cancel.session_id,
+            supervisor.cancel(&cancel.session_id),
+        )),
+        Some(client_frame::Msg::DropSteers(drop)) => Ok(job_control(
+            &drop.session_id,
+            supervisor.drop_steers(&drop.session_id),
+        )),
         Some(client_frame::Msg::CreateSession(create)) => {
-            create_session(ws, engine, supervisor, frame.request_id, create).await
+            Ok(create_session(engine, supervisor, create))
         }
-        Some(client_frame::Msg::ForkSession(fork)) => {
-            fork_session(ws, engine, frame.request_id, fork).await
-        }
+        Some(client_frame::Msg::ForkSession(fork)) => engine
+            .fork_session_with_choice(&fork.session_id, fork.fork_point, &fork.choice)
+            .map(accepted),
         Some(client_frame::Msg::MarkBranch(mark)) => {
-            mark_branch(ws, engine, frame.request_id, mark).await
+            let disposition =
+                branch_marked::Disposition::try_from(mark.disposition).unwrap_or_default();
+            engine
+                .mark_branch(&mark.session_id, disposition)
+                .map(|()| accepted(String::new()))
         }
         Some(client_frame::Msg::CancelTurn(cancel)) => {
-            cancel_turn(ws, engine, frame.request_id, &cancel.session_id).await
+            Ok(if engine.cancel_turn(&cancel.session_id) {
+                accepted(cancel.session_id)
+            } else {
+                error_frame(
+                    "no_turn",
+                    format!("no turn is running on session {}", cancel.session_id),
+                )
+            })
         }
-        // no reply frame: the subscription's frames are the notifications,
-        // pushed from the connection loop's select, not from here
         Some(client_frame::Msg::Subscribe(_)) => {
             *subscription = Some(Subscription {
                 request_id: frame.request_id,
                 rx: notifier.subscribe(),
             });
-            ControlFlow::Continue(())
+            return ControlFlow::Continue(());
         }
         Some(client_frame::Msg::CompactSession(compact)) => {
-            compact_session(
-                ws,
-                engine,
-                supervisor,
-                frame.request_id,
-                &compact.session_id,
-            )
-            .await
+            Ok(compact_session(engine, supervisor, &compact.session_id).await)
         }
         None => {
             warn!("client frame with no request");
             refuse(ws, frame.request_id).await;
-            ControlFlow::Break(())
+            return ControlFlow::Break(());
         }
-    }
+    };
+    flow(send_frame(ws, frame.request_id, reply.unwrap_or_else(session_error)).await)
 }
 
 async fn send_message(
@@ -311,45 +330,30 @@ async fn send_message(
 ) -> ControlFlow<()> {
     let session_id = (!send.session_id.is_empty()).then_some(send.session_id.as_str());
 
-    let result = if send.attachments.is_empty() {
-        supervisor.send(session_id, &send.content, Source::User, true)
-    } else {
-        supervisor.send_with_attachments(
-            session_id,
-            &send.content,
-            Source::User,
-            send.attachments,
-            true,
-        )
-    };
+    let result = supervisor.send(
+        session_id,
+        &send.content,
+        Source::User,
+        send.attachments,
+        true,
+    );
     match result {
         Ok(SendOutcome::Started { session_id, events }) => {
-            let Some(events) = events else {
-                return flow(
-                    send_frame(
-                        ws,
-                        request_id,
-                        error_frame("internal", "the turn started unattached"),
-                    )
-                    .await,
-                );
-            };
-            forward(ws, request_id, session_id, events).await
+            forward(
+                ws,
+                request_id,
+                session_id,
+                events.expect("requested attached turn"),
+            )
+            .await
         }
         Ok(SendOutcome::Queued { session_id }) => {
             flow(send_queued(ws, request_id, &session_id).await)
         }
-        Err(error) => {
-            warn!(%error, code = error_code(&error), "request failed");
-            flow(send_frame(ws, request_id, error_frame(error_code(&error), &error)).await)
-        }
+        Err(error) => flow(send_frame(ws, request_id, session_error(error)).await),
     }
 }
 
-/// A message into a session already working never streams on this
-/// connection: its answer belongs to the turn that took it, and reaches
-/// every client through the session's notifications. The sender gets an
-/// accepted and an empty stream end marked queued.
 async fn send_queued(ws: &mut Socket, request_id: u64, session_id: &str) -> bool {
     let accepted = server_frame::Msg::MessageAccepted(MessageAccepted {
         session_id: session_id.to_owned(),
@@ -369,8 +373,6 @@ async fn send_queued(ws: &mut Socket, request_id: u64, session_id: &str) -> bool
     send_frame(ws, request_id, end).await
 }
 
-/// The turn's own events, streamed to the connection that started it. The
-/// turn goes on without this connection if it drops: the task owns it.
 async fn forward(
     ws: &mut Socket,
     request_id: u64,
@@ -432,7 +434,6 @@ async fn forward(
             return ControlFlow::Break(());
         }
     }
-    // the task ended without a verdict: only a panicked turn gets here
     flow(
         send_frame(
             ws,
@@ -493,123 +494,27 @@ fn remaining_percent(value: f64) -> u32 {
     value.clamp(0.0, 100.0).floor() as u32
 }
 
-async fn list_sessions(ws: &mut Socket, reads: &Reader, request_id: u64) -> ControlFlow<()> {
-    let listed = reads.sessions();
-    let msg = match listed {
-        Ok(sessions) => server_frame::Msg::SessionList(SessionList {
-            sessions: sessions.iter().map(session_info).collect(),
-        }),
-        Err(error) => {
-            warn!(%error, "listing sessions failed");
-            error_frame("internal", &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
+fn accepted(session_id: String) -> server_frame::Msg {
+    server_frame::Msg::MessageAccepted(MessageAccepted { session_id })
 }
 
-async fn list_jobs(ws: &mut Socket, supervisor: &Supervisor, request_id: u64) -> ControlFlow<()> {
-    let msg = server_frame::Msg::JobList(JobList {
-        jobs: supervisor.list(),
-    });
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn list_projects(
-    ws: &mut Socket,
-    supervisor: &Supervisor,
-    request_id: u64,
-) -> ControlFlow<()> {
-    let msg = server_frame::Msg::ProjectList(ProjectList {
-        projects: supervisor.project_list().to_vec(),
-    });
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn list_models(ws: &mut Socket, engine: &Engine, request_id: u64) -> ControlFlow<()> {
-    let msg = match engine.model_list() {
-        Ok(list) => server_frame::Msg::ModelList(list),
-        Err(error) => error_frame(error_code(&error), error),
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn select_model(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    role: i32,
-    choice: &str,
-) -> ControlFlow<()> {
-    let role = SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified);
-    let msg = match engine
-        .select_model(role, choice)
-        .and_then(|()| engine.model_list())
-    {
-        Ok(list) => server_frame::Msg::ModelList(list),
-        Err(error) => {
-            warn!(%error, code = error_code(&error), "select_model failed");
-            error_frame(error_code(&error), error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn cancel_job(
-    ws: &mut Socket,
-    supervisor: &Supervisor,
-    request_id: u64,
-    session_id: &str,
-) -> ControlFlow<()> {
-    let msg = if supervisor.cancel(session_id) {
-        server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: session_id.to_owned(),
-        })
+fn job_control(session_id: &str, succeeded: bool) -> server_frame::Msg {
+    if succeeded {
+        accepted(session_id.to_owned())
     } else {
         error_frame("unknown_job", format!("no live job named {session_id}"))
-    };
-    flow(send_frame(ws, request_id, msg).await)
+    }
 }
 
-async fn cancel_turn(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    session_id: &str,
-) -> ControlFlow<()> {
-    let msg = if engine.cancel_turn(session_id) {
-        server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: session_id.to_owned(),
-        })
-    } else {
-        error_frame(
-            "no_turn",
-            format!("no turn is running on session {session_id}"),
-        )
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-/// The TUI's `:compact`. Refused while the session has a live turn — a
-/// concurrent compaction and turn would race the same log append; otherwise
-/// runs it on the session's own runner, the same one a turn would use.
 async fn compact_session(
-    ws: &mut Socket,
     engine: &Engine,
     supervisor: &Supervisor,
-    request_id: u64,
     session_id: &str,
-) -> ControlFlow<()> {
+) -> server_frame::Msg {
     if engine.turn_is_live(session_id) {
-        return flow(
-            send_frame(
-                ws,
-                request_id,
-                error_frame(
-                    "turn_running",
-                    format!("session {session_id} has a live turn"),
-                ),
-            )
-            .await,
+        return error_frame(
+            "turn_running",
+            format!("session {session_id} has a live turn"),
         );
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -617,43 +522,16 @@ async fn compact_session(
         Ok(served_by) => engine.compact(&served_by, session_id, &turn_id).await,
         Err(error) => Err(error),
     };
-    let msg = match compacted {
-        Ok(_) => server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: session_id.to_owned(),
-        }),
-        Err(error) => {
-            warn!(%error, code = error_code(&error), "compact_session failed");
-            error_frame(error_code(&error), &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
+    compacted.map_or_else(session_error, |_| accepted(session_id.to_owned()))
 }
 
-async fn drop_steers(
-    ws: &mut Socket,
-    supervisor: &Supervisor,
-    request_id: u64,
-    session_id: &str,
-) -> ControlFlow<()> {
-    let msg = if supervisor.drop_steers(session_id) {
-        server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: session_id.to_owned(),
-        })
-    } else {
-        error_frame("unknown_job", format!("no live job named {session_id}"))
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn create_session(
-    ws: &mut Socket,
+fn create_session(
     engine: &Engine,
     supervisor: &Supervisor,
-    request_id: u64,
     create: CreateSession,
-) -> ControlFlow<()> {
+) -> server_frame::Msg {
     let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
-    let msg = if !matches!(
+    if !matches!(
         role,
         SessionRole::Chat | SessionRole::Code | SessionRole::Executor
     ) {
@@ -666,119 +544,17 @@ async fn create_session(
             engine.create_session_with_choice(&runner, &create.choice)
         } else if role == SessionRole::Chat {
             Err(SessionError::UnknownProject {
-                project: create.project.clone(),
+                project: create.project,
             })
         } else {
             engine.create_direct_session_with_choice(&runner, &create.project, role, &create.choice)
         };
-        match result {
-            Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
-            Err(error) => {
-                warn!(%error, code = error_code(&error), "create_session failed");
-                error_frame(error_code(&error), &error)
-            }
-        }
+        result.map_or_else(session_error, accepted)
     } else {
         error_frame(
             "no_runner",
             format!("no runner is configured for the {} role", role_label(role)),
         )
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn fork_session(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    fork: ForkSession,
-) -> ControlFlow<()> {
-    let msg = match engine.fork_session_with_choice(&fork.session_id, fork.fork_point, &fork.choice)
-    {
-        Ok(session_id) => server_frame::Msg::MessageAccepted(MessageAccepted { session_id }),
-        Err(error) => {
-            warn!(%error, code = error_code(&error), "fork_session failed");
-            error_frame(error_code(&error), &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn mark_branch(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    mark: MarkBranch,
-) -> ControlFlow<()> {
-    let disposition = branch_marked::Disposition::try_from(mark.disposition)
-        .unwrap_or(branch_marked::Disposition::Unspecified);
-    let msg = match engine.mark_branch(&mark.session_id, disposition) {
-        Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: String::new(),
-        }),
-        Err(error) => {
-            warn!(%error, code = error_code(&error), "mark_branch failed");
-            error_frame(error_code(&error), &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn review_list(
-    ws: &mut Socket,
-    reads: &Reader,
-    request_id: u64,
-    since_micros: i64,
-) -> ControlFlow<()> {
-    let listed = reads.review_items(since_micros);
-    let msg = match listed {
-        Ok(items) => server_frame::Msg::MemoryReviewItems(MemoryReviewItems {
-            items: items.into_iter().map(review_item).collect(),
-        }),
-        Err(error) => {
-            warn!(%error, "listing review items failed");
-            error_frame("internal", &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
-}
-
-async fn review_accept(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    record_id: &str,
-) -> ControlFlow<()> {
-    let done = engine.review_accept(record_id);
-    flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
-}
-
-async fn review_delete(
-    ws: &mut Socket,
-    engine: &Engine,
-    request_id: u64,
-    record_id: &str,
-) -> ControlFlow<()> {
-    let done = engine.review_delete(record_id);
-    flow(send_frame(ws, request_id, verdict_msg(done, record_id)).await)
-}
-
-fn verdict_msg(done: Result<(), SessionError>, record_id: &str) -> server_frame::Msg {
-    match done {
-        Ok(()) => server_frame::Msg::MessageAccepted(MessageAccepted {
-            session_id: String::new(),
-        }),
-        Err(error) => {
-            warn!(%error, record_id, "review verdict failed");
-            error_frame(review_error_code(&error), &error)
-        }
-    }
-}
-
-fn review_error_code(error: &SessionError) -> &'static str {
-    match error {
-        SessionError::Store(StoreError::UnknownRecord { .. }) => "unknown_record",
-        _ => "internal",
     }
 }
 
@@ -834,45 +610,35 @@ fn stream_end(reply: &Reply) -> server_frame::Msg {
     })
 }
 
-async fn fetch_history(
-    ws: &mut Socket,
+fn session_history(
     reads: &Reader,
-    request_id: u64,
     session_id: &str,
-) -> ControlFlow<()> {
-    let read = reads.transcript(session_id).and_then(|entries| {
-        Ok((
-            entries,
-            reads.fork_parent(session_id)?,
-            reads.branches_of(session_id)?,
-        ))
-    });
-    let msg = match read {
-        Ok((entries, parent, branches)) => {
-            let (parent_session, fork_point) = parent.unwrap_or_default();
-            server_frame::Msg::SessionHistory(SessionHistory {
-                session_id: session_id.to_owned(),
-                entries,
-                parent_session,
+) -> Result<SessionHistory, arc_core::projection::Error> {
+    let entries = reads.transcript(session_id)?;
+    let (parent_session, fork_point) = reads.fork_parent(session_id)?.unwrap_or_default();
+    let branches = reads
+        .branches_of(session_id)?
+        .into_iter()
+        .map(
+            |(session_id, fork_point, title)| arc_proto::v1::BranchPointer {
+                session_id,
                 fork_point,
-                branches: branches
-                    .into_iter()
-                    .map(
-                        |(session_id, fork_point, title)| arc_proto::v1::BranchPointer {
-                            session_id,
-                            fork_point,
-                            title,
-                        },
-                    )
-                    .collect(),
-            })
-        }
-        Err(error) => {
-            warn!(%error, session_id, "reading history failed");
-            error_frame("internal", &error)
-        }
-    };
-    flow(send_frame(ws, request_id, msg).await)
+                title,
+            },
+        )
+        .collect();
+    Ok(SessionHistory {
+        session_id: session_id.to_owned(),
+        entries,
+        parent_session,
+        fork_point,
+        branches,
+    })
+}
+
+fn session_error(error: SessionError) -> server_frame::Msg {
+    warn!(%error, code = error_code(&error), "request failed");
+    error_frame(error_code(&error), error)
 }
 
 fn error_frame(code: &str, msg: impl std::fmt::Display) -> server_frame::Msg {
@@ -901,6 +667,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::UnknownSession { .. } => "unknown_session",
         SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
         SessionError::NotABranch { .. } => "not_a_branch",
+        SessionError::Store(StoreError::UnknownRecord { .. }) => "unknown_record",
         SessionError::Store(_) | SessionError::Projection(_) | SessionError::Grants { .. } => {
             "internal"
         }
@@ -953,7 +720,7 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
 fn timestamp(micros: i64) -> Timestamp {
     Timestamp {
         seconds: micros.div_euclid(1_000_000),
-        nanos: i32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or(0),
+        nanos: i32::try_from(micros.rem_euclid(1_000_000) * 1_000).expect("sub-second nanos"),
     }
 }
 
@@ -979,12 +746,12 @@ mod tests {
     use arc_core::store::Store;
     use arc_core::tool::{Registry, ToolSource};
     use arc_proto::v1::{
-        CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, HistoryEntry,
-        HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment, ListJobs, ListModels,
-        ListProjects, ListSessions, MemoryEvent, MemoryRecord, MemoryRecordCreated,
+        CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, ForkSession,
+        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment,
+        ListModels, ListSessions, MarkBranch, MemoryEvent, MemoryRecord, MemoryRecordCreated,
         MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Notification, ProjectInfo, Role,
-        SelectModel, SessionCreated, SessionEvent, SessionRole, Subscribe, ToolOutcome, event,
-        job_info, memory_event, memory_record, notification, session_event,
+        SelectModel, SessionRole, Subscribe, ToolOutcome, event, job_info, memory_event,
+        memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1152,7 +919,6 @@ mod tests {
                 system: None,
                 compact_at: None,
                 context_window: None,
-                counsel: false,
                 editing: arc_core::tool::Editing::Replacement,
             };
             Self::with_seed(
@@ -1216,9 +982,6 @@ mod tests {
                         .map(|grant| (name.clone(), grant.root.clone()))
                 })
                 .collect();
-            // mirrors daemon.rs: the picker's slate is the configured
-            // projects; specs carry no description, so the test list
-            // derives one from the name
             let project_list = projects
                 .keys()
                 .map(|name| ProjectInfo {
@@ -1241,7 +1004,6 @@ mod tests {
                 system: Some("be terse".to_owned()),
                 compact_at: None,
                 context_window: None,
-                counsel: false,
                 editing: arc_core::tool::Editing::Replacement,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -1254,8 +1016,6 @@ mod tests {
                             .collect(),
                     )
                     .with_notifier(notifier.clone())
-                    // mirrors daemon.rs: identity rides the supervisor for
-                    // direct executor turns, never for dispatched jobs
                     .with_identity(Some(TEST_IDENTITY.to_owned()))
                     .with_chat(runner)
                     .with_project_list(project_list),
@@ -1304,7 +1064,6 @@ mod tests {
                 system: Some("be terse".to_owned()),
                 compact_at: None,
                 context_window: None,
-                counsel: false,
                 editing: arc_core::tool::Editing::Replacement,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
@@ -1422,20 +1181,6 @@ mod tests {
 
     use arc_proto::v1::history_entry;
 
-    fn last_assistant_content(events: &[session_event::Event], session_id: &str) -> Option<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m)
-                    if m.session_id == session_id && m.role == Role::Assistant as i32 =>
-                {
-                    Some(m.content.clone())
-                }
-                _ => None,
-            })
-            .next_back()
-    }
-
     fn said(answer: &SessionHistory) -> Vec<(Role, &str)> {
         answer
             .entries
@@ -1521,26 +1266,6 @@ mod tests {
         let frame = next_frame(ws).await;
         assert_eq!(frame.request_id, request_id);
         frame.msg.expect("a server frame with no message")
-    }
-
-    #[tokio::test]
-    async fn a_message_round_trips_accepted_deltas_and_stream_end() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 7, say("", "hello")).await;
-        let (session_id, text, closing) = turn(&mut ws, 7).await;
-
-        assert_eq!(text, "re: hello");
-        let end = ended(closing);
-        assert_eq!(end.session_id, session_id);
-        assert_eq!(end.input_tokens, usage().input_tokens);
-        assert_eq!(end.output_tokens, usage().output_tokens);
-        assert!(!end.partial);
-        assert!(!end.step_capped, "the turn finished on its own");
-        assert!(!end.queued, "this connection streamed the turn it started");
-
-        harness.stop().await;
     }
 
     #[tokio::test]
@@ -1719,43 +1444,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_message_continues_the_session_with_its_history() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "one")).await;
-        let (session_id, first, _) = turn(&mut ws, 1).await;
-        send(&mut ws, 2, say(&session_id, "two")).await;
-        let (again, second, closing) = turn(&mut ws, 2).await;
-
-        assert_eq!(first, "re: one");
-        assert_eq!(second, "re: two");
-        assert_eq!(again, session_id, "the same session, not a new one");
-        assert!(!ended(closing).partial);
-
-        let requests = harness.provider.requests();
-        assert_eq!(requests.len(), 2);
-        let turns: Vec<(Role, &str)> = requests[1]
-            .messages
-            .iter()
-            .map(|m| match m {
-                Message::Text { role, content, .. } => (*role, content.as_str()),
-                other => panic!("expected a text message, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            turns,
-            [
-                (Role::User, "one"),
-                (Role::Assistant, "re: one"),
-                (Role::User, "two"),
-            ]
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
     async fn status_round_trips_the_latest_measurement_and_survives_client_reconnect() {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
@@ -1776,207 +1464,6 @@ mod tests {
         let mut client = arc_core::client::Client::connect(&url).await.unwrap();
         assert_eq!(client.fetch_status(&session_id).await.unwrap(), first);
         assert!(client.fetch_status("missing").await.is_err());
-        harness.stop().await;
-    }
-
-    #[test]
-    fn session_info_carries_role_and_project() {
-        let summary = SessionSummary {
-            provider: "provider".to_owned(),
-            model: "pinned-model".to_owned(),
-            id: "s-1".to_string(),
-            title: String::new(),
-            started_at: None,
-            preview: String::new(),
-            last_at: None,
-            role: SessionRole::Executor as i32,
-            project: Some("arc".to_string()),
-            dispatched_by: "s-parent".to_string(),
-            source: Source::Model as i32,
-            parent_session: "s-fork-parent".to_string(),
-            disposition: arc_proto::v1::branch_marked::Disposition::Real as i32,
-        };
-
-        let info = session_info(&summary);
-
-        assert_eq!(info.provider, "provider");
-        assert_eq!(info.model, "pinned-model");
-        assert_eq!(info.role, SessionRole::Executor as i32);
-        assert_eq!(info.project, "arc");
-        assert_eq!(info.dispatched_by, "s-parent");
-        assert_eq!(info.source, Source::Model as i32);
-        assert_eq!(info.parent_session, "s-fork-parent");
-        assert_eq!(
-            info.disposition,
-            arc_proto::v1::branch_marked::Disposition::Real as i32
-        );
-    }
-
-    #[tokio::test]
-    async fn list_sessions_is_empty_before_and_names_the_session_after() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        assert_eq!(list(&mut ws, 1).await, [], "nothing has happened yet");
-
-        send(&mut ws, 2, say("", "hello")).await;
-        let (session_id, _, _) = turn(&mut ws, 2).await;
-
-        let sessions = list(&mut ws, 3).await;
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, session_id);
-        assert_eq!(sessions[0].title, "", "sessions are unnamed in Phase 1");
-        assert!(
-            sessions[0].started_at.is_some(),
-            "the projection's micros became a Timestamp"
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn history_returns_the_whole_conversation_in_order() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "hello")).await;
-        let (session_id, _, _) = turn(&mut ws, 1).await;
-        send(&mut ws, 2, say(&session_id, "again")).await;
-        turn(&mut ws, 2).await;
-
-        let answer = history(&mut ws, 3, &session_id).await;
-
-        assert_eq!(
-            said(&answer),
-            [
-                (Role::User, "hello"),
-                (Role::Assistant, "re: hello"),
-                (Role::User, "again"),
-                (Role::Assistant, "re: again"),
-            ],
-            "both turns, in the order they happened"
-        );
-
-        assert_eq!(answer.entries.len(), 4, "an all-prose session is all prose");
-
-        let empty = history(&mut ws, 4, "no-such-session").await;
-        assert!(
-            empty.entries.is_empty(),
-            "an unknown session reads as an empty one"
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn history_carries_the_final_replys_usage_and_elapsed() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "hello")).await;
-        let (session_id, _, _) = turn(&mut ws, 1).await;
-
-        let answer = history(&mut ws, 2, &session_id).await;
-
-        let messages: Vec<&HistoryMessage> = answer
-            .entries
-            .iter()
-            .filter_map(|entry| match entry.entry.as_ref() {
-                Some(history_entry::Entry::Message(m)) => Some(m),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(
-            (messages[0].input_tokens, messages[0].output_tokens),
-            (0, 0),
-            "the user row carries no usage"
-        );
-        assert_eq!(
-            (messages[1].input_tokens, messages[1].output_tokens),
-            (usage().input_tokens, usage().output_tokens),
-            "the final assistant row carries the turn's reported usage"
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn listed_sessions_preview_their_first_user_message() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "what is a walking skeleton?")).await;
-        let (session_id, _, _) = turn(&mut ws, 1).await;
-        send(&mut ws, 2, say(&session_id, "a second question")).await;
-        turn(&mut ws, 2).await;
-
-        let sessions = list(&mut ws, 3).await;
-
-        assert_eq!(sessions[0].preview, "what is a walking skeleton?");
-        assert_eq!(
-            sessions[0].title, "",
-            "preview is not a title; titles wait for Phase 2"
-        );
-
-        harness.stop().await;
-    }
-
-    // also the "role with no runner in the map" case: job_runners is empty here
-    #[tokio::test]
-    async fn a_session_pinned_to_another_role_is_a_role_mismatch_error() {
-        let pinned = Event {
-            seq: 0,
-            ts: None,
-            source: Source::User as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::SessionCreated(SessionCreated {
-                    session_id: "s-exec".to_owned(),
-                    parent_session: String::new(),
-                    fork_point: 0,
-                    title: String::new(),
-                    provider: "mock".to_owned(),
-                    model: "test-model".to_owned(),
-                    role: SessionRole::Executor as i32,
-                    project: String::new(),
-                    budget: None,
-                    grants: Vec::new(),
-                    dispatched_by: String::new(),
-                    choice: String::new(),
-                    editing: String::new(),
-                })),
-            })),
-        };
-        let mut harness = Harness::with_seed(
-            Script::Echo,
-            Registry::new(512),
-            vec![pinned],
-            BTreeMap::new(),
-            BTreeMap::new(),
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("s-exec", "continue")).await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 1);
-        let error = failed(frame.msg.expect("a message"));
-        assert_eq!(error.code, "role_mismatch");
-        assert!(
-            error.msg.contains("executor"),
-            "the refusal names the pinned role: {}",
-            error.msg
-        );
-        assert!(
-            harness.provider.requests().is_empty(),
-            "a refused turn never reaches the provider"
-        );
-
-        send(&mut ws, 2, say("", "fresh")).await;
-        let (_, text, closing) = turn(&mut ws, 2).await;
-        assert_eq!(text, "re: fresh", "the connection survives a refusal");
-        assert!(!ended(closing).partial);
-
         harness.stop().await;
     }
 
@@ -2099,58 +1586,6 @@ mod tests {
             ]
         );
         assert_eq!(end.session_id, session_id);
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_step_capped_turn_marks_the_stream_end() {
-        // the chat's step cap: mirrors arc-core's MAX_TOOL_STEPS
-        let mut script: VecDeque<Vec<Result<CompletionDelta, ProviderError>>> = (0..8)
-            .map(|step| {
-                vec![
-                    Ok(CompletionDelta::ToolCall(ToolCall {
-                        id: format!("c{step}"),
-                        index: 0,
-                        name: "alpha".to_owned(),
-                        arguments: "{}".to_owned(),
-                        provider_roundtrip: Vec::new(),
-                    })),
-                    Ok(CompletionDelta::Done {
-                        usage: usage(),
-                        stop: Stop::ToolCalls,
-                    }),
-                ]
-            })
-            .collect();
-        script.push_back(vec![
-            Ok(CompletionDelta::Text("enough".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Canned {
-            name: "alpha",
-            content: "A",
-            ok: true,
-            source: ToolSource::Builtin,
-        }));
-        let mut harness = Harness::with_tools(Script::Canned(script), registry).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "hi")).await;
-
-        let end = loop {
-            let frame = next_frame(&mut ws).await;
-            assert_eq!(frame.request_id, 1, "request_id is echoed");
-            if let server_frame::Msg::StreamEnd(end) = frame.msg.expect("a message") {
-                break end;
-            }
-        };
-
-        assert!(end.step_capped, "the forced final step used up the cap");
 
         harness.stop().await;
     }
@@ -2279,57 +1714,6 @@ mod tests {
         match next_message(&mut ws).await {
             Some(WsMessage::Close(_)) | None => {}
             other => panic!("expected the connection to close, got {other:?}"),
-        }
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_frame_with_no_request_is_also_a_bad_frame() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        let frame = ClientFrame {
-            request_id: 9,
-            msg: None,
-        };
-        ws.send(WsMessage::binary(frame.encode_to_vec()))
-            .await
-            .expect("send");
-
-        let answer = next_frame(&mut ws).await;
-        assert_eq!(answer.request_id, 9, "a known request id is still echoed");
-        assert_eq!(failed(answer.msg.expect("a message")).code, "bad_frame");
-
-        harness.stop().await;
-    }
-
-    // different sessions now run concurrently (see arc_core::session's engine
-    // tests); this only checks two connections never cross their replies
-    #[tokio::test]
-    async fn two_connections_get_their_own_reply_and_never_cross() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut first = harness.connect().await;
-        let mut second = harness.connect().await;
-
-        send(&mut first, 1, say("", "alpha")).await;
-        send(&mut second, 2, say("", "beta")).await;
-
-        let (alpha_session, alpha, alpha_end) = turn(&mut first, 1).await;
-        let (beta_session, beta, beta_end) = turn(&mut second, 2).await;
-
-        assert_eq!(alpha, "re: alpha", "no crossed replies");
-        assert_eq!(beta, "re: beta");
-        assert_ne!(alpha_session, beta_session, "two sessions, not one");
-        assert!(!ended(alpha_end).partial);
-        assert!(!ended(beta_end).partial);
-
-        let sessions = list(&mut first, 3).await;
-        assert_eq!(sessions.len(), 2);
-        for request in harness.provider.requests() {
-            assert_eq!(request.messages.len(), 1, "no history bled across sessions");
-            let system = request.system.as_deref().expect("a system prompt");
-            assert!(system.starts_with("be terse"), "{system}");
         }
 
         harness.stop().await;
@@ -2478,228 +1862,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_dispatched_job_runs_and_the_childs_log_carries_the_brief_and_the_reply() {
-        let dispatch_args = serde_json::json!({
-            "role": "executor",
-            "project": "arc",
-            "brief": "fix the failing test",
-            "intent": "implement",
-            "budget_tokens": 0,
-            "budget_minutes": 0,
-        })
-        .to_string();
-        let chat_script = Script::Canned(VecDeque::from([
-            vec![
-                Ok(CompletionDelta::ToolCall(ToolCall {
-                    id: "d1".to_owned(),
-                    index: 0,
-                    name: "dispatch".to_owned(),
-                    arguments: dispatch_args,
-                    provider_roundtrip: Vec::new(),
-                })),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::ToolCalls,
-                }),
-            ],
-            vec![
-                Ok(CompletionDelta::Text("dispatched".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-            // the handback turn the finished job starts on this parent
-            vec![
-                Ok(CompletionDelta::Text("noted".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        ]));
-        let executor_script = Script::Canned(VecDeque::from([vec![
-            Ok(CompletionDelta::Text("on it".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]));
-
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let project_dir = TempDir::new().expect("project dir");
-        let projects = BTreeMap::from([(
-            "arc".to_owned(),
-            ProjectSpec {
-                sources: Vec::new(),
-                grants: vec![arc_core::tool::workspace::Grant::new(
-                    project_dir.path(),
-                    arc_core::tool::workspace::Mode::ReadWrite,
-                )],
-                command_prefix: Vec::new(),
-            },
-        )]);
-
-        let mut harness =
-            Harness::with_executor(chat_script, registry, executor_script, projects).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "start a job")).await;
-        let (parent_id, _text, _closing) = turn(&mut ws, 1).await;
-
-        harness.drain_jobs().await;
-
-        let events = harness.logged_events();
-        let child = events
-            .iter()
-            .find_map(|event| match event {
-                session_event::Event::SessionCreated(created)
-                    if created.role == SessionRole::Executor as i32 =>
-                {
-                    Some(created)
-                }
-                _ => None,
-            })
-            .expect("the child session was created durably");
-
-        let child_messages: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.session_id == child.session_id => {
-                    Some(m)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(child_messages.len(), 2, "the job's user turn and its reply");
-        assert_eq!(child_messages[0].role, Role::User as i32);
-        assert_eq!(
-            child_messages[0].content, "fix the failing test",
-            "the brief became the child's first message"
-        );
-        assert_eq!(child_messages[1].role, Role::Assistant as i32);
-        assert_eq!(child_messages[1].content, "on it");
-
-        let handback = events
-            .iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m)
-                    if m.session_id == parent_id && m.role == Role::User as i32 =>
-                {
-                    Some(m)
-                }
-                _ => None,
-            })
-            .next_back()
-            .expect("the handback landed in the parent's history");
-        assert_eq!(
-            handback.content,
-            format!(
-                "Job {0} finished.\non it\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {0} keeps its context; a new dispatch starts from nothing.",
-                child.session_id,
-                footprint = arc_core::footprint::report(Some(&[]), None)
-            ),
-            "the handback names the child and carries its final reply"
-        );
-        assert_eq!(
-            last_assistant_content(&events, &parent_id),
-            Some("noted".to_owned()),
-            "and the parent read it on a turn of its own"
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_job_naming_a_role_with_no_runner_logs_and_skips_without_a_panic() {
-        let dispatch_args = serde_json::json!({
-            "role": "archivist",
-            "project": "arc",
-            "brief": "file this away",
-            "intent": "implement",
-            "budget_tokens": 0,
-            "budget_minutes": 0,
-        })
-        .to_string();
-        let chat_script = Script::Canned(VecDeque::from([
-            vec![
-                Ok(CompletionDelta::ToolCall(ToolCall {
-                    id: "d1".to_owned(),
-                    index: 0,
-                    name: "dispatch".to_owned(),
-                    arguments: dispatch_args,
-                    provider_roundtrip: Vec::new(),
-                })),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::ToolCalls,
-                }),
-            ],
-            vec![
-                Ok(CompletionDelta::Text("dispatched".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        ]));
-
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(arc_core::tool::builtin::dispatch::Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let project_dir = TempDir::new().expect("project dir");
-        let projects = BTreeMap::from([(
-            "arc".to_owned(),
-            ProjectSpec {
-                sources: Vec::new(),
-                grants: vec![arc_core::tool::workspace::Grant::new(
-                    project_dir.path(),
-                    arc_core::tool::workspace::Mode::ReadWrite,
-                )],
-                command_prefix: Vec::new(),
-            },
-        )]);
-
-        // no runner maps to archivist here: the supervisor has nothing to run the job with
-        let mut harness =
-            Harness::with_seed(chat_script, registry, Vec::new(), BTreeMap::new(), projects).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "start a job")).await;
-        turn(&mut ws, 1).await;
-
-        harness.drain_jobs().await;
-
-        let events = harness.logged_events();
-        let child = events
-            .iter()
-            .find_map(|event| match event {
-                session_event::Event::SessionCreated(created)
-                    if created.role == SessionRole::Archivist as i32 =>
-                {
-                    Some(created)
-                }
-                _ => None,
-            })
-            .expect("the child session was still created durably by dispatch");
-        let child_messages = events.iter().any(|event| {
-            matches!(event, session_event::Event::MessageAppended(m) if m.session_id == child.session_id)
-        });
-        assert!(
-            !child_messages,
-            "no runner for the role means the job never ran, so no turn was appended"
-        );
-
-        harness.stop().await;
-    }
-
     fn dispatch_call(brief: &str) -> ToolCall {
         let args = serde_json::json!({
             "role": "executor",
@@ -2735,7 +1897,6 @@ mod tests {
                     stop: Stop::EndTurn,
                 }),
             ],
-            // the handback turn the finished job starts on this parent
             vec![
                 Ok(CompletionDelta::Text("noted".to_owned())),
                 Ok(CompletionDelta::Done {
@@ -2746,9 +1907,6 @@ mod tests {
         ]))
     }
 
-    /// Drains a turn to its `StreamEnd`, discarding everything else: the
-    /// dispatching chat's turn also emits tool-call frames, which
-    /// `turn` (built for plain prose turns) would mistake for the close.
     async fn run_turn_to_end(ws: &mut Client, request_id: u64) {
         loop {
             let frame = next_frame(ws).await;
@@ -2810,95 +1968,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for {want} messages in session {child_id}");
-    }
-
-    #[tokio::test]
-    async fn a_steer_to_a_live_job_is_accepted_and_lands_in_the_turn_it_is_running() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Gated {
-                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
-                notify: Arc::clone(&notify),
-                after: vec![Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                })],
-            },
-            Step::Immediate(vec![
-                Ok(CompletionDelta::Text("steer reply".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ]),
-        ]) as Arc<dyn Provider>;
-
-        let mut harness = Harness::with_executor_provider(
-            dispatching_chat("fix the failing test"),
-            registry,
-            executor_provider,
-            projects,
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "start a job")).await;
-        run_turn_to_end(&mut ws, 1).await;
-
-        let child_id = dispatched_child_id(&harness);
-        wait_for_child_message_count(&harness, &child_id, 1).await;
-
-        let mut steer_ws = harness.connect().await;
-        send(&mut steer_ws, 2, say(&child_id, "also check the linter")).await;
-        let accepted = next_frame(&mut steer_ws).await;
-        assert_eq!(accepted.request_id, 2);
-        match accepted.msg {
-            Some(server_frame::Msg::MessageAccepted(m)) => {
-                assert_eq!(m.session_id, child_id);
-            }
-            other => panic!("expected MessageAccepted, got {other:?}"),
-        }
-        let end = ended(next_frame(&mut steer_ws).await.msg.expect("a message"));
-        assert_eq!(end.session_id, child_id);
-        assert_eq!(
-            (end.input_tokens, end.output_tokens),
-            (0, 0),
-            "the steered turn's usage lands in the child's log, not this ack"
-        );
-        assert!(!end.partial);
-
-        notify.notify_one();
-        harness.drain_jobs().await;
-
-        let child_messages: Vec<_> = harness
-            .logged_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.session_id == child_id => {
-                    Some((Role::try_from(m.role).expect("a known role"), m.content))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            child_messages,
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "working".to_owned()),
-                (Role::User, "also check the linter".to_owned()),
-                (Role::Assistant, "steer reply".to_owned()),
-            ],
-            "the steer landed in the turn already running"
-        );
-        assert_eq!(
-            harness.provider.requests().len(),
-            3,
-            "the steer never reached the chat: its own turn, then the handback turn"
-        );
-
-        harness.stop().await;
     }
 
     #[tokio::test]
@@ -2973,7 +2042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_job_on_an_unknown_session_is_an_honest_error() {
+    async fn job_controls_on_an_unknown_session_are_honest_errors() {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
 
@@ -2987,6 +2056,18 @@ mod tests {
         .await;
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.request_id, 1);
+        assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
+
+        send(
+            &mut ws,
+            2,
+            client_frame::Msg::DropSteers(DropSteers {
+                session_id: "s-unknown".to_owned(),
+            }),
+        )
+        .await;
+        let frame = next_frame(&mut ws).await;
+        assert_eq!(frame.request_id, 2);
         assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
 
         harness.stop().await;
@@ -3062,26 +2143,6 @@ mod tests {
             .expect("the partial reply landed durably");
         assert_eq!(assistant.content, "working");
         assert!(assistant.partial);
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn cancel_turn_on_an_idle_session_is_an_honest_error() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(
-            &mut ws,
-            1,
-            client_frame::Msg::CancelTurn(CancelTurn {
-                session_id: "s-unknown".to_owned(),
-            }),
-        )
-        .await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 1);
-        assert_eq!(failed(frame.msg.expect("a message")).code, "no_turn");
 
         harness.stop().await;
     }
@@ -3227,94 +2288,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_steers_on_an_unknown_session_is_an_honest_error() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(
-            &mut ws,
-            1,
-            client_frame::Msg::DropSteers(DropSteers {
-                session_id: "s-unknown".to_owned(),
-            }),
-        )
-        .await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 1);
-        assert_eq!(failed(frame.msg.expect("a message")).code, "unknown_job");
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn typing_into_a_finished_executor_job_runs_a_real_turn_with_the_executor_runner() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let executor_script = Script::Canned(VecDeque::from([
-            vec![
-                Ok(CompletionDelta::Text("on it".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-            vec![
-                Ok(CompletionDelta::Text("still here".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        ]));
-
-        let mut harness = Harness::with_executor(
-            dispatching_chat("fix the failing test"),
-            registry,
-            executor_script,
-            projects,
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "start a job")).await;
-        run_turn_to_end(&mut ws, 1).await;
-
-        let child_id = dispatched_child_id(&harness);
-        harness.drain_jobs().await;
-
-        send(&mut ws, 2, say(&child_id, "still there?")).await;
-        let (session_id, text, closing) = turn(&mut ws, 2).await;
-        assert_eq!(
-            session_id, child_id,
-            "the turn ran in the job's own session"
-        );
-        assert_eq!(text, "still here");
-        assert!(!ended(closing).partial, "a real turn, not a fault");
-
-        let child_messages: Vec<_> = harness
-            .logged_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.session_id == child_id => {
-                    Some((Role::try_from(m.role).expect("a known role"), m.content))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            child_messages,
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "on it".to_owned()),
-                (Role::User, "still there?".to_owned()),
-                (Role::Assistant, "still here".to_owned()),
-            ],
-            "the follow-up landed in the child's own log, as a real conversation"
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
     async fn create_session_opens_a_code_session_with_the_direct_prompt_and_a_job_keeps_its_own() {
         let (registry, project_dir, projects) = dispatch_registry_and_projects();
         std::fs::write(
@@ -3412,25 +2385,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_refuses_a_project_for_chat() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let mut harness = Harness::with_executor_provider(
-            Script::Echo,
-            registry,
-            ScriptedProvider::scripted(vec![]) as Arc<dyn Provider>,
-            projects,
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        let msg = create_session(&mut ws, 1, SessionRole::Chat, "arc").await;
-
-        assert_eq!(failed(msg).code, "unknown_project");
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
     async fn create_chat_session_rejects_unknown_choice_and_accepts_a_turn() {
         let mut harness = Harness::start(Script::Echo).await;
         let mut ws = harness.connect().await;
@@ -3457,20 +2411,6 @@ mod tests {
         let (served, reply, _) = turn(&mut ws, 3).await;
         assert_eq!(served, id);
         assert_eq!(reply, "re: hello");
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn create_session_names_an_unknown_project() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        let msg = create_session(&mut ws, 1, SessionRole::Executor, "ghost").await;
-
-        let error = failed(msg);
-        assert_eq!(error.code, "unknown_project");
-        assert!(error.msg.contains("ghost"), "{}", error.msg);
 
         harness.stop().await;
     }
@@ -3511,68 +2451,6 @@ mod tests {
             [(Role::User, "hello")],
             "the branch inherits the parent's prefix through the fork point"
         );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn fork_session_names_an_unknown_parent() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(
-            &mut ws,
-            1,
-            client_frame::Msg::ForkSession(ForkSession {
-                session_id: "ghost".to_owned(),
-                fork_point: 1,
-                choice: String::new(),
-            }),
-        )
-        .await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 1);
-        let error = failed(frame.msg.expect("a message"));
-        assert_eq!(error.code, "unknown_session");
-        assert!(error.msg.contains("ghost"), "{}", error.msg);
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_fetched_forked_sessions_history_names_its_fork_lineage() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "hello")).await;
-        let (session_id, _text, closing) = turn(&mut ws, 1).await;
-        ended(closing);
-
-        let answer = history(&mut ws, 2, &session_id).await;
-        assert_eq!(
-            answer.parent_session, "",
-            "a root conversation has no lineage"
-        );
-        let fork_point = answer.entries[0].seq;
-
-        send(
-            &mut ws,
-            3,
-            client_frame::Msg::ForkSession(ForkSession {
-                session_id: session_id.clone(),
-                fork_point,
-                choice: String::new(),
-            }),
-        )
-        .await;
-        let fork_id = match next_frame(&mut ws).await.msg {
-            Some(server_frame::Msg::MessageAccepted(m)) => m.session_id,
-            other => panic!("expected MessageAccepted, got {other:?}"),
-        };
-
-        let forked_history = history(&mut ws, 4, &fork_id).await;
-        assert_eq!(forked_history.parent_session, session_id);
-        assert_eq!(forked_history.fork_point, fork_point);
 
         harness.stop().await;
     }
@@ -3627,78 +2505,6 @@ mod tests {
         assert_eq!(forked.disposition, branch_marked::Disposition::Real as i32);
 
         harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn mark_branch_on_a_root_session_is_an_instructive_error() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("", "hello")).await;
-        let (session_id, _text, closing) = turn(&mut ws, 1).await;
-        ended(closing);
-
-        send(
-            &mut ws,
-            2,
-            client_frame::Msg::MarkBranch(MarkBranch {
-                session_id: session_id.clone(),
-                disposition: branch_marked::Disposition::Real as i32,
-            }),
-        )
-        .await;
-        let frame = next_frame(&mut ws).await;
-        let error = failed(frame.msg.expect("a message"));
-        assert_eq!(error.code, "not_a_branch");
-        assert!(error.msg.contains(&session_id), "{}", error.msg);
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn mark_branch_on_an_unknown_session_is_an_honest_error() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(
-            &mut ws,
-            1,
-            client_frame::Msg::MarkBranch(MarkBranch {
-                session_id: "ghost".to_owned(),
-                disposition: branch_marked::Disposition::Abandoned as i32,
-            }),
-        )
-        .await;
-        let frame = next_frame(&mut ws).await;
-        let error = failed(frame.msg.expect("a message"));
-        assert_eq!(error.code, "unknown_session");
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn a_steer_to_an_unknown_session_falls_through_to_the_normal_path() {
-        let mut harness = Harness::start(Script::Echo).await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, say("s-unknown", "hello")).await;
-        let (session_id, text, closing) = turn(&mut ws, 1).await;
-
-        assert_eq!(session_id, "s-unknown", "the named session is used as-is");
-        assert_eq!(text, "re: hello");
-        assert!(!ended(closing).partial);
-
-        harness.stop().await;
-    }
-
-    async fn jobs(ws: &mut Client, request_id: u64) -> Vec<arc_proto::v1::JobInfo> {
-        send(ws, request_id, client_frame::Msg::ListJobs(ListJobs {})).await;
-        let frame = next_frame(ws).await;
-        assert_eq!(frame.request_id, request_id);
-        match frame.msg {
-            Some(server_frame::Msg::JobList(list)) => list.jobs,
-            other => panic!("expected JobList, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -3758,80 +2564,6 @@ mod tests {
             Some(server_frame::Msg::ModelList(list)) => assert!(list.choices[0].selected),
             other => panic!("expected ModelList, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn list_projects_names_every_configured_project() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let mut harness = Harness::with_executor(
-            Script::Canned(VecDeque::new()),
-            registry,
-            Script::Canned(VecDeque::new()),
-            projects,
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        send(&mut ws, 1, client_frame::Msg::ListProjects(ListProjects {})).await;
-        let frame = next_frame(&mut ws).await;
-        assert_eq!(frame.request_id, 1);
-        let listed = match frame.msg {
-            Some(server_frame::Msg::ProjectList(list)) => list.projects,
-            other => panic!("expected ProjectList, got {other:?}"),
-        };
-        assert_eq!(
-            listed,
-            vec![ProjectInfo {
-                name: "arc".to_owned(),
-                description: "about arc".to_owned(),
-                root: String::new(),
-            }]
-        );
-
-        harness.stop().await;
-    }
-
-    #[tokio::test]
-    async fn list_jobs_is_empty_before_a_dispatch_and_names_the_finished_job_after() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let executor_script = Script::Canned(VecDeque::from([vec![
-            Ok(CompletionDelta::Text("on it".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]));
-
-        let mut harness = Harness::with_executor(
-            dispatching_chat("fix the failing test"),
-            registry,
-            executor_script,
-            projects,
-        )
-        .await;
-        let mut ws = harness.connect().await;
-
-        assert_eq!(jobs(&mut ws, 1).await, [], "nothing dispatched yet");
-
-        send(&mut ws, 2, say("", "start a job")).await;
-        run_turn_to_end(&mut ws, 2).await;
-
-        let child_id = dispatched_child_id(&harness);
-        harness.drain_jobs().await;
-
-        let listed = jobs(&mut ws, 3).await;
-        assert_eq!(listed.len(), 1);
-        let job = &listed[0];
-        assert_eq!(job.session_id, child_id);
-        assert_eq!(job.role, SessionRole::Executor as i32);
-        assert_eq!(job.project, "arc");
-        assert_eq!(job.state, job_info::State::Finished as i32);
-        assert_eq!(
-            job.spent_tokens,
-            u64::from(usage().input_tokens) + u64::from(usage().output_tokens)
-        );
-
-        harness.stop().await;
     }
 
     async fn subscribe(ws: &mut Client, request_id: u64) {
@@ -3908,48 +2640,6 @@ mod tests {
         harness.stop().await;
     }
 
-    #[tokio::test]
-    async fn an_unsubscribed_connection_gets_no_notification_frames() {
-        let (registry, _project_dir, projects) = dispatch_registry_and_projects();
-        let executor_script = Script::Canned(VecDeque::from([vec![
-            Ok(CompletionDelta::Text("on it".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]));
-        let mut harness = Harness::with_executor(
-            dispatching_chat("fix the failing test"),
-            registry,
-            executor_script,
-            projects,
-        )
-        .await;
-
-        let mut bystander = harness.connect().await;
-
-        let mut ws = harness.connect().await;
-        send(&mut ws, 1, say("", "start a job")).await;
-        run_turn_to_end(&mut ws, 1).await;
-        harness.drain_jobs().await;
-
-        send(
-            &mut bystander,
-            2,
-            client_frame::Msg::ListSessions(ListSessions {}),
-        )
-        .await;
-        let frame = next_frame(&mut bystander).await;
-        assert_eq!(frame.request_id, 2);
-        assert!(
-            matches!(frame.msg, Some(server_frame::Msg::SessionList(_))),
-            "an unsubscribed connection's next frame is the plain reply, not a push: got {:?}",
-            frame.msg
-        );
-
-        harness.stop().await;
-    }
-
     /// The hard interleave guarantee: a notification must never land between
     /// two frames of the same streaming reply. A chat turn is gated
     /// mid-stream on this connection while a job finishes independently (its
@@ -4011,7 +2701,6 @@ mod tests {
             system: Some("be terse".to_owned()),
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: arc_core::tool::Editing::Replacement,
         };
         let executor_runner = Runner {
@@ -4022,7 +2711,6 @@ mod tests {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: arc_core::tool::Editing::Replacement,
         };
         let supervisor = Arc::new(

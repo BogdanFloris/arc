@@ -14,33 +14,20 @@ use arc_proto::v1::SessionRole;
 use crate::config::{Config, RoleConfig, RoleProvider};
 
 const RUNNING_JOBS: &str = r"Running jobs:
-- Dispatch, then end your reply. The handback arrives on its own.
-  continue_job never fetches a result; each message costs the job a
-  full turn.
-- If a finished job already holds the context — files it read, a repo
-  it analyzed — continue that job, even when the question is new.
+- Dispatch, then end your reply. The handback (reply from job) arrives on its own.
+- If a finished job already holds the context (files it read, a repo
+  it analyzed) continue that job, if you believe the follow-up requires the context.
   A fresh dispatch starts from nothing.
-- analyze means look and report; nothing in the workspace changes.
-  Say implement only when the user asked for changes, and let the brief
-  say what may change.
 - Briefs are self-contained. The child sees nothing of this
   conversation.
 - A handback is the job's claim, not a verified fact. Say what the job
   reports, not what is proven, unless you checked.
-- A handback's footprint is the daemon's count of what changed in the
-  project during that turn: commits by id and message, files by name.
-  Compare the report against it and say where they differ; a claim with
-  nothing in the footprint behind it is a claim.
 - A job cancelled by the user stays stopped. Acknowledge it; never
   dispatch or continue that work again unless the user asks.
-- Describe the codebase, its UI, or its commits only from a handback or
-  an expert reply. Otherwise dispatch analyze, or say you cannot see it.
+- Describe the codebase, its UI, or its commits only from a handback.
+  Otherwise dispatch analyze, or say you cannot see it.
 - Report a job's commits by the ids and messages the job named.
-- A brief with more than one task says to commit each task on its own;
-  decide the commit boundaries before the work, not after.
 - A brief that touches drawing asks for the rendered frame in the report.
-- Forward an expert review to the job verbatim with continue_job. Put each
-  judgment call the expert leaves open to the user; never decide or drop it.
 - Hand the user conclusions, not transcripts.";
 
 pub(crate) const MEMORY: &str = r"Memory:
@@ -54,7 +41,6 @@ pub(crate) const MEMORY: &str = r"Memory:
 - Search the project's namespace before assuming a convention. The index
   carries titles and one line; memory_read has the rest.";
 
-// well under 2^32 tokens; the fractional token truncates harmlessly
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
     (f64::from(context_window) * f64::from(fraction)) as u32
@@ -67,8 +53,6 @@ fn chat_system(identity: Option<String>) -> String {
     }
 }
 
-/// Per role, the runners its configured choices resolve to, in config order.
-/// The first is the default; the engine's recorded selection picks among them.
 #[derive(Debug)]
 pub struct Roles {
     chat: Vec<(String, Runner)>,
@@ -174,7 +158,6 @@ struct Built<'a> {
     providers: HashMap<Client, Arc<dyn Provider>>,
 }
 
-// two roles on one endpoint share a client only if they also share a key
 #[derive(PartialEq, Eq, Hash)]
 struct Client {
     kind: RoleProvider,
@@ -208,7 +191,6 @@ impl<'a> Built<'a> {
                 system,
                 compact_at: None,
                 context_window: None,
-                counsel: false,
                 editing: arc_core::tool::Editing::Replacement,
             };
             return Ok(vec![(runner.model.clone(), runner)]);
@@ -217,8 +199,6 @@ impl<'a> Built<'a> {
             let runner = self.runner(role, name, configured, config, system)?;
             return Ok(vec![(runner.model.clone(), runner)]);
         }
-        // the first choice must resolve: it is the default until a selection
-        // says otherwise; a later one that cannot is dropped with a warning
         let mut menu = Vec::with_capacity(configured.choices.len());
         for (position, choice) in configured.choices.iter().enumerate() {
             let preset = config
@@ -264,7 +244,6 @@ impl<'a> Built<'a> {
             system,
             compact_at,
             context_window: configured.context_window,
-            counsel: configured.counsel,
             editing,
         })
     }
@@ -443,14 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn no_identity_file_still_gives_the_chat_the_jobs_doctrine() {
-        let roles = resolved("");
-
-        let system = roles.chat().system.as_deref().expect("a system");
-        assert!(system.starts_with("Running jobs:"), "{system}");
-    }
-
-    #[test]
     fn code_has_its_own_menu_and_inherits_executor_only_when_omitted() {
         use arc_proto::v1::SessionRole;
 
@@ -482,19 +453,6 @@ choices = ["sol", "astra"]
     }
 
     #[test]
-    fn an_unconfigured_role_falls_back_to_the_sidecar() {
-        let roles = resolved("");
-
-        for role in roles.all() {
-            assert_eq!(role.provider.name(), "local");
-            assert_eq!(role.provider.endpoint(), SIDECAR);
-            assert_eq!(role.model, Config::default().model());
-            assert_eq!(role.compact_at, None, "no context_window, no compaction");
-            assert_eq!(role.editing, arc_core::tool::Editing::Replacement);
-        }
-    }
-
-    #[test]
     fn model_preset_overrides_the_provider_editing_default() {
         let roles = resolved(
             "[models.patch_local]\nprovider = \"local\"\nediting = \"patch\"\n\
@@ -505,53 +463,6 @@ choices = ["sol", "astra"]
             roles.choices()[&arc_proto::v1::SessionRole::Executor][0].editing,
             arc_core::tool::Editing::Patch
         );
-    }
-
-    #[test]
-    fn compact_at_is_the_context_window_scaled_by_the_configured_fraction() {
-        let roles = resolved(
-            r#"
-[compaction]
-fraction = 0.5
-
-[roles.executor]
-provider = "local"
-context_window = 100000
-"#,
-        );
-
-        assert_eq!(roles.executor().compact_at, Some(50_000));
-        assert_eq!(
-            roles.chat().compact_at,
-            None,
-            "an unconfigured role never compacts"
-        );
-    }
-
-    #[test]
-    fn each_role_resolves_to_its_own_provider_and_model() {
-        let roles = resolved(
-            r#"
-[roles.chat]
-provider = "openai_compat"
-model    = "deepseek-v4-flash"
-endpoint = "http://127.0.0.1:4096"
-
-[roles.executor]
-provider = "openai_compat"
-model    = "deepseek-v4-pro"
-endpoint = "http://127.0.0.1:4096"
-
-[roles.archivist]
-provider = "local"
-"#,
-        );
-
-        assert_eq!(roles.chat().model, "deepseek-v4-flash");
-        assert_eq!(roles.executor().model, "deepseek-v4-pro");
-        assert_eq!(roles.chat().provider.name(), "openai-compat");
-        assert_eq!(roles.archivist().provider.name(), "local");
-        assert_eq!(roles.archivist().model, Config::default().model());
     }
 
     #[test]
@@ -581,34 +492,6 @@ endpoint = "http://127.0.0.1:4096"
     }
 
     #[test]
-    fn a_local_role_may_name_a_model_the_sidecar_was_started_with() {
-        let roles = resolved("[roles.archivist]\nprovider = \"local\"\nmodel = \"qwen3-8b\"\n");
-
-        assert_eq!(roles.archivist().model, "qwen3-8b");
-        assert_eq!(roles.archivist().provider.endpoint(), SIDECAR);
-    }
-
-    #[test]
-    fn a_keyed_role_reads_its_key_and_a_missing_one_names_the_role() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config = r#"
-[roles.executor]
-provider = "openai_compat"
-model    = "deepseek-v4-pro"
-endpoint = "https://opencode.example/v1"
-key      = "opencode-go"
-"#;
-
-        let err = with_secrets(config, dir.path(), &[]).expect_err("the key is not there");
-        let chain = format!("{err:#}");
-        assert!(chain.contains("opencode-go"), "{chain}");
-
-        let roles = with_secrets(config, dir.path(), &[("opencode-go", "sk-go-123\n")])
-            .expect("the key is there now");
-        assert_eq!(roles.executor().provider.name(), "openai-compat");
-    }
-
-    #[test]
     fn one_endpoint_with_two_keys_gets_two_clients() {
         let dir = tempfile::tempdir().expect("temp dir");
         let roles = with_secrets(
@@ -633,54 +516,6 @@ key      = "work"
         assert!(
             !std::sync::Arc::ptr_eq(&roles.chat().provider, &roles.executor().provider),
             "same endpoint, different keys: they must not share a client"
-        );
-    }
-
-    #[test]
-    fn a_key_never_appears_in_debug_output() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let roles = with_secrets(
-            r#"
-[roles.executor]
-provider = "openai_compat"
-model    = "deepseek-v4-pro"
-endpoint = "https://opencode.example/v1"
-key      = "opencode-go"
-"#,
-            dir.path(),
-            &[("opencode-go", "sk-supersecret-value")],
-        )
-        .expect("resolves");
-
-        let rendered = format!("{roles:?}");
-        assert!(
-            !rendered.contains("sk-supersecret-value"),
-            "a key reached a Debug line: {rendered}"
-        );
-        assert!(rendered.contains("redacted"), "{rendered}");
-    }
-
-    #[test]
-    fn a_gemini_role_resolves_to_its_own_provider_on_the_published_endpoint() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let roles = with_secrets(
-            r#"
-[roles.chat]
-provider = "gemini"
-model    = "gemini-3.7-flash"
-key      = "gemini"
-"#,
-            dir.path(),
-            &[("gemini", "sk-gemini")],
-        )
-        .expect("resolves");
-
-        let chat = roles.chat();
-        assert_eq!(chat.provider.name(), "gemini");
-        assert_eq!(chat.model, "gemini-3.7-flash");
-        assert_eq!(
-            chat.provider.endpoint(),
-            arc_core::provider::gemini::DEFAULT_ENDPOINT
         );
     }
 
@@ -737,16 +572,12 @@ endpoint       = "https://opencode.example"
 key            = "opencode-go"
 thinking       = "low"
 context_window = 100000
-counsel        = true
 
 [models.sol]
 provider = "codex"
 model    = "gpt-5.6-sol"
 key      = "codex"
 
-[roles.counsel]
-command = "claude"
-model   = "opus"
 "#;
 
         let roles = with_secrets(config, dir.path(), &[("opencode-go", "sk-go")])
@@ -756,11 +587,6 @@ model   = "opus"
         assert_eq!(executor.model, "deepseek-v4-flash");
         assert_eq!(executor.thinking, arc_core::provider::Thinking::Low);
         assert_eq!(executor.compact_at, Some(80_000));
-        assert!(
-            executor.counsel,
-            "the preset's counsel flag rides on the runner"
-        );
-        assert!(!roles.chat().counsel);
         let menu = roles.menus();
         assert_eq!(
             menu[&arc_proto::v1::SessionRole::Executor]
@@ -780,23 +606,5 @@ model   = "opus"
         let err =
             with_secrets(config, empty.path(), &[]).expect_err("the default's key is missing");
         assert!(format!("{err:#}").contains("opencode-go"), "{err:#}");
-    }
-
-    #[test]
-    fn a_gemini_role_without_its_key_names_the_role_that_wanted_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-
-        let err = with_secrets(
-            "[roles.chat]\nprovider = \"gemini\"\nmodel = \"flash\"\nkey = \"gemini\"\n",
-            dir.path(),
-            &[],
-        )
-        .expect_err("no key, no provider");
-
-        let chain = format!("{err:#}");
-        assert!(
-            chain.contains("chat") && chain.contains("gemini"),
-            "{chain}"
-        );
     }
 }

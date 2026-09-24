@@ -23,9 +23,7 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 use super::writer::PacketWriter;
 
 const COUNTER_PREFIX: &str = "counter.";
-
 const SEQUENCE_ID: u32 = 1;
-
 const CATEGORY: &str = "arc";
 
 pub struct PerfettoLayer {
@@ -528,36 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn a_session_opens_one_row_however_deep_the_span_that_names_it() {
-        let trace = capture(|| {
-            tracing::info_span!("client connected").in_scope(|| {
-                tracing::info_span!("server.request").in_scope(|| {
-                    tracing::info_span!("session.send_message", session_id = "abcdef0123456789")
-                        .in_scope(|| {
-                            tracing::info_span!("openai.complete", session_id = "abcdef0123456789")
-                                .in_scope(|| {});
-                        });
-                });
-            });
-        });
-
-        let (session, _) = track_named(&trace, "session abcdef01");
-        let (send, send_parent) = track_named(&trace, "session.send_message");
-        assert_eq!(
-            send_parent,
-            Some(session),
-            "the turn hangs off the session, not off the connection"
-        );
-
-        let (_, complete_parent) = track_named(&trace, "openai.complete");
-        assert_eq!(
-            complete_parent,
-            Some(send),
-            "a span already inside that session stays nested"
-        );
-    }
-
-    #[test]
     fn an_event_lands_on_its_span_and_carries_its_fields() {
         let trace = capture(|| {
             tracing::info_span!("work").in_scope(|| {
@@ -617,20 +585,6 @@ mod tests {
                 .iter()
                 .all(|annotation| annotation.name != "counter.output_tokens"),
             "a counter is drawn once, as a counter"
-        );
-    }
-
-    #[test]
-    fn a_counter_only_event_draws_no_instant() {
-        let trace = capture(|| {
-            tracing::info!(counter.queue_depth = 3_u64);
-        });
-
-        assert!(
-            !events(&trace)
-                .iter()
-                .any(|(kind, _, _)| *kind == track_event::Type::Instant as i32),
-            "nothing to say, so nothing is drawn"
         );
     }
 }

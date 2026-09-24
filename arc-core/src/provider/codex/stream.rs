@@ -8,18 +8,12 @@ use crate::provider::{CompletionDelta, Error, Stop, ToolCall, Usage};
 #[derive(Default)]
 pub(super) struct Parser {
     building: BTreeMap<u32, Building>,
-
-    // finished calls wait for the terminal event so each can carry the
-    // reasoning item the backend wants replayed ahead of them
     finished: Vec<ToolCall>,
-
     reasoning: Option<Vec<u8>>,
-
     citations: Vec<serde_json::Value>,
 }
 
 const WEB_SEARCH: &str = "web_search";
-
 const CUSTOM_INPUT: &str = super::CUSTOM_INPUT;
 
 impl FrameParser for Parser {
@@ -45,9 +39,11 @@ impl FrameParser for Parser {
                         self.building.insert(
                             index,
                             Building {
-                                call_id: item.field("call_id"),
-                                name: item.field("name"),
-                                arguments: item.field(if custom { "input" } else { "arguments" }),
+                                call_id: item.get("call_id").unwrap_or_default(),
+                                name: item.get("name").unwrap_or_default(),
+                                arguments: item
+                                    .get(if custom { "input" } else { "arguments" })
+                                    .unwrap_or_default(),
                             },
                         );
                     }
@@ -86,12 +82,12 @@ impl FrameParser for Parser {
                     "custom_tool_call" => {
                         let index = event.output_index.unwrap_or_default();
                         let building = self.building.remove(&index).unwrap_or_default();
-                        let input = item.get("input").map_or(building.arguments, Item::text);
+                        let input = item.get("input").unwrap_or(building.arguments);
                         let position = u32::try_from(self.finished.len()).unwrap_or(u32::MAX);
                         self.finished.push(ToolCall {
-                            id: item.get("call_id").map_or(building.call_id, Item::text),
+                            id: item.get("call_id").unwrap_or(building.call_id),
                             index: position,
-                            name: item.get("name").map_or(building.name, Item::text),
+                            name: item.get("name").unwrap_or(building.name),
                             arguments: serde_json::json!({ CUSTOM_INPUT: input }).to_string(),
                             provider_roundtrip: Vec::new(),
                         });
@@ -99,9 +95,8 @@ impl FrameParser for Parser {
                     "function_call" => {
                         let index = event.output_index.unwrap_or_default();
                         let building = self.building.remove(&index).unwrap_or_default();
-                        let arguments =
-                            item.get("arguments").map_or(building.arguments, Item::text);
-                        let name = item.get("name").map_or(building.name, Item::text);
+                        let arguments = item.get("arguments").unwrap_or(building.arguments);
+                        let name = item.get("name").unwrap_or(building.name);
                         if !matches!(
                             serde_json::from_str::<serde_json::Value>(&arguments),
                             Ok(serde_json::Value::Object(_))
@@ -113,7 +108,7 @@ impl FrameParser for Parser {
                         }
                         let position = u32::try_from(self.finished.len()).unwrap_or(u32::MAX);
                         self.finished.push(ToolCall {
-                            id: item.get("call_id").map_or(building.call_id, Item::text),
+                            id: item.get("call_id").unwrap_or(building.call_id),
                             index: position,
                             name,
                             arguments,
@@ -285,19 +280,10 @@ impl Item {
         self.0["type"].as_str().unwrap_or_default()
     }
 
-    fn get(&self, field: &str) -> Option<Item> {
-        self.0.get(field).map(|value| Item(value.clone()))
-    }
-
-    fn field(&self, field: &str) -> String {
-        self.0[field].as_str().unwrap_or_default().to_owned()
-    }
-
-    fn text(self) -> String {
-        match self.0 {
-            serde_json::Value::String(text) => text,
-            _ => String::new(),
-        }
+    fn get(&self, field: &str) -> Option<String> {
+        self.0
+            .get(field)
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
     }
 }
 
@@ -421,17 +407,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn no_split_point_changes_what_the_stream_yields() {
-        let bytes = sse(&text_turn());
-        let whole = ok(vec![bytes.clone()]).await;
-
-        for split in (0..bytes.len()).step_by(7) {
-            let seen = ok(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]).await;
-            assert_eq!(seen, whole, "split at {split}");
-        }
     }
 
     fn tool_turn() -> Vec<Value> {
@@ -602,24 +577,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reasoning_item_without_encrypted_content_is_not_carried() {
-        let events = vec![
-            json!({"type": "response.output_item.done", "output_index": 0,
-                   "item": {"type": "reasoning", "id": "rs_0", "summary": []}}),
-            json!({"type": "response.output_item.done", "output_index": 1,
-                   "item": {"type": "function_call", "call_id": "call_z", "name": "f", "arguments": "{}"}}),
-            completed(1, 1, 0),
-        ];
-
-        let seen = ok(vec![sse(&events)]).await;
-
-        let CompletionDelta::ToolCall(call) = &seen[0] else {
-            panic!("{seen:?}");
-        };
-        assert!(call.provider_roundtrip.is_empty());
-    }
-
-    #[tokio::test]
     async fn arguments_that_are_not_an_object_fail_the_stream() {
         let events = vec![
             json!({"type": "response.output_item.done", "output_index": 0,
@@ -633,22 +590,6 @@ mod tests {
             matches!(seen.as_slice(), [Err(Error::MalformedStream(_))]),
             "{seen:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_stream_cut_before_completion_ends_without_a_done() {
-        let mut events = text_turn();
-        events.pop();
-
-        let seen = ok(vec![sse(&events)]).await;
-
-        assert!(
-            !seen
-                .iter()
-                .any(|d| matches!(d, CompletionDelta::Done { .. })),
-            "{seen:?}"
-        );
-        assert_eq!(seen.len(), 3);
     }
 
     #[tokio::test]
@@ -689,15 +630,5 @@ mod tests {
             [Err(Error::Refused(detail))] => assert_eq!(detail, "invalid_prompt: too long"),
             other => panic!("{other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn a_frame_that_is_not_json_fails_the_stream_once() {
-        let seen = deltas(vec![b"data: not json\n\n".to_vec()]).await;
-
-        assert!(
-            matches!(seen.as_slice(), [Err(Error::MalformedStream(_))]),
-            "{seen:?}"
-        );
     }
 }

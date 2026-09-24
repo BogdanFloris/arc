@@ -52,9 +52,6 @@ pub enum TurnEvent {
         partial: bool,
         step_capped: bool,
         grounding_json: String,
-        /// This send was queued into a turn already running in this
-        /// session; its reply streams on whichever request accepted that
-        /// turn, not this one.
         queued: bool,
     },
     Failed {
@@ -84,9 +81,6 @@ impl Client {
         })
     }
 
-    /// Opens the daemon's push stream. The reply never comes as a normal
-    /// answer: notifications tagged with this request id surface through
-    /// `poll_notification` instead.
     #[tracing::instrument(name = "client.subscribe", skip_all)]
     pub async fn subscribe(&mut self) -> Result<(), Error> {
         let id = self
@@ -121,15 +115,11 @@ impl Client {
 
     #[tracing::instrument(name = "client.list_sessions", skip_all)]
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>, Error> {
-        let id = self
-            .send(client_frame::Msg::ListSessions(ListSessions {}))
-            .await?;
-        match self.answer(id).await? {
+        match self
+            .request(client_frame::Msg::ListSessions(ListSessions {}))
+            .await?
+        {
             server_frame::Msg::SessionList(list) => Ok(list.sessions),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("SessionList", &other)),
         }
     }
@@ -139,34 +129,26 @@ impl Client {
         &mut self,
         session_id: &str,
     ) -> Result<arc_proto::v1::SessionStatus, Error> {
-        let id = self
-            .send(client_frame::Msg::FetchStatus(arc_proto::v1::FetchStatus {
+        match self
+            .request(client_frame::Msg::FetchStatus(arc_proto::v1::FetchStatus {
                 session_id: session_id.to_owned(),
             }))
-            .await?;
-        match self.answer(id).await? {
+            .await?
+        {
             server_frame::Msg::SessionStatus(status) => Ok(status),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("SessionStatus", &other)),
         }
     }
 
     #[tracing::instrument(name = "client.fetch_history", skip_all, fields(session_id))]
     pub async fn fetch_history(&mut self, session_id: &str) -> Result<SessionHistory, Error> {
-        let id = self
-            .send(client_frame::Msg::FetchHistory(FetchHistory {
+        match self
+            .request(client_frame::Msg::FetchHistory(FetchHistory {
                 session_id: session_id.to_owned(),
             }))
-            .await?;
-        match self.answer(id).await? {
+            .await?
+        {
             server_frame::Msg::SessionHistory(history) => Ok(history),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("SessionHistory", &other)),
         }
     }
@@ -176,75 +158,61 @@ impl Client {
         &mut self,
         since_micros: i64,
     ) -> Result<Vec<MemoryReviewItem>, Error> {
-        let id = self
-            .send(client_frame::Msg::MemoryReviewList(MemoryReviewList {
+        match self
+            .request(client_frame::Msg::MemoryReviewList(MemoryReviewList {
                 since_micros,
             }))
-            .await?;
-        match self.answer(id).await? {
+            .await?
+        {
             server_frame::Msg::MemoryReviewItems(items) => Ok(items.items),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("MemoryReviewItems", &other)),
         }
     }
 
     #[tracing::instrument(name = "client.review_accept", skip_all, fields(record_id))]
     pub async fn review_accept(&mut self, record_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::MemoryReviewAccept(MemoryReviewAccept {
-                record_id: record_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::MemoryReviewAccept(MemoryReviewAccept {
+            record_id: record_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.review_delete", skip_all, fields(record_id))]
     pub async fn review_delete(&mut self, record_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
-                record_id: record_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+            record_id: record_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.jobs", skip_all)]
     pub async fn jobs(&mut self) -> Result<Vec<JobInfo>, Error> {
-        let id = self.send(client_frame::Msg::ListJobs(ListJobs {})).await?;
-        match self.answer(id).await? {
+        match self
+            .request(client_frame::Msg::ListJobs(ListJobs {}))
+            .await?
+        {
             server_frame::Msg::JobList(list) => Ok(list.jobs),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("JobList", &other)),
         }
     }
 
     #[tracing::instrument(name = "client.projects", skip_all)]
     pub async fn projects(&mut self) -> Result<Vec<ProjectInfo>, Error> {
-        let id = self
-            .send(client_frame::Msg::ListProjects(ListProjects {}))
-            .await?;
-        match self.answer(id).await? {
+        match self
+            .request(client_frame::Msg::ListProjects(ListProjects {}))
+            .await?
+        {
             server_frame::Msg::ProjectList(list) => Ok(list.projects),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("ProjectList", &other)),
         }
     }
 
     #[tracing::instrument(name = "client.models", skip_all)]
     pub async fn models(&mut self) -> Result<Vec<ModelChoice>, Error> {
-        let id = self
-            .send(client_frame::Msg::ListModels(ListModels {}))
-            .await?;
-        self.model_list(id).await
+        self.model_list(client_frame::Msg::ListModels(ListModels {}))
+            .await
     }
 
     #[tracing::instrument(name = "client.select_model", skip_all, fields(choice))]
@@ -253,54 +221,45 @@ impl Client {
         role: SessionRole,
         choice: &str,
     ) -> Result<Vec<ModelChoice>, Error> {
-        let id = self
-            .send(client_frame::Msg::SelectModel(SelectModel {
-                role: role as i32,
-                choice: choice.to_owned(),
-            }))
-            .await?;
-        self.model_list(id).await
+        self.model_list(client_frame::Msg::SelectModel(SelectModel {
+            role: role as i32,
+            choice: choice.to_owned(),
+        }))
+        .await
     }
 
-    async fn model_list(&mut self, id: u64) -> Result<Vec<ModelChoice>, Error> {
-        match self.answer(id).await? {
+    async fn model_list(&mut self, request: client_frame::Msg) -> Result<Vec<ModelChoice>, Error> {
+        match self.request(request).await? {
             server_frame::Msg::ModelList(list) => Ok(list.choices),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
             other => Err(unexpected("ModelList", &other)),
         }
     }
 
     #[tracing::instrument(name = "client.cancel_job", skip_all, fields(session_id))]
     pub async fn cancel_job(&mut self, session_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::CancelJob(CancelJob {
-                session_id: session_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::CancelJob(CancelJob {
+            session_id: session_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.cancel_turn", skip_all, fields(session_id))]
     pub async fn cancel_turn(&mut self, session_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::CancelTurn(CancelTurn {
-                session_id: session_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::CancelTurn(CancelTurn {
+            session_id: session_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.drop_steers", skip_all, fields(session_id))]
     pub async fn drop_steers(&mut self, session_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::DropSteers(DropSteers {
-                session_id: session_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::DropSteers(DropSteers {
+            session_id: session_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.create_session", skip_all, fields(project))]
@@ -323,21 +282,12 @@ impl Client {
         project: &str,
         choice: &str,
     ) -> Result<String, Error> {
-        let id = self
-            .send(client_frame::Msg::CreateSession(CreateSession {
-                role: role as i32,
-                project: project.to_owned(),
-                choice: choice.to_owned(),
-            }))
-            .await?;
-        match self.answer(id).await? {
-            server_frame::Msg::MessageAccepted(accepted) => Ok(accepted.session_id),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
-            other => Err(unexpected("MessageAccepted", &other)),
-        }
+        self.accepted(client_frame::Msg::CreateSession(CreateSession {
+            role: role as i32,
+            project: project.to_owned(),
+            choice: choice.to_owned(),
+        }))
+        .await
     }
 
     #[tracing::instrument(name = "client.fork_session", skip_all, fields(session_id))]
@@ -361,21 +311,12 @@ impl Client {
         fork_point: u64,
         choice: &str,
     ) -> Result<String, Error> {
-        let id = self
-            .send(client_frame::Msg::ForkSession(ForkSession {
-                session_id: session_id.to_owned(),
-                fork_point,
-                choice: choice.to_owned(),
-            }))
-            .await?;
-        match self.answer(id).await? {
-            server_frame::Msg::MessageAccepted(accepted) => Ok(accepted.session_id),
-            server_frame::Msg::Error(error) => Err(Error::Server {
-                code: error.code,
-                msg: error.msg,
-            }),
-            other => Err(unexpected("MessageAccepted", &other)),
-        }
+        self.accepted(client_frame::Msg::ForkSession(ForkSession {
+            session_id: session_id.to_owned(),
+            fork_point,
+            choice: choice.to_owned(),
+        }))
+        .await
     }
 
     #[tracing::instrument(name = "client.mark_branch", skip_all, fields(session_id))]
@@ -384,33 +325,38 @@ impl Client {
         session_id: &str,
         disposition: branch_marked::Disposition,
     ) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::MarkBranch(MarkBranch {
-                session_id: session_id.to_owned(),
-                disposition: disposition as i32,
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::MarkBranch(MarkBranch {
+            session_id: session_id.to_owned(),
+            disposition: disposition as i32,
+        }))
+        .await
+        .map(|_| ())
     }
 
     #[tracing::instrument(name = "client.compact_session", skip_all, fields(session_id))]
     pub async fn compact_session(&mut self, session_id: &str) -> Result<(), Error> {
-        let id = self
-            .send(client_frame::Msg::CompactSession(CompactSession {
-                session_id: session_id.to_owned(),
-            }))
-            .await?;
-        self.verdict_ack(id).await
+        self.accepted(client_frame::Msg::CompactSession(CompactSession {
+            session_id: session_id.to_owned(),
+        }))
+        .await
+        .map(|_| ())
     }
 
-    async fn verdict_ack(&mut self, id: u64) -> Result<(), Error> {
+    async fn accepted(&mut self, request: client_frame::Msg) -> Result<String, Error> {
+        match self.request(request).await? {
+            server_frame::Msg::MessageAccepted(accepted) => Ok(accepted.session_id),
+            other => Err(unexpected("MessageAccepted", &other)),
+        }
+    }
+
+    async fn request(&mut self, request: client_frame::Msg) -> Result<server_frame::Msg, Error> {
+        let id = self.send(request).await?;
         match self.answer(id).await? {
-            server_frame::Msg::MessageAccepted(_) => Ok(()),
             server_frame::Msg::Error(error) => Err(Error::Server {
                 code: error.code,
                 msg: error.msg,
             }),
-            other => Err(unexpected("MessageAccepted", &other)),
+            reply => Ok(reply),
         }
     }
 

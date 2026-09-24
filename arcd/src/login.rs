@@ -11,8 +11,6 @@ use crate::dirs::DataDirs;
 
 const DEFAULT_CREDENTIAL: &str = "codex";
 
-/// The credential file the config expects: the `key` of the first codex
-/// role, or `codex` when no role is on codex yet.
 pub fn credential_name(config: &Config) -> &str {
     [
         config.roles.chat.as_ref(),

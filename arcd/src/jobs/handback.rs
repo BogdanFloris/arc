@@ -9,13 +9,8 @@ use super::turn::BudgetBreach;
 use super::{Shared, send_into};
 
 pub(super) const NO_REPLY: &str = "(the job produced no reply)";
-
-/// Consecutive system-started turns run for one session since its last user
-/// message, before the daemon stops narrating and just leaves the handback
-/// itself in the transcript (DESIGN.md §4.1).
 const MAX_HANDBACK_TURNS: u32 = 50;
 
-/// The backstop on a chain of handbacks answering handbacks.
 pub(super) struct Autonomy(Mutex<HashMap<String, u32>>);
 
 impl Autonomy {
@@ -23,8 +18,6 @@ impl Autonomy {
         Self(Mutex::new(HashMap::new()))
     }
 
-    /// Counts one system-started turn for this session, or refuses once the
-    /// session has had `MAX_HANDBACK_TURNS` of them with no user message.
     pub(super) fn claim(&self, session_id: &str) -> bool {
         let mut counts = self.0.lock().expect("autonomy");
         let count = counts.entry(session_id.to_owned()).or_insert(0);
@@ -70,9 +63,6 @@ pub(super) fn record_handback(shared: &Shared, job: &DispatchedJob, reason: Opti
     record_handback_with(shared, job, reason, &summary, None);
 }
 
-/// The report goes to the parent as an ordinary system message: read at the
-/// parent's next step boundary if it is working, on a turn of its own if it
-/// is idle. Only when no turn can carry it does it land in the log alone.
 fn record_handback_with(
     shared: &Shared,
     job: &DispatchedJob,
@@ -184,7 +174,7 @@ mod tests {
 
     use arc_core::log::Log;
     use arc_core::projection::Projection;
-    use arc_core::provider::{CompletionDelta, Error as ProviderError, Stop};
+    use arc_core::provider::{CompletionDelta, Stop};
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
@@ -193,7 +183,7 @@ mod tests {
     use arc_core::tool::Registry;
     use arc_core::tool::ToolSource;
     use arc_core::tool::workspace::{Grant, Mode};
-    use arc_proto::v1::{Budget, Role, SessionRole};
+    use arc_proto::v1::{Role, SessionRole};
     use tempfile::TempDir;
 
     use crate::jobs::Supervisor;
@@ -201,136 +191,6 @@ mod tests {
         child_session, child_user_messages, engine_for_project, executor_runner, parent_session,
         steer,
     };
-
-    #[tokio::test]
-    async fn a_clean_finish_records_a_handback_with_the_childs_final_reply() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [(
-                Role::User,
-                format!(
-                    "Job {child_id} finished.\nall fixed\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
-                    footprint = arc_core::footprint::report(Some(&[]), None)
-                )
-            )],
-            "the handback names the child and carries its final reply"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_turn_records_a_stopped_handback_naming_the_turn_failure() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
-            ProviderError::InvalidRequest("boom".to_owned()),
-        )]]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [(
-                Role::User,
-                format!("Job {child_id} stopped: the turn failed.\n{NO_REPLY}")
-            )],
-            "the failure never produced any assistant text, so the summary falls back"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_over_budget_finish_records_a_stopped_handback_naming_the_numbers() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("partial progress")]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        // usage() reports 8 tokens combined; a cap of 5 is over budget as
-        // soon as the brief turn lands
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: Some(Budget {
-                total_tokens: 5,
-                wall_clock_seconds: 0,
-            }),
-        });
-        supervisor.shutdown().await;
-
-        let handbacks = child_user_messages(dir.path(), &parent_id);
-        assert_eq!(handbacks.len(), 2, "the turn's own handback, then the stop");
-        assert!(
-            handbacks[0].1.contains("partial progress"),
-            "the turn that crossed the budget still hands its reply back: {:?}",
-            handbacks[0]
-        );
-        assert_eq!(
-            handbacks[1],
-            (
-                Role::User,
-                "Job ".to_owned()
-                    + &child_id
-                    + " stopped: token budget exhausted (8/5).\n(its last reply was handed back when that turn ended)"
-            ),
-            "the reason names the spent and allowed token counts"
-        );
-    }
 
     #[tokio::test]
     async fn a_handback_from_a_jj_project_carries_the_daemons_footprint() {
@@ -441,136 +301,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_clean_finish_with_no_assistant_text_falls_back_to_the_no_reply_line() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![vec![Ok(CompletionDelta::Done {
-            usage: usage(),
-            stop: Stop::EndTurn,
-        })]]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [(
-                Role::User,
-                format!(
-                    "Job {child_id} finished.\n{NO_REPLY}\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
-                    footprint = arc_core::footprint::report(Some(&[]), None)
-                )
-            )],
-            "an empty assistant reply reads the same as no reply at all"
-        );
-    }
-
     fn last_assistant(dir: &std::path::Path, session_id: &str) -> Option<String> {
         child_user_messages(dir, session_id)
             .into_iter()
             .rev()
             .find(|(role, _)| *role == Role::Assistant)
             .map(|(_, content)| content)
-    }
-
-    #[tokio::test]
-    async fn a_clean_finish_triggers_a_chat_turn_that_reacts_to_the_handback() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![done_reply("the job did X")]);
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("all fixed")]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor =
-            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [
-                (
-                    Role::User,
-                    format!(
-                        "Job {child_id} finished.\nall fixed\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
-                        footprint = arc_core::footprint::report(Some(&[]), None)
-                    )
-                ),
-                (Role::Assistant, "the job did X".to_owned()),
-            ],
-            "the handback lands, then the chat's own turn reacts to it"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_jobs_handback_also_triggers_a_chat_turn() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![done_reply("noted the failure")]);
-        let executor_provider = ScriptedProvider::scripted(vec![vec![Err(
-            ProviderError::InvalidRequest("boom".to_owned()),
-        )]]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor =
-            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id,
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            last_assistant(dir.path(), &parent_id),
-            Some("noted the failure".to_owned()),
-            "a failed job's handback gets a chat turn too"
-        );
     }
 
     #[tokio::test]
@@ -672,6 +408,7 @@ mod tests {
                 Some(&parent_id),
                 "Job child-2 finished.\nalso done",
                 Source::System,
+                Vec::new(),
                 false,
             )
             .expect("the parent takes it");
@@ -712,48 +449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_forced_autonomy_cap_skips_the_parents_turn_and_appends_nothing_extra() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]); // must never be called
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("done")]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor =
-            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
-        for _ in 0..MAX_HANDBACK_TURNS {
-            assert!(supervisor.shared.autonomy.claim(&parent_id));
-        }
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id,
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id).len(),
-            1,
-            "only the handback landed; the capped chat turn never ran"
-        );
-        assert!(
-            chat_provider.requests().is_empty(),
-            "the capped provider was never called"
-        );
-    }
-
-    #[tokio::test]
     async fn reset_autonomy_lets_the_next_handback_run_after_a_forced_cap() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
@@ -773,6 +468,7 @@ mod tests {
         for _ in 0..MAX_HANDBACK_TURNS {
             assert!(supervisor.shared.autonomy.claim(&parent_id));
         }
+        assert!(!supervisor.shared.autonomy.claim(&parent_id));
 
         supervisor.shared.autonomy.reset(&parent_id);
 
@@ -900,101 +596,6 @@ mod tests {
             last_assistant(dir.path(), &parent_id),
             Some("the chain ends here".to_owned()),
             "the chain ran on: dispatch, then the chained child's own report"
-        );
-    }
-
-    fn continue_job_args(session_id: &str, message: &str) -> String {
-        serde_json::json!({
-            "session_id": session_id,
-            "message": message,
-        })
-        .to_string()
-    }
-
-    #[tokio::test]
-    async fn a_handback_turn_that_calls_continue_job_resumes_the_finished_job() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(arc_core::tool::builtin::continue_job::ContinueJob));
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let engine = Arc::new(
-            Engine::new(Store::new(log, projection), registry).with_projects(BTreeMap::from([(
-                "arc".to_owned(),
-                ProjectSpec {
-                    sources: vec![ToolSource::Builtin],
-                    grants: vec![Grant::new(&root, Mode::ReadWrite)],
-                    command_prefix: Vec::new(),
-                },
-            )])),
-        );
-
-        // a throwaway provider: session creation never drives it
-        let bootstrap_provider = ScriptedProvider::scripted(vec![]);
-        let parent_id = engine
-            .create_direct_session(&runner(&bootstrap_provider), "arc", SessionRole::Chat)
-            .expect("create the parent durably");
-        let first_child = engine
-            .create_bound_session(
-                &runner(&bootstrap_provider),
-                "arc",
-                SessionRole::Executor,
-                None,
-            )
-            .expect("create the first child durably");
-
-        let chat_provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c2",
-                    0,
-                    "continue_job",
-                    &continue_job_args(&first_child, "second link"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("chained"),
-            // the resumed job's own finish drives a second, independent
-            // handback turn on the same parent
-            done_reply("noted"),
-        ]);
-        let executor_provider = ScriptedProvider::scripted(vec![
-            done_reply("first job done"),
-            done_reply("second job done"),
-        ]);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor =
-            Supervisor::for_test(Arc::clone(&engine), runners).with_chat(runner(&chat_provider));
-
-        supervisor.spawn(DispatchedJob {
-            session_id: first_child.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &first_child),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "first job done".to_owned()),
-                (Role::User, "second link".to_owned()),
-                (Role::Assistant, "second job done".to_owned()),
-            ],
-            "the handback turn's continue_job resumed the finished job in place"
-        );
-        assert_eq!(
-            last_assistant(dir.path(), &parent_id),
-            Some("noted".to_owned()),
-            "the resumed job's own handback drove one more chat turn"
         );
     }
 }

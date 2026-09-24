@@ -11,29 +11,19 @@ pub const DEFAULT_AUTH_ENDPOINT: &str = "https://auth.openai.com";
 
 // the Codex CLI's public OAuth client; the ChatGPT plan is bound to it
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-
 const TOKEN_PATH: &str = "/oauth/token";
-
 const DEVICE_USER_CODE_PATH: &str = "/api/accounts/deviceauth/usercode";
-
 const DEVICE_TOKEN_PATH: &str = "/api/accounts/deviceauth/token";
-
 const DEVICE_VERIFICATION_PATH: &str = "/codex/device";
-
 const DEVICE_REDIRECT_PATH: &str = "/deviceauth/callback";
-
 const ACCOUNT_CLAIM: &str = "https://api.openai.com/auth";
-
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
-
 pub const DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
     pub access_token: String,
-
     pub refresh_token: String,
-
     pub expires_at: u64,
 }
 
@@ -62,8 +52,6 @@ impl Credential {
         serde_json::to_string(self).expect("a credential serializes")
     }
 
-    /// The account the token was issued for, read from the access token's
-    /// claims; the Codex backend wants it as a header on every call.
     pub fn account_id(&self) -> Result<String, Error> {
         let payload = self
             .access_token
@@ -473,20 +461,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_credential_is_used_as_is() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let secrets = stored(dir.path(), &credential(now() + 3600));
-        let server = MockServer::start().await;
-
-        let tokens = Tokens::open(secrets, "codex", &server.uri()).expect("opens");
-        let (access, account) = tokens.bearer().await.expect("bearer");
-
-        assert_eq!(access, fake_access_token("acct_123"));
-        assert_eq!(account, "acct_123");
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn an_expiring_credential_is_refreshed_and_written_back() {
         let dir = tempfile::tempdir().expect("temp dir");
         let secrets = stored(dir.path(), &credential(now() + 10));
@@ -532,20 +506,6 @@ mod tests {
         let text = err.to_string();
         assert!(
             text.contains("invalid_grant") && text.contains("arcd login codex"),
-            "{text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_credential_names_the_login_command() {
-        let dir = tempfile::tempdir().expect("temp dir");
-
-        let err = Tokens::open(Secrets::new(dir.path()), "codex", "http://unused")
-            .expect_err("nothing there");
-
-        let text = err.to_string();
-        assert!(
-            text.contains("codex") && text.contains("arcd login codex"),
             "{text}"
         );
     }

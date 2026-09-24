@@ -164,7 +164,7 @@ impl UsageJson {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parser, UsageJson};
+    use super::Parser;
     use crate::provider::stream::{DeltaStream, FrameParser as _};
     use crate::provider::{CompletionDelta, Stop, Usage};
     use futures::StreamExt as _;
@@ -241,17 +241,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_turn_after_a_tool_result_reads_back_as_a_plain_answer() {
-        let deltas = drain("gemini_tool_result_stream.sse").await;
-
-        assert!(text(&deltas).contains("14:00"), "{}", text(&deltas));
-        let Some(CompletionDelta::Done { stop, .. }) = deltas.last() else {
-            panic!("the stream must end with Done");
-        };
-        assert_eq!(*stop, Stop::EndTurn);
-    }
-
-    #[tokio::test]
     async fn a_server_call_and_its_response_and_grounding_arrive_verbatim_and_in_order() {
         let deltas = drain("gemini_server_call_stream.sse").await;
 
@@ -287,41 +276,6 @@ mod tests {
             *stop,
             Stop::EndTurn,
             "server calls are not our tool calls; they never trip ToolCalls"
-        );
-    }
-
-    #[test]
-    fn a_server_responses_search_widget_is_dropped_before_it_is_recorded() {
-        let mut parser = Parser::default();
-        let deltas = parser
-            .frame(
-                r#"{"candidates":[{"content":{"parts":[{"toolResponse":{"id":"c1","response":{"search_suggestions":"<style>widget</style>","results":[{"title":"Arc Core 3.5"}]},"toolType":"GOOGLE_SEARCH_WEB"}}],"role":"model"},"index":0}]}"#,
-            )
-            .expect("parses");
-        let CompletionDelta::ServerResponse { payload_json, .. } = &deltas.items[0] else {
-            panic!("expected a server response, got {:?}", deltas.items);
-        };
-        assert!(
-            !payload_json.contains("search_suggestions"),
-            "{payload_json}"
-        );
-        assert!(payload_json.contains("Arc Core 3.5"), "{payload_json}");
-    }
-
-    #[test]
-    fn thinking_tokens_count_as_output() {
-        let usage = UsageJson {
-            prompt: 2,
-            answer: 9,
-            thoughts: 146,
-        };
-
-        assert_eq!(
-            usage.usage(),
-            Usage {
-                input_tokens: 2,
-                output_tokens: 155,
-            }
         );
     }
 

@@ -26,7 +26,6 @@ use crate::tool::workspace::{Grant, Grants, Mode};
 use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource, TurnContext};
 
 const MAX_TOOL_STEPS: usize = 8;
-// a coding turn explores and edits; 8 forced a nudge ratchet
 const MAX_EXECUTOR_TOOL_STEPS: usize = 256;
 
 fn max_tool_steps(role: SessionRole) -> usize {
@@ -53,21 +52,12 @@ pub struct Runner {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub thinking: Thinking,
-    /// The chat's identity file, or a job's spawn-built preamble.
     pub system: Option<String>,
-    /// The prompt-token count that triggers compaction (§4.4); `None` for a
-    /// role with no configured `context_window`, which never compacts.
     pub compact_at: Option<u32>,
     pub context_window: Option<u32>,
-    /// Whether sessions on this model hold `consult_expert` (§6.2): a
-    /// property of the model preset, not the role.
-    pub counsel: bool,
     pub editing: crate::tool::Editing,
 }
 
-// never held across an .await: it fences a single append batch or
-// projection read, so concurrent turns interleave everywhere else
-/// One entry of a role's configured menu; the log records which is chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub name: String,
@@ -81,19 +71,14 @@ pub struct Engine {
     store: StdMutex<Store>,
     registry: Registry,
     projects: BTreeMap<String, ProjectSpec>,
-    // per role, in config order: the first is the default when nothing is selected
     role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
     compaction_runners: Vec<(String, Runner)>,
-    // one guard per session, held for a whole turn: turns in the same
-    // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     live_turns: StdMutex<HashMap<String, LiveTurn>>,
     notifier: Option<broadcast::Sender<Notification>>,
     completed_turns: broadcast::Sender<String>,
 }
 
-/// A message queued into a session with a live turn, delivered at the
-/// turn's next step boundary rather than starting a turn of its own.
 #[derive(Debug, Clone)]
 pub struct Inbound {
     pub content: String,
@@ -136,18 +121,12 @@ pub struct Reply {
     pub grounding_json: String,
     pub jobs: Vec<DispatchedJob>,
     pub continues: Vec<ContinuedJob>,
-    /// `cancel_job` targets a turn validated: the engine only confirms the
-    /// shape, the same as `jobs`/`continues` — whether each is still live,
-    /// and stopping it, is the supervisor's.
     pub cancels: Vec<String>,
 }
 
-/// A child session `dispatch` created durably during this turn. The engine
-/// does not start it; the caller hands it to a supervisor that does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchedJob {
     pub session_id: String,
-    /// The session that dispatched it, and where its handback lands.
     pub parent_session: String,
     pub role: SessionRole,
     pub project: String,
@@ -312,8 +291,6 @@ impl Engine {
         }
     }
 
-    /// Whether a turn is currently driving this session — the same registry
-    /// `cancel_turn` checks, read without sending anything.
     pub fn turn_is_live(&self, session_id: &str) -> bool {
         self.live_turns
             .lock()
@@ -321,9 +298,6 @@ impl Engine {
             .contains_key(session_id)
     }
 
-    /// Queues a message into a session's live turn, delivered at its next
-    /// step boundary. Returns whether a turn was live and accepted it; a
-    /// caller sees `false` when it must start a turn itself instead.
     pub fn queue_message(&self, session_id: &str, content: &str, source: Source) -> bool {
         self.queue_message_with_attachments(session_id, content, source, Vec::new())
     }
@@ -379,8 +353,6 @@ impl Engine {
         self
     }
 
-    /// A one-entry menu per role, named by its model: what a runner with no
-    /// configured choices amounts to.
     #[must_use]
     pub fn with_role_identities(
         self,
@@ -405,9 +377,6 @@ impl Engine {
         )
     }
 
-    /// The name of the role's current choice: the recorded selection when it
-    /// is still on the menu, else the first choice. `None` for a role with no
-    /// menu.
     pub fn selected_choice(&self, role: SessionRole) -> Result<Option<String>, Error> {
         Ok(self.current_choice(role)?.map(|choice| choice.name))
     }
@@ -438,7 +407,6 @@ impl Engine {
             })
     }
 
-    /// Every role's menu with its current pick marked, in wire shape.
     pub fn model_list(&self) -> Result<ModelList, Error> {
         let mut choices = Vec::new();
         for (role, menu) in &self.role_choices {
@@ -457,8 +425,6 @@ impl Engine {
         Ok(ModelList { choices })
     }
 
-    /// Records the user's pick for a role. Open sessions keep their model
-    /// (invariant 9); new sessions and forks take this one.
     #[tracing::instrument(name = "engine.select_model", skip_all, fields(role = provider::role_label(role), choice))]
     pub fn select_model(&self, role: SessionRole, choice: &str) -> Result<(), Error> {
         let on_menu = self
@@ -492,12 +458,6 @@ impl Engine {
         self
     }
 
-    /// A new session bound to a project: grants are canonicalized now and
-    /// recorded in the log, so the session keeps them even if config changes.
-    /// `runner` supplies the recorded provider and model; `role` and `budget`
-    /// are what the new session is pinned to, which is `runner.role` for a
-    /// session the runner starts for itself but differs for a dispatched
-    /// job, where the runner is the dispatching parent, not the child.
     pub fn create_bound_session(
         &self,
         runner: &Runner,
@@ -517,8 +477,6 @@ impl Engine {
         )
     }
 
-    /// An unbound session with no message yet: what `send_message_from`
-    /// records for itself when it is handed no session id.
     pub fn create_session(&self, runner: &Runner) -> Result<String, Error> {
         self.create_session_with_choice(runner, "")
     }
@@ -530,34 +488,36 @@ impl Engine {
     ) -> Result<String, Error> {
         let selected = self.choice_for(runner.role, choice)?;
         let session_id = uuid::Uuid::new_v4().to_string();
+        let editing = selected
+            .as_ref()
+            .map_or(runner.editing, |pick| pick.editing);
+        self.record_unbound_session(&session_id, runner, selected.as_ref(), editing)?;
+        Ok(session_id)
+    }
+
+    fn record_unbound_session(
+        &self,
+        session_id: &str,
+        runner: &Runner,
+        selected: Option<&ModelChoice>,
+        editing: crate::tool::Editing,
+    ) -> Result<(), Error> {
         self.record(
             Source::User,
             session_event::Event::SessionCreated(SessionCreated {
-                session_id: session_id.clone(),
-                parent_session: String::new(),
-                fork_point: 0,
-                title: String::new(),
-                provider: selected.as_ref().map_or_else(
+                session_id: session_id.to_owned(),
+                provider: selected.map_or_else(
                     || runner.provider.name().to_owned(),
                     |pick| pick.provider.clone(),
                 ),
-                model: selected
-                    .as_ref()
-                    .map_or_else(|| runner.model.clone(), |pick| pick.model.clone()),
+                model: selected.map_or_else(|| runner.model.clone(), |pick| pick.model.clone()),
                 role: runner.role as i32,
-                project: String::new(),
-                budget: None,
-                grants: Vec::new(),
-                dispatched_by: String::new(),
-                editing: selected
-                    .as_ref()
-                    .map_or(runner.editing, |pick| pick.editing)
-                    .as_str()
-                    .to_owned(),
-                choice: selected.map_or_else(String::new, |pick| pick.name),
+                editing: editing.as_str().to_owned(),
+                choice: selected.map_or_else(String::new, |pick| pick.name.clone()),
+                ..Default::default()
             }),
         )?;
-        Ok(session_id)
+        Ok(())
     }
 
     pub fn create_direct_session(
@@ -609,13 +569,11 @@ impl Engine {
         let spec = self
             .projects
             .get(project)
-            .cloned()
             .ok_or_else(|| Error::UnknownProject {
                 project: project.to_owned(),
             })?;
-        let mut grant_specs = spec.grants;
+        let mut grant_specs = spec.grants.clone();
         if intent == Intent::Analyze {
-            // all of them, not grants[0]: ordering is convention, not contract
             for grant in &mut grant_specs {
                 grant.mode = Mode::ReadOnly;
             }
@@ -674,35 +632,44 @@ impl Engine {
         fork_point: u64,
         choice: &str,
     ) -> Result<String, Error> {
-        self.with_store(|store| store.projection().session_role(parent_id))?
-            .ok_or_else(|| Error::UnknownSession {
-                session_id: parent_id.to_owned(),
-            })?;
-        let owner = self.with_store(|store| store.projection().message_owner(fork_point))?;
-        let parent_id = match owner {
-            Some((owner_id, projection::KIND_MESSAGE)) if owner_id == parent_id => owner_id,
-            Some((owner_id, projection::KIND_MESSAGE)) => {
-                let ancestors = self.with_store(|store| store.projection().ancestors(parent_id))?;
-                if !ancestors.contains(&owner_id) {
-                    return Err(Error::InvalidForkPoint {
-                        session_id: parent_id.to_owned(),
-                        fork_point,
-                    });
-                }
-                owner_id
-            }
-            _ => {
-                return Err(Error::InvalidForkPoint {
-                    session_id: parent_id.to_owned(),
-                    fork_point,
-                });
-            }
-        };
-        let parent_id = parent_id.as_str();
-        let role = self
-            .with_store(|store| store.projection().session_role(parent_id))?
-            .ok_or_else(|| Error::UnknownSession {
-                session_id: parent_id.to_owned(),
+        let (parent_id, role, identity, recorded_editing, project, grants) =
+            self.with_store(|store| -> Result<_, Error> {
+                let projection = store.projection();
+                let role =
+                    projection
+                        .session_role(parent_id)?
+                        .ok_or_else(|| Error::UnknownSession {
+                            session_id: parent_id.to_owned(),
+                        })?;
+                let owner = projection.message_owner(fork_point)?;
+                let owner_id = match owner {
+                    Some((owner_id, projection::KIND_MESSAGE))
+                        if owner_id == parent_id
+                            || projection.ancestors(parent_id)?.contains(&owner_id) =>
+                    {
+                        owner_id
+                    }
+                    _ => {
+                        return Err(Error::InvalidForkPoint {
+                            session_id: parent_id.to_owned(),
+                            fork_point,
+                        });
+                    }
+                };
+                let role = if owner_id == parent_id {
+                    role
+                } else {
+                    projection
+                        .session_role(&owner_id)?
+                        .ok_or_else(|| Error::UnknownSession {
+                            session_id: owner_id.clone(),
+                        })?
+                };
+                let identity = projection.session_identity(&owner_id)?;
+                let editing = projection.session_editing(&owner_id)?;
+                let project = projection.session_project(&owner_id)?.unwrap_or_default();
+                let grants = projection.session_grants(&owner_id)?;
+                Ok((owner_id, role, identity, editing, project, grants))
             })?;
         let selected = self.choice_for(
             SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified),
@@ -710,31 +677,23 @@ impl Engine {
         )?;
         let (provider, model) = match &selected {
             Some(pick) => (pick.provider.clone(), pick.model.clone()),
-            None => self
-                .with_store(|store| store.projection().session_identity(parent_id))?
-                .unwrap_or_default(),
+            None => identity.unwrap_or_default(),
         };
         let editing = match &selected {
             Some(pick) => pick.editing.as_str().to_owned(),
-            None => self
-                .with_store(|store| store.projection().session_editing(parent_id))?
-                .unwrap_or_else(|| {
-                    crate::tool::Editing::for_provider(&provider)
-                        .as_str()
-                        .to_owned()
-                }),
+            None => recorded_editing.unwrap_or_else(|| {
+                crate::tool::Editing::for_provider(&provider)
+                    .as_str()
+                    .to_owned()
+            }),
         };
-        let project = self
-            .with_store(|store| store.projection().session_project(parent_id))?
-            .unwrap_or_default();
-        let grants = self.with_store(|store| store.projection().session_grants(parent_id))?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
         self.record(
             Source::User,
             session_event::Event::SessionCreated(SessionCreated {
                 session_id: session_id.clone(),
-                parent_session: parent_id.to_owned(),
+                parent_session: parent_id,
                 fork_point,
                 title: String::new(),
                 provider,
@@ -968,9 +927,6 @@ impl Engine {
         )
     }
 
-    /// The text a finished job hands its parent: the summary, the daemon's
-    /// footprint, and how to follow up. Delivering it is the
-    /// caller's, as an ordinary message into the parent session.
     pub fn compose_handback(
         &self,
         child_session: &str,
@@ -979,8 +935,6 @@ impl Engine {
         footprint: Option<&str>,
     ) -> Result<String, Error> {
         let summary = truncate_summary(summary, child_session);
-        // the daemon's count of what changed rides after the report, so a cut
-        // report never cuts it
         let footprint = footprint
             .map(|text| format!("\n{text}"))
             .unwrap_or_default();
@@ -1009,9 +963,6 @@ impl Engine {
         Ok(content)
     }
 
-    /// Appends a message into a session without driving a turn. `role =
-    /// User` because `rebuild_transcript` drops a `System`-role row instead
-    /// of sending it to the model.
     pub fn append_message(
         &self,
         session_id: &str,
@@ -1100,12 +1051,12 @@ impl Engine {
         Ok(unfinished)
     }
 
-    fn sources(
+    fn tool_setup(
         &self,
         session_id: &str,
         new_session: bool,
         runner: &Runner,
-    ) -> Result<Vec<ToolSource>, Error> {
+    ) -> Result<(Vec<ToolSource>, Vec<String>), Error> {
         let role = runner.role;
         let (project, source) = if new_session {
             (None, None)
@@ -1117,15 +1068,15 @@ impl Engine {
                 ))
             })?
         };
-        let mut sources = match project {
-            None => vec![ToolSource::Builtin],
+        let (mut sources, command_prefix) = match project {
+            None => (vec![ToolSource::Builtin], Vec::new()),
             Some(name) => {
                 if let Some(spec) = self.projects.get(&name) {
-                    spec.sources.clone()
+                    (spec.sources.clone(), spec.command_prefix.clone())
                 } else {
                     // fail closed: a project gone from config grants nothing
                     tracing::warn!(project = %name, "session names a project that is not configured");
-                    vec![ToolSource::Builtin]
+                    (vec![ToolSource::Builtin], Vec::new())
                 }
             }
         };
@@ -1160,38 +1111,12 @@ impl Engine {
         if source != Some(Source::Model as i32) {
             sources.push(ToolSource::Jobs);
         }
-        if runner.counsel
-            && matches!(
-                role,
-                SessionRole::Chat | SessionRole::Code | SessionRole::Executor
-            )
-        {
-            sources.push(ToolSource::Expert);
-        }
         if matches!(role, SessionRole::Chat | SessionRole::Code) {
             sources.push(ToolSource::Web);
         }
-        Ok(sources)
+        Ok((sources, command_prefix))
     }
 
-    fn command_prefix(&self, session_id: &str, new_session: bool) -> Result<Vec<String>, Error> {
-        let project = if new_session {
-            None
-        } else {
-            self.with_store(|store| store.projection().session_project(session_id))?
-        };
-        Ok(match project {
-            None => Vec::new(),
-            Some(name) => self
-                .projects
-                .get(&name)
-                .map(|spec| spec.command_prefix.clone())
-                .unwrap_or_default(),
-        })
-    }
-
-    /// The grants a session was created with, straight from the log: the
-    /// authority even if config has since changed. `None` means unbound.
     fn grants(&self, session_id: &str, new_session: bool) -> Result<Option<Arc<Grants>>, Error> {
         if new_session {
             return Ok(None);
@@ -1306,85 +1231,22 @@ impl Engine {
                 provider: runner.provider.name().to_owned(),
             });
         }
-        let span = tracing::Span::current();
         let (session_id, new_session) = match session_id {
             Some(id) => (id.to_owned(), false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
-        span.record("session_id", session_id.as_str());
-        span.record("new_session", new_session);
-        let turn_id = uuid::Uuid::new_v4().to_string();
-
-        // held for the whole turn: same-session turns serialize here
-        let guard = self.turn_guard(&session_id);
-        let turn = guard.lock().await;
-
-        if !new_session {
-            self.enforce_pin(runner, &session_id)?;
-        }
-        let sources = self.sources(&session_id, new_session, runner)?;
-        let grants = self.grants(&session_id, new_session)?;
-        let command_prefix = self.command_prefix(&session_id, new_session)?;
-
-        if new_session {
-            self.record(
-                Source::User,
-                session_event::Event::SessionCreated(SessionCreated {
-                    session_id: session_id.clone(),
-                    parent_session: String::new(),
-                    fork_point: 0,
-                    title: String::new(),
-                    provider: runner.provider.name().to_owned(),
-                    model: runner.model.clone(),
-                    role: runner.role as i32,
-                    project: String::new(),
-                    budget: None,
-                    grants: Vec::new(),
-                    dispatched_by: String::new(),
-                    editing: runner.editing.as_str().to_owned(),
-                    choice: self
-                        .role_choices
-                        .get(&runner.role)
-                        .and_then(|menu| {
-                            menu.iter().find(|choice| {
-                                choice.provider == runner.provider.name()
-                                    && choice.model == runner.model
-                                    && choice.thinking == runner.thinking
-                            })
-                        })
-                        .map_or_else(String::new, |choice| choice.name.clone()),
-                }),
-            )?;
-        }
-        self.record(
-            source,
-            session_event::Event::MessageAppended(MessageAppended {
-                session_id: session_id.clone(),
-                role: Role::User as i32,
+        self.run_session_turn(
+            runner,
+            session_id,
+            new_session,
+            Some(Inbound {
                 content: content.to_owned(),
-                partial: false,
-                turn_id: turn_id.clone(),
+                source,
                 attachments,
-                ..Default::default()
             }),
-        )?;
-
-        let reply = self
-            .drive_turn(
-                runner,
-                &session_id,
-                &turn_id,
-                &sources,
-                grants.as_ref(),
-                &command_prefix,
-                &events,
-            )
-            .await;
-        drop(turn);
-        if reply.as_ref().is_ok_and(|reply| !reply.partial) {
-            let _ = self.completed_turns.send(session_id.clone());
-        }
-        reply
+            events,
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -1414,22 +1276,61 @@ impl Engine {
         session_id: &str,
         events: mpsc::Sender<EngineEvent>,
     ) -> Result<Reply, Error> {
+        self.run_session_turn(runner, session_id.to_owned(), false, None, events)
+            .await
+    }
+
+    async fn run_session_turn(
+        &self,
+        runner: &Runner,
+        session_id: String,
+        new_session: bool,
+        message: Option<Inbound>,
+        events: mpsc::Sender<EngineEvent>,
+    ) -> Result<Reply, Error> {
+        let span = tracing::Span::current();
+        span.record("session_id", session_id.as_str());
+        span.record("new_session", new_session);
         let turn_id = uuid::Uuid::new_v4().to_string();
 
-        // held for the whole turn: serializes against a user send_message
-        // on this session through the same guard map
-        let guard = self.turn_guard(session_id);
+        let guard = self.turn_guard(&session_id);
         let turn = guard.lock().await;
 
-        self.enforce_pin(runner, session_id)?;
-        let sources = self.sources(session_id, false, runner)?;
-        let grants = self.grants(session_id, false)?;
-        let command_prefix = self.command_prefix(session_id, false)?;
+        if !new_session {
+            self.enforce_pin(runner, &session_id)?;
+        }
+        let (sources, command_prefix) = self.tool_setup(&session_id, new_session, runner)?;
+        let grants = self.grants(&session_id, new_session)?;
+
+        if new_session {
+            let selected = self.role_choices.get(&runner.role).and_then(|menu| {
+                menu.iter().find(|choice| {
+                    choice.provider == runner.provider.name()
+                        && choice.model == runner.model
+                        && choice.thinking == runner.thinking
+                })
+            });
+            self.record_unbound_session(&session_id, runner, selected, runner.editing)?;
+        }
+        if let Some(message) = message {
+            self.record(
+                message.source,
+                session_event::Event::MessageAppended(MessageAppended {
+                    session_id: session_id.clone(),
+                    role: Role::User as i32,
+                    content: message.content,
+                    partial: false,
+                    turn_id: turn_id.clone(),
+                    attachments: message.attachments,
+                    ..Default::default()
+                }),
+            )?;
+        }
 
         let reply = self
             .drive_turn(
                 runner,
-                session_id,
+                &session_id,
                 &turn_id,
                 &sources,
                 grants.as_ref(),
@@ -1439,7 +1340,7 @@ impl Engine {
             .await;
         drop(turn);
         if reply.as_ref().is_ok_and(|reply| !reply.partial) {
-            let _ = self.completed_turns.send(session_id.to_owned());
+            let _ = self.completed_turns.send(session_id);
         }
         reply
     }
@@ -1531,7 +1432,7 @@ impl Engine {
                 .compact_at
                 .is_some_and(|limit| step_usage.is_some_and(|usage| usage.input_tokens >= limit));
 
-            match ending {
+            let completed_seq = match ending {
                 Ending::Done(Stop::ToolCalls) if !last_step && !calls.is_empty() => {
                     steps += 1;
                     span.record("tool_steps", steps);
@@ -1572,18 +1473,7 @@ impl Engine {
                         });
                     }
                     self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
-                    if over_budget {
-                        let cutoff = self.compaction_cutoff(session_id)?;
-                        if cutoff > attempted_compaction {
-                            attempted_compaction = cutoff;
-                            if self.compact(runner, session_id, turn_id).await? {
-                                let rows = self.with_store(|store| {
-                                    store.projection().lineage_messages(session_id)
-                                })?;
-                                transcript = rebuild_transcript(&rows);
-                            }
-                        }
-                    }
+                    None
                 }
                 Ending::Done(_) => {
                     let elapsed_ms = elapsed_ms_since(turn_start);
@@ -1605,34 +1495,7 @@ impl Engine {
                     // the turn going instead of ending it unanswered
                     let steered =
                         self.drain_inbox(session_id, turn_id, &mut inbox_rx, &mut transcript)?;
-                    if over_budget {
-                        let cutoff = self.compaction_cutoff(session_id)?;
-                        if cutoff > attempted_compaction {
-                            attempted_compaction = cutoff;
-                            if self.compact(runner, session_id, turn_id).await? && steered {
-                                let rows = self.with_store(|store| {
-                                    store.projection().lineage_messages(session_id)
-                                })?;
-                                transcript = rebuild_transcript(&rows);
-                            }
-                        }
-                    }
-                    if steered {
-                        continue;
-                    }
-                    span.record("outcome", "done");
-                    span.record("assistant_seq", seq);
-                    break Ok(Reply {
-                        session_id: session_id.to_owned(),
-                        seq,
-                        usage: total_usage,
-                        partial: false,
-                        step_capped: last_step,
-                        grounding_json: grounding.clone().unwrap_or_default(),
-                        jobs,
-                        continues,
-                        cancels: cancel_requests,
-                    });
+                    (!steered).then_some(seq)
                 }
                 Ending::Cut { cancelled } if text.is_empty() => {
                     span.record("outcome", if cancelled { "cancelled" } else { "error" });
@@ -1684,6 +1547,32 @@ impl Engine {
                     span.record("outcome", "error");
                     break Err(error.into());
                 }
+            };
+            if over_budget {
+                let cutoff = self.compaction_cutoff(session_id)?;
+                if cutoff > attempted_compaction {
+                    attempted_compaction = cutoff;
+                    if self.compact(runner, session_id, turn_id).await? && completed_seq.is_none() {
+                        let rows = self
+                            .with_store(|store| store.projection().lineage_messages(session_id))?;
+                        transcript = rebuild_transcript(&rows);
+                    }
+                }
+            }
+            if let Some(seq) = completed_seq {
+                span.record("outcome", "done");
+                span.record("assistant_seq", seq);
+                break Ok(Reply {
+                    session_id: session_id.to_owned(),
+                    seq,
+                    usage: total_usage,
+                    partial: false,
+                    step_capped: last_step,
+                    grounding_json: grounding.clone().unwrap_or_default(),
+                    jobs,
+                    continues,
+                    cancels: cancel_requests,
+                });
             }
         };
         // a call the model saw but never got a response for still happened
@@ -1889,9 +1778,6 @@ impl Engine {
         let mut results = Vec::with_capacity(calls.len());
         let mut cancelled = false;
         for call in &calls {
-            if cancelled {
-                break;
-            }
             let ctx = TurnContext {
                 session_id: session_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -1908,7 +1794,7 @@ impl Engine {
                 outcome = dispatch => outcome,
                 _ = cancel_rx.changed() => {
                     cancelled = true;
-                    continue;
+                    break;
                 }
             };
             let DispatchOutcome {
@@ -1985,11 +1871,7 @@ impl Engine {
         }
 
         if cancelled {
-            let answered: HashSet<String> = results.iter().map(|(id, _)| id.clone()).collect();
-            for call in &calls {
-                if answered.contains(call.id.as_str()) {
-                    continue;
-                }
+            for call in calls.iter().skip(results.len()) {
                 let content = "cancelled by the user".to_owned();
                 self.record(
                     Source::System,
@@ -2010,8 +1892,8 @@ impl Engine {
                         content: content.clone(),
                     })
                     .await;
-                results.push((call.id.clone(), content));
             }
+            return Ok(true);
         }
 
         transcript.push(Message::ToolCalls {
@@ -2021,7 +1903,7 @@ impl Engine {
         for (call_id, content) in results {
             transcript.push(Message::ToolResult { call_id, content });
         }
-        Ok(cancelled)
+        Ok(false)
     }
 
     fn enforce_pin(&self, runner: &Runner, session_id: &str) -> Result<(), Error> {
@@ -2923,32 +2805,32 @@ mod tests {
     use std::sync::Arc;
 
     use arc_proto::v1::{
-        HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment,
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, Role, SessionRole, Source,
-        ToolOutcome, history_entry, memory_event, memory_record, session_event,
+        HistoryEntry, HistoryMessage, ImageAttachment, MemoryRecord, MemoryRecordCreated,
+        MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome, history_entry,
+        memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
     use super::{
-        COMPACTION_PROMPT_V3, ContinuedJob, DispatchedJob, Engine, EngineEvent, Error,
-        MAX_TOOL_STEPS, MemoryCounters, ProjectSpec, Runner, branch_marked,
+        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, ProjectSpec,
+        Runner,
     };
     use crate::log::Log;
-    use crate::projection::{MessageRow, Projection};
+    use crate::projection::Projection;
     use crate::provider::{
         CompletionDelta, Error as ProviderError, Message, Provider, Stop, Thinking, ToolCall, Usage,
     };
-    use crate::store::{self, Store};
+    use crate::store::Store;
     use crate::testkit::{
-        Canned, Gated, PrefixEcho, ScriptedProvider, Step, TraceCapture, appended, call,
-        call_carrying, channel, counter_samples, done_reply, drain, engine, engine_with_role,
-        engine_with_tools, engine_with_tools_at, issued, reopened_engine, replay_events,
-        replay_log, resulted, runner, runner_with_role, seed_log, seed_memory_log,
-        seed_memory_log_at, server_called, tool_stop, tools, turn, usage,
+        Canned, Gated, ScriptedProvider, Step, TraceCapture, appended, call, call_carrying,
+        channel, counter_samples, done_reply, drain, engine, engine_with_role, engine_with_tools,
+        engine_with_tools_at, issued, reopened_engine, replay_events, replay_log, resulted, runner,
+        runner_with_role, seed_log, seed_memory_log, seed_memory_log_at, server_called, tool_stop,
+        tools, turn, usage,
     };
     use crate::tool::builtin::dispatch::Dispatch;
     use crate::tool::workspace::{self, Grant, Mode, Workspace};
-    use crate::tool::{Intent, JobRequest, Registry, Tool, ToolReply, ToolSource, TurnContext};
+    use crate::tool::{Registry, ToolSource, TurnContext};
 
     fn conversation_log(path: &std::path::Path) -> Vec<session_event::Event> {
         replay_log(path)
@@ -3155,7 +3037,6 @@ mod tests {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
@@ -3210,43 +3091,6 @@ mod tests {
             turn_id: "t-01".to_owned(),
             ..Default::default()
         })
-    }
-
-    fn seeded_call(call_id: &str, index: u32) -> session_event::Event {
-        session_event::Event::ToolCallIssued(arc_proto::v1::ToolCallIssued {
-            session_id: "s-01".to_owned(),
-            turn_id: "t-01".to_owned(),
-            call_id: call_id.to_owned(),
-            index,
-            name: "lookup".to_owned(),
-            arguments_json: "{}".to_owned(),
-            provider_roundtrip: Vec::new(),
-        })
-    }
-
-    fn seeded_result(call_id: &str, content: &str) -> session_event::Event {
-        session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
-            changed_paths: Vec::new(),
-            session_id: "s-01".to_owned(),
-            turn_id: "t-01".to_owned(),
-            call_id: call_id.to_owned(),
-            outcome: ToolOutcome::Ok as i32,
-            content: content.to_owned(),
-            truncated: false,
-        })
-    }
-
-    fn sourced_entry(role: i32, content: &str, source: Source) -> HistoryEntry {
-        HistoryEntry {
-            entry: Some(history_entry::Entry::Message(HistoryMessage {
-                role,
-                content: content.to_owned(),
-                partial: false,
-                source: source as i32,
-                ..Default::default()
-            })),
-            seq: 0,
-        }
     }
 
     fn prose_entry(role: i32, content: &str, partial: bool) -> HistoryEntry {
@@ -3364,6 +3208,7 @@ mod tests {
         assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
         assert_eq!(created.role, SessionRole::Chat as i32);
+        assert!(created.project.is_empty());
 
         let user = appended(&events[1]);
         assert_eq!(
@@ -3399,93 +3244,6 @@ mod tests {
                 },
                 EngineEvent::Delta("hello there".to_owned()),
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_notifier_receives_session_appended_for_every_durable_append() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
-        let engine = engine.with_notifier(notifier);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send_message");
-
-        let mut session_ids = Vec::new();
-        while let Ok(notification) = notifications.try_recv() {
-            match notification.event {
-                Some(arc_proto::v1::notification::Event::SessionAppended(appended)) => {
-                    session_ids.push(appended.session_id);
-                }
-                other => panic!("expected SessionAppended, got {other:?}"),
-            }
-        }
-        assert_eq!(
-            session_ids,
-            vec![reply.session_id.clone(); 4],
-            "creation, user message, context measurement, and reply each notify"
-        );
-    }
-
-    #[tokio::test]
-    async fn with_no_notifier_configured_a_send_still_appends_normally() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello there")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send_message");
-
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            3,
-            "the append is unaffected"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_second_message_reuses_the_session_and_sends_history() {
-        let provider =
-            ScriptedProvider::scripted(vec![done_reply("first reply"), done_reply("second reply")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-
-        let (tx, _rx) = channel();
-        let first = engine
-            .send_message(&run, None, "one", tx)
-            .await
-            .expect("first send");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&first.session_id), "two", tx)
-            .await
-            .expect("second send");
-
-        let events = conversation_log(dir.path());
-        assert_eq!(events.len(), 5, "exactly one SessionCreated");
-
-        let requests = provider.requests();
-        assert_eq!(
-            requests[1].system,
-            Some(format!("be terse\n\n{}", today_line()))
-        );
-        let turns: Vec<(Role, &str)> = requests[1].messages.iter().map(turn).collect();
-        assert_eq!(
-            turns,
-            [
-                (Role::User, "one"),
-                (Role::Assistant, "first reply"),
-                (Role::User, "two"),
-            ],
-            "history in order, current message last, nothing duplicated"
         );
     }
 
@@ -3559,34 +3317,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_lists_what_send_message_created() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        assert_eq!(engine.sessions().expect("sessions"), []);
-
-        let (tx, _rx) = channel();
-        let first = engine
-            .send_message(&run, None, "a", tx)
-            .await
-            .expect("first send");
-        let (tx, _rx) = channel();
-        let second = engine
-            .send_message(&run, None, "b", tx)
-            .await
-            .expect("second send");
-
-        let listed = engine.sessions().expect("sessions");
-        let mut ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
-        ids.sort_unstable();
-        let mut expected = vec![first.session_id.as_str(), second.session_id.as_str()];
-        expected.sort_unstable();
-        assert_eq!(ids, expected);
-        assert!(listed.iter().all(|s| s.title.is_empty()));
-        assert!(listed.iter().all(|s| s.started_at.is_some()));
-    }
-
-    #[tokio::test]
     async fn a_cut_stream_appends_a_partial_reply() {
         let provider = ScriptedProvider::scripted(vec![vec![Ok(CompletionDelta::Text(
             "partial tex".to_owned(),
@@ -3637,103 +3367,6 @@ mod tests {
         let assistant = appended(&events[2]);
         assert!(assistant.partial);
         assert_eq!(assistant.content, "some tex");
-    }
-
-    #[tokio::test]
-    async fn an_error_before_text_appends_no_reply() {
-        let provider = ScriptedProvider::scripted(vec![vec![Err(ProviderError::MalformedStream(
-            "instant".to_owned(),
-        ))]]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let err = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect_err("must surface");
-
-        assert!(matches!(err, Error::Provider(_)), "got: {err:?}");
-        let events = conversation_log(dir.path());
-        assert_eq!(
-            events.len(),
-            2,
-            "session and user message survive, nothing else"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_cut_before_any_text_is_an_empty_reply() {
-        let provider = ScriptedProvider::scripted(vec![vec![]]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let err = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect_err("must surface");
-
-        assert!(matches!(err, Error::EmptyReply), "got: {err:?}");
-        assert_eq!(conversation_log(dir.path()).len(), 2);
-    }
-
-    #[tokio::test]
-    async fn cancel_turn_on_an_idle_session_returns_false() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = engine(&provider, &dir);
-
-        assert!(!engine.cancel_turn("s-never-existed"));
-    }
-
-    #[tokio::test]
-    async fn queue_message_on_an_idle_session_returns_false_and_appends_nothing() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = engine(&provider, &dir);
-
-        assert!(!engine.queue_message("s-never-existed", "hi", Source::User));
-        assert!(conversation_log(dir.path()).is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_finished_turn_unregisters_cancellation_and_messages() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("all done")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert!(!engine.turn_is_live(&reply.session_id));
-        assert!(!engine.cancel_turn(&reply.session_id));
-        assert!(
-            !engine.queue_message(&reply.session_id, "late", Source::User),
-            "the turn ended; the inbox is deregistered"
-        );
-    }
-
-    #[tokio::test]
-    async fn send_message_from_records_the_first_message_with_the_given_source() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi there")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message_from(&run, None, "hi", Source::System, tx)
-            .await
-            .expect("send");
-
-        let logged = conversation_log(dir.path());
-        let user = appended(&logged[1]);
-        assert_eq!(user.content, "hi");
-        assert_eq!(replay_events(dir.path())[1].source, Source::System as i32);
-        assert!(!reply.session_id.is_empty());
     }
 
     #[tokio::test]
@@ -3937,16 +3570,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_during_a_gated_tool_call_closes_the_issued_call_as_cancelled_with_no_orphan()
-     {
+    async fn cancelling_a_tool_step_keeps_completed_results_and_closes_remaining_calls() {
         // never notified: the tool call stalls until the cancel drops it
         let gate = Arc::new(tokio::sync::Notify::new());
         let provider = ScriptedProvider::scripted(vec![vec![
-            Ok(call("c1", 0, "slow", "{}")),
+            Ok(call("fast", 0, "fast", "{}")),
+            Ok(call("slow", 1, "slow", "{}")),
+            Ok(call("later", 2, "fast", "{}")),
             Ok(tool_stop()),
         ]]);
         let dir = TempDir::new().expect("temp dir");
         let mut registry = Registry::new(512);
+        registry.register(Box::new(Canned {
+            name: "fast",
+            content: "done",
+            ok: true,
+            source: ToolSource::Builtin,
+        }));
         registry.register(Box::new(Gated {
             name: "slow",
             notify: Arc::clone(&gate),
@@ -3969,9 +3609,10 @@ mod tests {
             }
         };
         loop {
-            if let EngineEvent::ToolCallStarted { .. } =
-                rx.recv().await.expect("events channel stays open")
-            {
+            if matches!(
+                rx.recv().await.expect("events channel stays open"),
+                EngineEvent::ToolCallEnded { call_id, .. } if call_id == "fast"
+            ) {
                 break;
             }
         }
@@ -3987,14 +3628,22 @@ mod tests {
         let results: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
-                session_event::Event::ToolResultRecorded(r) if r.call_id == "c1" => Some(r),
+                session_event::Event::ToolResultRecorded(r) if r.session_id == session_id => {
+                    Some(r)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(results.len(), 1, "the issued call was closed exactly once");
-        assert_eq!(results[0].outcome, ToolOutcome::Error as i32);
-        assert_eq!(results[0].content, "cancelled by the user");
-        assert!(!results[0].truncated);
+        assert_eq!(results.len(), 3, "every issued call has one result");
+        assert_eq!(results[0].call_id, "fast");
+        assert_eq!(results[0].outcome, ToolOutcome::Ok as i32);
+        assert_eq!(results[0].content, "done");
+        for (result, call_id) in results[1..].iter().zip(["slow", "later"]) {
+            assert_eq!(result.call_id, call_id);
+            assert_eq!(result.outcome, ToolOutcome::Error as i32);
+            assert_eq!(result.content, "cancelled by the user");
+            assert!(!result.truncated);
+        }
     }
 
     #[tokio::test]
@@ -4013,74 +3662,6 @@ mod tests {
         assert!(!reply.partial);
         let events = conversation_log(dir.path());
         assert_eq!(appended(&events[2]).content, "nobody watched");
-    }
-
-    #[tokio::test]
-    async fn an_empty_message_is_refused_before_anything_is_appended() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        let err = engine
-            .send_message(&run, None, "  \n\t ", tx)
-            .await
-            .expect_err("must refuse");
-
-        assert!(matches!(err, Error::EmptyMessage), "got: {err:?}");
-        assert_eq!(conversation_log(dir.path()).len(), 0, "log untouched");
-        assert!(provider.requests().is_empty(), "provider never called");
-    }
-
-    #[tokio::test]
-    async fn an_unmappable_role_in_history_is_skipped() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-
-        engine
-            .record(
-                Source::System,
-                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
-                    session_id: "s-old".to_owned(),
-                    parent_session: String::new(),
-                    fork_point: 0,
-                    title: String::new(),
-                    provider: "scripted".to_owned(),
-                    model: "test-model".to_owned(),
-                    role: arc_proto::v1::SessionRole::Unspecified as i32,
-                    project: String::new(),
-                    budget: None,
-                    grants: Vec::new(),
-                    dispatched_by: String::new(),
-                    choice: String::new(),
-                    editing: String::new(),
-                }),
-            )
-            .expect("record");
-        engine
-            .record(
-                Source::System,
-                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
-                    session_id: "s-old".to_owned(),
-                    role: 99,
-                    content: "from the future".to_owned(),
-                    partial: false,
-                    turn_id: String::new(),
-                    ..Default::default()
-                }),
-            )
-            .expect("record");
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some("s-old"), "hi", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        let turns: Vec<&str> = requests[0].messages.iter().map(|m| turn(m).1).collect();
-        assert_eq!(turns, ["hi"], "the unmappable message stayed out");
     }
 
     #[tokio::test]
@@ -4233,43 +3814,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unclosed_server_call_lands_with_an_empty_response_at_turn_end() {
-        let provider = ScriptedProvider::scripted(vec![vec![
-            Ok(CompletionDelta::ServerCall {
-                name: "google_search".to_owned(),
-                payload_json: r#"{"query":"arc release"}"#.to_owned(),
-            }),
-            Ok(CompletionDelta::Text("still searching".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        assert_eq!(
-            events.len(),
-            4,
-            "created, user message, assistant reply, flushed server call"
-        );
-        let call = server_called(&events[3]);
-        assert_eq!(call.name, "google_search");
-        assert_eq!(call.arguments_json, r#"{"query":"arc release"}"#);
-        assert!(
-            call.response_json.is_empty(),
-            "the search happened; losing it would un-replay what the model saw"
-        );
-    }
-
-    #[tokio::test]
     async fn provider_round_trip_data_survives_the_log_into_the_next_request() {
         let signature = b"opaque-thought-signature".to_vec();
         let provider = ScriptedProvider::scripted(vec![
@@ -4308,8 +3852,6 @@ mod tests {
             "the log kept the bytes"
         );
 
-        // a resumed session rebuilds its transcript from the log, so the bytes
-        // have to come back out of the projection, not out of memory
         let resumed = ScriptedProvider::scripted(vec![done_reply("still here")]);
         let (engine, run) = reopened_engine(&resumed, &dir, tools(&[("lookup", "found it", true)]));
         let (tx, _rx) = channel();
@@ -4468,150 +4010,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_order_results_rebuild_sorted_by_call_index() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                seeded_session(),
-                seeded_message(Role::User, "question"),
-                seeded_call("a", 0),
-                seeded_call("b", 1),
-                seeded_result("b", "B"),
-                seeded_result("a", "A"),
-            ],
-        );
-
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some("s-01"), "again", tx)
-            .await
-            .expect("send");
-
-        let messages = &provider.requests()[0].messages;
-        let Message::ToolCalls { calls, .. } = &messages[1] else {
-            panic!("expected the calls, got {:?}", messages[1]);
-        };
-        assert_eq!(
-            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
-            ["a", "b"],
-            "calls in index order"
-        );
-        assert_eq!(
-            messages[2..4],
-            [
-                Message::ToolResult {
-                    call_id: "a".to_owned(),
-                    content: "A".to_owned(),
-                },
-                Message::ToolResult {
-                    call_id: "b".to_owned(),
-                    content: "B".to_owned(),
-                },
-            ],
-            "results by call index, not completion order"
-        );
-    }
-
-    #[tokio::test]
-    async fn history_anomalies_are_skipped_not_fatal() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                seeded_session(),
-                seeded_message(Role::User, "question"),
-                seeded_call("open", 0),
-                seeded_result("ghost", "answers nothing"),
-            ],
-        );
-
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some("s-01"), "again", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            provider.requests()[0].messages,
-            [
-                Message::Text {
-                    role: Role::User,
-                    content: "question".to_owned(),
-                    reasoning: None,
-                },
-                Message::Text {
-                    role: Role::User,
-                    content: "again".to_owned(),
-                    reasoning: None,
-                },
-            ],
-            "the unanswered call and the unclaimed result stay out"
-        );
-    }
-
-    #[test]
-    fn transcript_maps_every_row_kind_and_preserves_raw_integers() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                seeded_session(),
-                seeded_message(Role::User, "question"),
-                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
-                    session_id: "s-01".to_owned(),
-                    role: 99,
-                    content: "from the future".to_owned(),
-                    partial: false,
-                    turn_id: "t-01".to_owned(),
-                    ..Default::default()
-                }),
-                seeded_call("c1", 0),
-                session_event::Event::ToolResultRecorded(arc_proto::v1::ToolResultRecorded {
-                    changed_paths: Vec::new(),
-                    session_id: "s-01".to_owned(),
-                    turn_id: "t-01".to_owned(),
-                    call_id: "c1".to_owned(),
-                    outcome: 42,
-                    content: "what the model saw".to_owned(),
-                    truncated: true,
-                }),
-            ],
-        );
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (engine, _run) = reopened_engine(&provider, &dir, Registry::new(512));
-
-        assert_eq!(
-            engine.transcript("s-01").expect("transcript"),
-            [
-                sourced_entry(Role::User as i32, "question", Source::System),
-                sourced_entry(99, "from the future", Source::System),
-                HistoryEntry {
-                    entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
-                        call_id: "c1".to_owned(),
-                        name: "lookup".to_owned(),
-                        arguments_json: "{}".to_owned(),
-                    })),
-                    seq: 0,
-                },
-                HistoryEntry {
-                    entry: Some(history_entry::Entry::ToolResult(HistoryToolResult {
-                        call_id: "c1".to_owned(),
-                        outcome: 42,
-                        truncated: true,
-                        content: "what the model saw".to_owned(),
-                    })),
-                    seq: 0,
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn a_reopened_session_rebuilds_the_tool_step_into_the_next_request() {
         let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("c1", 0, "lookup", r#"{"q":1}"#)), Ok(tool_stop())],
@@ -4703,88 +4101,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_text_is_appended_before_its_calls() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(CompletionDelta::Text("checking".to_owned())),
-                Ok(call("s", 0, "alpha", "{}")),
-                Ok(tool_stop()),
-            ],
-            done_reply("final"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        assert_eq!(events.len(), 6);
-        let step_text = appended(&events[2]);
-        assert_eq!(step_text.content, "checking");
-        assert!(!step_text.partial);
-        assert_eq!(issued(&events[3]).call_id, "s");
-        assert_eq!(appended(&events[5]).content, "final");
-        assert_eq!(step_text.turn_id, appended(&events[5]).turn_id);
-    }
-
-    #[tokio::test]
-    async fn a_multi_tool_step_turn_stamps_usage_only_on_the_final_append() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(CompletionDelta::Text("checking".to_owned())),
-                Ok(call("s", 0, "alpha", "{}")),
-                Ok(tool_stop()),
-            ],
-            done_reply("final"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            reply.usage,
-            Some(Usage {
-                input_tokens: 6,
-                output_tokens: 10
-            }),
-            "usage accumulates across both completion steps"
-        );
-
-        let events = conversation_log(dir.path());
-        let user = appended(&events[1]);
-        let step_text = appended(&events[2]);
-        let final_text = appended(&events[5]);
-
-        assert_eq!(
-            (user.input_tokens, user.output_tokens, user.elapsed_ms),
-            (0, 0, 0)
-        );
-        assert_eq!(
-            (
-                step_text.input_tokens,
-                step_text.output_tokens,
-                step_text.elapsed_ms
-            ),
-            (0, 0, 0),
-            "the intermediate tool-step assistant append stays zero"
-        );
-        assert_eq!(
-            (final_text.input_tokens, final_text.output_tokens),
-            (6, 10),
-            "only the turn's final assistant append carries the accumulated usage"
-        );
-    }
-
-    #[tokio::test]
     async fn the_step_cap_forces_a_final_completion_without_tools() {
         let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS)
             .map(|step| {
@@ -4826,43 +4142,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_executor_turn_runs_past_the_chat_step_cap() {
-        let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS + 4)
-            .map(|step| {
-                vec![
-                    Ok(call(&format!("c{step}"), 0, "alpha", "{}")),
-                    Ok(tool_stop()),
-                ]
-            })
-            .collect();
-        script.push(done_reply("done"));
-        let provider = ScriptedProvider::scripted(script);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
-        let run = Runner {
-            role: SessionRole::Executor,
-            ..run
-        };
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        assert_eq!(requests.len(), MAX_TOOL_STEPS + 5);
-        assert!(
-            requests.iter().all(|r| !r.tools.is_empty()),
-            "no forced tool-less completion before the executor cap"
-        );
-        assert!(!reply.partial);
-        assert!(
-            !reply.step_capped,
-            "the executor's own cap is 256, not this"
-        );
-    }
-
-    #[tokio::test]
     async fn reasoning_is_forwarded_and_never_stored() {
         let provider = ScriptedProvider::scripted(vec![vec![
             Ok(CompletionDelta::Reasoning("hmm".to_owned())),
@@ -4886,192 +4165,6 @@ mod tests {
         let events = conversation_log(dir.path());
         assert_eq!(events.len(), 3);
         assert_eq!(appended(&events[2]).content, "hi there");
-    }
-
-    #[tokio::test]
-    async fn a_steps_reasoning_replays_on_the_next_steps_request() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(CompletionDelta::Reasoning("checking the time".to_owned())),
-                Ok(call("t1", 0, "clock", "{}")),
-                Ok(tool_stop()),
-            ],
-            done_reply("it is noon"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("clock", "noon", true)]));
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "what time is it?", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        let Message::ToolCalls { reasoning, .. } = &requests[1].messages[1] else {
-            panic!("expected the calls, got {:?}", requests[1].messages[1]);
-        };
-        assert_eq!(reasoning.as_deref(), Some("checking the time"));
-    }
-
-    #[tokio::test]
-    async fn thinking_leaked_into_the_content_channel_is_reasoning_not_a_reply() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(CompletionDelta::Text(
-                    "let me check the clock</think>".to_owned(),
-                )),
-                Ok(call("t1", 0, "clock", "{}")),
-                Ok(tool_stop()),
-            ],
-            vec![
-                Ok(CompletionDelta::Text(
-                    "<think>noon then</think>it is noon".to_owned(),
-                )),
-                Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("clock", "noon", true)]));
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "what time is it?", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        let Message::ToolCalls { reasoning, .. } = &requests[1].messages[1] else {
-            panic!("expected the calls, got {:?}", requests[1].messages[1]);
-        };
-        assert_eq!(
-            reasoning.as_deref(),
-            Some("let me check the clock"),
-            "the head replays as reasoning on the next step"
-        );
-        let events = conversation_log(dir.path());
-        let texts: Vec<String> = events
-            .iter()
-            .filter_map(|event| match event {
-                session_event::Event::MessageAppended(m) if m.role == Role::Assistant as i32 => {
-                    Some(m.content.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            texts,
-            ["it is noon".to_owned()],
-            "neither head reaches the log; the empty first step appends nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_truncated_result_marks_the_event() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("t", 0, "big", "{}")), Ok(tool_stop())],
-            done_reply("ok"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let mut registry = Registry::new(8);
-        registry.register(Box::new(Canned {
-            name: "big",
-            content: "0123456789abcdef",
-            ok: true,
-            source: ToolSource::Builtin,
-        }));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert!(result.truncated);
-        assert_eq!(result.content, "01234567 [truncated]");
-        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
-    }
-
-    #[tokio::test]
-    async fn the_role_thinking_level_rides_the_request_not_the_prompt() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let dir = TempDir::new().expect("temp dir");
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let engine = Engine::new(Store::new(log, projection), Registry::new(512));
-        let run = Runner {
-            role: SessionRole::Chat,
-            provider: Arc::clone(&provider) as Arc<dyn Provider>,
-            model: "test-model".to_owned(),
-            thinking: Thinking::Minimal,
-            system: Some("be terse".to_owned()),
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            editing: crate::tool::Editing::Replacement,
-        };
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            provider.requests()[0].system,
-            Some(format!("be terse\n\n{}", today_line())),
-            "the marker is the sidecar's dialect and belongs to its provider"
-        );
-        assert_eq!(provider.requests()[0].thinking, Thinking::Minimal);
-    }
-
-    #[tokio::test]
-    async fn the_role_lands_on_the_session_and_on_every_request() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
-        let dir = TempDir::new().expect("temp dir");
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let engine = Engine::new(Store::new(log, projection), Registry::new(512));
-        let run = Runner {
-            role: SessionRole::Executor,
-            provider: Arc::clone(&provider) as Arc<dyn Provider>,
-            model: "test-model".to_owned(),
-            thinking: Thinking::Default,
-            system: None,
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            editing: crate::tool::Editing::Replacement,
-        };
-
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&reply.session_id), "again", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(created) = &events[0] else {
-            panic!("expected SessionCreated first, got {:?}", events[0]);
-        };
-        assert_eq!(created.role, SessionRole::Executor as i32);
-
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        for request in &requests {
-            assert_eq!(request.role, SessionRole::Executor);
-        }
     }
 
     fn seeded_records() -> Vec<memory_event::Event> {
@@ -5200,147 +4293,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_tool_turn_sends_one_snapshot_to_every_completion() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
-            done_reply("final text"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, seeded_records());
-        let (engine, run) =
-            reopened_engine(&provider, &dir, tools(&[("lookup", "found it", true)]));
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "question", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        let expected = Some(format!(
-            "be terse\n\n{}\n\n{}",
-            today_line(),
-            seeded_block()
-        ));
-        assert_eq!(requests[0].system, expected);
-        assert_eq!(requests[1].system, expected, "per turn, not per completion");
-    }
-
-    #[tokio::test]
-    async fn no_records_means_no_block() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            provider.requests()[0].system,
-            Some(format!("be terse\n\n{}", today_line()))
-        );
-    }
-
-    #[tokio::test]
-    async fn without_an_identity_the_block_stands_alone() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, seeded_records());
-        let log = Log::open(dir.path()).expect("open log");
-        let mut projection = Projection::in_memory().expect("open projection");
-        crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        let engine = Engine::new(Store::new(log, projection), Registry::new(512));
-        let run = Runner {
-            role: SessionRole::Chat,
-            provider: Arc::clone(&provider) as Arc<dyn Provider>,
-            model: "test-model".to_owned(),
-            thinking: Thinking::Default,
-            system: None,
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            editing: crate::tool::Editing::Replacement,
-        };
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            provider.requests()[0].system,
-            Some(format!("{}\n\n{}", today_line(), seeded_block()))
-        );
-    }
-
     const SEARCH_HIT: &str = r#"{"records":[{"id":"mr-pal","namespace":"global","kind":"fact","title":"Gruvbox","summary":"the palette"}]}"#;
-
-    const TURN_COUNTERS: [&str; 5] = [
-        "memory_searches",
-        "memory_search_hits",
-        "memory_reads_from_search",
-        "records_created",
-        "records_superseded",
-    ];
-
-    #[test]
-    fn memory_counters_follow_search_and_read() {
-        let mut counters = MemoryCounters::default();
-        counters.observe_call(
-            "memory_search",
-            r#"{"query":"palette"}"#,
-            r#"{"records":[{"id":"mr-1"},{"id":"mr-2"}]}"#,
-        );
-        counters.observe_call(
-            "memory_search",
-            r#"{"query":"nothing"}"#,
-            "No memory records match. For something from a past conversation, \
-             search sessions_search before giving up.",
-        );
-        counters.observe_call("memory_read", r#"{"id":"mr-1"}"#, "the body");
-        counters.observe_call(
-            "memory_read",
-            r#"{"id":"mr-ghost"}"#,
-            "ERROR: no such record",
-        );
-        counters.observe_call("sessions_search", r#"{"query":"x"}"#, "unrelated");
-
-        assert_eq!(counters.searches, 2);
-        assert_eq!(
-            counters.search_hits, 1,
-            "the prose no-match reply is not a hit"
-        );
-        assert_eq!(
-            counters.reads_from_search, 1,
-            "only the read of a surfaced id counts"
-        );
-        assert_eq!(counters.records_created, 0);
-        assert_eq!(counters.records_superseded, 0);
-    }
-
-    #[test]
-    fn memory_counters_split_events_by_kind() {
-        let mut counters = MemoryCounters::default();
-        counters.observe_event(&memory_event::Event::RecordCreated(MemoryRecordCreated {
-            record: None,
-        }));
-        counters.observe_event(&memory_event::Event::RecordSuperseded(
-            MemoryRecordSuperseded {
-                superseded_id: "mr-old".to_owned(),
-                record: None,
-            },
-        ));
-
-        assert_eq!(counters.records_created, 1);
-        assert_eq!(counters.records_superseded, 1);
-        assert_eq!(counters.searches, 0);
-    }
 
     #[tokio::test]
     async fn a_search_then_read_turn_records_the_retrieval_counters() {
@@ -5376,121 +4329,6 @@ mod tests {
         assert!(
             counter_samples(&trace, "records_created").is_empty(),
             "no writes, no write counters"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_search_without_a_read_records_zero_reads_from_search() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call("c1", 0, "memory_search", r#"{"query":"palette"}"#)),
-                Ok(tool_stop()),
-            ],
-            done_reply("answered from the summary"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(
-            &provider,
-            &dir,
-            tools(&[("memory_search", SEARCH_HIT, true)]),
-        );
-
-        let capture = TraceCapture::start();
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hm", tx)
-            .await
-            .expect("send");
-        let trace = capture.finish();
-
-        assert_eq!(counter_samples(&trace, "memory_searches"), [1.0]);
-        assert_eq!(counter_samples(&trace, "memory_search_hits"), [1.0]);
-        assert_eq!(
-            counter_samples(&trace, "memory_reads_from_search"),
-            [0.0],
-            "a searched turn records its zero — the denominator exists"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_memory_write_turn_records_one_record_created() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "memory_write",
-                    r#"{"kind":"preference","namespace":"global","title":"Terse replies",
-                        "summary":"prefers short answers","body":"Prefers short answers."}"#,
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("saved"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite::new(
-            vec!["global".to_owned(), "arc".to_owned()],
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-
-        let capture = TraceCapture::start();
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "remember this", tx)
-            .await
-            .expect("send");
-        let trace = capture.finish();
-
-        assert_eq!(counter_samples(&trace, "records_created"), [1.0]);
-        assert!(
-            counter_samples(&trace, "memory_searches").is_empty(),
-            "no retrieval traffic, no retrieval counters"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_inline_memory_write_pushes_a_review_changed_with_the_grown_count() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "memory_write",
-                    r#"{"kind":"preference","namespace":"global","title":"Terse replies",
-                        "summary":"prefers short answers","body":"Prefers short answers."}"#,
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("saved"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::builtin::memory::MemoryWrite::new(
-            vec!["global".to_owned(), "arc".to_owned()],
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
-        let engine = engine.with_notifier(notifier);
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "remember this", tx)
-            .await
-            .expect("send");
-
-        let mut pending_seen = Vec::new();
-        while let Ok(notification) = notifications.try_recv() {
-            if let Some(arc_proto::v1::notification::Event::ReviewChanged(changed)) =
-                notification.event
-            {
-                pending_seen.push(changed.pending);
-            }
-        }
-        assert_eq!(
-            pending_seen,
-            [1],
-            "the new record is the only one pending review"
         );
     }
 
@@ -5570,68 +4408,6 @@ mod tests {
 
         assert_eq!(counter_samples(&trace, "records_superseded"), [1.0]);
         assert!(counter_samples(&trace, "records_created").is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_turn_without_memory_traffic_records_no_counters() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
-            done_reply("plain answer"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("lookup", "found", true)]));
-
-        let capture = TraceCapture::start();
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-        let trace = capture.finish();
-
-        for name in TURN_COUNTERS {
-            assert!(
-                counter_samples(&trace, name).is_empty(),
-                "{name} must be absent on a memory-free turn"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn the_memory_block_is_the_tail_of_the_system_prompt() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, seeded_records());
-        let log = Log::open(dir.path()).expect("open log");
-        let mut projection = Projection::in_memory().expect("open projection");
-        crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        let engine = Engine::new(Store::new(log, projection), Registry::new(512));
-        let run = Runner {
-            role: SessionRole::Chat,
-            provider: Arc::clone(&provider) as Arc<dyn Provider>,
-            model: "test-model".to_owned(),
-            thinking: Thinking::Minimal,
-            system: Some("be terse".to_owned()),
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            editing: crate::tool::Editing::Replacement,
-        };
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            provider.requests()[0].system,
-            Some(format!(
-                "be terse\n\n{}\n\n{}",
-                today_line(),
-                seeded_block()
-            ))
-        );
     }
 
     fn review_engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> (Engine, Runner) {
@@ -5721,58 +4497,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_review_verdict_pushes_a_review_changed_with_the_shrunk_count() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log_at(
-            &dir,
-            seeded_records(),
-            chrono::Utc::now().timestamp_micros(),
-        );
-        let (engine, _run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
-        let engine = engine.with_notifier(notifier);
-
-        engine.review_accept("mr-fact").expect("accept");
-
-        let notification = notifications.try_recv().expect("a notification was pushed");
-        match notification.event {
-            Some(arc_proto::v1::notification::Event::ReviewChanged(changed)) => {
-                assert_eq!(
-                    changed.pending, 1,
-                    "one of the two seeded records left the queue"
-                );
-            }
-            other => panic!("expected ReviewChanged, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_verdict_for_an_unknown_record_is_refused_before_the_log() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = review_engine(&provider, &dir);
-        let before = replay_events(dir.path()).len();
-
-        let accept = engine.review_accept("mr-ghost");
-        assert!(
-            matches!(accept, Err(Error::Store(store::Error::UnknownRecord { ref id })) if id == "mr-ghost"),
-            "got: {accept:?}"
-        );
-        let delete = engine.review_delete("mr-ghost");
-        assert!(
-            matches!(delete, Err(Error::Store(store::Error::UnknownRecord { ref id })) if id == "mr-ghost"),
-            "got: {delete:?}"
-        );
-
-        assert_eq!(
-            replay_events(dir.path()).len(),
-            before,
-            "nothing was appended"
-        );
-    }
-
-    #[tokio::test]
     async fn a_project_bound_session_offers_and_can_call_its_workspace_tool() {
         let dir = TempDir::new().expect("temp dir");
         seed_log(&dir, vec![seeded_session_with_project("arc")]);
@@ -5809,75 +4533,6 @@ mod tests {
         let result = resulted(&events[3]);
         assert_eq!(result.outcome, ToolOutcome::Ok as i32);
         assert_eq!(result.content, "workspace file");
-    }
-
-    #[tokio::test]
-    async fn a_project_bound_session_gets_its_configured_command_prefix_in_turn_context() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(&dir, vec![seeded_session_with_project("arc")]);
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "prefix", "{}")), Ok(tool_stop())],
-            done_reply("done"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(PrefixEcho {
-            name: "prefix",
-            source: ToolSource::Workspace,
-        }));
-        let mut projects = BTreeMap::new();
-        projects.insert(
-            "arc".to_owned(),
-            ProjectSpec {
-                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
-                grants: Vec::new(),
-                command_prefix: vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()],
-            },
-        );
-        let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, Some("s-01"), "run it", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert_eq!(result.content, "nix,develop,-c");
-    }
-
-    #[tokio::test]
-    async fn an_unbound_session_gets_an_empty_command_prefix_in_turn_context() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "prefix", "{}")), Ok(tool_stop())],
-            done_reply("done"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(PrefixEcho {
-            name: "prefix",
-            source: ToolSource::Builtin,
-        }));
-        let mut projects = BTreeMap::new();
-        projects.insert(
-            "arc".to_owned(),
-            ProjectSpec {
-                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
-                grants: Vec::new(),
-                command_prefix: vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()],
-            },
-        );
-        let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "run it", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert_eq!(result.content, "");
     }
 
     #[tokio::test]
@@ -5961,137 +4616,6 @@ mod tests {
         );
     }
 
-    fn expert_tool() -> Box<dyn crate::tool::Tool> {
-        Box::new(Canned {
-            name: "consult_expert",
-            content: "",
-            ok: true,
-            source: ToolSource::Expert,
-        })
-    }
-
-    fn engine_with_expert(dir: &TempDir) -> Engine {
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let mut registry = Registry::new(512);
-        registry.register(expert_tool());
-        Engine::new(Store::new(log, projection), registry)
-    }
-
-    fn counsel_runner(provider: &Arc<ScriptedProvider>, role: SessionRole) -> Runner {
-        Runner {
-            counsel: true,
-            ..runner_with_role(provider, role)
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_holds_consult_expert_when_its_model_has_counsel() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir);
-        let run = counsel_runner(&provider, SessionRole::Chat);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        assert!(
-            requests[0]
-                .tools
-                .iter()
-                .any(|def| def.name == "consult_expert"),
-            "{:?}",
-            requests[0].tools
-        );
-    }
-
-    #[tokio::test]
-    async fn executor_holds_consult_expert_when_its_model_has_counsel() {
-        coding_role_holds_counsel(SessionRole::Executor).await;
-    }
-
-    #[tokio::test]
-    async fn code_holds_consult_expert_when_its_model_has_counsel() {
-        coding_role_holds_counsel(SessionRole::Code).await;
-    }
-
-    async fn coding_role_holds_counsel(role: SessionRole) {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir);
-        let run = counsel_runner(&provider, role);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        assert!(
-            requests[0]
-                .tools
-                .iter()
-                .any(|def| def.name == "consult_expert"),
-            "{:?}",
-            requests[0].tools
-        );
-    }
-
-    #[tokio::test]
-    async fn archivist_never_holds_consult_expert_even_when_its_model_has_counsel() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let engine = engine_with_expert(&dir);
-        let run = counsel_runner(&provider, SessionRole::Archivist);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let requests = provider.requests();
-        assert!(
-            requests[0]
-                .tools
-                .iter()
-                .all(|def| def.name != "consult_expert"),
-            "{:?}",
-            requests[0].tools
-        );
-    }
-
-    #[tokio::test]
-    async fn nobody_holds_consult_expert_when_the_model_has_no_counsel() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
-        let engine = engine_with_expert(&dir);
-
-        for role in [SessionRole::Chat, SessionRole::Executor] {
-            let run = runner_with_role(&provider, role);
-            assert!(!run.counsel);
-            let (tx, _rx) = channel();
-            engine
-                .send_message(&run, None, "hi", tx)
-                .await
-                .expect("send");
-        }
-
-        let requests = provider.requests();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.tools.iter().all(|def| def.name != "consult_expert")),
-            "{:?}",
-            requests.iter().map(|r| &r.tools).collect::<Vec<_>>()
-        );
-    }
-
     #[tokio::test]
     async fn a_direct_session_holds_the_job_tools_and_a_dispatched_job_never_does() {
         let dir = TempDir::new().expect("temp dir");
@@ -6161,21 +4685,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_code_session_asks_the_provider_for_web_grounding() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Code);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        assert!(provider.requests()[0].web, "code searches as chat does");
-    }
-
-    #[tokio::test]
     async fn executor_and_archivist_sessions_never_ask_for_web_grounding() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok"), done_reply("ok")]);
@@ -6199,25 +4708,6 @@ mod tests {
                 .map(|r| r.web)
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[tokio::test]
-    async fn a_new_session_records_an_empty_project() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(created) = &events[0] else {
-            panic!("expected SessionCreated first, got {:?}", events[0]);
-        };
-        assert_eq!(created.project, "");
     }
 
     fn projects_with(
@@ -6417,86 +4907,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selecting_a_model_is_logged_and_new_sessions_record_it() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-        let choice = |name: &str, model: &str| super::ModelChoice {
-            name: name.to_owned(),
-            provider: "codex".to_owned(),
-            model: model.to_owned(),
-            thinking: Thinking::Default,
-            editing: crate::tool::Editing::Replacement,
-        };
-
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
-        engine = engine
-            .with_projects(projects_with(
-                "arc",
-                vec![ToolSource::Builtin, ToolSource::Workspace],
-                vec![Grant::new(&root, Mode::ReadWrite)],
-            ))
-            .with_role_choices(BTreeMap::from([(
-                SessionRole::Executor,
-                vec![choice("sol", "gpt-5.6-sol"), choice("astra", "gpt-6-astra")],
-            )]));
-
-        assert_eq!(
-            engine
-                .selected_choice(SessionRole::Executor)
-                .expect("query")
-                .as_deref(),
-            Some("sol"),
-            "nothing selected: the first choice is the default"
-        );
-        let err = engine
-            .select_model(SessionRole::Executor, "luna")
-            .expect_err("not on the menu");
-        assert!(matches!(err, Error::UnknownChoice { .. }), "{err}");
-
-        engine
-            .select_model(SessionRole::Executor, "astra")
-            .expect("select");
-
-        let list = engine.model_list().expect("list");
-        let picked: Vec<(&str, bool)> = list
-            .choices
-            .iter()
-            .map(|entry| (entry.name.as_str(), entry.selected))
-            .collect();
-        assert_eq!(picked, [("sol", false), ("astra", true)]);
-
-        let session_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Executor, None)
-            .expect("create a bound session");
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(created) = &events[0] else {
-            panic!("expected SessionCreated first, got {:?}", events[0]);
-        };
-        assert_eq!(created.session_id, session_id);
-        assert_eq!(
-            (created.provider.as_str(), created.model.as_str()),
-            ("codex", "gpt-6-astra"),
-            "the new session runs under the selected choice"
-        );
-
-        let (reopened, _) = reopened_engine(&provider, &dir, Registry::new(512));
-        let reopened = reopened.with_role_choices(BTreeMap::from([(
-            SessionRole::Executor,
-            vec![choice("sol", "gpt-5.6-sol")],
-        )]));
-        assert_eq!(
-            reopened
-                .selected_choice(SessionRole::Executor)
-                .expect("query")
-                .as_deref(),
-            Some("sol"),
-            "a selection no longer on the menu falls back to the default"
-        );
-    }
-
-    #[tokio::test]
     async fn explicit_fork_choice_records_its_own_pin_without_changing_the_default() {
         let provider = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
@@ -6546,61 +4956,6 @@ mod tests {
             .fork_session_with_choice(&parent, fork_point, "missing")
             .expect_err("unknown choice");
         assert!(matches!(err, Error::UnknownChoice { .. }));
-    }
-
-    #[tokio::test]
-    async fn create_bound_session_with_role_identities_set_records_the_childs_own_provider_and_model()
-     {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
-        engine = engine
-            .with_projects(projects_with(
-                "arc",
-                vec![ToolSource::Builtin, ToolSource::Workspace],
-                vec![Grant::new(&root, Mode::ReadWrite)],
-            ))
-            .with_role_identities(BTreeMap::from([(
-                SessionRole::Executor,
-                ("opencode".to_owned(), "deepseek-v4-pro".to_owned()),
-            )]));
-
-        let session_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Executor, None)
-            .expect("create a bound session");
-
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(created) = &events[0] else {
-            panic!("expected SessionCreated first, got {:?}", events[0]);
-        };
-        assert_eq!(created.session_id, session_id);
-        assert_eq!(
-            created.provider, "opencode",
-            "the child role's own identity, not the dispatching runner's"
-        );
-        assert_eq!(created.model, "deepseek-v4-pro");
-    }
-
-    #[tokio::test]
-    async fn create_bound_session_names_an_unknown_project() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-
-        let err = engine
-            .create_bound_session(&run, "ghost", SessionRole::Chat, None)
-            .expect_err("an unconfigured project must be refused");
-
-        assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
-        assert!(err.to_string().contains("ghost"));
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            0,
-            "nothing was appended"
-        );
     }
 
     #[tokio::test]
@@ -6686,127 +5041,6 @@ mod tests {
             Source::User as i32,
             "the user asked for this, not a model"
         );
-    }
-
-    #[tokio::test]
-    async fn create_direct_session_names_an_unknown_project() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-
-        let err = engine
-            .create_direct_session(&run, "ghost", SessionRole::Executor)
-            .expect_err("an unconfigured project must be refused");
-
-        assert!(matches!(err, Error::UnknownProject { ref project } if project == "ghost"));
-        assert!(err.to_string().contains("ghost"));
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            0,
-            "nothing was appended"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_turn_served_into_a_direct_session_resolves_its_grants() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-        std::fs::write(root.join("inside.txt"), "hi").expect("write");
-
-        let mut registry = Registry::new(512);
-        for tool in workspace::tools(Arc::new(Workspace::new())) {
-            registry.register(tool);
-        }
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "read",
-                    &serde_json::json!({"path": root.join("inside.txt")}).to_string(),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("done"),
-        ]);
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let executor_run = runner_with_role(&provider, SessionRole::Executor);
-
-        let session_id = engine
-            .create_direct_session(&run, "arc", SessionRole::Executor)
-            .expect("create a direct session");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&executor_run, Some(&session_id), "read it", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
-        assert_eq!(result.content, "hi");
-    }
-
-    #[tokio::test]
-    async fn a_bound_sessions_grants_flow_from_the_log_through_the_gate() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-        std::fs::write(root.join("inside.txt"), "hi").expect("write");
-        let elsewhere = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("temp dir outside /tmp");
-        std::fs::write(elsewhere.path().join("outside.txt"), "nope").expect("write");
-
-        let mut registry = Registry::new(512);
-        for tool in workspace::tools(Arc::new(Workspace::new())) {
-            registry.register(tool);
-        }
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "read",
-                    &serde_json::json!({"path": root.join("inside.txt")}).to_string(),
-                )),
-                Ok(call(
-                    "c2",
-                    1,
-                    "read",
-                    &serde_json::json!({"path": elsewhere.path().join("outside.txt")}).to_string(),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("done"),
-        ]);
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-
-        let session_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Chat, None)
-            .expect("create a bound session");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "read both", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let inside = resulted(&events[4]);
-        let outside = resulted(&events[5]);
-        assert_eq!(inside.outcome, ToolOutcome::Ok as i32);
-        assert_eq!(inside.content, "hi");
-        assert_eq!(outside.outcome, ToolOutcome::Error as i32);
-        assert!(outside.content.contains("outside"), "{}", outside.content);
     }
 
     #[tokio::test]
@@ -6969,55 +5203,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_session_rejects_an_unknown_parent() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (engine, _run) = engine(&provider, &dir);
-
-        let err = engine
-            .fork_session("ghost", 1)
-            .expect_err("an unknown parent must be refused");
-
-        assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            0,
-            "nothing was appended"
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_session_rejects_a_fork_point_that_is_a_tool_call_seq() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "lookup", "{}")), Ok(tool_stop())],
-            done_reply("final text"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) =
-            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "question", tx)
-            .await
-            .expect("send");
-
-        // SessionCreated(0), user(1), ToolCallIssued(2), ToolResultRecorded(3), assistant(4)
-        let tool_call_seq = 2;
-        let err = engine
-            .fork_session(&reply.session_id, tool_call_seq)
-            .expect_err("a tool-call seq must be refused");
-
-        assert!(
-            matches!(err, Error::InvalidForkPoint { fork_point, .. } if fork_point == tool_call_seq)
-        );
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            5,
-            "nothing new was appended"
-        );
-    }
-
-    #[tokio::test]
     async fn fork_session_rejects_a_foreign_sessions_seq() {
         let provider = ScriptedProvider::scripted(vec![done_reply("a"), done_reply("b")]);
         let dir = TempDir::new().expect("temp dir");
@@ -7038,87 +5223,6 @@ mod tests {
             .expect_err("a foreign session's seq must be refused");
 
         assert!(matches!(err, Error::InvalidForkPoint { .. }));
-    }
-
-    #[tokio::test]
-    async fn mark_branch_records_the_disposition_durably() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-        let fork_id = engine
-            .fork_session(&reply.session_id, reply.seq)
-            .expect("fork_session");
-
-        engine
-            .mark_branch(&fork_id, branch_marked::Disposition::Real)
-            .expect("mark_branch");
-
-        let events = conversation_log(dir.path());
-        match events.last().expect("an event") {
-            session_event::Event::BranchMarked(marked) => {
-                assert_eq!(marked.session_id, fork_id);
-                assert_eq!(marked.disposition, branch_marked::Disposition::Real as i32);
-            }
-            other => panic!("expected BranchMarked, got {other:?}"),
-        }
-
-        let (reopened, _run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let sessions = reopened.sessions().expect("sessions");
-        let forked = sessions.iter().find(|s| s.id == fork_id).expect("listed");
-        assert_eq!(
-            forked.disposition,
-            branch_marked::Disposition::Real as i32,
-            "replay shows the mark"
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_branch_rejects_a_root_session() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let err = engine
-            .mark_branch(&reply.session_id, branch_marked::Disposition::Real)
-            .expect_err("a root conversation has nothing to mark");
-
-        assert!(
-            matches!(err, Error::NotABranch { ref session_id } if *session_id == reply.session_id)
-        );
-        assert!(
-            conversation_log(dir.path())
-                .iter()
-                .all(|event| !matches!(event, session_event::Event::BranchMarked(_))),
-            "nothing was appended"
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_branch_rejects_an_unknown_session() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = engine(&provider, &dir);
-
-        let err = engine
-            .mark_branch("ghost", branch_marked::Disposition::Abandoned)
-            .expect_err("an unknown session must be refused");
-
-        assert!(matches!(err, Error::UnknownSession { ref session_id } if session_id == "ghost"));
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            0,
-            "nothing was appended"
-        );
     }
 
     #[tokio::test]
@@ -7169,37 +5273,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_forked_session_is_pinned_to_the_parents_role_like_any_other_session() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
-        let (engine, _run) = engine(&provider, &dir);
-        let executor_run = runner_with_role(&provider, SessionRole::Executor);
-
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&executor_run, None, "hi", tx)
-            .await
-            .expect("send");
-        let fork_id = engine
-            .fork_session(&reply.session_id, reply.seq)
-            .expect("fork_session");
-
-        let chat_run = runner(&provider);
-        let (tx, _rx) = channel();
-        let err = engine
-            .send_message(&chat_run, Some(&fork_id), "continue", tx)
-            .await
-            .expect_err("a chat engine must refuse an executor branch");
-        assert!(matches!(err, Error::RoleMismatch { .. }));
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&executor_run, Some(&fork_id), "continue", tx)
-            .await
-            .expect("the parent's own role continues it");
-    }
-
-    #[tokio::test]
     async fn a_turn_on_a_forked_session_sends_the_parents_prefix_transcript() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![
@@ -7241,45 +5314,6 @@ mod tests {
             ],
             "the branch inherits the parent prefix through its fork point, not what came after"
         );
-    }
-
-    #[tokio::test]
-    async fn an_unbound_sessions_workspace_call_gets_the_no_workspace_error() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(&dir, vec![seeded_session_with_project("arc")]);
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "read",
-                    &serde_json::json!({"path": "/tmp/x"}).to_string(),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("no access"),
-        ]);
-        let mut registry = Registry::new(512);
-        for tool in workspace::tools(Arc::new(Workspace::new())) {
-            registry.register(tool);
-        }
-        let projects = projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            Vec::new(),
-        );
-        let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, Some("s-01"), "read it", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("granted"), "{}", result.content);
     }
 
     fn dispatch_args(role: &str, project: &str, brief: &str, intent: &str) -> String {
@@ -7398,7 +5432,6 @@ mod tests {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: crate::tool::Editing::Replacement,
         };
         let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
@@ -7412,112 +5445,6 @@ mod tests {
             .send_message(&executor_run, Some(&child_id), "go", tx)
             .await
             .expect("an executor runner continues the dispatched child");
-    }
-
-    #[tokio::test]
-    async fn a_bound_sessions_none_dispatch_resolves_to_its_own_project() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "none", "fix the bug", "implement"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("dispatched"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let (engine, _) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let run = runner_with_role(&provider, SessionRole::Executor);
-
-        let parent_id = engine
-            .create_direct_session(&run, "arc", SessionRole::Executor)
-            .expect("a bound direct session");
-
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, Some(&parent_id), "start a job", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(child) = &events[3] else {
-            panic!("expected the child SessionCreated, got {:?}", events[3]);
-        };
-        assert_eq!(
-            child.project, "arc",
-            "\"none\" resolved to the dispatching session's own project"
-        );
-        assert_eq!(
-            reply.jobs,
-            [DispatchedJob {
-                session_id: child.session_id.clone(),
-                parent_session: parent_id.clone(),
-                role: SessionRole::Executor,
-                project: "arc".to_owned(),
-                brief: "fix the bug".to_owned(),
-                budget: None,
-            }],
-            "identical to a dispatch that named \"arc\" explicitly"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unbound_sessions_none_dispatch_is_an_actionable_error_naming_projects() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "none", "fix the bug", "implement"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("done"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "start a job", tx)
-            .await
-            .expect("a bad dispatch fails the call, not the turn");
-
-        let events = conversation_log(dir.path());
-        assert_eq!(events.len(), 5, "no child session was created");
-        let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("arc"), "{}", result.content);
-        assert!(reply.jobs.is_empty(), "a failed dispatch spawns no job");
     }
 
     #[tokio::test]
@@ -7599,69 +5526,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_analyze_job_still_carries_its_recorded_read_only_grant() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "arc", "check consistency", "analyze"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("dispatched"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "start a job", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let session_event::Event::SessionCreated(child) = &events[3] else {
-            panic!("expected the child SessionCreated, got {:?}", events[3]);
-        };
-        let child_id = child.session_id.clone();
-
-        // config here still says read-write; a resumed job goes by its own
-        // recorded grant, not by re-resolving the project (5.1's rule)
-        let (reopened, _) = reopened_engine(
-            &ScriptedProvider::scripted(vec![]),
-            &dir,
-            Registry::new(512),
-        );
-        let reopened = reopened.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let grants = reopened
-            .grants(&child_id, false)
-            .expect("grants lookup")
-            .expect("a bound job carries grants");
-        assert_eq!(
-            grants.canonical_roots().to_vec(),
-            vec![(root.canonicalize().expect("canon"), Mode::ReadOnly)]
-        );
-    }
-
-    #[tokio::test]
     async fn a_dispatch_into_a_project_with_a_finished_job_is_bounced_toward_continue_job() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
@@ -7733,141 +5597,6 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("fresh: true"), "{}", result.content);
-    }
-
-    #[tokio::test]
-    async fn fresh_true_dispatches_past_the_finished_job() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let fresh_args = serde_json::json!({
-            "role": "executor",
-            "project": "arc",
-            "brief": "unrelated work",
-            "intent": "implement",
-            "fresh": true,
-        })
-        .to_string();
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "arc", "fix the bug", "implement"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("dispatched"),
-            vec![Ok(call("c2", 0, "dispatch", &fresh_args)), Ok(tool_stop())],
-            done_reply("dispatched fresh"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "start a job", tx)
-            .await
-            .expect("send");
-        let child_id = reply.jobs[0].session_id.clone();
-        record_handback(
-            &engine,
-            &reply.session_id,
-            &child_id,
-            None,
-            "fixed it",
-            None,
-        );
-
-        let (tx, _rx) = channel();
-        let second = engine
-            .send_message(&run, Some(&reply.session_id), "something else", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(second.jobs.len(), 1, "fresh passed the guard");
-        assert_ne!(
-            second.jobs[0].session_id, child_id,
-            "a new child, not a resume"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_implement_dispatch_is_not_bounced_toward_a_read_only_analyze_job() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "arc", "find the bug", "analyze"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("dispatched"),
-            vec![
-                Ok(call(
-                    "c2",
-                    0,
-                    "dispatch",
-                    &dispatch_args("executor", "arc", "fix the bug it found", "implement"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("dispatched the fix"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Dispatch::new(
-            vec![("arc".to_owned(), String::new())],
-            None,
-        )));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "look into it", tx)
-            .await
-            .expect("send");
-        let child_id = reply.jobs[0].session_id.clone();
-        record_handback(
-            &engine,
-            &reply.session_id,
-            &child_id,
-            None,
-            "found it",
-            None,
-        );
-
-        let (tx, _rx) = channel();
-        let second = engine
-            .send_message(&run, Some(&reply.session_id), "fix it", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            second.jobs.len(),
-            1,
-            "a read-only job cannot take the change; the implement dispatch runs"
-        );
-        assert_ne!(second.jobs[0].session_id, child_id);
     }
 
     fn continue_job_args(session_id: &str, message: &str) -> String {
@@ -7947,38 +5676,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_job_on_an_unknown_session_is_an_actionable_error_and_the_turn_completes() {
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "continue_job",
-                    &continue_job_args("s-ghost", "keep going"),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("noted"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(crate::tool::builtin::continue_job::ContinueJob));
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "continue it", tx)
-            .await
-            .expect("a bad continue_job fails the call, not the turn");
-
-        assert!(reply.continues.is_empty());
-        let events = conversation_log(dir.path());
-        let result = tool_result(&events);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("s-ghost"), "{}", result.content);
-    }
-
-    #[tokio::test]
     async fn continue_job_on_a_non_job_session_is_an_actionable_error() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
@@ -8024,24 +5721,6 @@ mod tests {
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
         assert!(result.content.contains("chat"), "{}", result.content);
         assert!(result.content.contains("not a job"), "{}", result.content);
-    }
-
-    fn unstamped_session(id: &str, role: SessionRole) -> session_event::Event {
-        session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
-            session_id: id.to_owned(),
-            parent_session: String::new(),
-            fork_point: 0,
-            title: String::new(),
-            provider: String::new(),
-            model: String::new(),
-            role: role as i32,
-            project: String::new(),
-            budget: None,
-            grants: Vec::new(),
-            dispatched_by: String::new(),
-            choice: String::new(),
-            editing: String::new(),
-        })
     }
 
     fn session_recorded_on(
@@ -8138,7 +5817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_refuses_a_session_recorded_on_a_different_model() {
+    async fn a_pinned_session_refuses_a_different_model_but_resumes_on_its_own() {
         let dir = TempDir::new().expect("temp dir");
         seed_log(
             &dir,
@@ -8149,7 +5828,7 @@ mod tests {
                 "model-a",
             )],
         );
-        let provider = ScriptedProvider::scripted(vec![]);
+        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
         let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
         let executor_run = Runner {
             role: SessionRole::Executor,
@@ -8159,7 +5838,6 @@ mod tests {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
@@ -8180,12 +5858,27 @@ mod tests {
             provider.requests().is_empty(),
             "a refused turn never reaches the provider"
         );
+        assert_eq!(conversation_log(dir.path()).len(), 1);
+
+        let matching_run = Runner {
+            model: "model-a".to_owned(),
+            ..executor_run
+        };
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&matching_run, Some("s-01"), "resume", tx)
+            .await
+            .expect("the recorded identity resumes");
+        assert_eq!(provider.requests().len(), 1);
     }
 
     #[tokio::test]
     async fn a_session_recorded_before_model_stamping_stays_resumable() {
         let dir = TempDir::new().expect("temp dir");
-        seed_log(&dir, vec![unstamped_session("s-01", SessionRole::Executor)]);
+        seed_log(
+            &dir,
+            vec![session_recorded_on("s-01", SessionRole::Executor, "", "")],
+        );
         let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
         let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
         let executor_run = Runner {
@@ -8196,7 +5889,6 @@ mod tests {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
@@ -8205,135 +5897,6 @@ mod tests {
             .send_message(&executor_run, Some("s-01"), "resume", tx)
             .await
             .expect("a session logged before provider/model stamping stays unpinned");
-    }
-
-    #[tokio::test]
-    async fn send_message_on_a_matching_model_resumes_untouched() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![session_recorded_on(
-                "s-01",
-                SessionRole::Executor,
-                "scripted",
-                "model-a",
-            )],
-        );
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let (engine, _) = reopened_engine(&provider, &dir, Registry::new(512));
-        let executor_run = Runner {
-            role: SessionRole::Executor,
-            provider: Arc::clone(&provider) as Arc<dyn Provider>,
-            model: "model-a".to_owned(),
-            thinking: Thinking::Default,
-            system: None,
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            editing: crate::tool::Editing::Replacement,
-        };
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&executor_run, Some("s-01"), "resume", tx)
-            .await
-            .expect("the same recorded identity resumes without a refusal");
-    }
-
-    #[tokio::test]
-    async fn a_footprint_rides_between_the_report_and_the_continue_line() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        record_handback(
-            &engine,
-            &reply.session_id,
-            "child-1",
-            None,
-            "all done",
-            Some("Footprint: two files"),
-        );
-
-        let entries = engine.transcript(&reply.session_id).expect("transcript");
-        let content = match &entries.last().expect("an entry").entry {
-            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
-            other => panic!("expected a message entry, got {other:?}"),
-        };
-        assert!(
-            content.contains("all done\nFootprint: two files\nFor follow-ups"),
-            "{content}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_handback_appends_a_system_sourced_message_visible_in_the_parents_log() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        record_handback(
-            &engine,
-            &reply.session_id,
-            "child-1",
-            None,
-            "all done",
-            None,
-        );
-
-        let events = replay_events(dir.path());
-        let last = events.last().expect("an event was appended");
-        assert_eq!(
-            last.source,
-            Source::System as i32,
-            "the daemon wrote the handback, not the user's turn"
-        );
-        let arc_proto::v1::event::Payload::Session(arc_proto::v1::SessionEvent {
-            event: Some(session_event::Event::MessageAppended(handback)),
-        }) = last.payload.clone().expect("payload")
-        else {
-            panic!("expected a MessageAppended, got {:?}", last.payload);
-        };
-        assert_eq!(handback.session_id, reply.session_id);
-        assert_eq!(
-            handback.role,
-            Role::User as i32,
-            "rebuild_transcript only carries User/Assistant rows to the model"
-        );
-        assert!(!handback.partial);
-        assert!(handback.content.contains("child-1"));
-        assert!(handback.content.contains("all done"));
-
-        let earlier_turn_id = match &events[1].payload {
-            Some(arc_proto::v1::event::Payload::Session(arc_proto::v1::SessionEvent {
-                event: Some(session_event::Event::MessageAppended(m)),
-            })) => m.turn_id.clone(),
-            other => panic!("expected the user's message, got {other:?}"),
-        };
-        assert!(!handback.turn_id.is_empty());
-        assert_ne!(
-            handback.turn_id, earlier_turn_id,
-            "the handback is its own turn, not part of the conversation turn"
-        );
-
-        let entries = engine.transcript(&reply.session_id).expect("transcript");
-        match &entries.last().expect("an entry").entry {
-            Some(history_entry::Entry::Message(HistoryMessage { role, content, .. })) => {
-                assert_eq!(*role, Role::User as i32);
-                assert!(content.contains("child-1"));
-            }
-            other => panic!("expected a message entry, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -8373,125 +5936,6 @@ mod tests {
             "the continue_job affordance stays the closing line: {content}"
         );
         assert!(content.len() < long_summary.len());
-    }
-
-    #[tokio::test]
-    async fn a_handback_for_an_analyze_child_warns_that_continuing_stays_read_only() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
-        engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let parent_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Chat, None)
-            .expect("create the parent");
-        let child_id = engine
-            .create_bound_session_with_intent(
-                &run,
-                "arc",
-                SessionRole::Executor,
-                None,
-                Intent::Analyze,
-                Some(&parent_id),
-                Source::Model,
-                "",
-            )
-            .expect("create an analyze child");
-
-        record_handback(&engine, &parent_id, &child_id, None, "found the bug", None);
-
-        let entries = engine.transcript(&parent_id).expect("transcript");
-        let content = match &entries.last().expect("an entry").entry {
-            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
-            other => panic!("expected a message entry, got {other:?}"),
-        };
-        assert_eq!(
-            content,
-            format!(
-                "Job {child_id} finished.\nfound the bug\nFor follow-ups about anything this \
-                 job read, continue_job {child_id} keeps its context but its project stays \
-                 read-only (/tmp is writable) — a project change needs a fresh implement \
-                 dispatch; a new dispatch starts from nothing."
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn a_handback_for_an_implement_child_keeps_the_plain_tail() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let provider = ScriptedProvider::scripted(vec![]);
-        let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
-        engine = engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let parent_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Chat, None)
-            .expect("create the parent");
-        let child_id = engine
-            .create_bound_session(&run, "arc", SessionRole::Executor, None)
-            .expect("create an implement child");
-
-        record_handback(&engine, &parent_id, &child_id, None, "fixed it", None);
-
-        let entries = engine.transcript(&parent_id).expect("transcript");
-        let content = match &entries.last().expect("an entry").entry {
-            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
-            other => panic!("expected a message entry, got {other:?}"),
-        };
-        assert_eq!(
-            content,
-            format!(
-                "Job {child_id} finished.\nfixed it\nFor follow-ups about anything this job \
-                 read or did, continue_job {child_id} keeps its context; a new dispatch starts \
-                 from nothing."
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn a_handback_for_a_grantless_child_keeps_the_plain_tail() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hi")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        // "child-2" was never created durably: its session_grants is empty,
-        // the same shape a non-workspace job leaves behind
-        record_handback(
-            &engine,
-            &reply.session_id,
-            "child-2",
-            None,
-            "no workspace here",
-            None,
-        );
-
-        let entries = engine.transcript(&reply.session_id).expect("transcript");
-        let content = match &entries.last().expect("an entry").entry {
-            Some(history_entry::Entry::Message(HistoryMessage { content, .. })) => content.clone(),
-            other => panic!("expected a message entry, got {other:?}"),
-        };
-        assert_eq!(
-            content,
-            "Job child-2 finished.\nno workspace here\nFor follow-ups about anything this job \
-             read or did, continue_job child-2 keeps its context; a new dispatch starts from \
-             nothing."
-        );
     }
 
     fn record_handback(
@@ -8574,80 +6018,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_session_over_a_transcript_with_no_messages_still_runs_a_turn() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(&dir, vec![seeded_session()]);
-        let provider =
-            ScriptedProvider::scripted(vec![done_reply("nothing to react to, but here I am")]);
-        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .continue_session(&run, "s-01", tx)
-            .await
-            .expect("continue_session");
-
-        assert!(!reply.partial);
-        let events = conversation_log(dir.path());
-        assert_eq!(
-            events.len(),
-            2,
-            "SessionCreated, then only the assistant reply"
-        );
-        assert_eq!(
-            appended(&events[1]).content,
-            "nothing to react to, but here I am"
-        );
-        let requests = provider.requests();
-        assert!(
-            requests[0].messages.is_empty(),
-            "no user message and no history: the model saw an empty transcript"
-        );
-    }
-
-    #[tokio::test]
-    async fn continue_session_on_a_session_pinned_to_another_role_refuses_and_appends_nothing() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
-                    session_id: "s-01".to_owned(),
-                    parent_session: String::new(),
-                    fork_point: 0,
-                    title: String::new(),
-                    provider: "scripted".to_owned(),
-                    model: "test-model".to_owned(),
-                    role: SessionRole::Executor as i32,
-                    project: String::new(),
-                    budget: None,
-                    grants: Vec::new(),
-                    dispatched_by: String::new(),
-                    choice: String::new(),
-                    editing: String::new(),
-                }),
-                seeded_message(Role::User, "earlier"),
-            ],
-        );
-        let provider = ScriptedProvider::scripted(vec![done_reply("never sent")]);
-        let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
-        let (tx, _rx) = channel();
-
-        let err = engine
-            .continue_session(&run, "s-01", tx)
-            .await
-            .expect_err("a chat engine must refuse an executor session");
-
-        assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
-        assert_eq!(
-            conversation_log(dir.path()).len(),
-            2,
-            "the refusal appended nothing"
-        );
-        assert!(provider.requests().is_empty(), "the provider never ran");
-    }
-
-    #[tokio::test]
     async fn continue_session_waits_for_a_pending_user_turns_guard_on_the_same_session() {
         let dir = TempDir::new().expect("temp dir");
         seed_log(&dir, vec![seeded_session()]);
@@ -8723,112 +6093,6 @@ mod tests {
         assert_eq!(continued_msg.content, "the chat reacts");
         assert_eq!(sent.session_id, "s-01");
         assert_eq!(continued.session_id, "s-01");
-    }
-
-    #[tokio::test]
-    async fn last_assistant_message_returns_the_most_recent_non_empty_reply() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("first"), done_reply("second")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "one", tx)
-            .await
-            .expect("send");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&reply.session_id), "two", tx)
-            .await
-            .expect("send");
-
-        assert_eq!(
-            engine
-                .last_assistant_message(&reply.session_id)
-                .expect("last"),
-            Some("second".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn last_assistant_message_is_none_for_a_session_with_no_assistant_text() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = engine(&provider, &dir);
-
-        assert_eq!(
-            engine.last_assistant_message("s-ghost").expect("last"),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_to_an_unknown_project_forged_past_the_enum_is_an_actionable_error_and_the_turn_completes()
-     {
-        struct Forged;
-
-        impl Tool for Forged {
-            fn definition(&self) -> crate::provider::ToolDefinition {
-                crate::provider::ToolDefinition {
-                    name: "forged_dispatch".to_owned(),
-                    description: String::new(),
-                    parameters: serde_json::json!({"type": "object"}),
-                }
-            }
-
-            fn source(&self) -> ToolSource {
-                ToolSource::Builtin
-            }
-
-            fn execute(
-                &self,
-                _arguments_json: String,
-                _ctx: TurnContext,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolReply> + Send + '_>>
-            {
-                Box::pin(async move {
-                    ToolReply {
-                        changed_paths: Vec::new(),
-                        content: "dispatching".to_owned(),
-                        ok: true,
-                        memory_events: Vec::new(),
-                        job_request: Some(JobRequest {
-                            role: SessionRole::Executor,
-                            project: "ghost".to_owned(),
-                            brief: "do it".to_owned(),
-                            budget: None,
-                            intent: Intent::Implement,
-                            fresh: false,
-                        }),
-                        continue_request: None,
-                        cancel_request: None,
-                    }
-                })
-            }
-        }
-
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![
-            vec![Ok(call("c1", 0, "forged_dispatch", "{}")), Ok(tool_stop())],
-            done_reply("done"),
-        ]);
-        let mut registry = Registry::new(512);
-        registry.register(Box::new(Forged));
-        let (engine, run) = engine_with_tools(&provider, &dir, registry);
-        let (tx, _rx) = channel();
-
-        let reply = engine
-            .send_message(&run, None, "start a job", tx)
-            .await
-            .expect("a bad dispatch fails the call, not the turn");
-
-        let events = conversation_log(dir.path());
-        assert_eq!(events.len(), 5, "no child session was created");
-        let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("ghost"), "{}", result.content);
-        assert!(reply.jobs.is_empty(), "a failed dispatch spawns no job");
-        let assistant = appended(&events[4]);
-        assert_eq!(assistant.content, "done");
     }
 
     #[tokio::test]
@@ -8993,36 +6257,15 @@ mod tests {
         })
     }
 
-    #[test]
-    fn copied_user_tail_is_contiguous_and_bounded() {
-        fn user(content: String) -> MessageRow {
-            MessageRow::Message {
-                role: Role::User as i32,
-                content,
-                partial: false,
-                turn_id: String::new(),
-                source: Source::User as i32,
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            }
-        }
-        let unicode = "🙂".repeat(1000);
-        let rows = vec![
-            (1, user("old".to_owned())),
-            (2, user("x".repeat(super::MAX_COPIED_USER_BYTES))),
-            (3, user("recent".to_owned())),
-            (4, user(unicode.clone())),
-            (5, user("after cutoff".to_owned())),
-        ];
-        assert_eq!(
-            super::recent_user_words(&rows, 4),
-            ["recent", unicode.as_str()],
-        );
-        assert_eq!(super::recent_user_words(&rows, 3), ["recent"]);
-        assert!(super::recent_user_words(&rows, 2).is_empty());
+    async fn hi_then_more(engine: &Engine, run: &Runner) -> String {
+        let (tx, _rx) = channel();
+        let reply = engine.send_message(run, None, "hi", tx).await.unwrap();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(run, Some(&reply.session_id), "more", tx)
+            .await
+            .unwrap();
+        reply.session_id
     }
 
     #[tokio::test]
@@ -9103,94 +6346,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_step_at_the_limit_compacts_and_the_next_request_carries_the_summary() {
-        const LIMIT: u32 = 42;
-        let provider = ScriptedProvider::scripted(vec![
-            done_reply("reply1"),
-            done_reply("reply2"),
-            vec![
-                Ok(call("c1", 0, "lookup", "{}")),
-                Ok(CompletionDelta::Done {
-                    usage: Usage {
-                        input_tokens: LIMIT,
-                        output_tokens: 5,
-                    },
-                    stop: Stop::ToolCalls,
-                }),
-            ],
-            done_reply("Continue with the pending implementation."),
-            done_reply("final answer"),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _) =
-            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
-        let run = Runner {
-            compact_at: Some(LIMIT),
-            context_window: None,
-            counsel: false,
-            ..runner_with_role(&provider, SessionRole::Executor)
-        };
-
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("turn 1");
-        let session_id = reply.session_id;
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "more", tx)
-            .await
-            .expect("turn 2");
-
-        let (tx, mut rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "third question", tx)
-            .await
-            .expect("turn 3");
-        drain(&mut rx);
-
-        let requests = provider.requests();
-        assert_eq!(
-            requests.len(),
-            5,
-            "two whole turns, then step, compact, step"
-        );
-        let compaction_request = &requests[3];
-        assert_eq!(
-            compaction_request.system.as_deref(),
-            Some(COMPACTION_PROMPT_V3)
-        );
-        assert!(
-            compaction_request.tools.is_empty(),
-            "compaction never offers tools"
-        );
-
-        let logged = conversation_log(dir.path());
-        let compacted = compacted_event(&logged).expect("a SessionCompacted event landed");
-        assert!(
-            compacted
-                .summary
-                .starts_with("Continue with the pending implementation."),
-            "{}",
-            compacted.summary
-        );
-        assert!(
-            compacted.summary.contains("hi"),
-            "the user's own words carry over verbatim: {}",
-            compacted.summary
-        );
-
-        let (role, content) = turn(&requests[4].messages[0]);
-        assert_eq!(role, Role::User);
-        assert!(
-            content.starts_with("Continue with the pending implementation."),
-            "{content}"
-        );
-    }
-
-    #[tokio::test]
     async fn one_user_request_compacts_twice_without_losing_instructions_or_tool_pairs() {
         const LIMIT: u32 = 42;
         let mut script = Vec::new();
@@ -9218,7 +6373,6 @@ mod tests {
         let run = Runner {
             compact_at: Some(LIMIT),
             context_window: None,
-            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
         let (tx, _rx) = channel();
@@ -9276,84 +6430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_step_under_the_limit_never_compacts() {
-        const LIMIT: u32 = 42;
-        let provider = ScriptedProvider::scripted(vec![
-            done_reply("reply1"),
-            done_reply("reply2"),
-            vec![
-                Ok(CompletionDelta::Text("under budget".to_owned())),
-                Ok(CompletionDelta::Done {
-                    usage: Usage {
-                        input_tokens: LIMIT - 1,
-                        output_tokens: 5,
-                    },
-                    stop: Stop::EndTurn,
-                }),
-            ],
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
-        let run = Runner {
-            compact_at: Some(LIMIT),
-            context_window: None,
-            counsel: false,
-            ..runner_with_role(&provider, SessionRole::Executor)
-        };
-
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("turn 1");
-        let session_id = reply.session_id;
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "more", tx)
-            .await
-            .expect("turn 2");
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "third question", tx)
-            .await
-            .expect("turn 3");
-
-        assert_eq!(provider.requests().len(), 3, "no compaction call was made");
-        assert!(compacted_event(&conversation_log(dir.path())).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_runner_with_no_context_window_never_compacts_however_large_the_usage() {
-        let provider = ScriptedProvider::scripted(vec![vec![
-            Ok(CompletionDelta::Text("no window configured".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: Usage {
-                    input_tokens: 1_000_000,
-                    output_tokens: 5,
-                },
-                stop: Stop::EndTurn,
-            }),
-        ]]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _) = engine_with_tools(&provider, &dir, Registry::new(512));
-        let run = Runner {
-            compact_at: None,
-            context_window: None,
-            counsel: false,
-            ..runner_with_role(&provider, SessionRole::Executor)
-        };
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hello", tx)
-            .await
-            .expect("turn");
-
-        assert_eq!(provider.requests().len(), 1, "no compaction call was made");
-        assert!(compacted_event(&conversation_log(dir.path())).is_none());
-    }
-
-    #[tokio::test]
     async fn a_failed_compaction_repairs_once_then_surfaces_an_error() {
         const LIMIT: u32 = 42;
         let provider = ScriptedProvider::scripted(vec![
@@ -9378,21 +6454,10 @@ mod tests {
         let run = Runner {
             compact_at: Some(LIMIT),
             context_window: None,
-            counsel: false,
             ..runner_with_role(&provider, SessionRole::Executor)
         };
 
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("turn 1");
-        let session_id = reply.session_id;
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&session_id), "more", tx)
-            .await
-            .expect("turn 2");
+        let session_id = hi_then_more(&engine, &run).await;
         let (tx, mut rx) = channel();
         let error = engine
             .send_message(&run, Some(&session_id), "third question", tx)
@@ -9417,33 +6482,6 @@ mod tests {
             compacted_event(&conversation_log(dir.path())).is_none(),
             "an invalid summary writes nothing to the log"
         );
-    }
-
-    #[tokio::test]
-    async fn an_empty_model_summary_fails_without_a_repair_call() {
-        let provider = ScriptedProvider::scripted(vec![
-            done_reply("first"),
-            done_reply("second"),
-            done_reply(" \n "),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let first = engine.send_message(&run, None, "one", tx).await.unwrap();
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&first.session_id), "two", tx)
-            .await
-            .unwrap();
-        let error = engine
-            .compact(&run, &first.session_id, "manual")
-            .await
-            .expect_err("a copied user tail is not a model summary");
-        assert!(
-            matches!(error, Error::CompactionFailed { ref reason } if reason == "empty model summary")
-        );
-        assert_eq!(provider.requests().len(), 3, "no repair without a draft");
-        assert!(compacted_event(&conversation_log(dir.path())).is_none());
     }
 
     #[tokio::test]
@@ -9513,16 +6551,10 @@ mod tests {
             compact_at: Some(LIMIT),
             ..runner_with_role(&provider, SessionRole::Executor)
         };
-        let (tx, _rx) = channel();
-        let first = engine.send_message(&run, None, "hi", tx).await.unwrap();
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&first.session_id), "more", tx)
-            .await
-            .unwrap();
+        let session_id = hi_then_more(&engine, &run).await;
         let (tx, _rx) = channel();
         engine
-            .send_message(&run, Some(&first.session_id), "third", tx)
+            .send_message(&run, Some(&session_id), "third", tx)
             .await
             .expect("repair succeeded");
 
@@ -9538,7 +6570,7 @@ mod tests {
             .clone();
         assert_eq!(compacted.model, "archivist-model");
         assert!(compacted.summary.contains("hi"));
-        let (provider_name, model) = engine.session_identity(&first.session_id).unwrap().unwrap();
+        let (provider_name, model) = engine.session_identity(&session_id).unwrap().unwrap();
         assert_eq!(provider_name, provider.name());
         assert_eq!(model, "test-model");
     }
@@ -9564,7 +6596,7 @@ mod tests {
         let session = engine
             .create_bound_session(&run, "arc", SessionRole::Code, None)
             .unwrap();
-        let patch_sources = engine.sources(&session, false, &run).unwrap();
+        let patch_sources = engine.tool_setup(&session, false, &run).unwrap().0;
         let names = engine
             .registry
             .definitions(&patch_sources)
@@ -9624,14 +6656,20 @@ mod tests {
                 .unwrap(),
             Some("patch".to_owned())
         );
-        let resumed = reopened.sources(&session, false, &changed_default).unwrap();
+        let resumed = reopened
+            .tool_setup(&session, false, &changed_default)
+            .unwrap()
+            .0;
         assert!(resumed.contains(&ToolSource::Patch));
         assert!(!resumed.contains(&ToolSource::Replacement));
 
         let legacy = reopened
             .create_bound_session(&changed_default, "arc", SessionRole::Code, None)
             .unwrap();
-        let replacement = reopened.sources(&legacy, false, &changed_default).unwrap();
+        let replacement = reopened
+            .tool_setup(&legacy, false, &changed_default)
+            .unwrap()
+            .0;
         assert!(replacement.contains(&ToolSource::Replacement));
         assert!(!replacement.contains(&ToolSource::Patch));
         let names = reopened
@@ -9689,8 +6727,9 @@ mod tests {
             )
             .unwrap();
         let old_sources = reopened
-            .sources("legacy-codex", false, &changed_default)
-            .unwrap();
+            .tool_setup("legacy-codex", false, &changed_default)
+            .unwrap()
+            .0;
         assert!(old_sources.contains(&ToolSource::Patch));
         assert!(!old_sources.contains(&ToolSource::Replacement));
     }

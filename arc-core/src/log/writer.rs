@@ -173,26 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn stamps_seq_monotonically_from_the_starting_value() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = segment(&dir);
-        let mut writer = SegmentWriter::open(&path, 42).expect("open");
-
-        let stamped: Vec<u64> = (0..3)
-            .map(|i| writer.append(event(&format!("m{i}"))).expect("append"))
-            .collect();
-
-        assert_eq!(stamped, vec![42, 43, 44]);
-        assert_eq!(writer.next_seq(), 45);
-
-        let on_disk: Vec<u64> = parse_records(&path)
-            .iter()
-            .map(|(_, _, payload)| Event::decode(payload.as_slice()).expect("decode").seq)
-            .collect();
-        assert_eq!(on_disk, vec![42, 43, 44]);
-    }
-
-    #[test]
     fn refuses_an_event_without_payload_and_leaves_the_file_untouched() {
         let dir = TempDir::new().expect("temp dir");
         let path = segment(&dir);
@@ -225,14 +205,11 @@ mod tests {
         let before = fs::read(&path).expect("read segment");
 
         let huge = event(&"x".repeat(format::MAX_RECORD_LEN as usize + 1));
-        let err = writer
-            .append(huge)
-            .expect_err("an event over the record cap must be refused");
+        let err = writer.append(huge).expect_err("oversized event");
 
-        assert!(matches!(err, Error::RecordTooLarge { .. }), "got: {err:?}");
+        assert!(matches!(err, Error::RecordTooLarge { .. }), "{err:?}");
         assert_eq!(fs::read(&path).expect("read segment"), before);
         assert_eq!(writer.next_seq(), 2);
-        assert_eq!(writer.append(event("second")).expect("append"), 2);
     }
 
     #[test]

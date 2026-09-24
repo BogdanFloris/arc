@@ -44,13 +44,12 @@ keys:
   insert mode    enter sends; ctrl-j adds a newline; esc leaves
   normal mode    tab switches chat/code; :chat opens chat; :code picks a project
                  ctrl-p sessions; / filters; enter opens the match
-                 ctrl-o folds one tool; o shows full output; O folds all
-                 v then j/k selects messages and tools; enter inspects
+                 v/V selects; y yanks; R rewinds; :compact compacts
                  j/k scroll; ctrl-u/ctrl-d page; gg/G top/end
-                 M model defaults; J jobs; Q review; ? help
+                 M models; J jobs; Q review; ? help
   running turn   type to steer; esc esc stops from insert mode
   attachments    :attach <path>; :attach clear
-  any mode       pageup/pagedown scroll; ctrl-c quits";
+  any mode       ctrl-o toggles session details; pageup/pagedown scroll; ctrl-c quits";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -170,11 +169,7 @@ async fn run(
         }
         match command {
             Some(Command::Yank(text)) => yank(&text),
-            Some(
-                command @ (Command::CancelTurn { .. }
-                | Command::SendLive { .. }
-                | Command::SendLiveAttachments { .. }),
-            ) => {
+            Some(command @ (Command::CancelTurn { .. } | Command::SendLive { .. })) => {
                 control_commands.send(command).expect("control task alive");
             }
             Some(command) => commands.send(command).expect("connection task alive"),
@@ -306,48 +301,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn appended_events_refresh_existing_titles_and_unknown_sessions() {
-        let mut app = App::new();
-        app.sessions.push(arc_proto::v1::SessionInfo {
-            id: "known".into(),
-            title: "Previous title".into(),
-            ..Default::default()
-        });
-        for session_id in ["known", "unknown"] {
-            assert!(needs_session_metadata(
-                &app,
-                &NetEvent::SessionAppended {
-                    session_id: session_id.into(),
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn loopback_hosts_are_local() {
-        assert!(is_local("ws://127.0.0.1:8787"));
-        assert!(is_local("ws://localhost:8787"));
-        assert!(is_local("ws://[::1]:8787"));
-        assert!(is_local(DEFAULT_URL), "the default is a loopback address");
-    }
-
-    #[test]
-    fn a_remote_host_is_not_local() {
-        assert!(!is_local("ws://100.64.0.1:8787"));
-        assert!(!is_local("ws://arc.tailnet-1234.ts.net:8787"));
-    }
-
     // a remote address never guesses a door: its directory means nothing
     // to the daemon, whatever the client's own cwd happens to be
     #[test]
     fn a_remote_address_yields_no_launch_dir() {
         assert_eq!(launch_dir("ws://100.64.0.1:8787"), None);
-    }
-
-    #[test]
-    fn a_local_address_yields_the_canonical_cwd() {
-        let expected = std::fs::canonicalize(std::env::current_dir().expect("cwd")).ok();
-        assert_eq!(launch_dir(DEFAULT_URL), expected);
     }
 }

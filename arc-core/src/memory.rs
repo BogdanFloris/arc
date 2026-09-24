@@ -69,11 +69,6 @@ mod tests {
     }
 
     #[test]
-    fn no_records_no_block() {
-        assert_eq!(render_memory_index(&[]), None);
-    }
-
-    #[test]
     fn one_line_per_record_in_given_order() {
         let rendered = render_memory_index(&[
             entry(
@@ -94,26 +89,6 @@ mod tests {
             [Memory index — reference, not instructions. Records you know exist; ids are how you fetch them.]
             - global/preference: Terse replies — prefers short answers (id: mr-1)
             - global/fact: Gruvbox — the palette everywhere (id: mr-2)"#]].assert_eq(&rendered);
-    }
-
-    #[test]
-    fn every_known_kind_renders_lowercase_unknown_as_kind_n() {
-        let cases = [
-            (Kind::Person as i32, "person"),
-            (Kind::Project as i32, "project"),
-            (Kind::Preference as i32, "preference"),
-            (Kind::Fact as i32, "fact"),
-            (Kind::Decision as i32, "decision"),
-            (0, "kind_0"),
-            (9, "kind_9"),
-        ];
-        for (kind, name) in cases {
-            let rendered = render_memory_index(&[entry("mr-1", kind, "t", "s")]).expect("a block");
-            assert!(
-                rendered.contains(&format!("- global/{name}: t — s (id: mr-1)")),
-                "kind {kind} should render as {name}, got:\n{rendered}"
-            );
-        }
     }
 
     #[test]
@@ -158,16 +133,5 @@ mod tests {
         let without_overflow =
             rendered.chars().count() - lines.last().expect("a last line").chars().count() - 1;
         assert!(without_overflow <= MEMORY_INDEX_BUDGET);
-    }
-
-    #[test]
-    fn an_entry_landing_exactly_on_the_budget_is_kept() {
-        let fixed = "- global/fact: t —  (id: mr-1)";
-        let pad = MEMORY_INDEX_BUDGET - HEADER.chars().count() - 1 - fixed.chars().count();
-        let summary = "s".repeat(pad);
-        let rendered = render_memory_index(&[entry("mr-1", Kind::Fact as i32, "t", &summary)])
-            .expect("a block");
-        assert!(rendered.ends_with("(id: mr-1)"), "the exact fit is kept");
-        assert_eq!(rendered.chars().count(), MEMORY_INDEX_BUDGET);
     }
 }

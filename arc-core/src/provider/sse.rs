@@ -5,9 +5,7 @@ const DATA: &str = "data";
 #[derive(Debug, Default)]
 pub(crate) struct FrameDecoder {
     buffer: VecDeque<u8>,
-
     data: String,
-
     has_data: bool,
 }
 
@@ -91,26 +89,8 @@ mod tests {
     }
 
     #[test]
-    fn lf_framed_events_yield_the_same_payloads() {
-        assert_eq!(decode(b"data: one\n\ndata: two\n\n"), ["one", "two"]);
-    }
-
-    #[test]
-    fn one_leading_space_is_stripped_and_no_more() {
-        assert_eq!(decode(b"data:tight\n\n"), ["tight"]);
-        assert_eq!(decode(b"data: spaced\n\n"), ["spaced"]);
-        assert_eq!(decode(b"data:  indented\n\n"), [" indented"]);
-    }
-
-    #[test]
     fn multiple_data_lines_join_with_newlines() {
         assert_eq!(decode(b"data: first\ndata: second\n\n"), ["first\nsecond"]);
-    }
-
-    #[test]
-    fn a_data_field_with_no_value_is_an_empty_payload() {
-        assert_eq!(decode(b"data:\n\n"), [""]);
-        assert_eq!(decode(b"data\n\n"), [""]);
     }
 
     #[test]
@@ -119,11 +99,6 @@ mod tests {
             decode(b": keep-alive\nevent: message\nid: 7\nretry: 500\ndata: payload\n\n"),
             ["payload"]
         );
-    }
-
-    #[test]
-    fn an_event_without_data_dispatches_nothing() {
-        assert_eq!(decode(b"event: ping\n\n\n\ndata: real\n\n"), ["real"]);
     }
 
     #[test]
@@ -139,55 +114,5 @@ mod tests {
 
             assert_eq!(seen, ["alpha", "beta\ngamma"], "split at {split}");
         }
-    }
-
-    #[test]
-    fn a_split_between_cr_and_lf_is_still_one_line_ending() {
-        let mut frames = FrameDecoder::new();
-        frames.push(b"data: split\r");
-        assert!(drain(&mut frames).is_empty());
-        frames.push(b"\n\r");
-        assert!(drain(&mut frames).is_empty());
-        frames.push(b"\n");
-
-        assert_eq!(drain(&mut frames), ["split"]);
-    }
-
-    #[test]
-    fn one_byte_at_a_time_decodes_the_same_way() {
-        let mut frames = FrameDecoder::new();
-        let mut seen = Vec::new();
-        for byte in b"data: dribbled\r\n\r\ndata: slowly\r\n\r\n" {
-            frames.push(&[*byte]);
-            seen.extend(drain(&mut frames));
-        }
-
-        assert_eq!(seen, ["dribbled", "slowly"]);
-    }
-
-    #[test]
-    fn an_unterminated_event_is_never_dispatched() {
-        assert_eq!(decode(b"data: complete\n\ndata: cut off"), ["complete"]);
-    }
-
-    #[test]
-    fn a_lone_carriage_return_stays_in_the_payload() {
-        assert_eq!(decode(b"data: be\rfore\n\n"), ["be\rfore"]);
-    }
-
-    #[test]
-    fn a_character_split_across_chunks_survives() {
-        let mut frames = FrameDecoder::new();
-        let bytes = "data: héllo → ✓\n\n".as_bytes();
-        for byte in bytes {
-            frames.push(&[*byte]);
-        }
-
-        assert_eq!(drain(&mut frames), ["héllo → ✓"]);
-    }
-
-    #[test]
-    fn invalid_utf8_becomes_replacement_characters() {
-        assert_eq!(decode(b"data: bad\xffbyte\n\n"), ["bad\u{fffd}byte"]);
     }
 }

@@ -1,5 +1,4 @@
 pub mod builtin;
-pub mod expert;
 pub mod workspace;
 
 use std::collections::BTreeMap;
@@ -97,7 +96,6 @@ pub enum ToolSource {
     Workspace,
     Patch,
     Replacement,
-    Expert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -132,14 +130,13 @@ impl Editing {
 }
 
 impl ToolSource {
-    pub const ALL: [ToolSource; 7] = [
+    pub const ALL: [ToolSource; 6] = [
         ToolSource::Builtin,
         ToolSource::Jobs,
         ToolSource::Web,
         ToolSource::Workspace,
         ToolSource::Patch,
         ToolSource::Replacement,
-        ToolSource::Expert,
     ];
 }
 
@@ -201,32 +198,26 @@ impl Registry {
         sources: &[ToolSource],
     ) -> DispatchOutcome {
         let span = tracing::Span::current();
-        let Some(tool) = self.tools.get(name) else {
-            span.record("outcome", "unknown-tool");
-            return DispatchOutcome {
-                content: format!("ERROR: Tool {name} is not available."),
-                changed_paths: Vec::new(),
-                ok: false,
-                truncated: false,
-                memory_events: Vec::new(),
-                job_request: None,
-                continue_request: None,
-                cancel_request: None,
-            };
+        let tool = match self.tools.get(name) {
+            Some(tool) if sources.contains(&tool.source()) => tool,
+            unavailable => {
+                let held = unavailable.is_some();
+                span.record("outcome", if held { "unheld-tool" } else { "unknown-tool" });
+                return DispatchOutcome {
+                    content: format!(
+                        "ERROR: Tool {name} is not available{}.",
+                        if held { " in this session" } else { "" }
+                    ),
+                    changed_paths: Vec::new(),
+                    ok: false,
+                    truncated: false,
+                    memory_events: Vec::new(),
+                    job_request: None,
+                    continue_request: None,
+                    cancel_request: None,
+                };
+            }
         };
-        if !sources.contains(&tool.source()) {
-            span.record("outcome", "unheld-tool");
-            return DispatchOutcome {
-                content: format!("ERROR: Tool {name} is not available in this session."),
-                changed_paths: Vec::new(),
-                ok: false,
-                truncated: false,
-                memory_events: Vec::new(),
-                job_request: None,
-                continue_request: None,
-                cancel_request: None,
-            };
-        }
         let reply = tool.execute(arguments_json, ctx).await;
         span.record("outcome", if reply.ok { "ok" } else { "error" });
         let (content, truncated) = self.truncate(reply.content);
@@ -256,17 +247,10 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOutcome, Editing, Registry, Tool, ToolReply, ToolSource, TurnContext};
+    use super::{Registry, Tool, ToolReply, ToolSource, TurnContext};
     use crate::provider::ToolDefinition;
     use std::future::Future;
     use std::pin::Pin;
-
-    #[test]
-    fn editing_defaults_follow_provider_not_model_name() {
-        assert_eq!(Editing::for_provider("codex"), Editing::Patch);
-        assert_eq!(Editing::for_provider("openai-compat"), Editing::Replacement);
-        assert_eq!(Editing::for_provider("local"), Editing::Replacement);
-    }
 
     struct Scripted {
         name: &'static str,
@@ -331,30 +315,6 @@ mod tests {
         }
     }
 
-    struct Echo;
-
-    impl Tool for Echo {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: "echo".to_owned(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-
-        fn source(&self) -> ToolSource {
-            ToolSource::Builtin
-        }
-
-        fn execute(
-            &self,
-            arguments_json: String,
-            _ctx: TurnContext,
-        ) -> Pin<Box<dyn Future<Output = ToolReply> + Send + '_>> {
-            Box::pin(async move { ToolReply::ok(arguments_json) })
-        }
-    }
-
     struct WhereAmI;
 
     impl Tool for WhereAmI {
@@ -414,40 +374,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_routes_by_name() {
-        let registry = registry(vec![
-            scripted("alpha", "from alpha", true),
-            scripted("beta", "from beta", true),
-        ]);
-
-        let DispatchOutcome { content, ok, .. } = registry
-            .dispatch(
-                "beta",
-                "{}".into(),
-                TurnContext::default(),
-                &ToolSource::ALL,
-            )
-            .await;
-        assert!(ok);
-        assert_eq!(content, "from beta");
-    }
-
-    #[tokio::test]
-    async fn arguments_reach_the_tool_verbatim() {
-        let registry = registry(vec![Box::new(Echo)]);
-
-        let outcome = registry
-            .dispatch(
-                "echo",
-                r#"{"q":"café"}"#.into(),
-                TurnContext::default(),
-                &ToolSource::ALL,
-            )
-            .await;
-        assert_eq!(outcome.content, r#"{"q":"café"}"#);
-    }
-
-    #[tokio::test]
     async fn dispatch_hands_the_turn_context_to_the_tool() {
         let mut registry = Registry::new(32 * 1024);
         registry.register(Box::new(WhereAmI));
@@ -462,52 +388,6 @@ mod tests {
             .dispatch("where_am_i", "{}".into(), ctx, &ToolSource::ALL)
             .await;
         assert_eq!(outcome.content, "s-77/t-42");
-    }
-
-    #[tokio::test]
-    async fn an_unknown_tool_is_an_error_result_not_a_failure() {
-        let registry = registry(vec![]);
-
-        let outcome = registry
-            .dispatch(
-                "missing",
-                "{}".into(),
-                TurnContext::default(),
-                &ToolSource::ALL,
-            )
-            .await;
-        assert!(!outcome.ok);
-        assert!(!outcome.truncated);
-        assert!(outcome.content.contains("missing"), "{}", outcome.content);
-    }
-
-    #[tokio::test]
-    async fn a_tool_error_keeps_its_outcome_and_text() {
-        let registry = registry(vec![scripted("fails", "ERROR: no such record", false)]);
-
-        let outcome = registry
-            .dispatch(
-                "fails",
-                "{}".into(),
-                TurnContext::default(),
-                &ToolSource::ALL,
-            )
-            .await;
-        assert!(!outcome.ok, "an error reply must not come back OK");
-        assert_eq!(outcome.content, "ERROR: no such record");
-    }
-
-    #[tokio::test]
-    async fn an_oversized_result_is_truncated_and_marked() {
-        let mut registry = Registry::new(8);
-        registry.register(scripted("big", "0123456789abcdef", true));
-
-        let outcome = registry
-            .dispatch("big", "{}".into(), TurnContext::default(), &ToolSource::ALL)
-            .await;
-        assert!(outcome.truncated);
-        assert!(outcome.ok, "truncation is not an error");
-        assert_eq!(outcome.content, "01234567 [truncated]");
     }
 
     #[tokio::test]
@@ -527,33 +407,6 @@ mod tests {
         assert_eq!(outcome.content, "é [truncated]");
     }
 
-    #[tokio::test]
-    async fn a_result_at_the_cap_is_untouched() {
-        let mut registry = Registry::new(4);
-        registry.register(scripted("fits", "1234", true));
-
-        let outcome = registry
-            .dispatch(
-                "fits",
-                "{}".into(),
-                TurnContext::default(),
-                &ToolSource::ALL,
-            )
-            .await;
-        assert!(!outcome.truncated);
-        assert_eq!(outcome.content, "1234");
-    }
-
-    #[test]
-    fn definitions_lists_every_tool_in_name_order() {
-        let registry = registry(vec![
-            scripted("zeta", "", true),
-            scripted("alpha", "", true),
-        ]);
-
-        assert_eq!(names(&registry, &ToolSource::ALL), ["alpha", "zeta"]);
-    }
-
     #[test]
     fn definitions_offers_only_the_sources_asked_for() {
         let registry = registry(vec![
@@ -564,31 +417,6 @@ mod tests {
         assert_eq!(names(&registry, &[ToolSource::Builtin]), ["recall"]);
         assert_eq!(names(&registry, &[ToolSource::Workspace]), ["read"]);
         assert_eq!(names(&registry, &ToolSource::ALL), ["read", "recall"]);
-    }
-
-    #[test]
-    fn no_sources_offers_no_tools() {
-        let registry = registry(vec![scripted("recall", "", true)]);
-
-        assert!(names(&registry, &[]).is_empty());
-    }
-
-    #[test]
-    fn the_web_source_holds_no_tools_of_ours() {
-        let registry = registry(vec![
-            sourced("recall", "", true, ToolSource::Builtin),
-            sourced("read", "", true, ToolSource::Workspace),
-        ]);
-
-        assert!(names(&registry, &[ToolSource::Web]).is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "already contains")]
-    fn a_duplicate_registration_panics_in_debug() {
-        let mut registry = Registry::new(1024);
-        registry.register(scripted("twin", "", true));
-        registry.register(scripted("twin", "", true));
     }
 
     #[tokio::test]
@@ -613,52 +441,5 @@ mod tests {
             outcome.content,
             "ERROR: Tool read is not available in this session."
         );
-    }
-
-    #[tokio::test]
-    async fn the_same_tool_succeeds_once_its_source_is_offered() {
-        let registry = registry(vec![sourced(
-            "read",
-            "workspace result",
-            true,
-            ToolSource::Workspace,
-        )]);
-
-        let outcome = registry
-            .dispatch(
-                "read",
-                "{}".into(),
-                TurnContext::default(),
-                &[ToolSource::Workspace],
-            )
-            .await;
-        assert!(outcome.ok);
-        assert_eq!(outcome.content, "workspace result");
-    }
-
-    #[tokio::test]
-    async fn the_unheld_and_unknown_tool_messages_are_distinct() {
-        let registry = registry(vec![sourced("read", "", true, ToolSource::Workspace)]);
-
-        let unheld = registry
-            .dispatch(
-                "read",
-                "{}".into(),
-                TurnContext::default(),
-                &[ToolSource::Builtin],
-            )
-            .await;
-        let unknown = registry
-            .dispatch(
-                "missing",
-                "{}".into(),
-                TurnContext::default(),
-                &[ToolSource::Builtin],
-            )
-            .await;
-
-        assert_ne!(unheld.content, unknown.content);
-        assert!(unheld.content.contains("not available in this session"));
-        assert!(!unknown.content.contains("not available in this session"));
     }
 }

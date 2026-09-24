@@ -3,7 +3,6 @@ pub mod continue_job;
 pub mod dispatch;
 pub mod memory;
 pub mod sessions;
-pub mod time;
 
 use std::sync::Arc;
 
@@ -12,7 +11,6 @@ use continue_job::ContinueJob;
 use dispatch::Dispatch;
 use memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use sessions::{SessionRead, SessionsSearch};
-use time::GetTime;
 
 use crate::archive::Archive;
 use crate::tool::Tool;
@@ -29,7 +27,6 @@ pub fn tools(
         Box::new(CancelJob),
         Box::new(ContinueJob),
         Box::new(Dispatch::new(projects, scratch)),
-        Box::new(GetTime),
         Box::new(MemoryRead::new(Arc::clone(&archive))),
         Box::new(MemorySearch::new(Arc::clone(&archive))),
         Box::new(MemorySupersede::new(
@@ -64,7 +61,6 @@ mod tests {
                 "cancel_job",
                 "continue_job",
                 "dispatch",
-                "get_time",
                 "memory_read",
                 "memory_search",
                 "memory_supersede",

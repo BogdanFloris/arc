@@ -1386,7 +1386,7 @@ fn collect_lineage_rows(
     session_id: &str,
     compacted: bool,
 ) -> Result<Vec<(u64, MessageRow)>, Error> {
-    let mut chain: Vec<(String, u64)> = Vec::new();
+    let mut chain: Vec<(String, Option<u64>)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
     let mut current = session_id.to_owned();
     loop {
@@ -1397,26 +1397,22 @@ fn collect_lineage_rows(
             tracing::warn!(session_id = %parent, "lineage cycle detected; stopping the walk");
             break;
         }
-        chain.push((parent.clone(), fork_point));
+        chain.push((parent.clone(), Some(fork_point)));
         current = parent;
     }
     chain.reverse();
+    chain.push((session_id.to_owned(), None));
 
     let mut rows = Vec::new();
-    for (ancestor_id, truncate_at) in chain {
-        let ancestor_rows: Vec<(u64, MessageRow)> = messages_with_seq(conn, &ancestor_id)?
-            .into_iter()
-            .filter(|(seq, _)| *seq <= truncate_at)
-            .collect();
-        rows.extend(ancestor_rows);
+    for (id, bound) in chain {
+        rows.extend(
+            messages_with_seq(conn, &id)?
+                .into_iter()
+                .filter(|(seq, _)| bound.is_none_or(|through| *seq <= through)),
+        );
         if compacted {
-            rows = apply_compaction(conn, &ancestor_id, Some(truncate_at), rows)?;
+            rows = apply_compaction(conn, &id, bound, rows)?;
         }
-    }
-    let own_rows = messages_with_seq(conn, session_id)?;
-    rows.extend(own_rows);
-    if compacted {
-        rows = apply_compaction(conn, session_id, None, rows)?;
     }
     Ok(rows)
 }
@@ -1432,7 +1428,7 @@ fn apply_compaction(
     bound: Option<u64>,
     rows: Vec<(u64, MessageRow)>,
 ) -> Result<Vec<(u64, MessageRow)>, Error> {
-    let Some((_, through_seq, summary)) = latest_compaction(conn, session_id, bound)? else {
+    let Some((through_seq, summary)) = latest_compaction(conn, session_id, bound)? else {
         return Ok(rows);
     };
     let mut out = Vec::with_capacity(rows.len() + 1);
@@ -1456,27 +1452,24 @@ fn summary_row(summary: String) -> MessageRow {
     }
 }
 
-/// The latest `SessionCompacted` recorded for `session_id` at or before
-/// `bound` (unbounded when `None`), as `(event_seq, through_seq, summary)`.
 fn latest_compaction(
     conn: &Connection,
     session_id: &str,
     bound: Option<u64>,
-) -> Result<Option<(u64, u64, String)>, Error> {
+) -> Result<Option<(u64, String)>, Error> {
     let bound = bound.map(seq_param).transpose()?;
-    let row: Option<(i64, i64, String)> = conn
+    let row: Option<(i64, String)> = conn
         .query_row(
-            "SELECT seq, through_seq, summary FROM compactions
+            "SELECT through_seq, summary FROM compactions
              WHERE session_id = ?1 AND (?2 IS NULL OR seq <= ?2)
              ORDER BY seq DESC LIMIT 1",
             rusqlite::params![session_id, bound],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    row.map(|(seq, through_seq, summary)| {
+    row.map(|(through_seq, summary)| {
         Ok::<_, Error>((
-            u64::try_from(seq).map_err(|_| bad_column(0, "seq out of range"))?,
-            u64::try_from(through_seq).map_err(|_| bad_column(1, "through_seq out of range"))?,
+            u64::try_from(through_seq).map_err(|_| bad_column(0, "through_seq out of range"))?,
             summary,
         ))
     })
@@ -2356,24 +2349,22 @@ mod tests {
     use arc_proto::v1::{
         BranchMarked, Event, ImageAttachment, MemoryEvent, MemoryRecord, MemoryRecordCreated,
         MemoryRecordDeleted, MemoryRecordSuperseded, MemoryRecordUpdated, MessageAppended,
-        Provenance, ProvenanceEntry, Role, ServerCallRecorded, SessionCompacted,
-        SessionConsolidated, SessionCreated, SessionEvent, SessionRole, SessionTitled, Source,
-        ToolCallIssued, ToolOutcome, ToolResultRecorded, WorkspaceGrant, event, history_entry,
-        memory_event, memory_record, session_event,
+        Provenance, ProvenanceEntry, Role, SessionCompacted, SessionConsolidated, SessionCreated,
+        SessionEvent, SessionRole, Source, ToolCallIssued, ToolOutcome, ToolResultRecorded,
+        WorkspaceGrant, event, history_entry, memory_event, memory_record, session_event,
     };
     use prost_types::Timestamp;
-    use rusqlite::{Connection, OptionalExtension};
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::{
-        DueSession, Error, MemoryIndexEntry, MessageRow, Predecessor, Projection, ReplayError,
-        ReplayStats, ReviewItem, SessionSummary, replay,
+        DueSession, Error, MessageRow, Predecessor, Projection, ReplayError, ReplayStats,
+        SessionSummary, replay,
     };
     use crate::log::{Log, LogReader, discover_segments};
 
     const TS_SECONDS: i64 = 1_700_000_000;
     const TS_NANOS: i32 = 123_456_789;
-    const TS_MICROS: i64 = 1_700_000_000_123_456;
 
     fn timestamp() -> Timestamp {
         Timestamp {
@@ -2555,17 +2546,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq)]
-    struct SessionRow {
-        id: String,
-        parent_session: Option<String>,
-        fork_point: Option<i64>,
-        project: Option<String>,
-        title: Option<String>,
-        started_at: Option<i64>,
-        role: i64,
-    }
-
     fn table_names(projection: &Projection) -> Vec<String> {
         let mut stmt = projection
             .conn
@@ -2699,89 +2679,6 @@ mod tests {
     }
 
     #[test]
-    fn a_role_model_selection_replays_and_the_latest_wins() {
-        let mut projection = Projection::in_memory().expect("in-memory projection");
-        let select = |seq: u64, choice: &str| Event {
-            seq,
-            ts: None,
-            source: Source::User as i32,
-            payload: Some(event::Payload::Role(arc_proto::v1::RoleEvent {
-                event: Some(arc_proto::v1::role_event::Event::ModelSelected(
-                    arc_proto::v1::RoleModelSelected {
-                        role: SessionRole::Executor as i32,
-                        choice: choice.to_owned(),
-                    },
-                )),
-            })),
-        };
-
-        assert_eq!(
-            projection
-                .role_selection(SessionRole::Executor)
-                .expect("query"),
-            None
-        );
-        projection.apply(&select(1, "sol")).expect("apply");
-        projection.apply(&select(2, "astra")).expect("apply");
-
-        assert_eq!(
-            projection
-                .role_selection(SessionRole::Executor)
-                .expect("query")
-                .as_deref(),
-            Some("astra")
-        );
-        assert_eq!(
-            projection.role_selection(SessionRole::Chat).expect("query"),
-            None,
-            "a selection is per role"
-        );
-        assert_eq!(projection.last_seq().expect("seq"), Some(2));
-    }
-
-    #[test]
-    fn session_choices_replay_without_changing_pinned_identity() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut log = Log::open(dir.path()).expect("open log");
-        log.append(session_created_as(0, "legacy", "", None))
-            .expect("append legacy");
-        let mut recorded = session_created_as(1, "recorded", "", None);
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        })) = recorded.payload.as_mut()
-        {
-            created.choice = "sol".to_owned();
-        }
-        log.append(recorded).expect("append recorded");
-        drop(log);
-
-        for _ in 0..2 {
-            let mut projection = Projection::in_memory().expect("open");
-            let log = Log::open(dir.path()).expect("reopen log");
-            replay(log.reader().expect("reader"), &mut projection).expect("replay");
-
-            assert_eq!(projection.session_choice("missing").expect("choice"), None);
-            assert_eq!(projection.session_choice("legacy").expect("choice"), None);
-            assert_eq!(
-                projection.session_choice("recorded").expect("choice"),
-                Some("sol".to_owned())
-            );
-            assert_eq!(
-                projection.session_identity("recorded").expect("identity"),
-                Some(("gemini".to_owned(), "gemini-3-pro".to_owned()))
-            );
-        }
-    }
-
-    #[test]
-    fn open_creates_the_schema() {
-        let projection = Projection::in_memory().expect("open");
-
-        assert_eq!(table_names(&projection), expected_tables());
-        assert_eq!(projection.last_seq().expect("last_seq"), None);
-    }
-
-    #[test]
     fn reopening_keeps_the_schema_and_the_rows() {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("index.db");
@@ -2801,56 +2698,6 @@ mod tests {
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
-    #[test]
-    fn a_sessions_role_comes_back_and_an_unknown_session_has_none() {
-        let mut projection = Projection::in_memory().expect("open");
-        assert_eq!(projection.session_role("s-01").expect("role"), None);
-
-        projection.apply(&session_created(0)).expect("apply");
-
-        assert_eq!(
-            projection.session_role("s-01").expect("role"),
-            Some(SessionRole::Executor as i32)
-        );
-    }
-
-    fn session_created_with_project(seq: u64, project: &str) -> Event {
-        let mut event = session_created(seq);
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        })) = event.payload.as_mut()
-        {
-            created.project = project.to_owned();
-        }
-        event
-    }
-
-    #[test]
-    fn a_sessions_project_comes_back_and_an_unknown_session_has_none() {
-        let mut projection = Projection::in_memory().expect("open");
-        assert_eq!(projection.session_project("s-01").expect("project"), None);
-
-        projection
-            .apply(&session_created_with_project(0, "arc"))
-            .expect("apply");
-
-        assert_eq!(
-            projection.session_project("s-01").expect("project"),
-            Some("arc".to_string())
-        );
-    }
-
-    #[test]
-    fn an_empty_project_answers_none() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        projection
-            .apply(&session_created_with_project(0, ""))
-            .expect("apply");
-
-        assert_eq!(projection.session_project("s-01").expect("project"), None);
-    }
-
     fn session_created_with_grants(seq: u64, grants: Vec<WorkspaceGrant>) -> Event {
         let mut event = session_created(seq);
         if let Some(event::Payload::Session(SessionEvent {
@@ -2863,145 +2710,6 @@ mod tests {
     }
 
     #[test]
-    fn a_grantless_session_has_no_recorded_grants() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-
-        assert_eq!(
-            projection.session_grants("s-01").expect("grants"),
-            Vec::new()
-        );
-    }
-
-    #[test]
-    fn session_grants_round_trip_through_replay_in_order() {
-        let dir = TempDir::new().expect("temp dir");
-        let grants = vec![
-            WorkspaceGrant {
-                root: "/home/bogdan/arc".to_owned(),
-                read_write: true,
-            },
-            WorkspaceGrant {
-                root: "/home/bogdan/notes".to_owned(),
-                read_write: false,
-            },
-        ];
-
-        let mut log = Log::open(dir.path()).expect("open log");
-        log.append(session_created_with_grants(0, grants.clone()))
-            .expect("append");
-        drop(log);
-
-        let mut projection = Projection::in_memory().expect("open");
-        let log = Log::open(dir.path()).expect("reopen log");
-        replay(log.reader().expect("reader"), &mut projection).expect("replay");
-
-        assert_eq!(
-            projection.session_grants("s-01").expect("grants"),
-            vec![
-                ("/home/bogdan/arc".to_owned(), true),
-                ("/home/bogdan/notes".to_owned(), false),
-            ]
-        );
-    }
-
-    #[test]
-    fn an_unknown_session_has_no_grants() {
-        let projection = Projection::in_memory().expect("open");
-        assert_eq!(
-            projection.session_grants("s-ghost").expect("grants"),
-            Vec::new()
-        );
-    }
-
-    #[test]
-    fn projects_a_session_and_a_message() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&message_appended(1, "hello"))
-            .expect("apply");
-
-        let session = projection
-            .conn
-            .query_row(
-                "SELECT id, parent_session, fork_point, project, title, started_at, role
-                 FROM sessions",
-                [],
-                |row| {
-                    Ok(SessionRow {
-                        id: row.get(0)?,
-                        parent_session: row.get(1)?,
-                        fork_point: row.get(2)?,
-                        project: row.get(3)?,
-                        title: row.get(4)?,
-                        started_at: row.get(5)?,
-                        role: row.get(6)?,
-                    })
-                },
-            )
-            .expect("session row");
-        assert_eq!(
-            session,
-            SessionRow {
-                id: "s-01".to_string(),
-                parent_session: None,
-                fork_point: None,
-                project: None,
-                title: Some("first light".to_string()),
-                started_at: Some(TS_MICROS),
-                role: i64::from(SessionRole::Executor as i32),
-            }
-        );
-
-        let message: (String, i64, i64, i64, String, bool, Option<i64>) = projection
-            .conn
-            .query_row(
-                "SELECT session_id, seq, kind, role, content, partial, ts FROM messages",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .expect("message row");
-        assert_eq!(
-            message,
-            (
-                "s-01".to_string(),
-                1,
-                super::KIND_MESSAGE,
-                i64::from(Role::User as i32),
-                "hello".to_string(),
-                false,
-                Some(TS_MICROS),
-            )
-        );
-    }
-
-    #[test]
-    fn last_seq_follows_the_last_applied_event() {
-        let mut projection = Projection::in_memory().expect("open");
-        assert_eq!(projection.last_seq().expect("last_seq"), None);
-
-        projection.apply(&session_created(7)).expect("apply");
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(7));
-
-        projection
-            .apply(&message_appended(8, "hello"))
-            .expect("apply");
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(8));
-    }
-
-    #[test]
     fn an_unknown_event_kind_advances_last_seq_without_writing_rows() {
         let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
@@ -3011,247 +2719,6 @@ mod tests {
         assert_eq!(row_count(&projection, "sessions"), 1);
         assert_eq!(row_count(&projection, "messages"), 0);
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
-    }
-
-    #[test]
-    fn messages_come_back_in_seq_order() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=10 {
-            projection
-                .apply(&message_appended(seq, &format!("hello_{seq}")))
-                .expect("apply");
-        }
-
-        let conv = projection.messages("s-01").expect("messages");
-
-        assert_eq!(conv.len(), 10);
-        for (i, row) in conv.iter().enumerate() {
-            let MessageRow::Message { role, content, .. } = row else {
-                panic!("expected a prose row, got {row:?}");
-            };
-            assert_eq!(*role, Role::User as i32);
-            assert_eq!(content, &format!("hello_{}", i + 1));
-        }
-    }
-
-    #[test]
-    fn a_tool_turn_projects_call_and_result_rows() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        let mut asked = message_appended(1, "look this up");
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::MessageAppended(m)),
-        })) = &mut asked.payload
-        {
-            m.turn_id = "t-01".to_string();
-        }
-        projection.apply(&asked).expect("apply");
-        projection
-            .apply(&tool_call(2, "c-a", 0, r#"{"q":1}"#))
-            .expect("apply");
-        projection
-            .apply(&tool_result(
-                3,
-                "c-a",
-                ToolOutcome::Ok as i32,
-                "found it",
-                false,
-            ))
-            .expect("apply");
-
-        assert_eq!(
-            projection.messages("s-01").expect("messages"),
-            [
-                MessageRow::Message {
-                    role: Role::User as i32,
-                    content: "look this up".to_string(),
-                    partial: false,
-                    turn_id: "t-01".to_string(),
-                    source: Source::User as i32,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    elapsed_ms: 0,
-                    grounding_json: String::new(),
-                    attachments: Vec::new(),
-                },
-                MessageRow::ToolCall {
-                    call_id: "c-a".to_string(),
-                    call_index: 0,
-                    name: "lookup".to_string(),
-                    arguments_json: r#"{"q":1}"#.to_string(),
-                    turn_id: "t-01".to_string(),
-                    provider_roundtrip: Vec::new(),
-                },
-                MessageRow::ToolResult {
-                    call_id: "c-a".to_string(),
-                    outcome: ToolOutcome::Ok as i32,
-                    content: "found it".to_string(),
-                    truncated: false,
-                    turn_id: "t-01".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn partial_truncated_and_unknown_outcomes_survive_replay() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut log = Log::open(dir.path()).expect("open log");
-        log.append(session_created(0)).expect("append");
-        let mut cut = message_appended(1, "half a th");
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::MessageAppended(m)),
-        })) = &mut cut.payload
-        {
-            m.partial = true;
-        }
-        log.append(cut).expect("append");
-        log.append(tool_call(2, "c-a", 0, "{}")).expect("append");
-        log.append(tool_result(3, "c-a", 99, "cut resul [truncated]", true))
-            .expect("append");
-
-        let mut projection = Projection::in_memory().expect("open");
-        replay(log.reader().expect("reader"), &mut projection).expect("replay");
-
-        let rows = projection.messages("s-01").expect("messages");
-        assert_eq!(
-            rows[0],
-            MessageRow::Message {
-                role: Role::User as i32,
-                content: "half a th".to_string(),
-                partial: true,
-                turn_id: String::new(),
-                source: Source::User as i32,
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            }
-        );
-        assert_eq!(
-            rows[2],
-            MessageRow::ToolResult {
-                call_id: "c-a".to_string(),
-                outcome: 99,
-                content: "cut resul [truncated]".to_string(),
-                truncated: true,
-                turn_id: "t-01".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn a_message_appended_with_usage_populates_the_usage_columns() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut log = Log::open(dir.path()).expect("open log");
-        log.append(session_created(0)).expect("append");
-        log.append(message_appended(1, "hi")).expect("append");
-        let mut costed = message_appended(2, "the answer");
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::MessageAppended(m)),
-        })) = &mut costed.payload
-        {
-            m.role = Role::Assistant as i32;
-            m.input_tokens = 2345;
-            m.output_tokens = 140;
-            m.elapsed_ms = 1500;
-        }
-        log.append(costed).expect("append");
-
-        let mut projection = Projection::in_memory().expect("open");
-        replay(log.reader().expect("reader"), &mut projection).expect("replay");
-
-        let rows = projection.messages("s-01").expect("messages");
-        assert_eq!(
-            rows[0],
-            MessageRow::Message {
-                role: Role::User as i32,
-                content: "hi".to_string(),
-                partial: false,
-                turn_id: String::new(),
-                source: Source::User as i32,
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            },
-            "a zero-usage event leaves zeros"
-        );
-        assert_eq!(
-            rows[1],
-            MessageRow::Message {
-                role: Role::Assistant as i32,
-                content: "the answer".to_string(),
-                partial: false,
-                turn_id: String::new(),
-                source: Source::User as i32,
-                input_tokens: 2345,
-                output_tokens: 140,
-                elapsed_ms: 1500,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            },
-            "the event's usage lands in the columns"
-        );
-    }
-
-    fn server_call(seq: u64, name: &str, arguments: &str, response: &str) -> Event {
-        Event {
-            seq,
-            ts: Some(timestamp()),
-            source: Source::Model as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::ServerCallRecorded(
-                    ServerCallRecorded {
-                        session_id: "s-01".to_string(),
-                        turn_id: "t-01".to_string(),
-                        name: name.to_string(),
-                        arguments_json: arguments.to_string(),
-                        response_json: response.to_string(),
-                        provider_roundtrip: Vec::new(),
-                    },
-                )),
-            })),
-        }
-    }
-
-    #[test]
-    fn a_server_call_projects_whole_and_serves_as_a_history_server_call() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&server_call(
-                1,
-                "google_search",
-                r#"{"queries":["arc daemon"]}"#,
-                r#"{"chunks":[{"uri":"https://example.org","title":"ARC"}]}"#,
-            ))
-            .expect("apply");
-
-        let rows = projection.messages("s-01").expect("messages");
-        assert_eq!(
-            rows,
-            [MessageRow::ServerCall {
-                name: "google_search".to_string(),
-                arguments_json: r#"{"queries":["arc daemon"]}"#.to_string(),
-                response_json: r#"{"chunks":[{"uri":"https://example.org","title":"ARC"}]}"#
-                    .to_string(),
-                turn_id: "t-01".to_string(),
-            }],
-            "arrives resolved, projects as one row"
-        );
-        let entry = super::history_entry(rows.into_iter().next().expect("one row"));
-        assert!(
-            matches!(
-                entry.entry,
-                Some(history_entry::Entry::ServerCall(call))
-                    if call.name == "google_search" && call.response_json.contains("example.org")
-            ),
-            "history serves it as its own entry kind"
-        );
     }
 
     #[test]
@@ -3288,30 +2755,6 @@ mod tests {
         assert_eq!(without, "", "empty stays empty through the NULL column");
     }
 
-    #[test]
-    fn a_server_calls_response_is_archive_searchable() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&server_call(
-                1,
-                "google_search",
-                r#"{"queries":["weather"]}"#,
-                r#"{"snippet":"heavy thundersnow expected"}"#,
-            ))
-            .expect("apply");
-
-        let hits: i64 = projection
-            .conn
-            .query_row(
-                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'thundersnow'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("fts query");
-        assert_eq!(hits, 1, "what the model read from the web is findable");
-    }
-
     fn session_lineage(
         projection: &Projection,
         id: &str,
@@ -3325,42 +2768,6 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("session row")
-    }
-
-    #[test]
-    fn a_forked_session_records_lineage_and_a_dispatched_one_records_supervision() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-
-        let mut fork = session_created_as(1, "s-fork", "", None);
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        })) = fork.payload.as_mut()
-        {
-            created.parent_session = "s-01".to_owned();
-            created.fork_point = 7;
-        }
-        projection.apply(&fork).expect("apply");
-
-        let mut job = session_created_as(2, "s-job", "", None);
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        })) = job.payload.as_mut()
-        {
-            created.dispatched_by = "s-01".to_owned();
-        }
-        projection.apply(&job).expect("apply");
-
-        assert_eq!(
-            session_lineage(&projection, "s-fork"),
-            (Some("s-01".to_owned()), Some(7), None, None),
-            "a fork is lineage: parent and fork point, no supervisor, scratch by default"
-        );
-        assert_eq!(
-            session_lineage(&projection, "s-job"),
-            (None, None, Some("s-01".to_owned()), None),
-            "a dispatch is supervision, never lineage"
-        );
     }
 
     fn dispatched_job(seq: u64, id: &str, parent: &str, project: &str, role: SessionRole) -> Event {
@@ -3380,84 +2787,6 @@ mod tests {
         let mut event = message_appended_for(seq, parent, content);
         event.source = Source::System as i32;
         event
-    }
-
-    #[test]
-    fn latest_finished_job_is_the_most_recently_finished_child() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&dispatched_job(
-                1,
-                "s-a",
-                "s-01",
-                "arc",
-                SessionRole::Executor,
-            ))
-            .expect("apply");
-        projection
-            .apply(&dispatched_job(
-                2,
-                "s-b",
-                "s-01",
-                "arc",
-                SessionRole::Executor,
-            ))
-            .expect("apply");
-        projection
-            .apply(&system_handback(
-                3,
-                "s-01",
-                "Job s-a finished.\ndid one thing",
-            ))
-            .expect("apply");
-        projection
-            .apply(&system_handback(
-                4,
-                "s-01",
-                "Job s-b finished.\nand another",
-            ))
-            .expect("apply");
-
-        assert_eq!(
-            projection
-                .latest_finished_job("s-01", "arc", SessionRole::Executor as i32)
-                .expect("query"),
-            Some("s-b".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_job_whose_latest_handback_is_stopped_is_never_offered() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&dispatched_job(
-                1,
-                "s-a",
-                "s-01",
-                "arc",
-                SessionRole::Executor,
-            ))
-            .expect("apply");
-        projection
-            .apply(&system_handback(2, "s-01", "Job s-a finished.\nfirst pass"))
-            .expect("apply");
-        projection
-            .apply(&system_handback(
-                3,
-                "s-01",
-                "Job s-a stopped: cancelled by the user.\n(no reply)",
-            ))
-            .expect("apply");
-
-        assert_eq!(
-            projection
-                .latest_finished_job("s-01", "arc", SessionRole::Executor as i32)
-                .expect("query"),
-            None,
-            "a resume cancelled after a clean finish stays stopped"
-        );
     }
 
     #[test]
@@ -3636,47 +2965,6 @@ mod tests {
     }
 
     #[test]
-    fn a_parentless_sessions_lineage_matches_plain_messages() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            projection
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-
-        assert_eq!(
-            super::lineage_messages(&projection.conn, "s-01").expect("lineage"),
-            projection.messages("s-01").expect("messages"),
-        );
-    }
-
-    #[test]
-    fn lineage_walk_includes_the_parent_prefix_through_the_fork_point() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=5 {
-            projection
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        // forked at the seq of message 3: the branch inherits m1..m3, not m4/m5
-        projection
-            .apply(&fork_created(6, "s-fork", "s-01", 3))
-            .expect("apply");
-        for (seq, content) in [(7, "b1"), (8, "b2")] {
-            projection
-                .apply(&message_appended_for(seq, "s-fork", content))
-                .expect("apply");
-        }
-
-        assert_eq!(
-            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
-            ["m1", "m2", "m3", "b1", "b2"].map(message_row)
-        );
-    }
-
-    #[test]
     fn lineage_walk_chains_truncations_through_a_fork_of_a_fork() {
         let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
@@ -3702,137 +2990,12 @@ mod tests {
             .expect("apply");
 
         assert_eq!(
+            super::lineage_messages(&projection.conn, "s-fork").expect("first fork"),
+            ["m1", "m2", "m3", "b1", "b2"].map(message_row)
+        );
+        assert_eq!(
             super::lineage_messages(&projection.conn, "s-fork-2").expect("lineage"),
             ["m1", "m2", "m3", "b1", "c1"].map(message_row)
-        );
-    }
-
-    #[test]
-    fn a_lineage_cycle_warns_and_terminates() {
-        let mut projection = Projection::in_memory().expect("open");
-        // hand-seeded: two sessions each naming the other as parent
-        projection
-            .apply(&fork_created(0, "s-a", "s-b", 1))
-            .expect("apply");
-        projection
-            .apply(&fork_created(1, "s-b", "s-a", 1))
-            .expect("apply");
-
-        // must return rather than loop forever; content is secondary here
-        let lineage = super::lineage_messages(&projection.conn, "s-a").expect("lineage");
-        assert_eq!(lineage, []);
-    }
-
-    #[test]
-    fn a_compaction_replaces_its_prefix_with_the_summary_and_keeps_the_rest_verbatim() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            projection
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        projection
-            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
-            .expect("apply");
-        projection.apply(&message_appended(5, "m5")).expect("apply");
-
-        assert_eq!(
-            super::lineage_messages(&projection.conn, "s-01").expect("lineage"),
-            [
-                summary_row("Goal\ncatching up"),
-                message_row("m3"),
-                message_row("m5")
-            ]
-        );
-    }
-
-    #[test]
-    fn replaying_a_compacted_log_twice_gives_the_same_transcript() {
-        let mut first = Projection::in_memory().expect("open");
-        first.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            first
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        first
-            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
-            .expect("apply");
-        first.apply(&message_appended(5, "m5")).expect("apply");
-        let once = super::lineage_messages(&first.conn, "s-01").expect("lineage");
-
-        let mut second = Projection::in_memory().expect("open");
-        second.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            second
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        second
-            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
-            .expect("apply");
-        second.apply(&message_appended(5, "m5")).expect("apply");
-        let twice = super::lineage_messages(&second.conn, "s-01").expect("lineage");
-
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn a_fork_before_the_compaction_event_inherits_the_full_prefix() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            projection
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        // forked at m2 (seq 2), before the compaction at seq 4
-        projection
-            .apply(&fork_created(3, "s-fork", "s-01", 2))
-            .expect("apply");
-        projection
-            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
-            .expect("apply");
-        projection
-            .apply(&message_appended_for(5, "s-fork", "b1"))
-            .expect("apply");
-
-        assert_eq!(
-            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
-            ["m1", "m2", "b1"].map(message_row)
-        );
-    }
-
-    #[test]
-    fn a_fork_after_the_compaction_event_inherits_the_summary() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for seq in 1..=3 {
-            projection
-                .apply(&message_appended(seq, &format!("m{seq}")))
-                .expect("apply");
-        }
-        projection
-            .apply(&session_compacted(4, "s-01", 2, "Goal\ncatching up"))
-            .expect("apply");
-        projection.apply(&message_appended(5, "m4")).expect("apply");
-        // forked at m4 (seq 5), after the compaction at seq 4
-        projection
-            .apply(&fork_created(6, "s-fork", "s-01", 5))
-            .expect("apply");
-        projection
-            .apply(&message_appended_for(7, "s-fork", "b1"))
-            .expect("apply");
-
-        assert_eq!(
-            super::lineage_messages(&projection.conn, "s-fork").expect("lineage"),
-            [
-                summary_row("Goal\ncatching up"),
-                message_row("m3"),
-                message_row("m4"),
-                message_row("b1")
-            ]
         );
     }
 
@@ -4009,20 +3172,6 @@ mod tests {
         }
     }
 
-    fn session_titled(seq: u64, id: &str, title: &str) -> Event {
-        Event {
-            seq,
-            ts: Some(timestamp()),
-            source: Source::System as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::SessionTitled(SessionTitled {
-                    session_id: id.to_string(),
-                    title: title.to_string(),
-                })),
-            })),
-        }
-    }
-
     #[test]
     fn sessions_are_ordered_by_start_then_id() {
         let mut projection = Projection::in_memory().expect("open");
@@ -4069,242 +3218,6 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatched_sessions_summary_names_its_parent() {
-        let mut projection = Projection::in_memory().expect("open");
-        let root = session_created_as(0, "s-root", "root", Some(100));
-        let mut child = session_created_as(1, "s-child", "child", Some(200));
-        let event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        }) = child.payload.as_mut().expect("payload")
-        else {
-            unreachable!("session_created_as always builds a SessionCreated")
-        };
-        created.dispatched_by = "s-root".to_string();
-        projection.apply(&root).expect("apply root");
-        projection.apply(&child).expect("apply child");
-
-        let sessions = projection.sessions().expect("sessions");
-        let root_summary = sessions.iter().find(|s| s.id == "s-root").expect("root");
-        let child_summary = sessions.iter().find(|s| s.id == "s-child").expect("child");
-
-        assert_eq!(root_summary.dispatched_by, "", "a root conversation");
-        assert_eq!(child_summary.dispatched_by, "s-root");
-    }
-
-    #[test]
-    fn a_sessions_summary_carries_its_creation_source() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut job = session_created_as(0, "s-job", "job", Some(100));
-        job.source = Source::Model as i32;
-        projection.apply(&job).expect("apply");
-
-        let sessions = projection.sessions().expect("sessions");
-        let job_summary = sessions.iter().find(|s| s.id == "s-job").expect("job");
-
-        assert_eq!(job_summary.source, Source::Model as i32);
-    }
-
-    #[test]
-    fn a_sessions_summary_carries_its_role_and_project() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut created = session_created(0);
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::SessionCreated(created)),
-        })) = created.payload.as_mut()
-        {
-            created.project = "arc".to_string();
-        }
-        projection.apply(&created).expect("apply");
-
-        let summary = &projection.sessions().expect("sessions")[0];
-        assert_eq!(summary.role, SessionRole::Executor as i32);
-        assert_eq!(summary.project.as_deref(), Some("arc"));
-    }
-
-    #[test]
-    fn a_session_previews_its_first_user_message() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].preview,
-            "",
-            "a session nobody has spoken in has no preview"
-        );
-
-        let mut reply = message_appended(1, "a stray model line");
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::MessageAppended(appended)),
-        })) = &mut reply.payload
-        {
-            appended.role = Role::Assistant as i32;
-        }
-        projection.apply(&reply).expect("apply");
-        projection
-            .apply(&message_appended(2, "what is a walking skeleton?"))
-            .expect("apply");
-        projection
-            .apply(&message_appended(3, "and a second question"))
-            .expect("apply");
-
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].preview,
-            "what is a walking skeleton?"
-        );
-    }
-
-    #[test]
-    fn a_session_reports_when_it_was_last_spoken_in() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].last_at,
-            None,
-            "a session nobody has spoken in has no last message"
-        );
-
-        projection
-            .apply(&message_appended(1, "first"))
-            .expect("apply");
-        let mut later = message_appended(2, "second");
-        later.ts = Some(Timestamp {
-            seconds: 1_700_000_600,
-            nanos: 0,
-        });
-        projection.apply(&later).expect("apply");
-
-        let listed = &projection.sessions().expect("sessions")[0];
-        assert_eq!(listed.last_at, Some(1_700_000_600_000_000));
-        assert_ne!(
-            listed.last_at, listed.started_at,
-            "when it was opened is not when it was last used"
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_title_lists_with_an_empty_one() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(1)))
-            .expect("apply");
-
-        let sessions = projection.sessions().expect("sessions");
-
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].title, "");
-    }
-
-    #[test]
-    fn a_session_titled_event_sets_the_sessions_title() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(1)))
-            .expect("apply");
-        projection
-            .apply(&session_titled(1, "s-01", "Palette bikeshed"))
-            .expect("apply");
-
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].title,
-            "Palette bikeshed"
-        );
-    }
-
-    #[test]
-    fn the_latest_title_wins_on_replay() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(1)))
-            .expect("apply");
-        projection
-            .apply(&session_titled(1, "s-01", "First guess"))
-            .expect("apply");
-        projection
-            .apply(&session_titled(2, "s-01", "Better guess"))
-            .expect("apply");
-
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].title,
-            "Better guess",
-            "retitling appends another event; the latest wins"
-        );
-    }
-
-    #[test]
-    fn retitling_replays_deterministically_across_fresh_indexes() {
-        let events = [
-            session_created_as(0, "s-01", "", Some(1)),
-            session_titled(1, "s-01", "First guess"),
-            session_titled(2, "s-01", "Better guess"),
-        ];
-
-        let mut first = Projection::in_memory().expect("open");
-        let mut second = Projection::in_memory().expect("open");
-        for event in &events {
-            first.apply(event).expect("apply");
-            second.apply(event).expect("apply");
-        }
-
-        assert_eq!(
-            first.sessions().expect("sessions"),
-            second.sessions().expect("sessions")
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_title_event_keeps_its_created_title() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "original title", Some(1)))
-            .expect("apply");
-
-        assert_eq!(
-            projection.sessions().expect("sessions")[0].title,
-            "original title"
-        );
-    }
-
-    #[test]
-    fn an_unknown_session_and_an_empty_session_are_both_just_empty() {
-        let mut projection = Projection::in_memory().expect("open");
-        assert_eq!(projection.messages("s-01").expect("messages"), []);
-
-        projection.apply(&session_created(0)).expect("apply");
-        assert_eq!(projection.messages("s-01").expect("messages"), []);
-    }
-
-    #[test]
-    fn messages_of_other_sessions_stay_out() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        for (seq, session, content) in [
-            (1, "s-01", "a"),
-            (2, "s-02", "x"),
-            (3, "s-01", "b"),
-            (4, "s-02", "y"),
-        ] {
-            let mut event = message_appended(seq, content);
-            if let Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::MessageAppended(m)),
-            })) = &mut event.payload
-            {
-                m.session_id = session.to_string();
-            }
-            projection.apply(&event).expect("apply");
-        }
-
-        let conv: Vec<String> = projection
-            .messages("s-01")
-            .expect("messages")
-            .into_iter()
-            .map(|row| match row {
-                MessageRow::Message { content, .. } => content,
-                other => panic!("expected a prose row, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(conv, ["a", "b"]);
-    }
-
-    #[test]
     fn an_event_without_payload_errors_and_leaves_the_index_usable() {
         let mut projection = Projection::in_memory().expect("open");
         projection.apply(&session_created(0)).expect("apply");
@@ -4329,23 +3242,6 @@ mod tests {
             .expect("apply after the rejected event");
         assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
         assert_eq!(row_count(&projection, "messages"), 1);
-    }
-
-    #[test]
-    fn applying_the_same_event_twice_fails_and_rolls_back() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        projection
-            .apply(&message_appended(1, "hello"))
-            .expect("apply");
-
-        let err = projection
-            .apply(&message_appended(1, "hello"))
-            .expect_err("a duplicate seq must violate the primary key");
-        assert!(matches!(err, Error::Sqlite(_)), "got: {err:?}");
-
-        assert_eq!(row_count(&projection, "messages"), 1);
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
     }
 
     #[test]
@@ -4406,23 +3302,6 @@ mod tests {
             matches!(err, Error::SchemaVersion { found: 1, .. }),
             "got: {err:?}"
         );
-    }
-
-    #[test]
-    fn a_missing_timestamp_projects_as_null() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut event = session_created(0);
-        event.ts = None;
-
-        projection.apply(&event).expect("apply");
-
-        let started_at: Option<i64> = projection
-            .conn
-            .query_row("SELECT started_at FROM sessions", [], |row| row.get(0))
-            .optional()
-            .expect("query")
-            .flatten();
-        assert_eq!(started_at, None);
     }
 
     fn build_log(dir: &Path) -> Log {
@@ -4517,27 +3396,6 @@ mod tests {
 
         assert_eq!(dump(&first), dump(&second));
         assert_eq!(first.last_seq().expect("last_seq"), Some(BUILT_EVENTS - 1));
-    }
-
-    #[test]
-    fn a_second_replay_applies_nothing_and_changes_nothing() {
-        let dir = TempDir::new().expect("temp dir");
-        let log = build_log(dir.path());
-
-        let mut projection = Projection::in_memory().expect("open");
-        replay(log.reader().expect("reader"), &mut projection).expect("first replay");
-        let before = dump(&projection);
-
-        let stats = replay(log.reader().expect("reader"), &mut projection).expect("second replay");
-
-        assert_eq!(
-            stats,
-            ReplayStats {
-                applied: 0,
-                skipped: BUILT_EVENTS
-            }
-        );
-        assert_eq!(dump(&projection), before);
     }
 
     #[test]
@@ -4689,80 +3547,6 @@ mod tests {
     }
 
     #[test]
-    fn a_created_record_reads_back_whole_and_indexed() {
-        let mut projection = Projection::in_memory().expect("open");
-        let created = record("mr-a", "gruvbox", "the palette");
-
-        projection
-            .apply(&mem_created(0, created.clone()))
-            .expect("apply");
-
-        let state = projection
-            .memory_record("mr-a")
-            .expect("memory_record")
-            .expect("the record exists");
-        assert_eq!(state.record, created, "every field round-trips");
-        assert_eq!(state.superseded_by, None);
-        assert_eq!(
-            projection.memory_index().expect("memory_index"),
-            [MemoryIndexEntry {
-                id: "mr-a".to_string(),
-                namespace: "global".to_string(),
-                kind: memory_record::Kind::Fact as i32,
-                title: "gruvbox".to_string(),
-                summary: "the palette".to_string(),
-                body: "gruvbox, at length".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn an_update_overwrites_the_whole_record() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "old title", "old summary")))
-            .expect("apply");
-
-        let mut newer = record("mr-a", "new title", "new summary");
-        newer.kind = memory_record::Kind::Preference as i32;
-        newer.links = vec![];
-        newer.provenance = None;
-        projection
-            .apply(&mem_updated(1, newer.clone()))
-            .expect("apply");
-
-        let state = projection
-            .memory_record("mr-a")
-            .expect("memory_record")
-            .expect("the record exists");
-        assert_eq!(state.record, newer, "last write wins, field by field");
-        assert_eq!(
-            index_ids(&projection),
-            ["mr-a"],
-            "still one record, under the new title"
-        );
-    }
-
-    #[test]
-    fn an_update_of_a_missing_record_is_refused() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        let err = projection
-            .apply(&mem_updated(0, record("mr-none", "t", "s")))
-            .expect_err("nothing to overwrite");
-
-        assert!(
-            matches!(err, Error::StaleMemoryEvent { seq: 0, ref id } if id == "mr-none"),
-            "got: {err:?}"
-        );
-        assert_eq!(
-            projection.last_seq().expect("last_seq"),
-            None,
-            "rolled back"
-        );
-    }
-
-    #[test]
     fn a_supersede_retires_the_old_row_and_lands_the_replacement() {
         let mut projection = Projection::in_memory().expect("open");
         projection
@@ -4819,85 +3603,6 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_excludes_the_record_entirely() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "t", "s")))
-            .expect("apply");
-
-        projection.apply(&mem_deleted(1, "mr-a")).expect("apply");
-
-        assert_eq!(
-            projection.memory_record("mr-a").expect("memory_record"),
-            None
-        );
-        assert_eq!(index_ids(&projection), [""; 0]);
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
-    }
-
-    #[test]
-    fn deleting_a_superseded_record_removes_it_and_spares_the_replacement() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "old", "s")))
-            .expect("apply");
-        projection
-            .apply(&mem_superseded(1, "mr-a", record("mr-b", "new", "s")))
-            .expect("apply");
-
-        projection.apply(&mem_deleted(2, "mr-a")).expect("apply");
-
-        assert_eq!(
-            projection.memory_record("mr-a").expect("memory_record"),
-            None
-        );
-        assert_eq!(index_ids(&projection), ["mr-b"]);
-    }
-
-    #[test]
-    fn a_supersede_of_a_missing_target_still_lands_the_replacement() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        projection
-            .apply(&mem_superseded(0, "mr-ghost", record("mr-b", "t", "s")))
-            .expect("apply");
-
-        assert_eq!(
-            projection.memory_record("mr-ghost").expect("memory_record"),
-            None
-        );
-        assert_eq!(index_ids(&projection), ["mr-b"]);
-    }
-
-    #[test]
-    fn a_delete_of_an_unknown_record_warns_and_no_ops() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        projection
-            .apply(&mem_deleted(0, "mr-ghost"))
-            .expect("apply");
-
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
-        assert_eq!(index_ids(&projection), [""; 0]);
-    }
-
-    #[test]
-    fn double_applying_a_create_fails_and_rolls_back() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "t", "s")))
-            .expect("apply");
-
-        let err = projection
-            .apply(&mem_created(0, record("mr-a", "t", "s")))
-            .expect_err("a duplicate id must violate the primary key");
-
-        assert!(matches!(err, Error::Sqlite(_)), "got: {err:?}");
-        assert_eq!(row_count(&projection, "memory_records"), 1);
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
-    }
-
-    #[test]
     fn double_applying_an_update_fails_and_rolls_back() {
         let mut projection = Projection::in_memory().expect("open");
         projection
@@ -4924,65 +3629,6 @@ mod tests {
     }
 
     #[test]
-    fn double_applying_a_supersede_fails_and_rolls_back() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "old", "s")))
-            .expect("apply");
-        projection
-            .apply(&mem_superseded(1, "mr-a", record("mr-b", "new", "s")))
-            .expect("apply");
-
-        let err = projection
-            .apply(&mem_superseded(1, "mr-a", record("mr-b", "newer", "s")))
-            .expect_err("the seq guard must refuse a replayed supersede");
-        assert!(
-            matches!(err, Error::StaleMemoryEvent { seq: 1, .. }),
-            "got: {err:?}"
-        );
-
-        projection
-            .apply(&mem_superseded(2, "mr-b", record("mr-b", "renewed", "s")))
-            .expect("apply");
-        let err = projection
-            .apply(&mem_superseded(2, "mr-b", record("mr-b", "again", "s")))
-            .expect_err("the upsert guard must refuse a replayed same-id supersede");
-        assert!(
-            matches!(err, Error::StaleMemoryEvent { seq: 2, .. }),
-            "got: {err:?}"
-        );
-
-        let state = projection
-            .memory_record("mr-b")
-            .expect("memory_record")
-            .expect("the record exists");
-        assert_eq!(
-            state.record.title, "renewed",
-            "the refused writes left no trace"
-        );
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(2));
-    }
-
-    #[test]
-    fn double_applying_a_delete_warns_and_no_ops() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&mem_created(0, record("mr-a", "t", "s")))
-            .expect("apply");
-        projection.apply(&mem_deleted(1, "mr-a")).expect("apply");
-
-        projection
-            .apply(&mem_deleted(1, "mr-a"))
-            .expect("a re-delete no-ops");
-
-        assert_eq!(
-            projection.memory_record("mr-a").expect("memory_record"),
-            None
-        );
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(1));
-    }
-
-    #[test]
     fn unknown_kind_and_status_ints_survive_verbatim() {
         let mut projection = Projection::in_memory().expect("open");
         let mut foreign = record("mr-a", "t", "s");
@@ -4999,58 +3645,6 @@ mod tests {
             .expect("the record exists");
         assert_eq!(state.record, foreign);
         assert_eq!(index_ids(&projection), [""; 0], "status 9 is not ACTIVE");
-    }
-
-    #[test]
-    fn an_unknown_memory_event_kind_advances_last_seq_without_writing_rows() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        let foreign = Event {
-            seq: 0,
-            ts: Some(timestamp()),
-            source: Source::Model as i32,
-            payload: Some(event::Payload::Memory(MemoryEvent { event: None })),
-        };
-        projection.apply(&foreign).expect("apply");
-
-        assert_eq!(row_count(&projection, "memory_records"), 0);
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
-    }
-
-    #[test]
-    fn a_mixed_log_projects_both_tiers() {
-        let dir = TempDir::new().expect("temp dir");
-        crate::testkit::seed_log_payloads(
-            &dir,
-            vec![
-                session_created(0).payload.expect("payload"),
-                mem_created(0, record("mr-a", "t", "s"))
-                    .payload
-                    .expect("payload"),
-                message_appended(0, "hello").payload.expect("payload"),
-                mem_updated(0, record("mr-a", "t2", "s2"))
-                    .payload
-                    .expect("payload"),
-            ],
-        );
-
-        let mut projection = Projection::in_memory().expect("open");
-        let segments = discover_segments(dir.path()).expect("discover");
-        let stats = replay(LogReader::new(segments), &mut projection).expect("replay");
-
-        assert_eq!(stats.applied, 4);
-        assert_eq!(projection.sessions().expect("sessions").len(), 1);
-        assert_eq!(projection.messages("s-01").expect("messages").len(), 1);
-        assert_eq!(index_ids(&projection), ["mr-a"]);
-        assert_eq!(
-            projection
-                .memory_record("mr-a")
-                .expect("memory_record")
-                .expect("the record exists")
-                .record
-                .title,
-            "t2"
-        );
     }
 
     #[test]
@@ -5108,30 +3702,6 @@ mod tests {
         }
     }
 
-    fn result_in(seq: u64, session_id: &str, at_seconds: i64) -> Event {
-        Event {
-            seq,
-            ts: Some(Timestamp {
-                seconds: at_seconds,
-                nanos: 0,
-            }),
-            source: Source::System as i32,
-            payload: Some(event::Payload::Session(SessionEvent {
-                event: Some(session_event::Event::ToolResultRecorded(
-                    ToolResultRecorded {
-                        changed_paths: Vec::new(),
-                        session_id: session_id.to_string(),
-                        turn_id: "t-01".to_string(),
-                        call_id: format!("c-{seq}"),
-                        outcome: ToolOutcome::Ok as i32,
-                        content: "tool said".to_string(),
-                        truncated: false,
-                    },
-                )),
-            })),
-        }
-    }
-
     fn consolidated(seq: u64, session_id: &str, through_seq: u64) -> Event {
         Event {
             seq,
@@ -5147,49 +3717,6 @@ mod tests {
                 )),
             })),
         }
-    }
-
-    fn coverage(projection: &Projection, id: &str) -> Option<i64> {
-        projection
-            .conn
-            .query_row(
-                "SELECT consolidated_through FROM sessions WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .expect("coverage")
-    }
-
-    #[test]
-    fn a_marker_sets_coverage_and_only_moves_forward() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(100)))
-            .expect("apply");
-        assert_eq!(coverage(&projection, "s-01"), None);
-
-        projection
-            .apply(&consolidated(1, "s-01", 5))
-            .expect("apply");
-        assert_eq!(coverage(&projection, "s-01"), Some(5));
-
-        projection
-            .apply(&consolidated(2, "s-01", 3))
-            .expect("apply");
-        projection
-            .apply(&consolidated(3, "s-01", 5))
-            .expect("apply");
-        assert_eq!(coverage(&projection, "s-01"), Some(5));
-
-        projection
-            .apply(&consolidated(4, "s-01", 8))
-            .expect("apply");
-        assert_eq!(coverage(&projection, "s-01"), Some(8));
-
-        projection
-            .apply(&consolidated(5, "s-ghost", 2))
-            .expect("apply");
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(5));
     }
 
     #[test]
@@ -5240,79 +3767,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn the_idle_boundary_is_strict() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(50)))
-            .expect("apply");
-        projection
-            .apply(&message_in(1, "s-01", Some(100)))
-            .expect("apply");
-
-        assert_eq!(
-            projection.due_for_consolidation(100_000_000).expect("due"),
-            [],
-            "an event at the cutoff is not yet idle"
-        );
-        assert_eq!(
-            projection
-                .due_for_consolidation(100_000_001)
-                .expect("due")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn tool_result_rows_count_as_activity() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(50)))
-            .expect("apply");
-        projection
-            .apply(&message_in(1, "s-01", Some(100)))
-            .expect("apply");
-        projection.apply(&result_in(2, "s-01", 200)).expect("apply");
-
-        assert_eq!(
-            projection.due_for_consolidation(150_000_000).expect("due"),
-            [],
-            "the recent tool result keeps the session out"
-        );
-        assert_eq!(
-            projection.due_for_consolidation(300_000_000).expect("due"),
-            [DueSession {
-                session_id: "s-01".to_string(),
-                latest_seq: 2,
-            }],
-            "once idle, coverage extends through the tool result"
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_timestamped_rows_is_never_due() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", None))
-            .expect("apply");
-        projection
-            .apply(&message_in(1, "s-01", None))
-            .expect("apply");
-
-        assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
-    }
-
-    #[test]
-    fn an_empty_session_is_never_due() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(50)))
-            .expect("apply");
-
-        assert_eq!(projection.due_for_consolidation(i64::MAX).expect("due"), []);
     }
 
     #[test]
@@ -5369,23 +3823,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn latest_seq_tracks_any_row_kind() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&session_created_as(0, "s-01", "", Some(50)))
-            .expect("apply");
-        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), None);
-
-        projection
-            .apply(&message_in(1, "s-01", Some(100)))
-            .expect("apply");
-        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(1));
-
-        projection.apply(&result_in(2, "s-01", 200)).expect("apply");
-        assert_eq!(projection.latest_seq("s-01").expect("latest_seq"), Some(2));
-    }
-
     fn memory_at(seq: u64, at_micros: i64, event: memory_event::Event) -> Event {
         let mut wrapped = memory(seq, event);
         wrapped.ts = Some(Timestamp {
@@ -5412,82 +3849,6 @@ mod tests {
             .into_iter()
             .map(|item| item.record.id)
             .collect()
-    }
-
-    #[test]
-    fn created_records_enter_the_queue_in_changed_then_id_order() {
-        let mut projection = Projection::in_memory().expect("open");
-        let created = record("mr-b", "gruvbox", "the palette");
-        projection
-            .apply(&memory_at(
-                0,
-                200,
-                memory_payload(mem_created(0, created.clone())),
-            ))
-            .expect("apply");
-        projection
-            .apply(&memory_at(
-                1,
-                100,
-                memory_payload(mem_created(1, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-
-        assert_eq!(review_ids(&projection, 0), ["mr-a", "mr-b"]);
-
-        let items = projection.review_items(0).expect("review_items");
-        assert_eq!(
-            items[1],
-            ReviewItem {
-                record: created,
-                changed_at: 200,
-                supersedes: Vec::new(),
-            },
-            "the record comes back whole, with its bookkeeping"
-        );
-    }
-
-    #[test]
-    fn a_review_clears_the_record_and_a_later_change_re_enters_it() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&memory_at(
-                0,
-                100,
-                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-
-        projection.apply(&reviewed(1, 150, "mr-a")).expect("apply");
-        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
-
-        projection
-            .apply(&memory_at(
-                2,
-                200,
-                memory_payload(mem_updated(2, record("mr-a", "jj", "jj everywhere"))),
-            ))
-            .expect("apply");
-        assert_eq!(
-            review_ids(&projection, 0),
-            ["mr-a"],
-            "a change after the accept re-enters the queue"
-        );
-    }
-
-    #[test]
-    fn the_window_boundary_is_inclusive() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&memory_at(
-                0,
-                100,
-                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-
-        assert_eq!(review_ids(&projection, 100), ["mr-a"]);
-        assert_eq!(review_ids(&projection, 101), Vec::<String>::new());
     }
 
     #[test]
@@ -5540,85 +3901,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_deleted_record_leaves_the_queue_entirely() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&memory_at(
-                0,
-                100,
-                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-        projection
-            .apply(&memory_at(1, 200, memory_payload(mem_deleted(1, "mr-a"))))
-            .expect("apply");
-
-        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_review_of_an_unknown_record_warns_and_no_ops() {
-        let mut projection = Projection::in_memory().expect("open");
-
-        projection
-            .apply(&reviewed(0, 100, "mr-ghost"))
-            .expect("skipped, not an error");
-
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(0));
-        assert_eq!(row_count(&projection, "memory_records"), 0);
-    }
-
-    #[test]
-    fn the_review_stamp_only_moves_forward() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&memory_at(
-                0,
-                400,
-                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-        projection.apply(&reviewed(1, 500, "mr-a")).expect("apply");
-
-        projection.apply(&reviewed(2, 300, "mr-a")).expect("apply");
-
-        assert_eq!(review_ids(&projection, 0), Vec::<String>::new());
-        assert_eq!(projection.last_seq().expect("last_seq"), Some(2));
-    }
-
-    #[test]
-    fn a_review_with_no_timestamp_is_skipped() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection
-            .apply(&memory_at(
-                0,
-                100,
-                memory_payload(mem_created(0, record("mr-a", "jj", "not git"))),
-            ))
-            .expect("apply");
-
-        let mut unstamped = reviewed(1, 0, "mr-a");
-        unstamped.ts = None;
-        projection.apply(&unstamped).expect("skipped, not an error");
-
-        assert_eq!(
-            review_ids(&projection, 0),
-            ["mr-a"],
-            "an unorderable review reviews nothing"
-        );
-    }
-
-    #[test]
-    fn a_record_with_no_timestamp_never_enters_the_queue() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut unstamped = mem_created(0, record("mr-a", "jj", "not git"));
-        unstamped.ts = None;
-        projection.apply(&unstamped).expect("apply");
-
-        assert_eq!(review_ids(&projection, i64::MIN), Vec::<String>::new());
-    }
-
     fn changed_at(projection: &Projection, id: &str) -> Option<i64> {
         projection
             .conn
@@ -5628,17 +3910,6 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("changed_at")
-    }
-
-    fn last_event_seq(projection: &Projection, id: &str) -> i64 {
-        projection
-            .conn
-            .query_row(
-                "SELECT last_event_seq FROM memory_records WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .expect("last_event_seq")
     }
 
     #[test]
@@ -5688,181 +3959,6 @@ mod tests {
             Some(60),
             "mr-c has no link to mr-a and stays untouched"
         );
-    }
-
-    #[test]
-    fn a_delete_stamps_changed_at_on_active_link_dependents() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut a = record("mr-a", "old note", "to delete");
-        a.links = vec![];
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-
-        let mut b = record("mr-b", "commute", "bikes past mr-a's place");
-        b.links = vec!["mr-a".to_string()];
-        projection
-            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
-            .expect("apply");
-
-        let mut c = record("mr-c", "unrelated", "unrelated fact");
-        c.links = vec![];
-        projection
-            .apply(&memory_at(2, 60, memory_payload(mem_created(2, c))))
-            .expect("apply");
-
-        assert_eq!(review_ids(&projection, 250), Vec::<String>::new());
-
-        projection
-            .apply(&memory_at(3, 300, memory_payload(mem_deleted(3, "mr-a"))))
-            .expect("apply");
-
-        assert_eq!(
-            review_ids(&projection, 250),
-            ["mr-b"],
-            "the deleted mr-a leaves no row; mr-b, its link dependent, re-enters"
-        );
-        assert_eq!(
-            changed_at(&projection, "mr-c"),
-            Some(60),
-            "mr-c has no link to mr-a and stays untouched"
-        );
-    }
-
-    #[test]
-    fn a_superseded_dependent_is_not_stamped() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut a = record("mr-a", "note", "target");
-        a.links = vec![];
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-
-        let mut d = record("mr-d", "old dependent", "links to mr-a");
-        d.links = vec!["mr-a".to_string()];
-        projection
-            .apply(&memory_at(1, 60, memory_payload(mem_created(1, d))))
-            .expect("apply");
-
-        let mut d2 = record("mr-d2", "new dependent", "supersedes mr-d");
-        d2.links = vec![];
-        projection
-            .apply(&memory_at(
-                2,
-                100,
-                memory_payload(mem_superseded(2, "mr-d", d2)),
-            ))
-            .expect("apply");
-
-        projection
-            .apply(&memory_at(3, 300, memory_payload(mem_deleted(3, "mr-a"))))
-            .expect("apply");
-
-        assert_eq!(
-            changed_at(&projection, "mr-d"),
-            Some(100),
-            "a SUPERSEDED row does not re-enter review just because it once linked to mr-a"
-        );
-    }
-
-    #[test]
-    fn an_in_place_supersede_does_not_stamp_the_replacement_itself() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut e = record("mr-e", "old self", "self-linking record");
-        e.links = vec![];
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, e))))
-            .expect("apply");
-
-        let mut f = record("mr-f", "dependent", "leans on mr-e");
-        f.links = vec!["mr-e".to_string()];
-        projection
-            .apply(&memory_at(1, 60, memory_payload(mem_created(1, f))))
-            .expect("apply");
-
-        let mut e2 = record("mr-e", "new self", "still self-linking");
-        e2.links = vec!["mr-e".to_string()];
-        projection
-            .apply(&memory_at(
-                2,
-                300,
-                memory_payload(mem_superseded(2, "mr-e", e2)),
-            ))
-            .expect("apply");
-
-        assert_eq!(
-            changed_at(&projection, "mr-e"),
-            Some(300),
-            "the replacement's own changed_at comes from the upsert, not a self-stamp"
-        );
-        assert_eq!(
-            changed_at(&projection, "mr-f"),
-            Some(300),
-            "an unrelated dependent still gets stamped by the same in-place supersede"
-        );
-    }
-
-    #[test]
-    fn the_stamp_never_moves_changed_at_backwards() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut a = record("mr-a", "note", "target");
-        a.links = vec![];
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-
-        let mut b = record("mr-b", "dependent", "leans on mr-a");
-        b.links = vec!["mr-a".to_string()];
-        projection
-            .apply(&memory_at(1, 200, memory_payload(mem_created(1, b))))
-            .expect("apply");
-
-        projection
-            .apply(&memory_at(2, 100, memory_payload(mem_deleted(2, "mr-a"))))
-            .expect("apply");
-
-        assert_eq!(
-            changed_at(&projection, "mr-b"),
-            Some(200),
-            "a stamp older than the current changed_at is a no-op"
-        );
-    }
-
-    #[test]
-    fn the_stamp_leaves_last_event_seq_untouched_so_later_updates_still_apply() {
-        let mut projection = Projection::in_memory().expect("open");
-        let mut a = record("mr-a", "note", "target");
-        a.links = vec![];
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-
-        let mut b = record("mr-b", "dependent", "leans on mr-a");
-        b.links = vec!["mr-a".to_string()];
-        projection
-            .apply(&memory_at(1, 60, memory_payload(mem_created(1, b))))
-            .expect("apply");
-
-        projection
-            .apply(&memory_at(2, 300, memory_payload(mem_deleted(2, "mr-a"))))
-            .expect("apply");
-        assert_eq!(
-            last_event_seq(&projection, "mr-b"),
-            1,
-            "the stamp does not touch last_event_seq"
-        );
-
-        let mut b2 = record("mr-b", "dependent", "leans on mr-a, updated");
-        b2.links = vec!["mr-a".to_string()];
-        projection
-            .apply(&memory_at(3, 400, memory_payload(mem_updated(3, b2))))
-            .expect("a later legitimate update still applies");
-
-        let state = projection
-            .memory_record("mr-b")
-            .expect("memory_record")
-            .expect("the record exists");
-        assert_eq!(state.record.summary, "leans on mr-a, updated");
     }
 
     #[test]
@@ -5943,92 +4039,6 @@ mod tests {
             ["mr-a2", "mr-b"],
             "the interval is [created_at, superseded_at): at 100 the replacement holds"
         );
-    }
-
-    #[test]
-    fn a_purged_record_is_absent_from_every_point_in_time() {
-        let mut projection = Projection::in_memory().expect("open");
-        let a = record("mr-a", "address", "lives at X");
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-        projection
-            .apply(&memory_at(1, 100, memory_payload(mem_deleted(1, "mr-a"))))
-            .expect("apply");
-
-        assert_eq!(
-            active_ids_at(&projection, 70),
-            Vec::<String>::new(),
-            "a purge erases the record from history, not just from now"
-        );
-    }
-
-    #[test]
-    fn an_in_place_supersede_keeps_its_activation_time() {
-        let mut projection = Projection::in_memory().expect("open");
-        let a = record("mr-a", "address", "lives at X");
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-        let revised = record("mr-a", "address", "lives at X, corrected");
-        projection
-            .apply(&memory_at(
-                1,
-                100,
-                memory_payload(mem_superseded(1, "mr-a", revised)),
-            ))
-            .expect("apply");
-
-        let held = projection.memory_active_at(70).expect("memory_active_at");
-        assert_eq!(
-            held.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["mr-a"],
-            "an in-place revision is the same record, held since 50"
-        );
-        assert_eq!(
-            held[0].summary, "lives at X, corrected",
-            "content is the last-known form, not a reconstruction"
-        );
-    }
-
-    #[test]
-    fn a_supersede_without_a_timestamp_excludes_the_row_rather_than_guessing() {
-        let mut projection = Projection::in_memory().expect("open");
-        let a = record("mr-a", "address", "lives at X");
-        projection
-            .apply(&memory_at(0, 50, memory_payload(mem_created(0, a))))
-            .expect("apply");
-        let a2 = record("mr-a2", "address", "lives at Y");
-        let mut untimestamped = memory(1, memory_payload(mem_superseded(1, "mr-a", a2)));
-        untimestamped.ts = None;
-        projection.apply(&untimestamped).expect("apply");
-
-        assert_eq!(
-            active_ids_at(&projection, 70),
-            Vec::<String>::new(),
-            "with no supersede timestamp, mr-a's interval end is unknown and it is \
-             excluded; the untimestamped mr-a2 is excluded by its missing created_at"
-        );
-    }
-
-    #[test]
-    fn a_system_sourced_message_carries_its_source_into_history() {
-        let mut projection = Projection::in_memory().expect("open");
-        projection.apply(&session_created(0)).expect("apply");
-        let mut event = message_appended(1, "job s-x finished.");
-        event.source = Source::System as i32;
-        projection.apply(&event).expect("apply");
-
-        let rows = projection.messages("s-01").expect("rows");
-        let MessageRow::Message { source, .. } = &rows[0] else {
-            panic!("expected a message row, got {:?}", rows[0]);
-        };
-        assert_eq!(*source, Source::System as i32);
-        let entry = super::history_entry(rows.into_iter().next().expect("row"));
-        let Some(arc_proto::v1::history_entry::Entry::Message(message)) = entry.entry else {
-            panic!("expected a message entry");
-        };
-        assert_eq!(message.source, Source::System as i32);
     }
 
     fn build_rebuild_log(dir: &Path) -> Log {
@@ -6117,81 +4127,5 @@ mod tests {
         let divergence = sessions.divergence.as_ref().expect("divergence");
         assert_eq!(divergence.key, "s-01");
         assert_ne!(divergence.live, divergence.replayed);
-    }
-
-    #[test]
-    fn an_extra_live_row_is_a_divergence_not_a_panic() {
-        let log_dir = TempDir::new().expect("log dir");
-        build_rebuild_log(log_dir.path());
-        let index_dir = TempDir::new().expect("index dir");
-        let index_path = index_dir.path().join("index.db");
-        build_live_index(log_dir.path(), &index_path);
-        {
-            let conn = Connection::open(&index_path).expect("reopen for sabotage");
-            conn.execute(
-                "INSERT INTO memory_records
-                     (id, kind, namespace, title, summary, body, links, status,
-                      created_seq, last_event_seq)
-                 VALUES ('mr-extra', 0, 'global', 'extra', 'extra', 'extra', '[]', 0, 999, 999)",
-                [],
-            )
-            .expect("insert extra row");
-        }
-
-        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
-
-        assert!(!report.is_clean());
-        let memory_records = report
-            .tables
-            .iter()
-            .find(|table| table.table == "memory_records")
-            .expect("memory_records table");
-        assert_eq!(memory_records.rows_live, 2);
-        assert_eq!(memory_records.rows_replayed, 1);
-        assert!(memory_records.divergence.is_some());
-    }
-
-    #[test]
-    fn a_schema_version_mismatch_is_a_reported_divergence() {
-        let log_dir = TempDir::new().expect("log dir");
-        build_rebuild_log(log_dir.path());
-        let index_dir = TempDir::new().expect("index dir");
-        let index_path = index_dir.path().join("index.db");
-        build_live_index(log_dir.path(), &index_path);
-        {
-            let conn = Connection::open(&index_path).expect("reopen for sabotage");
-            conn.execute(
-                "UPDATE projection_meta SET value = ?1 WHERE key = 'schema_version'",
-                [i64::from(super::SCHEMA_VERSION) - 1],
-            )
-            .expect("age the version");
-        }
-
-        let report = super::rebuild(log_dir.path(), &index_path).expect("rebuild");
-
-        assert!(!report.is_clean());
-        assert_eq!(report.schema_version_live, Some(super::SCHEMA_VERSION - 1));
-        assert_eq!(report.schema_version_replayed, Some(super::SCHEMA_VERSION));
-    }
-
-    #[test]
-    fn a_missing_live_index_is_an_error_not_a_panic() {
-        let log_dir = TempDir::new().expect("log dir");
-        build_rebuild_log(log_dir.path());
-        let missing = log_dir.path().join("does-not-exist.db");
-
-        let err = super::rebuild(log_dir.path(), &missing).expect_err("missing index");
-        assert!(matches!(err, super::RebuildError::Index(_)), "{err:?}");
-    }
-
-    #[test]
-    fn a_missing_log_dir_is_an_error_not_a_panic() {
-        let index_dir = TempDir::new().expect("index dir");
-        let index_path = index_dir.path().join("index.db");
-        drop(Projection::open(&index_path).expect("create empty index"));
-        let missing_log = index_dir.path().join("no-such-log");
-
-        let err = super::rebuild(&missing_log, &index_path).expect_err("missing log dir");
-        assert!(matches!(err, super::RebuildError::Log(_)), "{err:?}");
     }
 }

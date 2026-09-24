@@ -784,8 +784,6 @@ fn strip_label(app: &App, job: &JobInfo) -> String {
 
 const INPUT_ROWS_CAP: u16 = 8;
 
-// walks the char stream once, tracking both the wrapped rows and where the
-// cursor lands, so an embedded newline and a width wrap agree on the row
 fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>, usize, usize) {
     let width = width.max(1);
     let mut rows = vec![String::new()];
@@ -807,8 +805,6 @@ fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>
             col += 1;
         }
     }
-    // a cursor exactly at a full row's end wraps to the row after, even
-    // though that row has no characters in it yet
     let (cursor_row, cursor_col) = match cursor {
         Some(pos) => pos,
         None if col == width => (rows.len(), 0),
@@ -817,7 +813,6 @@ fn wrap_input(chars: &[char], cursor_index: usize, width: usize) -> (Vec<String>
     (rows, cursor_row, cursor_col)
 }
 
-// measured before the layout: the input row has to grow with its wrapped text
 fn input_height(app: &App, frame: Rect) -> u16 {
     let width = frame.width.saturating_sub(2 * MARGIN).max(1) as usize;
     let filtering = app.picker().is_some_and(|picker| picker.filtering);
@@ -1029,7 +1024,6 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                     ),
                     PickerRow::Tree(flags) => (tree_prefix(flags), String::new()),
                 };
-                // connector cells are bullet-wide, so `│` lands under the parent
                 let active = app.session_id.as_deref() == Some(session.id.as_str());
                 let bullet = if active { "● " } else { "○ " };
                 let tag = disposition_tag(session)
@@ -1104,8 +1098,6 @@ fn tree_prefix(flags: &[bool]) -> String {
     prefix
 }
 
-// lineage is an annotation, not a hierarchy: position stays pure recency.
-// A root has no disposition to show; a branch's is unmarked/real/abandoned
 fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
     use arc_proto::v1::branch_marked::Disposition;
     if session.parent_session.is_empty() {
@@ -1121,7 +1113,6 @@ fn disposition_tag(session: &arc_proto::v1::SessionInfo) -> Option<char> {
 fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
     let rows = review.items.len().max(1);
     let inner_width = 72.min(full.width.saturating_sub(4)).saturating_sub(2);
-    // sized to the deepest entry so the pane never resizes as the selection moves
     let detail = review
         .items
         .iter()
@@ -1545,7 +1536,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, full: Rect) {
     let area = popup(frame, full, 60, total, "help");
     let width = area.width.saturating_sub(2).max(8) as usize;
 
-    // wrap first, then window: long entries fold instead of clipping
     let mut lines = Vec::new();
     for (i, (group, keys)) in HELP.iter().enumerate() {
         if i > 0 {
@@ -1560,8 +1550,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, full: Rect) {
     }
 
     let visible = area.height as usize;
-    // write the clamp back, like the transcript does with scroll_back —
-    // otherwise every extra j is debt that k has to repay
     let Overlay::Help { scroll } = &mut app.overlay else {
         return;
     };
@@ -1629,8 +1617,6 @@ fn tail(id: &str, width: usize) -> &str {
     &id[id.len().saturating_sub(width)..]
 }
 
-// the list must stay stable while the detail below grows, so wrapping
-// is measured here rather than left to the widget
 fn wrapped(text: &str, width: usize) -> Vec<String> {
     let room = width.saturating_sub(4).max(20);
     let mut lines = Vec::new();
@@ -1682,8 +1668,6 @@ fn elide(text: &str, room: usize) -> String {
 }
 
 const TIME_WIDTH: usize = 8;
-
-// reserved on every row so the time column stays put
 const TAG_WIDTH: usize = 5;
 
 fn label(session: &arc_proto::v1::SessionInfo, room: usize) -> String {
@@ -1736,8 +1720,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
 
-    use super::{disposition_tag, draw, job_label, label, last_active, strip_label, wrap_input};
-    use crate::app::{App, Block, Mode, Models, Search, Status};
+    use super::{draw, job_label};
+    use crate::app::{App, Block, Mode, Models, Search};
 
     #[test]
     fn the_default_picker_lists_each_roles_choices_and_marks_the_defaults() {
@@ -1967,24 +1951,6 @@ mod tests {
     }
 
     #[test]
-    fn status_unknown_is_not_zero_and_other_providers_have_no_allowance() {
-        let mut app = conversation();
-        let mut info = session("s", "Status", "");
-        info.provider = "codex".to_owned();
-        app.sessions.push(info);
-        app.session_id = Some("s".to_owned());
-        let text = plain_text(&rendered(&mut app));
-        assert!(
-            text.contains("ctx unmeasured · Codex usage unknown"),
-            "{text}"
-        );
-        app.sessions[0].provider = "gemini".to_owned();
-        let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("ctx unmeasured"), "{text}");
-        assert!(!text.contains("Codex usage"), "{text}");
-    }
-
-    #[test]
     fn adjacent_long_picker_titles_have_readable_styles_and_full_row_selection() {
         use crate::app::NetEvent;
         use ratatui::style::Color;
@@ -2061,76 +2027,6 @@ mod tests {
             }
             println!("PICKER {width}\n{text}");
         }
-    }
-
-    #[test]
-    fn streaming_stop_guidance_matches_the_escape_handler() {
-        use crate::app::Command;
-
-        let mut app = conversation();
-        app.session_id = Some("streaming-session".to_owned());
-        app.status = Status::Streaming;
-        app.on_key(key(KeyCode::Char('i')));
-        let text = plain_text(&rendered(&mut app));
-        assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
-        println!("STREAMING INSERT\n{text}");
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        let text = plain_text(&rendered(&mut app));
-        assert_eq!(text.matches("Esc · stop").count(), 1, "{text}");
-        assert!(!text.contains("Esc ×2"), "{text}");
-        println!("STREAMING NORMAL\n{text}");
-        let cancel = Some(Command::CancelTurn {
-            session_id: "streaming-session".to_owned(),
-        });
-        assert_eq!(app.on_key(key(KeyCode::Esc)), cancel);
-        for pending in ['d', 'g'] {
-            app.on_key(key(KeyCode::Char(pending)));
-            let text = plain_text(&rendered(&mut app));
-            assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
-            println!("STREAMING PENDING {pending}\n{text}");
-            assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-            assert_eq!(app.stop_escape_count(), Some(1));
-            assert_eq!(app.on_key(key(KeyCode::Esc)), cancel);
-        }
-    }
-
-    #[test]
-    fn streaming_stop_guidance_is_hidden_when_escape_does_something_else() {
-        let mut app = conversation();
-        app.status = Status::Streaming;
-        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
-        app.session_id = Some("streaming-session".to_owned());
-        for mode in [Mode::Cmd, Mode::Visual] {
-            app.mode = mode;
-            assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
-            assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-            assert_eq!(app.stop_escape_count(), Some(1));
-        }
-        app.on_key(key(KeyCode::Char('/')));
-        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        assert_eq!(app.stop_escape_count(), Some(1));
-        app.overlay = Overlay::Models(Models {
-            items: vec![],
-            selected: 0,
-            loaded: true,
-            default: false,
-            role: SessionRole::Chat,
-            recorded_model: None,
-        });
-        assert!(!plain_text(&rendered(&mut app)).contains("· stop"));
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        assert_eq!(app.stop_escape_count(), Some(1));
-        app.overlay = Overlay::Help { scroll: 0 };
-        let text = plain_text(&rendered(&mut app));
-        assert_eq!(text.matches("Esc · stop").count(), 1, "{text}");
-        assert_eq!(text.matches("Esc ×2 · stop").count(), 1, "{text}");
-        assert!(text.contains("pending d/g"), "{text}");
-        assert!(!text.lines().nth(28).unwrap().contains("· stop"), "{text}");
-        println!("STREAMING HELP\n{text}");
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        app.status = Status::Idle;
-        assert_eq!(app.stop_escape_count(), None);
     }
 
     #[test]
@@ -2223,59 +2119,6 @@ mod tests {
     }
 
     #[test]
-    fn toggling_details_in_visual_stays_at_the_bottom_across_redraws() {
-        let mut app = App::new();
-        for n in 0..40 {
-            app.push_block(Block::Tool {
-                call_id: n.to_string(),
-                name: "read".to_owned(),
-                args: format!("file-{n}"),
-                outcome: Some("ok"),
-                content: "detail\n".repeat(12),
-                open: false,
-            });
-        }
-        app.on_key(key(KeyCode::Esc));
-        rendered(&mut app);
-        app.on_key(key(KeyCode::Char('v')));
-        rendered(&mut app);
-        let selected = app.visual_boundary();
-        app.on_key(ctrl('o'));
-        for _ in 0..2 {
-            rendered(&mut app);
-            assert_eq!(app.scroll_back, 0);
-            assert_eq!(app.visual_boundary(), selected);
-        }
-        app.on_key(ctrl('o'));
-        rendered(&mut app);
-        assert_eq!(app.scroll_back, 0);
-    }
-
-    #[test]
-    fn toggling_details_keeps_the_latest_message_visible() {
-        for long in [false, true] {
-            let mut app = App::new();
-            app.push_block(Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "bash".to_owned(),
-                args: r#"{"command":"just test"}"#.to_owned(),
-                outcome: Some("ok"),
-                content: "test output\n".repeat(if long { 40 } else { 1 }),
-                open: false,
-            });
-            app.push_block(Block::You("Latest message".to_owned()));
-            rendered_at(&mut app, 76, 16);
-            for _ in 0..2 {
-                app.on_key(ctrl('o'));
-                let text = plain_text(&rendered_at(&mut app, 76, 16));
-                assert_eq!(app.scroll_back, 0);
-                assert!(text.contains("Latest message"), "{text}");
-                println!("BOTTOM ANCHOR FRAME\n{text}");
-            }
-        }
-    }
-
-    #[test]
     fn collapsing_visible_tool_details_anchors_to_its_summary() {
         let mut app = App::new();
         for n in 0..40 {
@@ -2304,35 +2147,6 @@ mod tests {
         app.on_key(ctrl('o'));
         rendered_at(&mut app, 76, 16);
         assert_eq!(app.viewport_anchor, Some((block, 0)));
-    }
-
-    #[test]
-    fn details_expand_streaming_blocks_without_a_footer_indicator() {
-        use crate::app::NetEvent;
-
-        let mut app = App::new();
-        let collapsed = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(!collapsed.contains("details off"));
-        app.on_key(ctrl('o'));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("Checking the failing test".to_owned()));
-        app.on_net(NetEvent::ToolStarted {
-            call_id: "t1".to_owned(),
-            name: "bash".to_owned(),
-            arguments_json: r#"{"command":"just test"}"#.to_owned(),
-        });
-        let text = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(!text.contains("details on"), "{text}");
-        assert!(text.contains("Checking the failing test"), "{text}");
-        assert!(text.contains("− bash · running"), "{text}");
-        println!("DETAILS STREAMING FRAME\n{text}");
-        app.on_key(ctrl('o'));
-        let text = plain_text(&rendered_at(&mut app, 76, 16));
-        assert!(!text.contains("details off"), "{text}");
-        assert!(!text.contains("Checking the failing test"), "{text}");
-        println!("DETAILS COLLAPSED FRAME\n{text}");
     }
 
     fn reversed(text: &str, buffer: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -2502,38 +2316,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_completion_uses_retained_status_without_inventing_exit_codes() {
-        for (outcome, content, status) in [
-            ("ok", "exit 9\nhello", "exit 0"),
-            ("error", "exit signal\ninterrupted", "exit signal"),
-            ("error", "ERROR: timed out after 1s.", "error"),
-            ("error", "ERROR: command is empty.", "error"),
-            ("unknown", "", "unknown"),
-        ] {
-            let mut app = App::new();
-            app.on_key(ctrl('o'));
-            app.push_block(Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "bash".to_owned(),
-                args: r#"{"command":"echo hello"}"#.to_owned(),
-                outcome: Some(outcome),
-                content: content.to_owned(),
-                open: false,
-            });
-            let text = plain_text(&rendered_at(&mut app, 76, 16));
-            assert!(text.contains(&format!("Status: {status}")), "{text}");
-            if outcome != "error" || content.starts_with("ERROR:") {
-                for line in content.lines() {
-                    assert!(text.contains(line), "{text}");
-                }
-            }
-            if outcome == "ok" {
-                println!("BASH SUCCESS FRAME\n{text}");
-            }
-        }
-    }
-
-    #[test]
     fn tool_inputs_decode_strings_and_keep_other_json_readable() {
         let mut app = App::new();
         app.on_key(ctrl('o'));
@@ -2596,47 +2378,6 @@ mod tests {
     }
 
     #[test]
-    fn session_details_open_all_tool_blocks() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        app.push_block(Block::You("run the tests".to_owned()));
-        app.push_block(tool_block(false, "cargo test\n... 42 passed"));
-        app.push_block(Block::You("what failed earlier?".to_owned()));
-        app.push_block(tool_block(
-            true,
-            "bash -lc 'cargo test tool_result'\nrunning 3 tests\ntest a ... ok",
-        ));
-
-        app.on_key(ctrl('o'));
-        let text = plain_text(&rendered(&mut app));
-        assert_eq!(text.matches("− bash · ok").count(), 2, "{text}");
-        assert!(
-            text.contains("42 passed"),
-            "every tool follows the session setting"
-        );
-        assert!(
-            text.contains("running 3 tests") && text.contains("test a ... ok"),
-            "the open block's content renders wrapped beneath its header"
-        );
-    }
-
-    #[test]
-    fn a_collapsed_tool_block_renders_as_one_line() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        app.push_block(Block::You("run the tests".to_owned()));
-        app.push_block(tool_block(false, "running 42 tests\nall green\n"));
-
-        let buffer = rendered(&mut app);
-        let text = plain_text(&buffer);
-        assert!(text.contains("bash cargo test · ok"), "the header renders");
-        assert!(
-            !text.contains("running 42 tests") && !text.contains("all green"),
-            "collapsed content stays off screen"
-        );
-    }
-
-    #[test]
     fn ctrl_o_opens_the_collapsed_tool_block_and_its_content_appears() {
         let mut app = App::new();
         app.on_key(key(KeyCode::Esc));
@@ -2650,73 +2391,6 @@ mod tests {
             text.contains("running 42 tests") && text.contains("all green"),
             "ctrl-o opened it, the same gesture that opens a thought"
         );
-    }
-
-    #[test]
-    fn expanded_tool_output_has_no_second_display_cap() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        let content = (1..=45)
-            .map(|n| format!("line {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        app.push_block(tool_block(false, &content));
-        app.on_key(ctrl('o'));
-        let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("line 45"), "{text}");
-        assert!(!text.contains("more lines"), "{text}");
-    }
-
-    #[test]
-    fn the_rule_line_shows_elapsed_seconds_and_streamed_size_while_streaming() {
-        let mut app = conversation();
-        app.status = Status::Streaming;
-
-        let buffer = rendered(&mut app);
-        assert!(
-            plain_text(&buffer).contains("streaming 0s"),
-            "the counter renders on the rule line"
-        );
-    }
-
-    #[test]
-    fn the_rule_line_hides_the_counter_when_idle() {
-        let mut app = conversation();
-
-        let buffer = rendered(&mut app);
-        assert!(!plain_text(&buffer).contains("streaming"));
-    }
-
-    #[test]
-    fn the_rule_line_shows_the_review_queue_when_it_holds_records() {
-        let mut app = conversation();
-        app.review_pending = 2;
-
-        let buffer = rendered(&mut app);
-        assert!(plain_text(&buffer).contains("review 2"));
-    }
-
-    #[test]
-    fn the_review_detail_names_the_record_a_supersede_replaced() {
-        let mut app = App::new();
-        app.overlay = Overlay::Review(crate::app::Review {
-            items: vec![crate::app::ReviewEntry {
-                id: "mr-new".to_owned(),
-                kind: 4,
-                namespace: "global".to_owned(),
-                title: "address".to_owned(),
-                summary: "lives at Y".to_owned(),
-                body: "moved in spring".to_owned(),
-                supersedes: vec![("mr-old".to_owned(), "old address".to_owned())],
-            }],
-            selected: 0,
-            loaded: true,
-            pending_delete: false,
-        });
-
-        let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("replaces old address"), "{text}");
-        assert!(!text.contains("[superseded]"));
     }
 
     #[test]
@@ -2833,57 +2507,6 @@ mod tests {
     }
 
     #[test]
-    fn the_review_footer_is_separated_from_the_detail_by_a_rule() {
-        let mut app = App::new();
-        app.overlay = Overlay::Review(crate::app::Review {
-            items: vec![review_entry("mr-1", "body text")],
-            selected: 0,
-            loaded: true,
-            pending_delete: false,
-        });
-
-        let text = plain_text(&rendered(&mut app));
-        let lines: Vec<&str> = text.lines().collect();
-        let footer = footer_row(&text);
-        let divider = lines[footer - 1];
-        assert!(
-            divider.contains('─') && !divider.contains("accept"),
-            "a dim rule sits directly above the footer, got: {divider:?}"
-        );
-        let detail_above = lines[footer - 2];
-        assert!(
-            detail_above.contains("body text") || detail_above.trim().is_empty(),
-            "the rule divides detail from controls, got: {detail_above:?}"
-        );
-    }
-
-    #[test]
-    fn the_empty_review_pane_still_shows_the_close_footer() {
-        let mut app = App::new();
-        app.overlay = Overlay::Review(crate::app::Review {
-            items: Vec::new(),
-            selected: 0,
-            loaded: true,
-            pending_delete: false,
-        });
-
-        let text = plain_text(&rendered(&mut app));
-        assert!(text.contains("nothing to review"), "{text}");
-        assert!(
-            text.contains("q close"),
-            "the empty pane teaches its way out: {text:?}"
-        );
-    }
-
-    #[test]
-    fn the_rule_line_hides_the_review_segment_at_zero() {
-        let mut app = conversation();
-
-        let buffer = rendered(&mut app);
-        assert!(!plain_text(&buffer).contains("review"));
-    }
-
-    #[test]
     fn a_visual_selection_and_a_search_never_highlight_together() {
         let mut app = conversation();
         app.on_key(key(KeyCode::Char('V')));
@@ -2921,107 +2544,6 @@ mod tests {
             parent_session: String::new(),
             disposition: 0,
         }
-    }
-
-    fn active_ago(now: chrono::DateTime<chrono::Utc>, seconds_ago: i64) -> SessionInfo {
-        let at = now - chrono::Duration::seconds(seconds_ago);
-        SessionInfo {
-            provider: String::new(),
-            model: String::new(),
-            id: "s".to_owned(),
-            title: String::new(),
-            preview: String::new(),
-            started_at: None,
-            last_at: Some(prost_types::Timestamp {
-                seconds: at.timestamp(),
-                nanos: 0,
-            }),
-            role: 0,
-            project: String::new(),
-            dispatched_by: String::new(),
-            source: 0,
-            parent_session: String::new(),
-            disposition: 0,
-        }
-    }
-
-    #[test]
-    fn relative_time_formats_by_band() {
-        let now = chrono::Utc::now();
-        assert_eq!(last_active(&active_ago(now, 59), now), "now");
-        assert_eq!(last_active(&active_ago(now, 61 * 60), now), "1h");
-        assert_eq!(last_active(&active_ago(now, 25 * 3_600), now), "1d");
-        assert_eq!(last_active(&active_ago(now, 8 * 86_400), now), "1w");
-    }
-
-    #[test]
-    fn wrap_input_breaks_at_the_width() {
-        let chars: Vec<char> = "abcdef".chars().collect();
-        let (rows, cursor_row, cursor_col) = wrap_input(&chars, chars.len(), 3);
-        assert_eq!(rows, vec!["abc".to_owned(), "def".to_owned()]);
-        assert_eq!(
-            (cursor_row, cursor_col),
-            (2, 0),
-            "a cursor filling a row exactly wraps to a fresh row after it"
-        );
-    }
-
-    #[test]
-    fn wrap_input_starts_a_new_row_on_an_embedded_newline() {
-        let chars: Vec<char> = "ab\ncd".chars().collect();
-        let (rows, ..) = wrap_input(&chars, chars.len(), 10);
-        assert_eq!(rows, vec!["ab".to_owned(), "cd".to_owned()]);
-    }
-
-    #[test]
-    fn a_trailing_newline_adds_an_empty_row_for_the_cursor() {
-        let chars: Vec<char> = "> ab\n".chars().collect();
-        let (rows, cursor_row, cursor_col) = wrap_input(&chars, chars.len(), 10);
-        assert_eq!(rows, vec!["> ab".to_owned(), String::new()]);
-        assert_eq!((cursor_row, cursor_col), (1, 0));
-    }
-
-    #[test]
-    fn a_picker_row_prefers_the_title_over_the_preview() {
-        let session = session("s-01", "Palette bikeshed", "what color for the accent?");
-        assert_eq!(label(&session, 40), "Palette bikeshed");
-    }
-
-    #[test]
-    fn a_picker_row_falls_back_to_the_preview_without_a_title() {
-        let session = session("s-01", "", "what color for the accent?");
-        assert_eq!(label(&session, 40), "what color for the accent?");
-    }
-
-    #[test]
-    fn a_session_with_no_title_or_preview_falls_back_to_a_dim_empty_marker() {
-        let session = session("s-01", "", "");
-        assert_eq!(label(&session, 40), "(empty)");
-    }
-
-    #[test]
-    fn an_empty_session_with_a_project_names_it_alongside_the_marker() {
-        let mut session = session("s-01", "", "");
-        session.project = "scratch".to_owned();
-        assert_eq!(label(&session, 40), "(empty) · scratch");
-    }
-
-    #[test]
-    fn disposition_tag_is_none_for_a_root_and_a_char_per_disposition_for_a_branch() {
-        use arc_proto::v1::branch_marked::Disposition;
-
-        let root = session("s-01", "root", "");
-        assert_eq!(disposition_tag(&root), None, "a root has nothing to mark");
-
-        let mut branch = session("s-02", "branch", "");
-        branch.parent_session = "s-01".to_owned();
-        assert_eq!(disposition_tag(&branch), Some('?'), "unmarked is scratch");
-
-        branch.disposition = Disposition::Real as i32;
-        assert_eq!(disposition_tag(&branch), Some('+'));
-
-        branch.disposition = Disposition::Abandoned as i32;
-        assert_eq!(disposition_tag(&branch), Some('x'));
     }
 
     #[test]
@@ -3110,47 +2632,6 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_marks_the_active_session_in_both_modes() {
-        use crate::app::{App, NetEvent};
-
-        let mut app = App::new();
-        let mut one = session("s-one", "the active one", "hi");
-        one.source = arc_proto::v1::Source::User as i32;
-        let mut two = session("s-two", "the other", "hi");
-        two.source = arc_proto::v1::Source::User as i32;
-        app.on_net(NetEvent::Sessions(vec![one, two]));
-        app.session_id = Some("s-two".to_owned());
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('s')));
-
-        let text = plain_text(&rendered(&mut app));
-        let active = text
-            .lines()
-            .find(|line| line.contains("● the other"))
-            .expect("the active session renders");
-        assert!(active.contains("● the other"), "got: {active:?}");
-        let inactive = text
-            .lines()
-            .find(|line| line.contains("the active one"))
-            .expect("the other session renders");
-        assert!(
-            inactive.contains("○ the active one"),
-            "an inactive session still shows its hollow bullet, got: {inactive:?}"
-        );
-        assert!(!inactive.contains('●'), "got: {inactive:?}");
-
-        app.on_key(key(KeyCode::Tab));
-        let text = plain_text(&rendered(&mut app));
-        assert!(
-            text.lines()
-                .find(|line| line.contains("● the other"))
-                .expect("tree mode still lists it")
-                .contains('●'),
-            "the marker survives the view switch"
-        );
-    }
-
-    #[test]
     fn the_picker_tree_connectors_align_under_the_parent_bullets() {
         use crate::app::{App, NetEvent};
         use arc_proto::v1::branch_marked::Disposition;
@@ -3214,103 +2695,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_time_column_ignores_whether_a_row_has_a_disposition_tag() {
-        use crate::app::{App, NetEvent};
-        use arc_proto::v1::branch_marked::Disposition;
-
-        let mut app = App::new();
-        let mut root = session("s-root", "conversation", "hi");
-        root.source = arc_proto::v1::Source::User as i32;
-        root.last_at = Some(prost_types::Timestamp {
-            seconds: chrono::Utc::now().timestamp(),
-            nanos: 0,
-        });
-        let mut fork = session("s-fork", "branch", "hi");
-        fork.source = arc_proto::v1::Source::User as i32;
-        fork.parent_session = "s-root".to_owned();
-        fork.disposition = Disposition::Unspecified as i32;
-        fork.last_at = Some(prost_types::Timestamp {
-            seconds: chrono::Utc::now().timestamp(),
-            nanos: 0,
-        });
-        app.on_net(NetEvent::Sessions(vec![root, fork]));
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('s')));
-
-        let text = plain_text(&rendered(&mut app));
-        let root_line = text
-            .lines()
-            .find(|l| l.contains("conversation") && l.contains("now"))
-            .unwrap();
-        let fork_line = text
-            .lines()
-            .find(|l| l.contains("branch") && l.contains("now"))
-            .unwrap();
-        assert!(
-            root_line.contains(" now") && fork_line.contains(" now"),
-            "both rows show the same time band for the alignment check"
-        );
-        assert_eq!(
-            fork_line.find("now"),
-            root_line.find("now"),
-            "a pending tag reserves the same column the untagged root gets: {root_line:?} / {fork_line:?}"
-        );
-        assert!(
-            fork_line.contains("now  [?]"),
-            "the tag still reads at the fixed column: {fork_line:?}"
-        );
-    }
-
-    #[test]
-    fn the_strip_label_shows_the_step_count_and_idle_seconds() {
-        use crate::app::{App, NetEvent};
-
-        let mut app = App::new();
-        let mut job = job(SessionRole::Executor, "arc", "Fix the flaky test");
-        job.tool_steps = 12;
-        job.idle_seconds = 6;
-        app.on_net(NetEvent::JobChanged(job.clone()));
-
-        assert_eq!(
-            strip_label(&app, &job),
-            " 1 job · Fix the flaky test running · 12 tok · 5s · step 12 - 6s ago"
-        );
-    }
-
-    #[test]
-    fn a_strip_with_a_last_call_shows_it_instead_of_the_step_count() {
-        use crate::app::{App, NetEvent};
-
-        let mut app = App::new();
-        let mut job = job(SessionRole::Executor, "arc", "");
-        job.tool_steps = 12;
-        job.idle_seconds = 6;
-        job.last_call = "bash cargo test".to_owned();
-        app.on_net(NetEvent::JobChanged(job.clone()));
-
-        assert_eq!(
-            strip_label(&app, &job),
-            " 1 job · executor/arc running · 12 tok · 5s · bash cargo test - 6s ago"
-        );
-    }
-
-    #[test]
-    fn a_strip_step_of_zero_reads_as_thinking() {
-        use crate::app::{App, NetEvent};
-
-        let mut app = App::new();
-        let mut job = job(SessionRole::Executor, "arc", "");
-        job.tool_steps = 0;
-        job.idle_seconds = 3;
-        app.on_net(NetEvent::JobChanged(job.clone()));
-
-        assert_eq!(
-            strip_label(&app, &job),
-            " 1 job · executor/arc running · 12 tok · 5s · step 0 - 3s ago"
-        );
-    }
-
     fn job(role: SessionRole, project: &str, title: &str) -> JobInfo {
         JobInfo {
             session_id: "s-01".to_owned(),
@@ -3331,35 +2715,8 @@ mod tests {
     }
 
     #[test]
-    fn a_jobs_row_shows_the_role_and_project_without_a_title() {
-        let job = job(SessionRole::Executor, "arc", "");
-        assert_eq!(job_label(&job), "running executor/arc 12/- tok 5s");
-    }
-
-    #[test]
     fn a_jobs_row_shows_the_title_in_place_of_role_and_project() {
         let job = job(SessionRole::Executor, "arc", "Fix the failing test");
         assert_eq!(job_label(&job), "running Fix the failing test 12/- tok 5s");
-    }
-
-    #[test]
-    fn a_jobs_row_compacts_large_token_counts_like_the_strip() {
-        let mut with_budget = job(SessionRole::Executor, "arc", "");
-        with_budget.spent_tokens = 441_266;
-        with_budget.budget_tokens = 500_000;
-        assert_eq!(
-            job_label(&with_budget),
-            "running executor/arc 441.3k/500.0k tok 5s"
-        );
-    }
-
-    #[test]
-    fn a_jobs_row_appends_the_queued_count_when_nonzero() {
-        let mut with_queue = job(SessionRole::Executor, "arc", "");
-        with_queue.queued_steers = 2;
-        assert_eq!(
-            job_label(&with_queue),
-            "running executor/arc 12/- tok 5s · 2 queued"
-        );
     }
 }

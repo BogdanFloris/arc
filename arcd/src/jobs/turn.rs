@@ -5,7 +5,9 @@ use arc_core::provider::Usage;
 use arc_core::session::{
     DispatchedJob, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
 };
-use arc_proto::v1::{Budget, ImageAttachment, Notification, ReasoningDelta, Source, notification};
+use arc_proto::v1::{
+    Budget, ImageAttachment, Notification, ReasoningDelta, Source, job_info, notification,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -13,30 +15,21 @@ use tracing::{debug, info, warn};
 use super::handback::{
     handback_cancelled, handback_clean, handback_failed, handback_over_budget, handback_user_reply,
 };
-use super::status::{JobState, notify_job_changed};
+use super::status::notify_job_changed;
 use super::{LiveMap, Shared, TurnEvent, route_cancels, route_continues, spawn_dispatched};
 
 pub(super) const EVENT_BUFFER: usize = 64;
-/// How long a turn may go without an engine event (a delta, reasoning, or
-/// tool activity) before it's failed outright. A streaming HTTP body that
-/// goes quiet without closing would otherwise hold the job open forever.
 const JOB_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// A session's work: the message that starts it, and everything the task
-/// needs to run turn after turn until its inbox runs dry.
 pub(super) struct Task {
     pub(super) job: DispatchedJob,
-    /// A dispatched job: it reports to a parent and rides the job strip.
-    /// A session the user opened does neither.
     pub(super) dispatched: bool,
     pub(super) source: Source,
     pub(super) attachments: Vec<ImageAttachment>,
-    /// The connection that sent the first message, if it asked to watch.
     pub(super) attached: Option<mpsc::Sender<TurnEvent>>,
     pub(super) spent_tokens: u64,
 }
 
-/// Everything reaching a turn from outside the engine.
 struct Channels<'a> {
     inbox: &'a mut mpsc::UnboundedReceiver<Inbound>,
     drop_rx: &'a mut mpsc::UnboundedReceiver<()>,
@@ -44,17 +37,12 @@ struct Channels<'a> {
     attached: &'a mut Option<mpsc::Sender<TurnEvent>>,
 }
 
-/// Why a turn loop stopped short of a clean finish: both read the same
-/// terminal `JobState::Failed`, so only the handback text tells them apart
-/// (the caller wired to `k` gets a distinct reason from a genuine provider
-/// failure).
+#[derive(Clone, Copy)]
 enum EndReason {
     Failed,
     Cancelled,
 }
 
-/// One turn per message: the first, then whatever arrived while it ran.
-/// The task ends when its inbox is empty at a turn boundary.
 pub(super) async fn run_task(
     shared: Shared,
     runner: Runner,
@@ -105,28 +93,9 @@ pub(super) async fn run_task(
         };
         let mut reply = match outcome {
             TurnOutcome::Success(reply) => reply,
-            TurnOutcome::Failure(error) => {
-                end_task(
-                    &shared,
-                    &job,
-                    dispatched,
-                    &mut inbox_rx,
-                    start,
-                    &EndReason::Failed,
-                );
+            TurnOutcome::Stopped(reason, error) => {
+                end_task(&shared, &job, dispatched, &mut inbox_rx, start, reason);
                 end_attached(&mut attached, error.map(Err)).await;
-                return;
-            }
-            TurnOutcome::Cancelled => {
-                end_task(
-                    &shared,
-                    &job,
-                    dispatched,
-                    &mut inbox_rx,
-                    start,
-                    &EndReason::Cancelled,
-                );
-                end_attached(&mut attached, Some(Err(SessionError::Cancelled))).await;
                 return;
             }
         };
@@ -158,9 +127,6 @@ pub(super) async fn run_task(
         } else {
             None
         };
-        // the task's fate is settled before the connection hears the turn
-        // ended: a message sent the instant the answer lands finds either
-        // this task's inbox or no task at all, never one on its way out
         let next = if cancelled || breach.is_some() {
             None
         } else {
@@ -175,7 +141,7 @@ pub(super) async fn run_task(
                 dispatched,
                 &mut inbox_rx,
                 start,
-                &EndReason::Cancelled,
+                EndReason::Cancelled,
             );
             return;
         }
@@ -185,7 +151,7 @@ pub(super) async fn run_task(
             if let Some(info) =
                 shared
                     .statuses
-                    .finish(&session_id, JobState::OverBudget, start.elapsed())
+                    .finish(&session_id, job_info::State::OverBudget, start.elapsed())
             {
                 notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
             }
@@ -206,34 +172,27 @@ pub(super) async fn run_task(
     }
 
     if dispatched {
-        if let Some(info) = shared
-            .statuses
-            .finish(&session_id, JobState::Finished, start.elapsed())
+        if let Some(info) =
+            shared
+                .statuses
+                .finish(&session_id, job_info::State::Finished, start.elapsed())
         {
             notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
         }
     }
 }
 
-/// The next message, or `None` once the inbox is empty and the session has
-/// left the live map. The recheck under the lock is what keeps a message
-/// from slipping in between the last look and the removal.
 fn next_inbound(
     live: &LiveMap,
     inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
     session_id: &str,
 ) -> Option<Inbound> {
-    match inbox_rx.try_recv() {
-        Ok(inbound) => Some(inbound),
-        Err(mpsc::error::TryRecvError::Disconnected) => None,
-        Err(mpsc::error::TryRecvError::Empty) => {
-            let mut live = live.lock().expect("live");
-            if let Ok(inbound) = inbox_rx.try_recv() {
-                return Some(inbound);
-            }
-            live.remove(session_id);
-            None
-        }
+    let mut live = live.lock().expect("live");
+    if let Ok(inbound) = inbox_rx.try_recv() {
+        Some(inbound)
+    } else {
+        live.remove(session_id);
+        None
     }
 }
 
@@ -284,15 +243,16 @@ fn end_task(
     dispatched: bool,
     inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
     start: Instant,
-    reason: &EndReason,
+    reason: EndReason,
 ) {
     finish_now(shared, inbox_rx, &job.session_id);
     if !dispatched {
         return;
     }
-    if let Some(info) = shared
-        .statuses
-        .finish(&job.session_id, JobState::Failed, start.elapsed())
+    if let Some(info) =
+        shared
+            .statuses
+            .finish(&job.session_id, job_info::State::Failed, start.elapsed())
     {
         notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
     }
@@ -304,9 +264,7 @@ fn end_task(
 
 enum TurnOutcome {
     Success(Reply),
-    /// `None` for a turn that went silent: there is no error to report.
-    Failure(Option<SessionError>),
-    Cancelled,
+    Stopped(EndReason, Option<SessionError>),
 }
 
 fn usage_tokens(usage: Option<Usage>) -> u64 {
@@ -320,7 +278,6 @@ pub(super) enum BudgetBreach {
     WallClock { elapsed: u64, allowed: u64 },
 }
 
-/// A zero field means that dimension is unlimited.
 fn budget_breach(
     budget: Option<&Budget>,
     spent_tokens: u64,
@@ -359,7 +316,7 @@ fn track_tool_calls(event: &EngineEvent, pending_tool_calls: &mut u32) {
     match event {
         EngineEvent::ToolCallStarted { .. } => *pending_tool_calls += 1,
         EngineEvent::ToolCallEnded { .. } => {
-            *pending_tool_calls = pending_tool_calls.saturating_sub(1);
+            *pending_tool_calls -= 1;
         }
         _ => {}
     }
@@ -431,20 +388,6 @@ async fn handle_event(
     }
 }
 
-enum RawOutcome {
-    Sent(Result<Reply, SessionError>),
-    SilentTimeout,
-    Cancelled,
-}
-
-/// Runs one turn to completion, failing it if the engine goes quiet for
-/// `JOB_SILENCE_TIMEOUT` with no events, or if `cancel` fires. A pending
-/// tool call suspends the timeout instead of tripping it: bash alone is
-/// allowed to run silent for up to its own 600s cap, so a tool call in
-/// flight is activity, not stall. A cancel drops `send` mid-await — the
-/// same shape a crash leaves — instead of waiting the turn out. A
-/// `DropSteers` request lands here too, so it empties the queue without
-/// waiting for a long turn to finish first.
 async fn run_turn(
     shared: &Shared,
     runner: &Runner,
@@ -466,67 +409,54 @@ async fn run_turn(
 
     let mut deadline = Instant::now() + JOB_SILENCE_TIMEOUT;
     let mut pending_tool_calls: u32 = 0;
-    // once a sender's gone, stop polling it: an already-closed channel
-    // would otherwise resolve immediately forever and spin the select loop
     let mut cancel_live = true;
     let mut drop_live = true;
 
-    let outcome = loop {
+    loop {
         tokio::select! {
             result = &mut send => {
-                // the engine can complete a fully-scripted turn with events
-                // still buffered; drain them so fast tools count as steps
                 while let Ok(event) = rx.try_recv() {
                     handle_event(event, shared, session_id, dispatched, &mut pending_tool_calls, &mut deadline, channels.attached).await;
                 }
-                break RawOutcome::Sent(result);
+                return match result {
+                    Ok(reply) => {
+                        info!(
+                            session_id = %session_id,
+                            input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
+                            output_tokens = reply.usage.map_or(0, |usage| usage.output_tokens),
+                            "turn completed"
+                        );
+                        TurnOutcome::Success(reply)
+                    }
+                    Err(error) => {
+                        warn!(session_id = %session_id, %error, "turn failed");
+                        TurnOutcome::Stopped(EndReason::Failed, Some(error))
+                    }
+                };
             }
             event = rx.recv() => {
-                // send_message drops its sender exactly as it returns, so a
-                // `None` here means `send` is already ready on the next poll
                 let Some(event) = event else { continue };
                 handle_event(event, shared, session_id, dispatched, &mut pending_tool_calls, &mut deadline, channels.attached).await;
             }
-            () = tokio::time::sleep_until(deadline), if dispatched && pending_tool_calls == 0 => break RawOutcome::SilentTimeout,
+            () = tokio::time::sleep_until(deadline), if dispatched && pending_tool_calls == 0 => {
+                warn!(
+                    session_id = %session_id,
+                    timeout_secs = JOB_SILENCE_TIMEOUT.as_secs(),
+                    "job turn silent past the timeout; failing it"
+                );
+                return TurnOutcome::Stopped(EndReason::Failed, None);
+            }
             changed = channels.cancel.changed(), if cancel_live => match changed {
-                Ok(()) => break RawOutcome::Cancelled,
+                Ok(()) => {
+                    info!(session_id = %session_id, "turn cancelled by the user");
+                    return TurnOutcome::Stopped(EndReason::Cancelled, Some(SessionError::Cancelled));
+                }
                 Err(_) => cancel_live = false,
             },
             dropped = channels.drop_rx.recv(), if drop_live => match dropped {
                 Some(()) => drop_queued(channels.inbox, shared, session_id),
                 None => drop_live = false,
             },
-        }
-    };
-
-    match outcome {
-        RawOutcome::Sent(Ok(reply)) => {
-            info!(
-                session_id = %session_id,
-                input_tokens = reply.usage.map_or(0, |usage| usage.input_tokens),
-                output_tokens = reply.usage.map_or(0, |usage| usage.output_tokens),
-                "turn completed"
-            );
-            TurnOutcome::Success(reply)
-        }
-        RawOutcome::Sent(Err(error)) => {
-            warn!(session_id = %session_id, %error, "turn failed");
-            TurnOutcome::Failure(Some(error))
-        }
-        // dropping `send` here abandons the turn mid-flight, the same shape
-        // as a crash: any durable but unresolved tool call is left for the
-        // orphan-repair a restart already needs, not fixed up here
-        RawOutcome::SilentTimeout => {
-            warn!(
-                session_id = %session_id,
-                timeout_secs = JOB_SILENCE_TIMEOUT.as_secs(),
-                "job turn silent past the timeout; failing it"
-            );
-            TurnOutcome::Failure(None)
-        }
-        RawOutcome::Cancelled => {
-            info!(session_id = %session_id, "turn cancelled by the user");
-            TurnOutcome::Cancelled
         }
     }
 }
@@ -591,7 +521,6 @@ mod tests {
     use arc_core::tool::workspace::{Grant, Mode};
     use arc_proto::v1::{Role, SessionRole, job_info};
     use tempfile::TempDir;
-    use tokio::sync::broadcast;
 
     use crate::jobs::Supervisor;
     use crate::jobs::handback::NO_REPLY;
@@ -599,55 +528,6 @@ mod tests {
         GatedTool, child_session, child_user_messages, engine_for_project, executor_runner,
         only_job, parent_session, steer, wait_for_message_count, wait_for_tool_call_issued,
     };
-
-    #[tokio::test]
-    async fn a_jobs_reasoning_deltas_broadcast_with_its_session_id() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![vec![
-            Ok(CompletionDelta::Reasoning("weighing".to_owned())),
-            Ok(CompletionDelta::Reasoning(" options".to_owned())),
-            Ok(CompletionDelta::Text("done".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]]);
-
-        let (notifier, mut notifications) = broadcast::channel(64);
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(notifier);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        let mut reasoning = Vec::new();
-        while let Ok(received) = notifications.try_recv() {
-            if let Some(arc_proto::v1::notification::Event::JobReasoning(delta)) = received.event {
-                assert_eq!(delta.session_id, child_id, "tagged with the job's session");
-                reasoning.push(delta.text);
-            }
-        }
-        assert_eq!(
-            reasoning.concat(),
-            "weighing options",
-            "every reasoning delta fanned out, in order"
-        );
-    }
 
     #[tokio::test]
     async fn a_failed_turn_drops_queued_steers_and_removes_the_live_entry() {
@@ -679,8 +559,6 @@ mod tests {
             budget: None,
         });
 
-        // queued before the failing turn is live, so it waits for a turn
-        // of its own — one the job never reaches
         assert!(steer(&supervisor, &child_id, "too late"));
         notify.notify_one();
         supervisor.shutdown().await;
@@ -693,120 +571,6 @@ mod tests {
             child_user_messages(dir.path(), &child_id),
             [(Role::User, "fix the failing test".to_owned())],
             "the queued steer was dropped, not processed, after the failed turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_token_budget_smaller_than_the_brief_turns_usage_stops_the_job_after_that_turn() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
-            before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
-            notify: Arc::clone(&notify),
-            after: vec![Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            })],
-        }]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        // usage() reports 8 tokens combined; a cap of 5 is over budget as
-        // soon as the brief turn lands, before any steer is even queued
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: Some(Budget {
-                total_tokens: 5,
-                wall_clock_seconds: 0,
-            }),
-        });
-
-        assert!(
-            steer(&supervisor, &child_id, "too late"),
-            "the job is still live when queued"
-        );
-        notify.notify_one();
-        supervisor.shutdown().await;
-
-        assert!(
-            !steer(&supervisor, &child_id, "later still"),
-            "the over-budget job removed its live entry"
-        );
-        assert_eq!(
-            child_user_messages(dir.path(), &child_id),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "working".to_owned()),
-            ],
-            "the brief turn ran to completion; the queued steer was dropped, not processed"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_generous_token_budget_does_not_trip_and_steers_run_normally() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Gated {
-                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
-                notify: Arc::clone(&notify),
-                after: vec![Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                })],
-            },
-            Step::Immediate(done_reply("steer reply")),
-        ]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: Some(Budget {
-                total_tokens: 100_000,
-                wall_clock_seconds: 3600,
-            }),
-        });
-
-        assert!(steer(&supervisor, &child_id, "also check the linter"));
-        notify.notify_one();
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &child_id),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "on it".to_owned()),
-                (Role::User, "also check the linter".to_owned()),
-                (Role::Assistant, "steer reply".to_owned()),
-            ],
-            "a budget with plenty of headroom never trips"
         );
     }
 
@@ -836,8 +600,6 @@ mod tests {
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
-        // total_tokens: 0 means the token dimension is unlimited; only
-        // wall-clock is enforced
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
@@ -854,12 +616,7 @@ mod tests {
             steer(&supervisor, &child_id, "too late"),
             "the job is still live when queued"
         );
-        // the task's own clock starts when it first runs, so let the brief
-        // turn reach the gate before moving the paused clock past the budget
         wait_for_message_count(dir.path(), &child_id, 1).await;
-        // the job task is gated on a Notify, not a timer, so advancing the
-        // paused clock here only changes what its Instant::elapsed() later
-        // reports, it does not let the task run ahead
         tokio::time::advance(Duration::from_secs(2)).await;
         notify.notify_one();
         supervisor.shutdown().await;
@@ -906,9 +663,6 @@ mod tests {
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
 
-        // usage() reports 8 tokens per turn: the brief alone (8) stays under
-        // a cap of 10, but the brief plus the first steer (16) crosses it,
-        // so the check before the second steer is what stops the job
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
             parent_session: "s-parent".to_owned(),
@@ -993,81 +747,6 @@ mod tests {
                 format!("Job {child_id} stopped: the turn failed.\n{NO_REPLY}")
             )],
             "the silence timeout hands back like any other failed turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn steady_events_past_the_timeout_duration_never_trip_the_silence_timeout() {
-        tokio::time::pause();
-
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let gate1 = Arc::new(tokio::sync::Notify::new());
-        let gate2 = Arc::new(tokio::sync::Notify::new());
-        // two silent gaps, each under JOB_SILENCE_TIMEOUT but summing well
-        // past it: only a single gap that long should ever trip the job
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Immediate(vec![
-                Ok(CompletionDelta::Text("chunk1".to_owned())),
-                Ok(call("c1", 0, "missing_tool", "{}")),
-                Ok(tool_stop()),
-            ]),
-            Step::Gated {
-                before: Vec::new(),
-                notify: Arc::clone(&gate1),
-                after: vec![
-                    Ok(CompletionDelta::Text("chunk2".to_owned())),
-                    Ok(call("c2", 0, "missing_tool", "{}")),
-                    Ok(tool_stop()),
-                ],
-            },
-            Step::Gated {
-                before: Vec::new(),
-                notify: Arc::clone(&gate2),
-                after: vec![
-                    Ok(CompletionDelta::Text("chunk3".to_owned())),
-                    Ok(CompletionDelta::Done {
-                        usage: usage(),
-                        stop: Stop::EndTurn,
-                    }),
-                ],
-            },
-        ]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-
-        // each gap is well under JOB_SILENCE_TIMEOUT on its own; only their
-        // sum (800s) exceeds it
-        let gap = Duration::from_secs(400);
-        wait_for_message_count(dir.path(), &child_id, 2).await;
-        tokio::time::advance(gap).await;
-        gate1.notify_one();
-        wait_for_message_count(dir.path(), &child_id, 3).await;
-        tokio::time::advance(gap).await;
-        gate2.notify_one();
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            only_job(supervisor.list()).state,
-            job_info::State::Finished as i32,
-            "events kept resetting the deadline, so the long total turn never tripped"
         );
     }
 

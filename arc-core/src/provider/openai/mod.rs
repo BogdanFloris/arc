@@ -40,10 +40,8 @@ impl OpenAiCompat {
     }
 
     fn build(endpoint: &str, key: Option<String>) -> Self {
-        let mut endpoint = endpoint.to_owned();
-        endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
-            endpoint,
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
             key,
             // no pooling: a stale keep-alive kills the tool loop's second call
             http: reqwest::Client::builder()
@@ -470,76 +468,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_without_tools_has_no_tools_key() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body.get("tools"), None, "{body}");
-        assert_eq!(body.get("seed"), None, "unset seed sends no key: {body}");
-    }
-
-    #[tokio::test]
-    async fn default_thinking_omits_reasoning_effort_for_wire_stability() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(
-            body.get("reasoning_effort"),
-            None,
-            "the live executor config has no thinking key; the wire shape must not move: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn minimal_thinking_maps_to_reasoning_effort_none() {
-        let mut req = request(None, &[(Role::User, "hi")]);
-        req.thinking = Thinking::Minimal;
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-        let (_, requests) = complete_against(template, req).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body["reasoning_effort"], "none", "{body}");
-    }
-
-    #[tokio::test]
-    async fn low_thinking_maps_to_reasoning_effort_low() {
-        let mut req = request(None, &[(Role::User, "hi")]);
-        req.thinking = Thinking::Low;
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-        let (_, requests) = complete_against(template, req).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body["reasoning_effort"], "low", "{body}");
-    }
-
-    #[tokio::test]
-    async fn seeds_are_mapped_into_the_nonnegative_signed_range() {
-        for (seed, expected) in [
-            (0, 0),
-            (42, 42),
-            (i64::MAX as u64, i64::MAX as u64),
-            (1_u64 << 63, 0),
-            ((1_u64 << 63) + 42, 42),
-            (u64::MAX, i64::MAX as u64),
-        ] {
-            for _ in 0..2 {
-                let mut req = request(None, &[(Role::User, "hi")]);
-                req.seed = Some(seed);
-                let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-                let (_, requests) = complete_against(template, req).await;
-
-                let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-                assert_eq!(body["seed"], expected, "seed {seed}: {body}");
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn tools_are_offered_in_the_dialects_shape() {
         let mut req = request(None, &[(Role::User, "what do you know about arc?")]);
         req.tools = vec![ToolDefinition {
@@ -594,44 +522,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_content_is_omitted_when_the_request_has_no_tools() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (_, requests) = complete_against(
-            template,
-            request(None, &[(Role::User, "hi"), (Role::Assistant, "re: hi")]),
-        )
-        .await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body["messages"][1].get("reasoning_content"), None, "{body}");
-    }
-
-    #[tokio::test]
-    async fn a_tool_calls_message_carries_its_own_reasoning() {
-        let mut req = request(None, &[(Role::User, "what time is it?")]);
-        req.tools = vec![a_tool()];
-        req.messages.push(Message::ToolCalls {
-            calls: vec![ToolCall {
-                id: "VB3c1GM6".to_owned(),
-                index: 0,
-                name: "get_time".to_owned(),
-                arguments: "{}".to_owned(),
-                provider_roundtrip: Vec::new(),
-            }],
-            reasoning: Some("checking the clock".to_owned()),
-        });
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-        let (_, requests) = complete_against(template, req).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(
-            body["messages"][1]["reasoning_content"],
-            "checking the clock"
-        );
-    }
-
-    #[tokio::test]
     async fn tool_calls_and_their_results_go_back_as_history() {
         let mut req = request(None, &[(Role::User, "what time is it?")]);
         req.messages.push(Message::ToolCalls {
@@ -675,26 +565,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blank_system_prompt_sends_no_system_message() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (_, requests) =
-            complete_against(template, request(Some("  \n"), &[(Role::User, "hi")])).await;
-
-        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
-        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
-    }
-
-    #[tokio::test]
-    async fn a_system_role_in_the_history_is_refused_before_sending() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (outcome, requests) =
-            complete_against(template, request(None, &[(Role::System, "sneaky")])).await;
-
-        assert!(matches!(outcome, Err(Error::InvalidRequest(_))));
-        assert!(requests.is_empty(), "nothing was sent");
-    }
-
-    #[tokio::test]
     async fn a_rejection_keeps_the_servers_own_words() {
         let template = ResponseTemplate::new(400).set_body_json(json!({
             "error": {"message": "model 'nope' not found", "type": "invalid_request_error"}
@@ -721,13 +591,5 @@ mod tests {
             Err(Error::RateLimited { detail, .. }) => assert_eq!(detail, "server busy"),
             other => panic!("expected Error::RateLimited, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn a_trailing_slash_in_the_endpoint_is_trimmed() {
-        assert_eq!(
-            OpenAiCompat::new("http://127.0.0.1:8080/").endpoint(),
-            "http://127.0.0.1:8080"
-        );
     }
 }

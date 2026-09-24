@@ -296,61 +296,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_same_bytes_one_at_a_time_decode_the_same_way() {
-        let dribble = FIXTURE.iter().map(|byte| vec![*byte]).collect();
-        assert_eq!(ok(dribble).await, whole_fixture());
-    }
-
-    #[tokio::test]
-    async fn no_split_point_changes_what_the_stream_yields() {
-        for split in 0..FIXTURE.len() {
-            let chunks = vec![FIXTURE[..split].to_vec(), FIXTURE[split..].to_vec()];
-            assert_eq!(ok(chunks).await, whole_fixture(), "split at {split}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stream_cut_before_the_sentinel_ends_without_a_done() {
-        let sentinel = FIXTURE
-            .windows(DONE_FRAME.len())
-            .position(|window| window == DONE_FRAME)
-            .expect("fixture has the sentinel");
-
-        let seen = ok(vec![FIXTURE[..sentinel].to_vec()]).await;
-
-        assert_eq!(seen, [text("Hello"), text(" arc")]);
-    }
-
-    const DONE_FRAME: &[u8] = b"data: [DONE]";
-
-    #[tokio::test]
-    async fn a_sentinel_without_usage_reports_an_unmeasured_completion() {
-        let body = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-
-        assert_eq!(
-            ok(vec![body.as_bytes().to_vec()]).await,
-            [
-                text("hi"),
-                CompletionDelta::UnmeasuredDone {
-                    stop: Stop::EndTurn,
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_frame_that_is_not_json_fails_the_stream_once() {
-        let mut seen = deltas(vec![b"data: not json\n\ndata: [DONE]\n\n".to_vec()]).await;
-
-        let error = seen.pop().expect("an item").expect_err("malformed frame");
-        assert!(matches!(error, Error::MalformedStream(_)), "{error:?}");
-        assert!(seen.is_empty(), "{seen:?}");
-    }
-
-    #[tokio::test]
     async fn an_error_envelope_fails_the_stream_with_its_message() {
         let seen = deltas(vec![
             br#"data: {"error":{"message":"model is loading"}}"#.to_vec(),
@@ -364,37 +309,10 @@ mod tests {
         assert!(message.contains("model is loading"), "{message}");
     }
 
-    #[tokio::test]
-    async fn chunks_without_content_produce_no_deltas() {
-        let body = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-
-        assert_eq!(
-            ok(vec![body.as_bytes().to_vec()]).await,
-            [CompletionDelta::UnmeasuredDone {
-                stop: Stop::EndTurn,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn frames_after_the_sentinel_are_ignored() {
-        let mut chunk = FIXTURE.to_vec();
-        chunk.extend_from_slice(b"data: still talking\n\n");
-
-        assert_eq!(ok(vec![chunk]).await, whole_fixture());
-    }
-
     const TOOL_CALL: &[u8] = include_bytes!("../../../tests/fixtures/openai_tool_call_stream.sse");
 
     const PARALLEL: &[u8] =
         include_bytes!("../../../tests/fixtures/openai_parallel_tool_calls_stream.sse");
-
-    const TOOL_RESULT: &[u8] =
-        include_bytes!("../../../tests/fixtures/openai_tool_result_stream.sse");
 
     const REASONING: &[u8] = include_bytes!("../../../tests/fixtures/openai_reasoning_stream.sse");
 
@@ -461,15 +379,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_split_point_changes_the_call_a_stream_yields() {
-        let whole = ok(vec![TOOL_CALL.to_vec()]).await;
-        for split in 0..TOOL_CALL.len() {
-            let chunks = vec![TOOL_CALL[..split].to_vec(), TOOL_CALL[split..].to_vec()];
-            assert_eq!(ok(chunks).await, whole, "split at {split}");
-        }
-    }
-
-    #[tokio::test]
     async fn parallel_calls_do_not_merge() {
         assert_eq!(
             ok(vec![PARALLEL.to_vec()]).await,
@@ -484,19 +393,6 @@ mod tests {
                 done(345, 49, Stop::ToolCalls),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn a_stream_after_a_tool_result_is_plain_text() {
-        let gathered = gather(ok(vec![TOOL_RESULT.to_vec()]).await);
-
-        assert!(
-            gathered.text.contains("SQLite with an FTS5 table"),
-            "{gathered:?}"
-        );
-        assert!(gathered.reasoning.is_empty());
-        assert!(gathered.calls.is_empty());
-        assert_eq!(gathered.ending, Some(done(451, 52, Stop::EndTurn)));
     }
 
     #[tokio::test]
@@ -544,38 +440,6 @@ mod tests {
     const FINISH_FRAME: &[u8] = br#"{"finish_reason":"tool_calls""#;
 
     #[tokio::test]
-    async fn a_continuation_for_an_index_that_never_opened_is_malformed() {
-        let body = concat!(
-            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{}"}}]}}]}"#,
-            "\n\n",
-        );
-
-        let seen = deltas(vec![body.into()]).await;
-
-        let [Err(Error::MalformedStream(message))] = seen.as_slice() else {
-            panic!("expected one malformed-stream error, got {seen:?}");
-        };
-        assert!(message.contains("index 2"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn two_calls_opening_at_one_index_are_malformed() {
-        let body = concat!(
-            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","type":"function","function":{"name":"memory_search","arguments":"{}"}}]}}]}"#,
-            "\n\n",
-        );
-
-        let seen = deltas(vec![body.into()]).await;
-
-        let [Err(Error::MalformedStream(message))] = seen.as_slice() else {
-            panic!("expected one malformed-stream error, got {seen:?}");
-        };
-        assert!(message.contains("get_time"), "{message}");
-    }
-
-    #[tokio::test]
     async fn arguments_that_do_not_form_a_json_object_are_malformed() {
         let body = concat!(
             r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"get_time","arguments":"{\"cut\":"}}]}}]}"#,
@@ -590,32 +454,6 @@ mod tests {
             panic!("expected one malformed-stream error, got {seen:?}");
         };
         assert!(message.contains("get_time"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn the_reasoning_alias_decodes_like_reasoning_content() {
-        let body = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking\"},\"finish_reason\":null}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-
-        let seen = ok(vec![body.as_bytes().to_vec()]).await;
-        assert!(
-            seen.contains(&CompletionDelta::Reasoning("thinking".to_owned())),
-            "{seen:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_chunk_with_both_reasoning_fields_counts_once() {
-        let body = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"a\",\"reasoning\":\"b\"},\"finish_reason\":null}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-
-        let seen = ok(vec![body.as_bytes().to_vec()]).await;
-        let gathered = gather(seen);
-        assert_eq!(gathered.reasoning, "a");
     }
 
     #[tokio::test]

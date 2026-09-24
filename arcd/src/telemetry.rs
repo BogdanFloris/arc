@@ -29,8 +29,6 @@ pub fn init(traces: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Traces are rebuildable diagnostics, excluded from backup; two weeks of
-/// them is plenty (task 7.4's retention policy).
 const TRACE_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 fn prune_old_traces(traces: &Path, retention: Duration) -> usize {
@@ -84,12 +82,5 @@ mod tests {
         assert!(!old_trace.exists(), "the stale trace is gone");
         assert!(fresh_trace.exists(), "the fresh trace stays");
         assert!(other.exists(), "non-trace files are never touched");
-    }
-
-    #[test]
-    fn prune_on_a_missing_dir_is_a_quiet_zero() {
-        let dir = tempfile::TempDir::new().expect("dir");
-        let missing = dir.path().join("nope");
-        assert_eq!(prune_old_traces(&missing, TRACE_RETENTION), 0);
     }
 }

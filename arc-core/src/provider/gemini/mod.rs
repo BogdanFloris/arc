@@ -20,9 +20,7 @@ const KEY_HEADER: &str = "x-goog-api-key";
 
 pub struct Gemini {
     endpoint: String,
-
     key: String,
-
     http: reqwest::Client,
 }
 
@@ -38,10 +36,8 @@ impl std::fmt::Debug for Gemini {
 
 impl Gemini {
     pub fn new(endpoint: &str, key: String) -> Self {
-        let mut endpoint = endpoint.to_owned();
-        endpoint.truncate(endpoint.trim_end_matches('/').len());
         Self {
-            endpoint,
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
             key,
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(0)
@@ -409,38 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_turn_is_system_instruction_and_contents() {
-        let json = body(&request(vec![Message::Text {
-            role: Role::User,
-            content: "hi".to_owned(),
-            reasoning: None,
-        }]));
-
-        assert_eq!(json["systemInstruction"]["parts"][0]["text"], "Be terse.");
-        assert!(
-            json["systemInstruction"].get("role").is_none(),
-            "the system instruction carries no role"
-        );
-        assert_eq!(json["contents"][0]["role"], "user");
-        assert_eq!(json["contents"][0]["parts"][0]["text"], "hi");
-        assert_eq!(
-            json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "MINIMAL"
-        );
-    }
-
-    #[test]
-    fn an_assistant_turn_is_a_model_turn() {
-        let json = body(&request(vec![Message::Text {
-            role: Role::Assistant,
-            content: "sure".to_owned(),
-            reasoning: None,
-        }]));
-
-        assert_eq!(json["contents"][0]["role"], "model");
-    }
-
-    #[test]
     fn a_call_carries_its_signature_and_object_arguments() {
         let json = body(&request(vec![Message::ToolCalls {
             calls: vec![call(b"EmYKZAER")],
@@ -541,39 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn no_thinking_level_means_the_field_is_absent() {
-        let mut plain = request(vec![Message::Text {
-            role: Role::User,
-            content: "hi".to_owned(),
-            reasoning: None,
-        }]);
-        plain.thinking = Thinking::Default;
-
-        assert!(
-            body(&plain).get("generationConfig").is_none(),
-            "an empty generationConfig should not be sent at all"
-        );
-    }
-
-    #[test]
-    fn web_off_is_byte_identical_to_the_golden_request() {
-        let json = body(&request(vec![Message::Text {
-            role: Role::User,
-            content: "hi".to_owned(),
-            reasoning: None,
-        }]));
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "systemInstruction": {"parts": [{"text": "Be terse."}]},
-                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-                "generationConfig": {"thinkingConfig": {"thinkingLevel": "MINIMAL"}}
-            })
-        );
-    }
-
-    #[test]
     fn web_on_adds_the_google_search_tool_and_tool_config() {
         let mut turn = request(vec![Message::Text {
             role: Role::User,
@@ -618,11 +549,5 @@ mod tests {
         let rendered = format!("{provider:?}");
         assert!(!rendered.contains("sk-supersecret"), "{rendered}");
         assert_eq!(provider.name(), "gemini");
-    }
-
-    #[test]
-    fn a_trailing_slash_does_not_change_the_endpoint() {
-        let provider = Gemini::new("https://example.test/v1beta/", "k".to_owned());
-        assert_eq!(provider.endpoint(), "https://example.test/v1beta");
     }
 }

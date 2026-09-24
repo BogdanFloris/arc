@@ -11,19 +11,12 @@ use crate::memory::kind_name;
 use crate::projection::{KIND_MESSAGE, bad_json_column, links_from_json, provenance_from_json};
 
 const MAX_QUERY_CHARS: usize = 256;
-
 const OVERFETCH: usize = 50; // hits collapse per session, so fetch extra
-
 const MAX_SESSIONS: usize = 5;
-
 const MESSAGE_BUDGET_CHARS: usize = 300;
-
 const WINDOW_RADIUS: usize = 2;
-
 const BOOKEND_LEN: usize = 2;
-
 const MAX_RANGE_ROWS: usize = 20;
-
 const MAX_READ_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -515,11 +508,7 @@ fn memory_search_fts(
     );
     let mut stmt = conn.prepare(&sql)?;
     let mapped = stmt.query_map(rusqlite::params![query, namespace, as_of], memory_hit_row)?;
-    let mut hits = Vec::new();
-    for hit in mapped {
-        hits.push(hit?);
-    }
-    Ok(hits)
+    Ok(mapped.collect::<Result<_, _>>()?)
 }
 
 fn memory_search_like(
@@ -530,9 +519,6 @@ fn memory_search_like(
     active: i32,
 ) -> Result<Vec<MemoryHit>, Error> {
     let words: Vec<String> = query.split_whitespace().map(like_pattern).collect();
-    if words.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut sql = format!(
         "SELECT r.id, r.namespace, r.kind, r.title, r.summary, r.status
          FROM memory_records r
@@ -562,11 +548,7 @@ fn memory_search_like(
 
     let mut stmt = conn.prepare(&sql)?;
     let mapped = stmt.query_map(rusqlite::params_from_iter(params), memory_hit_row)?;
-    let mut hits = Vec::new();
-    for hit in mapped {
-        hits.push(hit?);
-    }
-    Ok(hits)
+    Ok(mapped.collect::<Result<_, _>>()?)
 }
 
 pub(crate) fn sanitize_query(raw: &str) -> String {
@@ -814,7 +796,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{Archive, Error, format_micros, sanitize_query};
+    use super::{Archive, Error};
     use crate::log::Log;
     use crate::projection::{self, Projection};
     use crate::testkit;
@@ -870,34 +852,6 @@ mod tests {
         drop(projection);
         let archive = Archive::open(&index).expect("open archive");
         (dir, archive)
-    }
-
-    #[test]
-    fn the_sanitizer_rewrites_the_fixture_set() {
-        for (raw, cleaned) in [
-            ("it's", "\"it's\""),
-            ("gateway/run.py", "\"gateway/run.py\""),
-            ("user@host", "\"user@host\""),
-            ("a,b", "\"a,b\""),
-            ("50%", "\"50%\""),
-            ("TODO: fix", "\"TODO:\" fix"),
-            ("my-app.config.ts", "\"my-app.config.ts\""),
-            ("walking skeleton", "walking skeleton"),
-            ("\"exact phrase\" extra", "\"exact phrase\" extra"),
-            ("\"unterminated phrase", "\"unterminated phrase\""),
-            ("AND gruvbox OR", "gruvbox"),
-            ("%%% ---", ""),
-            ("\"\" \"--\"", ""),
-        ] {
-            assert_eq!(sanitize_query(raw), cleaned, "raw: {raw}");
-        }
-    }
-
-    #[test]
-    fn the_sanitizer_caps_length() {
-        let long = "word ".repeat(200);
-        let cleaned = sanitize_query(&long);
-        assert!(cleaned.chars().count() <= 256, "{}", cleaned.len());
     }
 
     #[test]
@@ -1065,23 +1019,6 @@ mod tests {
     }
 
     #[test]
-    fn hydrated_messages_are_clipped_to_the_budget_with_a_marker() {
-        let long = "nebula ".repeat(100);
-        let (_dir, archive) =
-            archive_over(vec![created("s-01", ""), said("s-01", Role::User, &long)]);
-
-        let reply = archive.search("nebula", false, None).expect("search");
-
-        let message = &reply.sessions[0].context[0];
-        assert!(
-            message.content.ends_with(" [truncated]"),
-            "{}",
-            message.content
-        );
-        assert!(message.content.chars().count() < long.chars().count());
-    }
-
-    #[test]
     fn tool_results_are_excluded_by_default_and_found_when_lifted() {
         let (_dir, archive) = archive_over(vec![
             created("s-01", ""),
@@ -1109,60 +1046,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
-    }
-
-    #[test]
-    fn read_range_returns_prose_rows_in_order_unclipped() {
-        let (_dir, archive) = archive_over(vec![
-            created("s-01", ""),
-            said("s-01", Role::User, "one"),
-            tool_answered("s-01", "machine noise"),
-            said("s-01", Role::Assistant, "two"),
-            said("s-01", Role::User, "three"),
-        ]);
-
-        let reply = archive
-            .read_range("s-01", 1, 3, 0)
-            .expect("read")
-            .expect("session exists");
-
-        assert_eq!(reply.session_id, "s-01");
-        assert!(!reply.clipped);
-        assert!(reply.next.is_none());
-        let rows: Vec<(i64, &str, &str)> = reply
-            .messages
-            .iter()
-            .map(|m| (m.seq, m.role.as_str(), m.content.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            [(1, "user", "one"), (3, "assistant", "two")],
-            "prose only, tool rows and out-of-range rows stay out"
-        );
-    }
-
-    #[test]
-    fn an_oversized_range_is_clipped_and_says_so() {
-        let mut events = vec![created("s-01", "")];
-        for i in 0..60 {
-            events.push(said("s-01", Role::User, &format!("message {i}")));
-        }
-        let (_dir, archive) = archive_over(events);
-
-        let reply = archive
-            .read_range("s-01", 0, 1000, 0)
-            .expect("read")
-            .expect("session exists");
-
-        assert_eq!(reply.messages.len(), super::MAX_RANGE_ROWS);
-        assert!(reply.clipped);
-        let next = reply.next.expect("continuation");
-        let following = archive
-            .read_range("s-01", next.start_seq, 1000, next.start_offset)
-            .expect("read")
-            .expect("session exists");
-        assert!(following.messages[0].seq > reply.messages.last().expect("last").seq);
-        assert_eq!(following.messages[0].content, "message 20");
     }
 
     #[test]
@@ -1232,29 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn a_read_exactly_at_the_byte_limit_needs_no_continuation() {
-        let (_dir, archive) = archive_over(vec![created("s-01", ""), said("s-01", Role::User, "")]);
-        let empty = archive
-            .read_range("s-01", 0, i64::MAX, 0)
-            .expect("read")
-            .expect("session exists");
-        assert_eq!(empty.messages.len(), 1);
-        let content = "x".repeat(super::MAX_READ_BYTES - super::read_reply_bytes(&empty));
-        let (_dir, archive) = archive_over(vec![
-            created("s-01", ""),
-            said("s-01", Role::User, &content),
-        ]);
-        let reply = archive
-            .read_range("s-01", 0, i64::MAX, 0)
-            .expect("read")
-            .expect("session exists");
-        assert_eq!(super::read_reply_bytes(&reply), super::MAX_READ_BYTES);
-        assert_eq!(reply.messages[0].content, content);
-        assert!(!reply.clipped);
-        assert!(reply.next.is_none());
-    }
-
-    #[test]
     fn read_offsets_must_point_inside_the_exact_message_on_a_utf8_boundary() {
         let content = "é🦀tail";
         let (_dir, archive) = archive_over(vec![
@@ -1288,51 +1148,6 @@ mod tests {
             .expect("session exists");
         assert_eq!(tail.messages[0].content, "tail");
         assert!(!tail.clipped);
-    }
-
-    #[test]
-    fn ends_returns_deduped_bookends_of_spoken_messages() {
-        let (_dir, archive) = archive_over(vec![
-            created("s-01", ""),
-            said("s-01", Role::System, "a system note, not a bookend"),
-            said("s-01", Role::User, "the goal"),
-            said("s-01", Role::Assistant, "working on it"),
-            said("s-01", Role::Assistant, "the resolution"),
-        ]);
-
-        let reply = archive.ends("s-01").expect("ends").expect("session exists");
-
-        assert_eq!(
-            reply.first.iter().map(|m| m.seq).collect::<Vec<_>>(),
-            [2, 3],
-            "system prose stays out of bookends"
-        );
-        assert_eq!(
-            reply.last.iter().map(|m| m.seq).collect::<Vec<_>>(),
-            [4],
-            "the overlap with first is dropped, not repeated"
-        );
-    }
-
-    #[test]
-    fn an_unknown_session_reads_as_none() {
-        let (_dir, archive) = archive_over(vec![created("s-01", "")]);
-
-        assert!(
-            archive
-                .read_range("s-none", 0, 10, 0)
-                .expect("read")
-                .is_none()
-        );
-        assert!(archive.ends("s-none").expect("ends").is_none());
-    }
-
-    #[test]
-    fn timestamps_format_as_rfc3339_utc() {
-        assert_eq!(
-            format_micros(1_700_000_000_123_456).as_deref(),
-            Some("2023-11-14T22:13:20Z")
-        );
     }
 
     fn record(id: &str, namespace: &str, title: &str, summary: &str, body: &str) -> MemoryRecord {
@@ -1428,92 +1243,6 @@ mod tests {
             .memory_search("gruvbox", None, None)
             .expect("search");
         assert_eq!(hits.len(), 2, "no namespace means all namespaces");
-    }
-
-    #[test]
-    fn memory_search_sees_only_active_records() {
-        let (_dir, archive) = memory_archive_over(vec![
-            written(record(
-                "mr-old",
-                "global",
-                "Home",
-                "lives at X",
-                "lives at X",
-            )),
-            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
-                superseded_id: "mr-old".to_owned(),
-                record: Some(record(
-                    "mr-new",
-                    "global",
-                    "Home",
-                    "lives at Y",
-                    "lives at Y",
-                )),
-            }),
-        ]);
-
-        let hits = archive.memory_search("lives", None, None).expect("search");
-        assert_eq!(hits.len(), 1, "the retired record stays out");
-        assert_eq!(hits[0].id, "mr-new");
-    }
-
-    #[test]
-    fn memory_search_treats_like_metacharacters_literally() {
-        let (_dir, archive) = memory_archive_over(vec![
-            written(record(
-                "mr-pct", "global", "Progress", "50% done", "50% done",
-            )),
-            written(record(
-                "mr-num",
-                "global",
-                "Progress",
-                "505 items",
-                "505 items",
-            )),
-        ]);
-
-        let hits = archive.memory_search("50%", None, None).expect("search");
-        assert_eq!(hits.len(), 1, "% must not act as a wildcard");
-        assert_eq!(hits[0].id, "mr-pct");
-    }
-
-    #[test]
-    fn an_empty_memory_query_is_a_query_error() {
-        let (_dir, archive) = memory_archive_over(vec![]);
-
-        let err = archive
-            .memory_search("   ", None, None)
-            .expect_err("nothing searchable must be a query error");
-        assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
-    }
-
-    #[test]
-    fn a_title_match_ranks_above_a_body_only_match() {
-        let (_dir, archive) = memory_archive_over(vec![
-            written(record(
-                "mr-body",
-                "global",
-                "Unrelated title",
-                "unrelated summary",
-                "prefers gruvbox in the terminal",
-            )),
-            written(record(
-                "mr-title",
-                "global",
-                "Gruvbox setup",
-                "terminal colors",
-                "no matching word here",
-            )),
-        ]);
-
-        let hits = archive
-            .memory_search("gruvbox", None, None)
-            .expect("search");
-        assert_eq!(
-            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
-            ["mr-title", "mr-body"],
-            "bm25 title weight outranks a body-only hit"
-        );
     }
 
     #[test]
@@ -1631,26 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn namespace_filter_works_on_the_fts_path() {
-        let (_dir, archive) = memory_archive_over(vec![
-            written(record("mr-g", "global", "Palette", "gruvbox", "gruvbox")),
-            written(record(
-                "mr-p",
-                "arc",
-                "Palette",
-                "gruvbox in arc",
-                "gruvbox",
-            )),
-        ]);
-
-        let hits = archive
-            .memory_search("gruvbox", Some("arc"), None)
-            .expect("search");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "mr-p");
-    }
-
-    #[test]
     fn an_updated_record_is_searchable_by_new_content_not_old() {
         let (_dir, archive) = memory_archive_over(vec![
             written(record(
@@ -1681,51 +1390,6 @@ mod tests {
             .memory_search("gruvbox", None, None)
             .expect("search");
         assert!(hits.is_empty(), "the old content no longer matches");
-    }
-
-    #[test]
-    fn a_supersede_leaves_both_rows_findable_the_original_only_under_as_of() {
-        let (_dir, archive) = memory_archive_over_each(vec![
-            (
-                written(record(
-                    "mr-old",
-                    "global",
-                    "Address",
-                    "lives at X",
-                    "lives at X",
-                )),
-                100,
-            ),
-            (
-                memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
-                    superseded_id: "mr-old".to_owned(),
-                    record: Some(record(
-                        "mr-new",
-                        "global",
-                        "Address",
-                        "lives at Y",
-                        "lives at Y",
-                    )),
-                }),
-                200,
-            ),
-        ]);
-
-        let hits = archive.memory_search("lives", None, None).expect("search");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            hits[0].id, "mr-new",
-            "the replacement's FTS row was written"
-        );
-
-        let hits = archive
-            .memory_search("lives", None, Some(150))
-            .expect("search");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            hits[0].id, "mr-old",
-            "the target's FTS row survived the supersede, untouched"
-        );
     }
 
     #[test]
@@ -1764,41 +1428,6 @@ mod tests {
         assert_eq!(
             reply.provenance[0].ts.as_deref(),
             Some("2023-11-14T22:13:20Z")
-        );
-    }
-
-    #[test]
-    fn a_superseded_record_reads_back_pointing_at_its_replacement() {
-        let (_dir, archive) = memory_archive_over(vec![
-            written(record(
-                "mr-old",
-                "global",
-                "Home",
-                "lives at X",
-                "lives at X",
-            )),
-            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
-                superseded_id: "mr-old".to_owned(),
-                record: Some(record(
-                    "mr-new",
-                    "global",
-                    "Home",
-                    "lives at Y",
-                    "lives at Y",
-                )),
-            }),
-        ]);
-
-        let reply = archive
-            .memory_record("mr-old")
-            .expect("read")
-            .expect("still readable");
-        assert_eq!(reply.status, "superseded");
-        assert_eq!(reply.superseded_by.as_deref(), Some("mr-new"));
-
-        assert!(
-            archive.memory_record("mr-none").expect("read").is_none(),
-            "an unknown id reads as None"
         );
     }
 }

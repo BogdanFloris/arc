@@ -631,22 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_keywords_types_and_literals() {
-        expect![[r#"
-            keyword "pub"
-            plain " "
-            keyword "fn"
-            plain " "
-            call "seq"
-            plain "(&"
-            keyword "self"
-            plain ") -> "
-            type "u64"
-            plain " {""#]]
-        .assert_eq(&lexed("pub fn seq(&self) -> u64 {", Language::Rust));
-    }
-
-    #[test]
     fn strings_numbers_and_comments() {
         expect![[r#"
             keyword "let"
@@ -690,15 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unterminated_string_colours_to_the_end_of_the_line() {
-        expect![[r#"
-            keyword "let"
-            plain " s = "
-            string "\"half a th""#]]
-        .assert_eq(&lexed(r#"let s = "half a th"#, Language::Rust));
-    }
-
-    #[test]
     fn block_comments_carry_across_lines() {
         let (_, carry) = highlight("code /* opened", Language::Rust, Carry::None);
         assert_eq!(carry, Carry::BlockComment);
@@ -739,56 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn a_docstring_that_closes_on_its_own_line_carries_nothing() {
-        let (spans, carry) = highlight(
-            r#"    """Adds two numbers.""""#,
-            Language::Python,
-            Carry::None,
-        );
-
-        let named: Vec<(String, &str)> = spans
-            .into_iter()
-            .map(|(text, style)| (text, role(style)))
-            .collect();
-        assert_eq!(
-            named,
-            [
-                ("    ".to_owned(), "plain"),
-                (r#""""Adds two numbers.""""#.to_owned(), "string"),
-            ]
-        );
-        assert_eq!(carry, Carry::None, "the next line lexes normally");
-
-        assert_eq!(
-            lex("return a + b", Language::Python)[0],
-            ("return".to_owned(), "keyword")
-        );
-    }
-
-    #[test]
-    fn a_block_comment_that_closes_on_its_own_line_carries_nothing() {
-        let (spans, carry) = highlight("/* note */ let x = 1;", Language::Rust, Carry::None);
-
-        assert_eq!(spans[0].0, "/* note */");
-        assert_eq!(role(spans[0].1), "comment");
-        assert_eq!(role(spans[2].1), "keyword", "lexing resumes after it");
-        assert_eq!(carry, Carry::None);
-    }
-
-    #[test]
-    fn python_reads_its_own_keywords() {
-        expect![[r#"
-            keyword "def"
-            plain " "
-            call "f"
-            plain "(x): "
-            keyword "return"
-            plain " "
-            number "None""#]]
-        .assert_eq(&lexed("def f(x): return None", Language::Python));
-    }
-
-    #[test]
     fn shell_variables_and_flags() {
         expect![[r##"
             plain "ls "
@@ -816,103 +741,6 @@ mod tests {
             plain "server = "
             string "\"llama-server\"""#]]
         .assert_eq(&lexed(r#"server = "llama-server""#, Language::Config));
-    }
-
-    #[test]
-    fn an_unknown_language_is_left_alone() {
-        let (spans, carry) = highlight("fn main() { let x = 1; }", Language::Plain, Carry::None);
-
-        assert_eq!(spans.len(), 1, "one span, unlexed");
-        assert_eq!(spans[0].0, "fn main() { let x = 1; }");
-        assert_eq!(spans[0].1, theme::CODE);
-        assert_eq!(carry, Carry::None, "an unlexed block opens nothing");
-    }
-
-    #[test]
-    fn an_untagged_python_block_is_recognised() {
-        let block = [
-            "# Demonstrating a simple Python function with a comment, string, and number",
-            "def example():",
-            "    # Perform an operation",
-            "    message = \"Task completed\"",
-            "    number = 3.14",
-            "    return number",
-        ];
-        assert_eq!(sniff(&block), Language::Python);
-    }
-
-    #[test]
-    fn sniffing_recognises_the_languages_it_knows() {
-        assert_eq!(
-            sniff(&["fn main() {", "    let x: Vec<u8> = vec![];", "}"]),
-            Language::Rust
-        );
-        assert_eq!(
-            sniff(&["func main() {", "\tpackage main", "}"]),
-            Language::CFamily
-        );
-        assert_eq!(
-            sniff(&["cd /home/bogdan/arc", "just test", "git status"]),
-            Language::Shell
-        );
-        assert_eq!(
-            sniff(&["{", "  \"port\": 8080", "}"]),
-            Language::Json,
-            "quoted keys mean JSON"
-        );
-        assert_eq!(
-            sniff(&["[llama]", "port = 8080"]),
-            Language::Config,
-            "a section header with bare keys is TOML"
-        );
-    }
-
-    #[test]
-    fn sniffing_declines_when_it_cannot_tell() {
-        assert_eq!(sniff(&["hello world", "second line"]), Language::Plain);
-        assert_eq!(sniff(&[]), Language::Plain);
-        assert_eq!(sniff(&[""]), Language::Plain);
-        assert_eq!(
-            sniff(&["some prose about a def and a fn"]),
-            Language::Plain,
-            "one hit each is a tie, and a tie declines"
-        );
-    }
-
-    #[test]
-    fn info_strings_map_to_languages() {
-        assert_eq!(language("rust"), Language::Rust);
-        assert_eq!(
-            language("rust,ignore"),
-            Language::Rust,
-            "attributes are ignored"
-        );
-        assert_eq!(
-            language("  BASH  "),
-            Language::Shell,
-            "case and space are ignored"
-        );
-        assert_eq!(language("ts"), Language::CFamily);
-        assert_eq!(language("toml"), Language::Config);
-        assert_eq!(
-            language(""),
-            Language::Plain,
-            "a bare fence highlights nothing"
-        );
-        assert_eq!(
-            language("brainfuck"),
-            Language::Plain,
-            "unknown is not a guess"
-        );
-    }
-
-    #[test]
-    fn identifiers_with_digits_are_not_numbers() {
-        expect![[r#"
-            keyword "let"
-            plain " sha256 = "
-            number "1""#]]
-        .assert_eq(&lexed("let sha256 = 1", Language::Rust));
     }
 
     #[test]

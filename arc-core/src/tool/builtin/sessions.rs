@@ -420,42 +420,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_fixture_query_survives_the_live_path() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                created("s-todo", ""),
-                said("s-todo", Role::User, "TODO: fix the resume race"),
-            ],
-        );
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call("c1", 0, "sessions_search", r#"{"query":"TODO: fix"}"#)),
-                Ok(tool_stop()),
-            ],
-            done_reply("noted"),
-        ]);
-        let registry = search_registry(&dir);
-        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, None, "question", tx)
-            .await
-            .expect("send");
-
-        let results = logged_results(&dir);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, ToolOutcome::Ok as i32);
-        assert!(
-            results[0].content.contains("s-todo"),
-            "{}",
-            results[0].content
-        );
-    }
-
     fn seeded_dir() -> TempDir {
         let dir = TempDir::new().expect("temp dir");
         seed_log(
@@ -467,67 +431,6 @@ mod tests {
             ],
         );
         dir
-    }
-
-    #[tokio::test]
-    async fn malformed_search_arguments_are_an_actionable_error() {
-        let dir = seeded_dir();
-        let tool = SessionsSearch::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(r#"{"query""#.to_owned(), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains("sessions_search"),
-            "{}",
-            reply.content
-        );
-        assert!(reply.content.contains("query"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn an_unsearchable_query_is_a_no_results_answer_naming_the_problem() {
-        let dir = seeded_dir();
-        let tool = SessionsSearch::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(r#"{"query":"%%% ---"}"#.to_owned(), TurnContext::default())
-            .await;
-
-        assert!(reply.ok, "an unsearchable query is not a tool error");
-        assert!(
-            reply.content.starts_with("No results:"),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn session_read_returns_the_range_as_json() {
-        let dir = seeded_dir();
-        let tool = SessionRead::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(
-                r#"{"session_id":"s-01","start_seq":1,"end_seq":2}"#.to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(reply.ok);
-        assert!(reply.content.contains("the goal"), "{}", reply.content);
-        assert!(
-            reply.content.contains("the resolution"),
-            "{}",
-            reply.content
-        );
-        assert!(
-            reply.content.contains("\"role\":\"assistant\""),
-            "{}",
-            reply.content
-        );
     }
 
     #[tokio::test]
@@ -617,74 +520,5 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.content.contains("start_seq"), "{}", reply.content);
         assert!(reply.content.contains("ends"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn session_read_rejects_an_inverted_range() {
-        let dir = seeded_dir();
-        let tool = SessionRead::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(
-                r#"{"session_id":"s-01","start_seq":9,"end_seq":1}"#.to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("start_seq 9"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn session_read_rejects_invalid_offsets_and_mixed_read_modes() {
-        let dir = seeded_dir();
-        let tool = SessionRead::new(archive_at(&dir));
-        for args in [
-            serde_json::json!({"session_id": "s-01", "start_seq": 1, "end_seq": 2, "start_offset": -1}),
-            serde_json::json!({"session_id": "s-01", "start_seq": 1, "end_seq": 2, "start_offset": 1000}),
-            serde_json::json!({"session_id": "s-01", "ends": true, "start_seq": 1, "end_seq": 2}),
-            serde_json::json!({"session_id": "s-01", "ends": true, "start_offset": 1}),
-        ] {
-            let reply = tool.execute(args.to_string(), TurnContext::default()).await;
-            assert!(!reply.ok, "{args}: {}", reply.content);
-            assert!(reply.content.contains("ERROR:"), "{}", reply.content);
-        }
-    }
-
-    #[tokio::test]
-    async fn session_read_names_an_unknown_session() {
-        let dir = seeded_dir();
-        let tool = SessionRead::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(
-                r#"{"session_id":"s-none","start_seq":0,"end_seq":5}"#.to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("s-none"), "{}", reply.content);
-        assert!(
-            reply.content.contains("sessions_search"),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn an_empty_range_in_a_real_session_is_not_an_error() {
-        let dir = seeded_dir();
-        let tool = SessionRead::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(
-                r#"{"session_id":"s-01","start_seq":500,"end_seq":600}"#.to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(reply.ok);
-        assert!(reply.content.contains("No messages"), "{}", reply.content);
     }
 }

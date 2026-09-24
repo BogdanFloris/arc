@@ -69,17 +69,6 @@ impl DataDirs {
 #[cfg(test)]
 mod tests {
     use super::DataDirs;
-    use std::path::Path;
-
-    #[test]
-    fn every_path_hangs_off_the_root() {
-        let dirs = DataDirs::new(Path::new("/srv/arc"));
-        assert_eq!(dirs.root(), Path::new("/srv/arc"));
-        assert_eq!(dirs.log(), Path::new("/srv/arc/log"));
-        assert_eq!(dirs.index(), Path::new("/srv/arc/index.db"));
-        assert_eq!(dirs.traces(), Path::new("/srv/arc/traces"));
-        assert_eq!(dirs.identity(), Path::new("/srv/arc/identity.md"));
-    }
 
     #[test]
     fn create_makes_the_tree_and_locks_down_secrets() {

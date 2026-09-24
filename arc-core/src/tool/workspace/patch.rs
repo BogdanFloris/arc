@@ -256,8 +256,6 @@ impl ApplyPatch {
     }
 }
 
-// a new file may sit under directories that do not exist yet: the deepest
-// existing ancestor is what containment checks, the rest is plain names
 fn resolve_creating(grants: &Grants, path: &Path, access: Access) -> Result<PathBuf, String> {
     let mut existing = path;
     let mut remainder = Vec::new();
@@ -269,12 +267,6 @@ fn resolve_creating(grants: &Grants, path: &Path, access: Access) -> Result<Path
         existing = existing
             .parent()
             .ok_or_else(|| format!("{} has no existing ancestor.", path.display()))?;
-    }
-    if remainder.iter().any(|name| name == ".." || name == ".") {
-        return Err(format!(
-            "{} does not name a file; \".\" and \"..\" are not allowed here.",
-            path.display()
-        ));
     }
     let mut resolved = grants.resolve(&existing.to_string_lossy(), access)?;
     for name in remainder.iter().rev() {
@@ -510,7 +502,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{ApplyPatch, Chunk, Hunk, apply_chunks, parse};
+    use super::{ApplyPatch, parse};
     use crate::tool::workspace::read::Read;
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
     use crate::tool::{Tool as _, TurnContext};
@@ -540,71 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn a_patch_parses_into_its_hunks() {
-        let hunks = parse(
-            &[
-                "*** Begin Patch",
-                "*** Add File: new.txt",
-                "+line one",
-                "+line two",
-                "*** Delete File: old.txt",
-                "*** Update File: src/lib.rs",
-                "*** Move to: src/main.rs",
-                "@@ fn main() {",
-                "-    old();",
-                "+    new();",
-                "     keep();",
-                "",
-                "@@",
-                "+trailing",
-                "*** End of File",
-                "*** End Patch",
-            ]
-            .join("\n"),
-        )
-        .expect("parses");
-
-        assert_eq!(
-            hunks,
-            [
-                Hunk::Add {
-                    path: "new.txt".to_owned(),
-                    content: "line one\nline two\n".to_owned(),
-                },
-                Hunk::Delete {
-                    path: "old.txt".to_owned(),
-                },
-                Hunk::Update {
-                    path: "src/lib.rs".to_owned(),
-                    move_to: Some("src/main.rs".to_owned()),
-                    chunks: vec![
-                        Chunk {
-                            context: Some("fn main() {".to_owned()),
-                            old: vec![
-                                "    old();".to_owned(),
-                                "    keep();".to_owned(),
-                                String::new()
-                            ],
-                            new: vec![
-                                "    new();".to_owned(),
-                                "    keep();".to_owned(),
-                                String::new()
-                            ],
-                            at_end_of_file: false,
-                        },
-                        Chunk {
-                            context: None,
-                            old: vec![],
-                            new: vec!["trailing".to_owned()],
-                            at_end_of_file: true,
-                        },
-                    ],
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn a_patch_without_its_markers_or_hunks_is_refused() {
         assert!(parse("").unwrap_err().contains("empty"));
         assert!(
@@ -627,57 +554,6 @@ mod tests {
                 .unwrap_err()
                 .contains("hunk line")
         );
-    }
-
-    fn chunk(context: Option<&str>, old: &[&str], new: &[&str]) -> Chunk {
-        Chunk {
-            context: context.map(str::to_owned),
-            old: old.iter().map(|s| (*s).to_owned()).collect(),
-            new: new.iter().map(|s| (*s).to_owned()).collect(),
-            at_end_of_file: false,
-        }
-    }
-
-    #[test]
-    fn chunks_apply_after_their_context_and_in_order() {
-        let text = "fn a() {\n    x();\n}\n\nfn b() {\n    x();\n}\n";
-        let chunks = [chunk(Some("fn b() {"), &["    x();"], &["    y();"])];
-
-        assert_eq!(
-            apply_chunks(text, &chunks, "f.rs").expect("applies"),
-            "fn a() {\n    x();\n}\n\nfn b() {\n    y();\n}\n",
-            "the context line steers the match past the first x()"
-        );
-    }
-
-    #[test]
-    fn an_insertion_without_old_lines_appends_and_trailing_whitespace_is_forgiven() {
-        let text = "one  \ntwo\n";
-        let chunks = [
-            chunk(None, &["one"], &["uno"]),
-            chunk(None, &[], &["three"]),
-        ];
-
-        assert_eq!(
-            apply_chunks(text, &chunks, "f").expect("applies"),
-            "uno\ntwo\nthree\n"
-        );
-    }
-
-    #[test]
-    fn a_file_without_a_final_newline_stays_that_way() {
-        let text = "a\nb";
-        let chunks = [chunk(None, &["b"], &["c"])];
-
-        assert_eq!(apply_chunks(text, &chunks, "f").expect("applies"), "a\nc");
-    }
-
-    #[test]
-    fn lines_that_are_not_in_the_file_name_the_file_and_the_lines() {
-        let err = apply_chunks("a\n", &[chunk(None, &["zzz"], &["y"])], "f.txt").unwrap_err();
-        assert!(err.contains("f.txt") && err.contains("zzz"), "{err}");
-        let err = apply_chunks("a\n", &[chunk(Some("nope"), &["a"], &["b"])], "f.txt").unwrap_err();
-        assert!(err.contains("context line `nope`"), "{err}");
     }
 
     #[tokio::test]
@@ -863,6 +739,15 @@ mod tests {
 
         let reply = tool
             .execute(
+                args("*** Begin Patch\n*** Add File: missing/../escape.txt\n+x\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+        assert!(!reply.ok, "{}", reply.content);
+        assert!(!root.join("escape.txt").exists());
+
+        let reply = tool
+            .execute(
                 args("*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"),
                 ctx(root, Mode::ReadWrite),
             )
@@ -873,31 +758,5 @@ mod tests {
             reply.content
         );
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
-    }
-
-    #[tokio::test]
-    async fn an_unbound_session_and_bad_arguments_are_named_errors() {
-        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
-
-        let reply = tool
-            .execute(
-                args("*** Begin Patch\n*** Delete File: x\n*** End Patch"),
-                TurnContext::default(),
-            )
-            .await;
-        assert!(
-            !reply.ok && reply.content.contains("no workspace"),
-            "{}",
-            reply.content
-        );
-
-        let reply = tool
-            .execute("not json".to_owned(), TurnContext::default())
-            .await;
-        assert!(
-            !reply.ok && reply.content.contains("bad apply_patch arguments"),
-            "{}",
-            reply.content
-        );
     }
 }

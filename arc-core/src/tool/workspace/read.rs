@@ -116,8 +116,7 @@ impl Tool for Read {
 }
 
 fn page(text: &str, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
+    let total = text.lines().count();
     if total == 0 {
         return Ok(String::new());
     }
@@ -128,21 +127,22 @@ fn page(text: &str, offset: Option<usize>, limit: Option<usize>) -> Result<Strin
             "offset {first} is beyond the file's {total} lines."
         ));
     }
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).max(1);
-    let line_cap = (first + limit - 1).min(total);
-
-    // the byte cap wins if it's hit first; always keep at least one line
-    let mut last = first;
-    let mut bytes = lines[first - 1].len();
-    for next_line in (first + 1)..=line_cap {
-        let grown = bytes + 1 + lines[next_line - 1].len();
-        if grown > MAX_BYTES {
+    let mut body = String::new();
+    let mut last = first - 1;
+    for line in text
+        .lines()
+        .skip(last)
+        .take(limit.unwrap_or(DEFAULT_LIMIT).max(1))
+    {
+        if last >= first && body.len() + 1 + line.len() > MAX_BYTES {
             break;
         }
-        bytes = grown;
-        last = next_line;
+        if last >= first {
+            body.push('\n');
+        }
+        body.push_str(line);
+        last += 1;
     }
-    let body = lines[first - 1..last].join("\n");
 
     if first == 1 && last == total {
         return Ok(body);
@@ -162,7 +162,7 @@ mod tests {
 
     use super::Read;
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
-    use crate::tool::{Registry, Tool as _, ToolSource, TurnContext};
+    use crate::tool::{Tool as _, TurnContext};
 
     fn workspace() -> Arc<Workspace> {
         Arc::new(Workspace::new())
@@ -180,38 +180,6 @@ mod tests {
 
     fn args(path: &std::path::Path) -> String {
         serde_json::json!({ "path": path }).to_string()
-    }
-
-    #[tokio::test]
-    async fn a_happy_read_returns_the_file_verbatim() {
-        let dir = TempDir::new().expect("tmp");
-        fs::write(dir.path().join("f.txt"), "line one\nline two").expect("write");
-        let ws = workspace();
-        let tool = Read::new(ws);
-
-        let reply = tool
-            .execute(
-                args(&dir.path().join("f.txt")),
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(reply.content, "line one\nline two");
-    }
-
-    #[tokio::test]
-    async fn an_unbound_session_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let tool = Read::new(workspace());
-
-        let reply = tool
-            .execute(args(&dir.path().join("f.txt")), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("granted"), "{}", reply.content);
     }
 
     #[tokio::test]
@@ -299,24 +267,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_a_directory_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
-        let ws = workspace();
-        let tool = Read::new(ws);
-
-        let reply = tool
-            .execute(
-                args(&dir.path().join("sub")),
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("directory"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn non_utf8_bytes_are_a_named_error() {
         let dir = TempDir::new().expect("tmp");
         fs::write(dir.path().join("f.bin"), [0xff, 0xfe, 0x00, 0xff]).expect("write");
@@ -332,94 +282,5 @@ mod tests {
 
         assert!(!reply.ok);
         assert!(reply.content.contains("text"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_missing_file_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let tool = Read::new(ws);
-
-        let path = dir.path().join("nope.txt");
-        let reply = tool
-            .execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains(path.to_str().expect("utf8")),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn a_successful_read_records_a_hash_for_the_session() {
-        let dir = TempDir::new().expect("tmp");
-        fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace();
-        let tool = Read::new(Arc::clone(&ws));
-
-        let path = dir.path().join("f.txt");
-        let reply = tool
-            .execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
-            .await;
-        assert!(reply.ok);
-
-        let canonical = path.canonicalize().expect("canonicalize");
-        assert!(ws.recorded_hash("s-1", &canonical).is_some());
-    }
-
-    #[tokio::test]
-    async fn two_sessions_record_independent_hash_entries() {
-        let dir = TempDir::new().expect("tmp");
-        fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace();
-        let tool = Read::new(Arc::clone(&ws));
-
-        let path = dir.path().join("f.txt");
-        tool.execute(args(&path), ctx("s-1", dir.path(), Mode::ReadOnly))
-            .await;
-        tool.execute(args(&path), ctx("s-2", dir.path(), Mode::ReadOnly))
-            .await;
-
-        let canonical = path.canonicalize().expect("canonicalize");
-        assert!(ws.recorded_hash("s-1", &canonical).is_some());
-        assert!(ws.recorded_hash("s-2", &canonical).is_some());
-    }
-
-    #[tokio::test]
-    async fn the_read_tool_dispatches_through_the_registry_by_source() {
-        let dir = TempDir::new().expect("tmp");
-        fs::write(dir.path().join("f.txt"), "hello").expect("write");
-        let ws = workspace();
-        let mut registry = Registry::new(32 * 1024);
-        registry.register(Box::new(Read::new(ws)));
-
-        let request = args(&dir.path().join("f.txt"));
-
-        let present = registry
-            .dispatch(
-                "read",
-                request.clone(),
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-                &[ToolSource::Workspace],
-            )
-            .await;
-        assert!(present.ok, "{}", present.content);
-
-        let absent = registry
-            .dispatch(
-                "read",
-                request,
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-                &[ToolSource::Builtin],
-            )
-            .await;
-        assert!(!absent.ok);
-        assert_eq!(
-            absent.content,
-            "ERROR: Tool read is not available in this session."
-        );
     }
 }

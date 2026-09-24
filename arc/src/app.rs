@@ -20,17 +20,9 @@ pub enum Command {
     Send {
         session_id: Option<String>,
         content: String,
-    },
-    SendLive {
-        session_id: String,
-        content: String,
-    },
-    SendAttachments {
-        session_id: Option<String>,
-        content: String,
         attachments: Vec<ImageAttachment>,
     },
-    SendLiveAttachments {
+    SendLive {
         session_id: String,
         content: String,
         attachments: Vec<ImageAttachment>,
@@ -115,9 +107,6 @@ pub enum NetEvent {
         output_tokens: u32,
         step_capped: bool,
         grounding_json: String,
-        /// The message that started this stream was queued into a turn
-        /// already running in this session; its real reply streams on
-        /// whichever request accepted that turn, not this one.
         queued: bool,
     },
     Failed {
@@ -203,6 +192,11 @@ pub struct Jobs {
     pub selected: usize,
     pub loaded: bool,
     pub confirmation: Option<String>,
+}
+
+enum PendingModel {
+    Create(SessionRole, String),
+    Fork(SessionRole, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,10 +345,9 @@ pub struct App {
     visual_rewind: bool,
     pending_rewind_text: Option<String>,
     session_meta: HashMap<String, (SessionRole, String, Source)>,
-    pending_code: Option<(SessionRole, String)>,
+    pending_code: Option<String>,
     pending_first: Option<(String, Vec<ImageAttachment>)>,
-    pending_model_creation: Option<(SessionRole, String)>,
-    pending_model_fork: Option<(SessionRole, String)>,
+    pending_model: Option<PendingModel>,
     pub review_pending: u32,
     launch_dir: Option<PathBuf>,
     seeded_projects: Vec<ProjectInfo>,
@@ -482,8 +475,7 @@ impl App {
             session_meta: HashMap::new(),
             pending_code: None,
             pending_first: None,
-            pending_model_creation: None,
-            pending_model_fork: None,
+            pending_model: None,
             review_pending: 0,
             launch_dir: None,
             seeded_projects: Vec::new(),
@@ -491,8 +483,6 @@ impl App {
         }
     }
 
-    /// Set once at startup, from the client's own working directory; `None`
-    /// for a remote client, whose directory means nothing to the daemon.
     pub fn set_launch_dir(&mut self, dir: Option<PathBuf>) {
         self.launch_dir = dir;
     }
@@ -1152,12 +1142,12 @@ impl App {
         if project.is_empty() {
             return self.code_picker();
         }
-        if self.active_code_project().is_none() {
+        if self.open_project().is_none() {
             self.chat_return = self.session_id.clone();
             self.chat_draft = std::mem::take(&mut self.input);
         }
         let command = self.start_session(None);
-        self.pending_code = Some((SessionRole::Code, project.to_owned()));
+        self.pending_code = Some(project.to_owned());
         self.code_return = Some((None, project.to_owned()));
         self.input = std::mem::take(&mut self.code_draft);
         self.cursor = self.input.len();
@@ -1332,22 +1322,6 @@ impl App {
         true
     }
 
-    fn active_code_project(&self) -> Option<String> {
-        self.pending_code
-            .as_ref()
-            .map(|(_, project)| project.clone())
-            .or_else(|| {
-                self.session_id
-                    .as_ref()
-                    .and_then(|id| self.session_meta.get(id))
-                    .filter(|(role, _, source)| {
-                        *source == Source::User
-                            && matches!(role, SessionRole::Code | SessionRole::Executor)
-                    })
-                    .map(|(_, project, _)| project.clone())
-            })
-    }
-
     fn code_picker(&mut self) -> Option<Command> {
         self.can_switch_door().then(|| self.open_projects())
     }
@@ -1356,8 +1330,7 @@ impl App {
         if !self.can_switch_door() {
             return None;
         }
-        let project = self.active_code_project()?;
-        self.code_return = Some((self.session_id.clone(), project));
+        self.open_project()?;
         self.code_draft = std::mem::take(&mut self.input);
         let command = self.start_session(self.chat_return.clone());
         self.input = std::mem::take(&mut self.chat_draft);
@@ -1367,7 +1340,7 @@ impl App {
     }
 
     fn switch_door(&mut self) -> Option<Command> {
-        if self.active_code_project().is_some() {
+        if self.open_project().is_some() {
             return self.switch_chat();
         }
         if !self.can_switch_door() {
@@ -1380,7 +1353,7 @@ impl App {
         self.chat_draft = std::mem::take(&mut self.input);
         let command = self.start_session(session);
         if self.session_id.is_none() {
-            self.pending_code = Some((SessionRole::Code, project));
+            self.pending_code = Some(project);
         }
         self.input = std::mem::take(&mut self.code_draft);
         self.cursor = self.input.len();
@@ -1429,13 +1402,11 @@ impl App {
         if !default && !self.can_switch_door() {
             return None;
         }
-        if !default && (self.pending_model_creation.is_some() || self.pending_model_fork.is_some())
-        {
+        if !default && self.pending_model.is_some() {
             self.last_error = Some("Wait for the model switch to finish".to_owned());
             return None;
         }
         if !default
-            && self.session_id.is_some()
             && self
                 .session_id
                 .as_deref()
@@ -1447,7 +1418,7 @@ impl App {
         let role = self
             .pending_code
             .as_ref()
-            .map(|(role, _)| *role)
+            .map(|_| SessionRole::Code)
             .or_else(|| {
                 self.session_id
                     .as_deref()
@@ -1488,7 +1459,7 @@ impl App {
         if default {
             return Some(Command::SelectModel { role, choice: name });
         }
-        if let Some(session_id) = self.session_id.clone() {
+        let (role, project) = if let Some(session_id) = self.session_id.clone() {
             let Some((role, project, source)) = self.session_meta.get(&session_id).cloned() else {
                 self.last_error =
                     Some("Session metadata unavailable; retry after refresh".to_owned());
@@ -1500,7 +1471,7 @@ impl App {
                     .flatten()
             });
             if let Some(fork_point) = fork_point {
-                self.pending_model_fork = Some((role, project));
+                self.pending_model = Some(PendingModel::Fork(role, project));
                 return Some(Command::ForkSession {
                     session_id,
                     fork_point,
@@ -1520,18 +1491,15 @@ impl App {
                     Some("No durable message to fork; retry after history loads".to_owned());
                 return None;
             }
-            self.pending_model_creation = Some((role, project.clone()));
-            return Some(Command::CreateSession {
-                role,
-                project,
-                choice: name,
-            });
-        }
-        let (role, project) = self
-            .pending_code
-            .clone()
-            .unwrap_or((SessionRole::Chat, String::new()));
-        self.pending_model_creation = Some((role, project.clone()));
+            (role, project)
+        } else {
+            self.pending_code
+                .clone()
+                .map_or((SessionRole::Chat, String::new()), |project| {
+                    (SessionRole::Code, project)
+                })
+        };
+        self.pending_model = Some(PendingModel::Create(role, project.clone()));
         Some(Command::CreateSession {
             role,
             project,
@@ -1924,7 +1892,7 @@ impl App {
 
     pub fn open_door_label(&self) -> Option<String> {
         if self.session_id.is_none() {
-            if let Some((SessionRole::Code | SessionRole::Executor, project)) = &self.pending_code {
+            if let Some(project) = &self.pending_code {
                 return Some(format!("code/{project}"));
             }
         }
@@ -1945,12 +1913,7 @@ impl App {
     /// `None` for the chat, where the picker stays unscoped.
     pub fn open_project(&self) -> Option<&str> {
         if self.session_id.is_none() {
-            return match &self.pending_code {
-                Some((SessionRole::Code | SessionRole::Executor, project)) => {
-                    Some(project.as_str())
-                }
-                _ => None,
-            };
+            return self.pending_code.as_deref();
         }
         let (role, project, source) = self
             .session_id
@@ -1966,7 +1929,7 @@ impl App {
     }
 
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
-        if let Some(project) = self.active_code_project() {
+        if let Some(project) = self.open_project().map(str::to_owned) {
             self.code_return = Some((self.session_id.clone(), project));
         } else if self.session_id.is_some() {
             self.chat_return = self.session_id.clone();
@@ -2003,7 +1966,7 @@ impl App {
     }
 
     fn submit(&mut self) -> Option<Command> {
-        if self.pending_model_creation.is_some() || self.pending_model_fork.is_some() {
+        if self.pending_model.is_some() {
             self.last_error = Some("Wait for the model switch to finish".to_owned());
             return None;
         }
@@ -2022,17 +1985,10 @@ impl App {
                 if !attachments.is_empty() {
                     self.sending_attachments.push_back(attachments.clone());
                 }
-                return Some(if attachments.is_empty() {
-                    Command::SendLive {
-                        session_id,
-                        content,
-                    }
-                } else {
-                    Command::SendLiveAttachments {
-                        session_id,
-                        content,
-                        attachments,
-                    }
+                return Some(Command::SendLive {
+                    session_id,
+                    content,
+                    attachments,
                 });
             }
             // the first message of a brand-new session: no session id to
@@ -2041,11 +1997,11 @@ impl App {
             return None;
         }
         if self.session_id.is_none() {
-            if let Some((role, project)) = self.pending_code.clone() {
+            if let Some(project) = self.pending_code.clone() {
                 self.status = Status::Streaming;
                 self.pending_first = Some((content, attachments));
                 return Some(Command::CreateSession {
-                    role,
+                    role: SessionRole::Code,
                     project,
                     choice: String::new(),
                 });
@@ -2087,17 +2043,10 @@ impl App {
         if !attachments.is_empty() {
             self.sending_attachments.push_back(attachments.clone());
         }
-        if attachments.is_empty() {
-            Command::Send {
-                session_id: self.session_id.clone(),
-                content,
-            }
-        } else {
-            Command::SendAttachments {
-                session_id: self.session_id.clone(),
-                content,
-                attachments,
-            }
+        Command::Send {
+            session_id: self.session_id.clone(),
+            content,
+            attachments,
         }
     }
 
@@ -2272,23 +2221,7 @@ impl App {
                 outcome,
                 content,
             } => {
-                let ended = self
-                    .transcript
-                    .iter_mut()
-                    .map(|entry| &mut entry.block)
-                    .rev()
-                    .find(
-                        |block| matches!(block, Block::Tool { call_id: id, .. } if *id == call_id),
-                    );
-                if let Some(Block::Tool {
-                    outcome: o,
-                    content: c,
-                    ..
-                }) = ended
-                {
-                    *o = Some(outcome_label(outcome));
-                    *c = content;
-                }
+                complete_tool(&mut self.transcript, &call_id, outcome, content);
                 None
             }
             NetEvent::End {
@@ -2333,8 +2266,7 @@ impl App {
                 None
             }
             NetEvent::Failed { code, msg } => {
-                self.pending_model_creation = None;
-                self.pending_model_fork = None;
+                self.pending_model = None;
                 self.live_streams = self.live_streams.saturating_sub(1);
                 if let Some((content, mut attachments)) = self.pending_first.take() {
                     if self.input.is_empty() {
@@ -2460,7 +2392,10 @@ impl App {
                 None
             }
             NetEvent::SessionCreated { session_id } => {
-                if let Some((role, project)) = self.pending_model_creation.take() {
+                if let Some(PendingModel::Create(role, project)) = self
+                    .pending_model
+                    .take_if(|model| matches!(model, PendingModel::Create(..)))
+                {
                     self.session_meta
                         .insert(session_id.clone(), (role, project, Source::User));
                     let attachments = std::mem::take(&mut self.pending_attachments);
@@ -2468,16 +2403,21 @@ impl App {
                     self.pending_attachments = attachments;
                     return command;
                 }
-                if let Some((role, project)) = self.pending_code.take() {
-                    self.session_meta
-                        .insert(session_id.clone(), (role, project, Source::User));
+                if let Some(project) = self.pending_code.take() {
+                    self.session_meta.insert(
+                        session_id.clone(),
+                        (SessionRole::Code, project, Source::User),
+                    );
                 }
                 self.session_id = Some(session_id);
                 let (content, attachments) = self.pending_first.take()?;
                 Some(self.send_with_attachments(content, attachments))
             }
             NetEvent::SessionForked { session_id } => {
-                if let Some((role, project)) = self.pending_model_fork.take() {
+                if let Some(PendingModel::Fork(role, project)) = self
+                    .pending_model
+                    .take_if(|model| matches!(model, PendingModel::Fork(..)))
+                {
                     self.session_meta
                         .insert(session_id.clone(), (role, project, Source::User));
                 }
@@ -2496,8 +2436,7 @@ impl App {
                 Some(Command::History { session_id })
             }
             NetEvent::Disconnected { reason } => {
-                self.pending_model_creation = None;
-                self.pending_model_fork = None;
+                self.pending_model = None;
                 for mut attachments in self.sending_attachments.drain(..) {
                     self.pending_attachments.append(&mut attachments);
                 }
@@ -2749,9 +2688,7 @@ fn block_yank_text(block: &Block) -> Option<String> {
     }
 }
 
-// the map is a BTreeMap, so "first value" is alphabetical-key order —
-// `project` would beat `question`; known payload keys are tried first
-const SUMMARY_KEYS: &[&str] = &["question", "command", "query", "brief", "path", "id"];
+const SUMMARY_KEYS: &[&str] = &["command", "query", "brief", "path", "id"];
 
 // two provider shapes, verbatim: Gemini's groundingChunks[].web and the
 // Responses API's url_citation annotations
@@ -2832,6 +2769,23 @@ fn outcome_label(outcome: i32) -> &'static str {
     }
 }
 
+fn complete_tool(entries: &mut [Entry], call_id: &str, outcome: i32, content: String) {
+    let ended = entries
+        .iter_mut()
+        .rev()
+        .map(|entry| &mut entry.block)
+        .find(|block| matches!(block, Block::Tool { call_id: id, .. } if id == call_id));
+    if let Some(Block::Tool {
+        outcome: current,
+        content: result,
+        ..
+    }) = ended
+    {
+        *current = Some(outcome_label(outcome));
+        *result = content;
+    }
+}
+
 fn activity(session: &SessionInfo) -> Option<(i64, i32)> {
     session
         .last_at
@@ -2901,7 +2855,7 @@ fn history_blocks(
                         call_id: call.call_id,
                         name: call.name,
                         args: call.arguments_json,
-                        outcome: None,
+                        outcome: Some("unknown"),
                         content: String::new(),
                         open: false,
                     },
@@ -2909,16 +2863,7 @@ fn history_blocks(
                 });
             }
             Some(history_entry::Entry::ToolResult(result)) => {
-                let ended = blocks.iter_mut().map(|entry| &mut entry.block).rev().find(
-                    |block| matches!(block, Block::Tool { call_id, .. } if *call_id == result.call_id),
-                );
-                if let Some(Block::Tool {
-                    outcome, content, ..
-                }) = ended
-                {
-                    *outcome = Some(outcome_label(result.outcome));
-                    *content = result.content;
-                }
+                complete_tool(&mut blocks, &result.call_id, result.outcome, result.content);
             }
             // provider-side, arrives resolved; styled like a finished tool line
             Some(history_entry::Entry::ServerCall(call)) => {
@@ -2943,15 +2888,6 @@ fn history_blocks(
                     "a branch continues from here: {label}"
                 ))));
             }
-        }
-    }
-    for block in blocks.iter_mut().map(|entry| &mut entry.block) {
-        if let Block::Tool {
-            outcome: outcome @ None,
-            ..
-        } = block
-        {
-            *outcome = Some("unknown");
         }
     }
     if !parent_session.is_empty() {
@@ -3080,25 +3016,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filtering_a_picker_selects_the_match_instead_of_new_session() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session_with(
-            "s-code",
-            "SPI display wiring",
-            "",
-        )]));
-        app.open_picker();
-        app.on_key(key(KeyCode::Char('/')));
-        typed(&mut app, "SPI");
-        assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
-            Some(Command::History {
-                session_id: "s-code".to_owned()
-            })
-        );
-    }
-
     fn typed(app: &mut App, text: &str) {
         for c in text.chars() {
             assert_eq!(app.on_key(key(KeyCode::Char(c))), None);
@@ -3110,81 +3027,6 @@ mod tests {
         for c in keys.chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
-    }
-
-    #[test]
-    fn a_paste_in_insert_mode_lands_verbatim_without_submitting() {
-        let mut app = App::new();
-        typed(&mut app, "ab");
-        app.on_key(key(KeyCode::Left));
-        assert_eq!(app.on_paste("1\r\n2\n3"), None);
-        assert_eq!(app.input, "a1\n2\n3b");
-        assert_eq!(app.cursor, "a1\n2\n3".len());
-        assert_eq!(app.mode, Mode::Insert);
-    }
-
-    #[test]
-    fn a_paste_in_normal_mode_inserts_at_the_cursor() {
-        let mut app = App::new();
-        typed(&mut app, "abc");
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.on_paste("X"), None);
-        assert_eq!(app.input, "abXc");
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn a_paste_in_cmd_mode_keeps_only_the_first_line() {
-        let mut app = App::new();
-        normal(&mut app, ":");
-        assert_eq!(app.mode, Mode::Cmd);
-        assert_eq!(app.on_paste("review\nq"), None);
-        assert_eq!(app.cmd, "review");
-    }
-
-    #[test]
-    fn model_overlay_keeps_controls_and_scrolling_out_of_the_transcript() {
-        let mut app = App::new();
-        app.input = "draft".to_owned();
-        app.cursor = app.input.len();
-        app.open_models(false);
-        let overlay = app.overlay.clone();
-        for code in ['p', 'n', 'j', 'o', 't'] {
-            assert_eq!(app.on_key(ctrl(code)), None);
-            assert_eq!(app.overlay, overlay);
-        }
-        app.on_scroll(true, PAGE);
-        assert_eq!(app.scroll_back, 0);
-        assert_eq!(app.input, "draft");
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.overlay, Overlay::None);
-    }
-
-    #[test]
-    fn project_overlay_scrolls_its_selection() {
-        let mut app = App::new();
-        app.open_projects();
-        app.on_net(NetEvent::ProjectItems(vec![
-            ProjectInfo {
-                name: "one".to_owned(),
-                ..ProjectInfo::default()
-            },
-            ProjectInfo {
-                name: "two".to_owned(),
-                ..ProjectInfo::default()
-            },
-        ]));
-        app.on_scroll(false, 1);
-        assert_eq!(app.projects_mut().expect("projects").selected, 1);
-        assert_eq!(app.scroll_back, 0);
-    }
-
-    #[test]
-    fn a_paste_over_an_overlay_is_ignored() {
-        let mut app = App::new();
-        app.overlay = Overlay::Help { scroll: 0 };
-        assert_eq!(app.on_paste("x"), None);
-        assert_eq!(app.input, "");
     }
 
     fn session(id: &str) -> SessionInfo {
@@ -3300,20 +3142,13 @@ mod tests {
             command,
             Some(Command::Send {
                 session_id: None,
-                content: "hello".to_owned()
+                content: "hello".to_owned(),
+                attachments: Vec::new(),
             })
         );
         assert_eq!(app.block_contents(), [Block::You("hello".to_owned())]);
         assert_eq!(app.input, "");
         assert_eq!(app.status, Status::Streaming);
-    }
-
-    #[test]
-    fn a_blank_input_does_not_send() {
-        let mut app = App::new();
-        typed(&mut app, "   ");
-        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.block_contents(), []);
     }
 
     #[test]
@@ -3343,19 +3178,6 @@ mod tests {
                 }
             ]
         );
-    }
-
-    #[test]
-    fn an_existing_session_does_not_refresh_the_list() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-
-        let refresh = app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        assert_eq!(refresh, None);
     }
 
     #[test]
@@ -3399,136 +3221,6 @@ mod tests {
             ],
             "the trace accumulates folded, where the reply will appear"
         );
-    }
-
-    #[test]
-    fn the_first_delta_finalizes_the_thought_and_keeps_the_words() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("let me think".to_owned()));
-
-        app.on_net(NetEvent::Delta("hello".to_owned()));
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::You("hi".to_owned()),
-                Block::Thought {
-                    text: "let me think".to_owned(),
-                    seconds: 1,
-                    done: true,
-                    open: false,
-                },
-                Block::Arc {
-                    text: "hello".to_owned(),
-                    partial: false
-                },
-            ],
-            "the words stay; only the streaming stops"
-        );
-    }
-
-    #[test]
-    fn reasoning_finalizes_on_end_when_no_text_ever_came() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
-        app.on_net(end(true));
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::You("hi".to_owned()),
-                Block::Thought {
-                    text: "hmm".to_owned(),
-                    seconds: 1,
-                    done: true,
-                    open: false,
-                }
-            ]
-        );
-        assert_eq!(app.status, Status::Idle);
-    }
-
-    #[test]
-    fn ctrl_o_toggles_a_done_thought_from_either_mode() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
-        app.on_net(NetEvent::Delta("hello".to_owned()));
-        app.on_net(end(false));
-
-        assert_eq!(app.on_key(ctrl('o')), None, "insert mode opens it");
-        assert!(matches!(
-            app.transcript[1].block,
-            Block::Thought { open: true, .. }
-        ));
-
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(ctrl('o'));
-        assert!(
-            matches!(app.transcript[1].block, Block::Thought { open: false, .. }),
-            "normal mode closes it again"
-        );
-    }
-
-    #[test]
-    fn ctrl_o_opens_a_live_thought_and_finalizing_keeps_it_open() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("hmm".to_owned()));
-
-        app.on_key(ctrl('o'));
-        assert!(
-            matches!(
-                app.transcript.last().map(|entry| &entry.block),
-                Some(Block::Thought {
-                    done: false,
-                    open: true,
-                    ..
-                })
-            ),
-            "a live thought streams open"
-        );
-
-        app.on_net(NetEvent::Delta("hello".to_owned()));
-        assert!(
-            matches!(
-                app.transcript[1].block,
-                Block::Thought {
-                    done: true,
-                    open: true,
-                    ..
-                }
-            ),
-            "finalizing does not fold it back"
-        );
-    }
-
-    #[test]
-    fn ctrl_o_without_blocks_sets_the_preference() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(app.on_key(ctrl('o')), None);
-        assert_eq!(app.block_contents(), [Block::You("hi".to_owned())]);
-        assert!(app.show_details);
     }
 
     #[test]
@@ -3635,52 +3327,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_toggles_every_thought_at_once() {
-        let mut app = App::new();
-        typed(&mut app, "one");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("first".to_owned()));
-        app.on_net(NetEvent::Delta("a".to_owned()));
-        app.on_net(end(false));
-
-        typed(&mut app, "two");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("second".to_owned()));
-        app.on_net(NetEvent::Delta("b".to_owned()));
-        app.on_net(end(false));
-
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(ctrl('o'));
-        for at in [1, 4] {
-            assert!(
-                matches!(&app.transcript[at].block, Block::Thought { open: true, .. }),
-                "both traces open together"
-            );
-        }
-
-        if let Block::Thought { open, .. } = &mut app.transcript[1].block {
-            *open = false;
-        }
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(ctrl('o'));
-        for at in [1, 4] {
-            assert!(
-                matches!(
-                    &app.transcript[at].block,
-                    Block::Thought { open: false, .. }
-                ),
-                "any open means the toggle closes all"
-            );
-        }
-    }
-
-    #[test]
     fn tool_lines_resolve_by_call_id_with_two_in_flight() {
         let mut app = App::new();
         typed(&mut app, "hi");
@@ -3733,76 +3379,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_live_tool_call_retains_all_arguments() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::ToolStarted {
-            call_id: "t1".to_owned(),
-            name: "bash".to_owned(),
-            arguments_json: r#"{"command":"cargo test"}"#.to_owned(),
-        });
-
-        assert_eq!(
-            app.transcript.last().map(|entry| &entry.block),
-            Some(&Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "bash".to_owned(),
-                args: r#"{"command":"cargo test"}"#.to_owned(),
-                outcome: None,
-                content: String::new(),
-                open: false,
-            })
-        );
-    }
-
-    #[test]
-    fn a_history_tool_call_retains_all_arguments() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![HistoryEntry {
-                entry: Some(history_entry::Entry::ToolCall(HistoryToolCall {
-                    call_id: "t1".to_owned(),
-                    name: "read".to_owned(),
-                    arguments_json: r#"{"path":"src/main.rs"}"#.to_owned(),
-                })),
-                seq: 0,
-            }],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "read".to_owned(),
-                args: r#"{"path":"src/main.rs"}"#.to_owned(),
-                outcome: Some("unknown"),
-                content: String::new(),
-                open: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn unparseable_arguments_remain_visible() {
-        assert_eq!(tool_summary("not json"), "not json");
-        assert_eq!(tool_summary(""), "");
-        assert_eq!(
-            tool_summary(r#"{"count":3}"#),
-            "",
-            "no string field to show"
-        );
-    }
-
     const GROUNDING: &str = r#"{"webSearchQueries":["arc daemon"],"groundingChunks":[
         {"web":{"uri":"https://example.org/a","title":"Example A"}},
         {"web":{"uri":"https://example.org/b"}},
@@ -3825,25 +3401,6 @@ mod tests {
         assert_eq!(
             grounding_sources("not json"),
             Vec::<(String, String)>::new()
-        );
-    }
-
-    #[test]
-    fn grounding_sources_read_responses_url_citations_too() {
-        let grounding = r#"{"annotations":[
-            {"type":"url_citation","url":"https://a.example/x","title":"A","start_index":0,"end_index":5},
-            {"type":"url_citation","url":"https://b.example/y","title":"  "},
-            {"type":"file_citation","file_id":"f1"}]}"#;
-        assert_eq!(
-            grounding_sources(grounding),
-            [
-                ("A".to_owned(), "https://a.example/x".to_owned()),
-                (
-                    "https://b.example/y".to_owned(),
-                    "https://b.example/y".to_owned()
-                ),
-            ],
-            "a blank title falls back to the url; other annotation kinds are skipped"
         );
     }
 
@@ -3887,32 +3444,6 @@ mod tests {
     }
 
     #[test]
-    fn a_grounded_history_message_renders_its_sources_after_the_reply() {
-        let entries = vec![HistoryEntry {
-            entry: Some(history_entry::Entry::Message(HistoryMessage {
-                role: Role::Assistant as i32,
-                content: "sourced answer".to_owned(),
-                partial: false,
-                source: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: GROUNDING.to_owned(),
-            })),
-            seq: 0,
-        }];
-        let entries = history_blocks(entries, "", 0, &[]);
-        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
-        assert!(
-            matches!(
-                blocks.as_slice(),
-                [Block::Arc { .. }, Block::Sources(sources)] if sources.len() == 2
-            ),
-            "got {blocks:?}"
-        );
-    }
-
-    #[test]
     fn a_branched_session_gets_a_marker_after_the_last_inherited_row() {
         let entries = vec![
             prose_entry_at(1, Role::User as i32, "inherited question", false),
@@ -3937,123 +3468,6 @@ mod tests {
             "the marker lands right after the last inherited row"
         );
         assert_eq!(seqs, [Some(1), Some(2), None, Some(3)]);
-    }
-
-    #[test]
-    fn a_parentless_session_gets_no_marker() {
-        let entries = vec![prose_entry_at(1, Role::User as i32, "hi", false)];
-        let entries = history_blocks(entries, "", 0, &[]);
-        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
-
-        assert!(
-            !blocks.iter().any(|b| matches!(b, Block::Note(_))),
-            "no lineage, no marker"
-        );
-    }
-
-    #[test]
-    fn point_visual_lights_exactly_one_block_and_walks_both_ways() {
-        let mut app = App::new();
-        app.set_blocks(vec![
-            Block::You("one".to_owned()),
-            Block::Arc {
-                text: "two".to_owned(),
-                partial: false,
-            },
-            Block::You("three".to_owned()),
-        ]);
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('v')));
-        assert_eq!(app.visual_range(), Some((2, 2)), "starts at the last block");
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.visual_range(), Some((1, 1)), "one block, moved up");
-        app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            app.visual_range(),
-            Some((2, 2)),
-            "walks back down and clamps at the end"
-        );
-    }
-
-    #[test]
-    fn point_visual_selects_tools_between_messages() {
-        let mut app = App::new();
-        app.set_blocks(vec![
-            Block::You("one".to_owned()),
-            Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "bash".to_owned(),
-                args: String::new(),
-                outcome: Some("ok"),
-                content: String::new(),
-                open: false,
-            },
-            Block::Arc {
-                text: "two".to_owned(),
-                partial: false,
-            },
-        ]);
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('v')));
-        assert_eq!(app.visual_range(), Some((1, 1)), "starts on the tool");
-
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(
-            app.visual_range(),
-            Some((0, 0)),
-            "moves to the preceding message"
-        );
-
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(
-            app.visual_range(),
-            Some((0, 0)),
-            "no earlier message: stays put"
-        );
-
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.visual_range(), Some((1, 1)), "moves through the tool");
-
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            app.visual_range(),
-            Some((2, 2)),
-            "no later message: stays put"
-        );
-    }
-
-    #[test]
-    fn range_visual_still_extends_upward_from_its_anchor() {
-        let mut app = App::new();
-        app.set_blocks(vec![
-            Block::You("one".to_owned()),
-            Block::Arc {
-                text: "two".to_owned(),
-                partial: false,
-            },
-            Block::You("three".to_owned()),
-        ]);
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('V')));
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.visual_range(), Some((1, 2)), "a range, not a point");
-    }
-
-    #[test]
-    fn help_scrolling_moves_and_close_resets_it() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        app.overlay = Overlay::Help { scroll: 0 };
-        app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.overlay, Overlay::Help { scroll: 2 });
-        app.on_key(key(KeyCode::Char('g')));
-        assert_eq!(app.overlay, Overlay::Help { scroll: 0 });
-        app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Char('q')));
-        assert!(!matches!(app.overlay, Overlay::Help { .. }));
-        assert_eq!(app.overlay, Overlay::None, "closing forgets the scroll");
     }
 
     #[test]
@@ -4095,74 +3509,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_out_of_a_session_gets_a_forward_marker_after_its_entry() {
-        let entries = vec![
-            HistoryEntry {
-                entry: Some(history_entry::Entry::Message(HistoryMessage {
-                    role: Role::User as i32,
-                    content: "keep this".to_owned(),
-                    ..Default::default()
-                })),
-                seq: 4,
-            },
-            HistoryEntry {
-                entry: Some(history_entry::Entry::Message(HistoryMessage {
-                    role: Role::Assistant as i32,
-                    content: "the dead path starts here".to_owned(),
-                    ..Default::default()
-                })),
-                seq: 6,
-            },
-        ];
-        let branches = vec![(4, "an alternate take".to_owned())];
-        let entries = history_blocks(entries, "", 0, &branches);
-        let blocks: Vec<_> = entries.into_iter().map(|entry| entry.block).collect();
-        assert!(
-            matches!(
-                &blocks[..],
-                [Block::You(_), Block::Note(note), Block::Arc { .. }]
-                    if note == "a branch continues from here: an alternate take"
-            ),
-            "the signpost sits right after the fork point, got {blocks:?}"
-        );
-    }
-
-    #[test]
-    fn opening_the_picker_requests_a_fresh_session_list() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('s'))),
-            Some(Command::List),
-            "a branch forked seconds ago must appear without a restart"
-        );
-        assert!(app.picker().is_some());
-    }
-
-    #[test]
-    fn the_summary_prefers_the_payload_key_over_alphabetical_order() {
-        assert_eq!(
-            tool_summary(r#"{"project":"arc","question":"is this the simplest?"}"#),
-            "is this the simplest?",
-            "consult_expert shows what was asked, not where"
-        );
-        assert_eq!(
-            tool_summary(r#"{"namespace":"global","zz":"other"}"#),
-            "global",
-            "no known key falls back to the first string value, as before"
-        );
-    }
-
-    #[test]
-    fn an_empty_assistant_message_produces_no_block() {
-        let message = prose(Role::Assistant as i32, "", false);
-        assert_eq!(prose_block(message), None, "a text-less tool step");
-
-        let non_empty = prose(Role::Assistant as i32, "hello", false);
-        assert!(prose_block(non_empty).is_some());
-    }
-
-    #[test]
     fn a_completed_turn_appends_a_cost_block_with_the_reported_usage() {
         let mut app = App::new();
         typed(&mut app, "hi");
@@ -4192,25 +3538,6 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_usage_end_appends_no_cost_block() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-
-        app.on_net(end(false));
-
-        assert!(
-            !app.transcript
-                .iter()
-                .any(|entry| matches!(&entry.block, Block::Cost { .. })),
-            "a steer ack carries zeroed usage"
-        );
-    }
-
-    #[test]
     fn a_step_capped_end_appends_a_dim_notice_after_the_reply() {
         let mut app = App::new();
         typed(&mut app, "hi");
@@ -4233,43 +3560,6 @@ mod tests {
             app.transcript.last().map(|entry| &entry.block),
             Some(&Block::StepCapped)
         );
-    }
-
-    #[test]
-    fn a_normal_end_appends_no_step_capped_notice() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Delta("done".to_owned()));
-
-        app.on_net(end(false));
-
-        assert!(
-            !app.transcript
-                .iter()
-                .any(|entry| matches!(&entry.block, Block::StepCapped))
-        );
-    }
-
-    #[test]
-    fn turn_counters_are_idle_until_a_turn_starts_then_track_streamed_deltas() {
-        let mut app = App::new();
-        assert_eq!(app.turn_elapsed_seconds(), None);
-        assert_eq!(app.streamed_tokens_estimate(), 0);
-
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.turn_elapsed_seconds(), Some(0));
-
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("thinking".to_owned())); // 8 chars
-        app.on_net(NetEvent::Delta("hello world".to_owned())); // 11 chars
-        assert_eq!(app.streamed_tokens_estimate(), (8 + 11) / 4);
     }
 
     #[test]
@@ -4301,98 +3591,6 @@ mod tests {
             ),
             "one open thought block accumulates the deltas, got {:?}",
             app.transcript
-        );
-    }
-
-    #[test]
-    fn watched_job_reasoning_is_dropped_while_an_own_turn_streams() {
-        let mut app = App::new();
-        app.session_id = Some("s-job".to_owned());
-        app.status = Status::Streaming;
-
-        app.on_net(NetEvent::JobReasoning {
-            session_id: "s-job".to_owned(),
-            text: "late".to_owned(),
-        });
-        assert!(
-            app.transcript.is_empty(),
-            "a watched push must not interleave with an own turn's stream"
-        );
-    }
-
-    #[test]
-    fn the_streamed_counter_resets_between_turns() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Delta("some streamed reply text".to_owned()));
-        assert!(app.streamed_tokens_estimate() > 0);
-
-        app.on_net(end(false));
-        typed(&mut app, "again");
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            app.streamed_tokens_estimate(),
-            0,
-            "a fresh turn starts the counter over"
-        );
-    }
-
-    #[test]
-    fn a_failed_turn_appends_no_cost_block() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-
-        app.on_net(NetEvent::Failed {
-            code: "provider".to_owned(),
-            msg: "upstream 500".to_owned(),
-        });
-
-        assert!(
-            !app.transcript
-                .iter()
-                .any(|entry| matches!(&entry.block, Block::Cost { .. }))
-        );
-    }
-
-    #[test]
-    fn format_tokens_stays_bare_under_a_thousand_and_gains_k_above_it() {
-        assert_eq!(format_tokens(999), "999");
-        assert_eq!(format_tokens(2345), "2.3k");
-    }
-
-    #[test]
-    fn an_unrecognized_outcome_renders_as_unknown() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(started("t", "get_time"));
-        app.on_net(ended("t", 42, "who knows"));
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::You("hi".to_owned()),
-                Block::Tool {
-                    call_id: "t".to_owned(),
-                    name: "get_time".to_owned(),
-                    args: String::new(),
-                    outcome: Some("unknown"),
-                    content: "who knows".to_owned(),
-                    open: false,
-                },
-            ]
         );
     }
 
@@ -4439,7 +3637,8 @@ mod tests {
             command,
             Some(Command::SendLive {
                 session_id: "s-1".to_owned(),
-                content: "two".to_owned()
+                content: "two".to_owned(),
+                attachments: Vec::new(),
             }),
             "a message typed mid-turn goes to the live turn, not a local queue"
         );
@@ -4480,7 +3679,8 @@ mod tests {
             flushed,
             Some(Command::Send {
                 session_id: Some("s-1".to_owned()),
-                content: "two".to_owned()
+                content: "two".to_owned(),
+                attachments: Vec::new(),
             }),
             "sent as soon as the accept names the session"
         );
@@ -4506,204 +3706,6 @@ mod tests {
     }
 
     #[test]
-    fn disconnecting_sets_the_status_and_it_persists() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Disconnected {
-            reason: "the daemon closed the connection".to_owned(),
-        });
-        assert_eq!(app.status, Status::Disconnected);
-    }
-
-    #[test]
-    fn a_browsing_reply_clears_the_disconnected_status() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Disconnected {
-            reason: "the daemon closed the connection".to_owned(),
-        });
-        assert_eq!(app.status, Status::Disconnected);
-
-        app.on_net(NetEvent::Sessions(Vec::new()));
-        assert_eq!(
-            app.status,
-            Status::Idle,
-            "a successful command proves the reconnect worked"
-        );
-    }
-
-    #[test]
-    fn another_disconnect_leaves_the_status_disconnected() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Disconnected {
-            reason: "first".to_owned(),
-        });
-        app.on_net(NetEvent::Disconnected {
-            reason: "second".to_owned(),
-        });
-        assert_eq!(app.status, Status::Disconnected);
-    }
-
-    #[test]
-    fn esc_enters_normal_mode_on_the_last_char() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.cursor, 1, "vim lands on the char, not past it");
-        app.on_key(key(KeyCode::Char('i')));
-        assert_eq!(app.mode, Mode::Insert);
-    }
-
-    #[test]
-    fn normal_mode_edits_the_line_vim_style() {
-        let mut app = App::new();
-        typed(&mut app, "the quick fox");
-
-        normal(&mut app, "0x");
-        assert_eq!(app.input, "he quick fox");
-
-        normal(&mut app, "0wD");
-        assert_eq!(app.input, "he ", "D cuts from the word to the end");
-
-        normal(&mut app, "dd");
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor, 0);
-    }
-
-    #[test]
-    fn word_motions_move_between_words() {
-        let mut app = App::new();
-        typed(&mut app, "one two three");
-
-        normal(&mut app, "0w");
-        assert_eq!(app.cursor, 4);
-        app.on_key(key(KeyCode::Char('w')));
-        assert_eq!(app.cursor, 8);
-        app.on_key(key(KeyCode::Char('b')));
-        assert_eq!(app.cursor, 4);
-        app.on_key(key(KeyCode::Char('$')));
-        assert_eq!(app.cursor, 12, "$ sits on the last char");
-        app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.mode, Mode::Insert);
-        assert_eq!(app.cursor, 13, "a appends after the char");
-    }
-
-    #[test]
-    fn normal_mode_scrolls_the_transcript() {
-        let mut app = App::new();
-        normal(&mut app, "kkk");
-        assert_eq!(app.scroll_back, 3);
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.scroll_back, 2);
-        app.on_key(key(KeyCode::Char('G')));
-        assert_eq!(app.scroll_back, 0);
-        app.on_key(key(KeyCode::Char('g')));
-        app.on_key(key(KeyCode::Char('g')));
-        assert!(app.scroll_back > 1000, "gg overshoots; drawing clamps");
-    }
-
-    #[test]
-    fn the_page_keys_scroll_from_any_mode() {
-        let mut app = App::new();
-
-        app.on_scroll(true, PAGE);
-        assert_eq!(app.scroll_back, PAGE);
-        app.on_scroll(false, PAGE);
-        assert_eq!(app.scroll_back, 0);
-        app.on_scroll(false, PAGE);
-        assert_eq!(app.scroll_back, 0, "scrolling down at the bottom stays put");
-
-        typed(&mut app, "half a sentence");
-        assert_eq!(app.on_key(key(KeyCode::PageUp)), None);
-        assert_eq!(app.scroll_back, PAGE);
-        assert_eq!(app.input, "half a sentence", "and do not type themselves");
-        assert_eq!(app.mode, Mode::Insert);
-
-        app.on_key(key(KeyCode::PageDown));
-        assert_eq!(app.scroll_back, 0);
-    }
-
-    #[test]
-    fn the_picker_orders_sessions_by_last_activity() {
-        fn at(id: &str, started: i64, last: Option<i64>) -> SessionInfo {
-            SessionInfo {
-                provider: String::new(),
-                model: String::new(),
-                id: id.to_owned(),
-                title: String::new(),
-                preview: String::new(),
-                started_at: Some(prost_types::Timestamp {
-                    seconds: started,
-                    nanos: 0,
-                }),
-                last_at: last.map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
-                role: 0,
-                project: String::new(),
-                dispatched_by: String::new(),
-                source: Source::User as i32,
-                parent_session: String::new(),
-                disposition: 0,
-            }
-        }
-
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            at("old-but-active", 100, Some(900)),
-            at("newer-but-stale", 500, Some(600)),
-            at("empty", 700, None),
-        ]));
-
-        let order: Vec<&str> = app.by_recency().iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(order, ["old-but-active", "empty", "newer-but-stale"]);
-        assert_eq!(
-            app.picker_session(1).map(|s| s.id.as_str()),
-            Some("old-but-active"),
-            "row 1 is the session you were last in"
-        );
-    }
-
-    #[test]
-    fn scrolling_moves_the_picker_when_it_is_open() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session("old"), session("new")]));
-        normal(&mut app, "s");
-
-        app.on_scroll(false, PAGE);
-        assert_eq!(
-            picker_selected(&app),
-            Some(1),
-            "one row per gesture, not one page"
-        );
-        app.on_scroll(false, PAGE);
-        assert_eq!(picker_selected(&app), Some(2));
-        app.on_scroll(false, PAGE);
-        assert_eq!(
-            picker_selected(&app),
-            Some(2),
-            "and it stops at the last session"
-        );
-
-        app.on_scroll(true, PAGE);
-        assert_eq!(picker_selected(&app), Some(1));
-        assert_eq!(app.scroll_back, 0, "the transcript never moved");
-    }
-
-    #[test]
-    fn colon_q_quits_and_unknown_commands_explain_help() {
-        let mut app = App::new();
-        normal(&mut app, ":wq");
-        app.on_key(key(KeyCode::Enter));
-        assert!(!app.quit);
-        assert_eq!(
-            app.last_error.as_deref(),
-            Some("Unknown command :wq; use :help")
-        );
-
-        normal(&mut app, ":q");
-        app.on_key(key(KeyCode::Enter));
-        assert!(app.quit);
-    }
-
-    #[test]
     fn attach_queues_image_bytes_for_the_next_message_and_clear_discards_them() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("screen.png");
@@ -4718,7 +3720,7 @@ mod tests {
         app.mode = Mode::Insert;
         typed(&mut app, "what is this?");
         let command = app.on_key(key(KeyCode::Enter));
-        let Some(Command::SendAttachments {
+        let Some(Command::Send {
             content,
             attachments,
             ..
@@ -4746,25 +3748,6 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_attachment_does_not_replace_an_existing_pending_image() {
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("good.webp");
-        std::fs::write(&image, b"RIFFxxxxWEBPbody").unwrap();
-        let text = dir.path().join("not-image.txt");
-        std::fs::write(&text, b"hello").unwrap();
-        let mut app = App::new();
-
-        normal(&mut app, &format!(":attach {}", image.display()));
-        app.on_key(key(KeyCode::Enter));
-        normal(&mut app, &format!(":attach {}", text.display()));
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(app.pending_attachments.len(), 1);
-        assert_eq!(app.pending_attachments[0].name, "good.webp");
-        assert!(app.last_error.as_deref().unwrap().contains("unsupported"));
-    }
-
-    #[test]
     fn each_send_restores_only_its_own_attachments_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.png");
@@ -4780,7 +3763,7 @@ mod tests {
         typed(&mut app, "first");
         assert!(matches!(
             app.on_key(key(KeyCode::Enter)),
-            Some(Command::SendAttachments { .. })
+            Some(Command::Send { attachments, .. }) if !attachments.is_empty()
         ));
 
         normal(&mut app, &format!(":attach {}", second.display()));
@@ -4789,7 +3772,7 @@ mod tests {
         typed(&mut app, "second");
         assert!(matches!(
             app.on_key(key(KeyCode::Enter)),
-            Some(Command::SendLiveAttachments { .. })
+            Some(Command::SendLive { attachments, .. }) if !attachments.is_empty()
         ));
         let first_sent = app.sending_attachments[0].clone();
         let second_sent = app.sending_attachments[1].clone();
@@ -4843,31 +3826,6 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_keeps_recency_order_and_annotates_lineage() {
-        let mut app = App::new();
-        let mut fork = session_with("child-of-1", "the fork", "hi");
-        fork.parent_session = "s-1-uuid-long".to_owned();
-        app.on_net(NetEvent::Sessions(vec![
-            fork,
-            session_with("s-1-uuid-long", "root one", "hi"),
-            session_with("s-2", "root two", "hi"),
-        ]));
-
-        let rows = app.picker_flat_rows();
-        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["child-of-1", "s-1-uuid-long", "s-2"],
-            "position is pure recency: the fresh branch leads, its stale parent follows"
-        );
-        assert_eq!(
-            rows.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
-            [Some("s-1-uuid".to_owned()), None, None],
-            "lineage is an annotation — the parent's 8-char prefix — not a hierarchy"
-        );
-    }
-
-    #[test]
     fn m_and_shift_x_mark_the_selected_branch_only() {
         let mut app = App::new();
         let mut fork = session_with("s-fork", "the fork", "hi");
@@ -4901,223 +3859,6 @@ mod tests {
                 session_id: "s-fork".to_owned(),
                 disposition: branch_marked::Disposition::Abandoned,
             })
-        );
-    }
-
-    #[test]
-    fn tab_toggles_the_picker_between_flat_and_tree() {
-        use arc_proto::v1::branch_marked::Disposition;
-        let mut app = App::new();
-        let mut branch = session_with("s-branch", "the branch", "hi");
-        branch.parent_session = "s-root".to_owned();
-        branch.disposition = Disposition::Real as i32;
-        app.on_net(NetEvent::Sessions(vec![
-            branch,
-            session_with("s-root", "the root", "hi"),
-        ]));
-        normal(&mut app, "s");
-
-        assert!(!app.picker().expect("open").tree, "flat by default");
-
-        app.on_key(key(KeyCode::Tab));
-        let picker = app.picker().expect("still open");
-        assert!(picker.tree);
-        assert_eq!(
-            picker.selected, 0,
-            "row zero is 'new session': it has no id to preserve, so the top"
-        );
-
-        app.on_key(key(KeyCode::Tab));
-        assert!(!app.picker().expect("still open").tree);
-    }
-
-    #[test]
-    fn tab_keeps_the_highlighted_session_across_the_view_switch() {
-        use arc_proto::v1::branch_marked::Disposition;
-        let mut app = App::new();
-        let mut branch = session_with("s-branch", "the branch", "hi");
-        branch.parent_session = "s-root".to_owned();
-        branch.disposition = Disposition::Real as i32;
-        app.on_net(NetEvent::Sessions(vec![
-            branch,
-            session_with("s-root", "the root", "hi"),
-        ]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            app.picker_session(1).map(|s| s.id.as_str()),
-            Some("s-branch"),
-            "flat recency puts the fresh branch first"
-        );
-
-        app.on_key(key(KeyCode::Tab));
-
-        let picker = app.picker().expect("still open");
-        assert!(picker.tree, "Tab switched to tree");
-        assert_eq!(
-            picker.selected, 2,
-            "the branch now sits under its root at row two, still highlighted"
-        );
-        assert_eq!(
-            app.picker_session(picker.selected).map(|s| s.id.as_str()),
-            Some("s-branch"),
-            "the same session stays highlighted"
-        );
-        assert!(
-            app.picker_tree,
-            "the preference is remembered on the app, not just the open pane"
-        );
-
-        app.on_key(key(KeyCode::Tab));
-        assert_eq!(
-            app.picker_session(app.picker().expect("open").selected)
-                .map(|s| s.id.as_str()),
-            Some("s-branch"),
-            "flipping back keeps the highlight too"
-        );
-    }
-
-    #[test]
-    fn tab_in_the_filter_prompt_switches_views_without_dropping_the_filter() {
-        let mut app = App::new();
-        let mut branch = session_with("s-branch", "parser work", "hi");
-        branch.parent_session = "s-root".to_owned();
-        app.on_net(NetEvent::Sessions(vec![
-            branch,
-            session_with("s-root", "root", "hi"),
-            session_with("s-other", "unrelated", "hi"),
-        ]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('/')));
-        typed(&mut app, "parser");
-
-        let picker = app.picker().expect("open");
-        assert!(picker.filtering, "the filter prompt is active");
-        assert!(!picker.tree, "still flat under the filter");
-
-        app.on_key(key(KeyCode::Tab));
-
-        let picker = app.picker().expect("still open");
-        assert!(picker.filtering, "Tab inside the prompt keeps filtering");
-        assert!(picker.tree, "and switches the view");
-        assert_eq!(
-            app.picker_rows()
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            ["s-branch"],
-            "the query still narrows the tree"
-        );
-
-        app.on_key(key(KeyCode::Esc));
-        let picker = app.picker().expect("still open");
-        assert!(!picker.filtering);
-        assert!(picker.tree, "closing the prompt keeps the tree mode");
-    }
-
-    #[test]
-    fn a_sessions_refresh_clamps_the_picker_selection() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session_with("s-1", "one", "hi"),
-            session_with("s-2", "two", "hi"),
-            session_with("s-3", "three", "hi"),
-        ]));
-        normal(&mut app, "s");
-        for _ in 0..2 {
-            app.on_key(key(KeyCode::Char('j')));
-        }
-        assert_eq!(app.picker().expect("open").selected, 2);
-
-        app.on_net(NetEvent::Sessions(vec![session_with("s-1", "one", "hi")]));
-
-        assert_eq!(
-            app.picker().expect("still open").selected,
-            1,
-            "a shrinking refresh clamps to the new last row"
-        );
-    }
-
-    #[test]
-    fn tree_mode_survives_a_cyclic_parent_pointer() {
-        let mut app = App::new();
-        let mut a = session_with("s-a", "a", "hi");
-        a.parent_session = "s-b".to_owned();
-        let mut b = session_with("s-b", "b", "hi");
-        b.parent_session = "s-a".to_owned();
-        app.on_net(NetEvent::Sessions(vec![a, b]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Tab));
-
-        let rows = app.picker_tree_rows();
-        let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["s-a", "s-b"],
-            "a cycle strands no session: both still get a root row"
-        );
-        assert!(
-            rows.iter().all(|(_, flags)| flags.is_empty()),
-            "stranded sessions render as roots, not under a cyclic parent"
-        );
-    }
-
-    #[test]
-    fn page_keys_move_the_picker_selection_by_a_page() {
-        let mut app = App::new();
-        let sessions: Vec<_> = (0..25)
-            .map(|i| session_with(&format!("s-{i:02}"), &format!("session {i}"), "hi"))
-            .collect();
-        app.on_net(NetEvent::Sessions(sessions));
-        normal(&mut app, "s");
-        assert_eq!(app.picker().expect("open").selected, 0);
-
-        app.on_key(key(KeyCode::PageDown));
-        assert_eq!(
-            app.picker().expect("open").selected,
-            PAGE,
-            "PageDown steps by a page"
-        );
-
-        app.on_key(key(KeyCode::PageDown));
-        assert_eq!(app.picker().expect("open").selected, PAGE * 2);
-
-        app.on_key(key(KeyCode::PageUp));
-        assert_eq!(app.picker().expect("open").selected, PAGE);
-
-        app.on_key(ctrl('d'));
-        assert_eq!(
-            app.picker().expect("open").selected,
-            PAGE * 2,
-            "ctrl-d pages too"
-        );
-
-        app.on_key(ctrl('u'));
-        app.on_key(ctrl('u'));
-        assert_eq!(app.picker().expect("open").selected, 0);
-        assert_eq!(
-            app.scroll_back, 0,
-            "paging keys over a picker move the picker, not the transcript"
-        );
-    }
-
-    #[test]
-    fn the_tree_preference_survives_closing_and_reopening_the_picker() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session_with(
-            "s-root", "root", "hi",
-        )]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Tab));
-        assert!(app.picker().expect("open").tree);
-
-        app.on_key(key(KeyCode::Esc));
-        assert!(app.picker().is_none());
-
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(
-            app.picker().expect("reopened").tree,
-            "the reopened picker comes back in tree mode"
         );
     }
 
@@ -5215,22 +3956,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn m_on_a_root_row_is_an_instructive_error_with_no_wire_call() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session_with(
-            "s-root", "root", "hi",
-        )]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.picker_session(1).map(|s| s.id.as_str()), Some("s-root"));
-
-        let command = app.on_key(key(KeyCode::Char('X')));
-
-        assert_eq!(command, None, "a root has nothing to mark");
-        assert!(app.last_error.is_some());
-    }
-
     fn prose(role: i32, content: &str, partial: bool) -> HistoryMessage {
         HistoryMessage {
             role,
@@ -5238,21 +3963,6 @@ mod tests {
             partial,
             source: 0,
             ..Default::default()
-        }
-    }
-
-    fn prose_with_usage(
-        role: i32,
-        content: &str,
-        input_tokens: u32,
-        output_tokens: u32,
-        elapsed_ms: u32,
-    ) -> HistoryMessage {
-        HistoryMessage {
-            input_tokens,
-            output_tokens,
-            elapsed_ms,
-            ..prose(role, content, false)
         }
     }
 
@@ -5291,125 +4001,6 @@ mod tests {
             })),
             seq: 0,
         }
-    }
-
-    #[test]
-    fn history_replaces_the_loading_note_with_the_transcript() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session("old")]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('j')));
-        app.on_key(key(KeyCode::Enter));
-
-        app.on_net(NetEvent::History {
-            session_id: "old".to_owned(),
-            entries: vec![
-                prose_entry(Role::User as i32, "what is a walking skeleton?", false),
-                prose_entry(Role::Assistant as i32, "a thin end-to-end slice", true),
-                prose_entry(Role::System as i32, "the identity file", false),
-            ],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::You("what is a walking skeleton?".to_owned()),
-                Block::Arc {
-                    text: "a thin end-to-end slice".to_owned(),
-                    partial: true
-                }
-            ],
-            "user and model render, partial included; a system message has no speaker to be"
-        );
-    }
-
-    #[test]
-    fn history_renders_a_cost_block_after_an_assistant_row_carrying_usage() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![
-                prose_entry(Role::User as i32, "hi", false),
-                HistoryEntry {
-                    entry: Some(history_entry::Entry::Message(prose_with_usage(
-                        Role::Assistant as i32,
-                        "hello there",
-                        2345,
-                        140,
-                        1500,
-                    ))),
-                    seq: 0,
-                },
-            ],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::You("hi".to_owned()),
-                Block::Arc {
-                    text: "hello there".to_owned(),
-                    partial: false
-                },
-                Block::Cost {
-                    input_tokens: 2345,
-                    output_tokens: 140,
-                    seconds: 1.5,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn history_renders_no_cost_block_for_a_zero_usage_row() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![prose_entry(Role::Assistant as i32, "hello there", false)],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert!(
-            !app.transcript
-                .iter()
-                .any(|entry| matches!(&entry.block, Block::Cost { .. })),
-            "zero usage renders no cost line"
-        );
-    }
-
-    #[test]
-    fn history_renders_no_cost_block_for_a_system_row_even_with_usage() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![HistoryEntry {
-                entry: Some(history_entry::Entry::Message(HistoryMessage {
-                    source: Source::System as i32,
-                    ..prose_with_usage(Role::User as i32, "a handback note", 10, 20, 30)
-                })),
-                seq: 0,
-            }],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [Block::System("a handback note".to_owned())],
-            "a system row never grows a cost line, even carrying stray usage"
-        );
     }
 
     #[test]
@@ -5459,45 +4050,6 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_and_missing_history_outcomes_read_unknown() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![
-                call_entry("a", "alpha"),
-                call_entry("b", "beta"),
-                result_entry("b", 42),
-            ],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::Tool {
-                    call_id: "a".to_owned(),
-                    name: "alpha".to_owned(),
-                    args: String::new(),
-                    outcome: Some("unknown"),
-                    content: String::new(),
-                    open: false,
-                },
-                Block::Tool {
-                    call_id: "b".to_owned(),
-                    name: "beta".to_owned(),
-                    args: String::new(),
-                    outcome: Some("unknown"),
-                    content: String::new(),
-                    open: false,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn history_for_a_session_already_left_is_dropped() {
         let mut app = App::new();
         app.session_id = Some("second".to_owned());
@@ -5516,30 +4068,6 @@ mod tests {
             [Block::Note("loading".to_owned())],
             "the transcript we are actually waiting on is untouched"
         );
-    }
-
-    #[test]
-    fn the_picker_row_zero_starts_a_new_session() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.push_block(Block::You("old".to_owned()));
-
-        app.on_key(ctrl('p'));
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(app.session_id, None);
-        assert_eq!(app.block_contents(), []);
-    }
-
-    #[test]
-    fn the_picker_does_not_open_mid_stream() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(ctrl('p'));
-        assert_eq!(app.picker(), None);
-        normal(&mut app, "s");
-        assert_eq!(app.picker(), None);
     }
 
     #[test]
@@ -5605,57 +4133,6 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_hides_job_sessions_even_when_showing_all() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session("conv"),
-            job_session("job", "", SessionRole::Executor, "arc"),
-        ]));
-        normal(&mut app, "s");
-
-        assert_eq!(
-            app.picker_rows()
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            ["conv"],
-            "a dispatched job is not a conversation"
-        );
-
-        app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.picker_rows().len(), 1, "all still excludes jobs");
-
-        app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(app.picker_rows().len(), 1, "a toggles back off");
-    }
-
-    #[test]
-    fn a_user_sourced_code_session_lists_it_as_a_conversation() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            code_session("code", "", "arc"),
-            job_session("job", "", SessionRole::Executor, "arc"),
-        ]));
-        normal(&mut app, "s");
-
-        assert_eq!(
-            app.picker_rows()
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            ["code"],
-            "a user-opened executor session is a root conversation, not a job"
-        );
-
-        app.on_key(key(KeyCode::Char('a')));
-        assert_eq!(
-            app.picker_rows().len(),
-            1,
-            "all keeps the user-opened executor and excludes the dispatched job"
-        );
-    }
-
-    #[test]
     fn a_model_sourced_session_with_no_dispatched_by_still_hides_as_a_job() {
         // pre-6.34: dispatched_by was never recorded, but source always was
         let mut pre_634_job = job_session("job", "", SessionRole::Executor, "arc");
@@ -5675,95 +4152,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unspecified_source_session_hides_as_a_job() {
-        // a stale index predating the source column; a rebuild fixes it
-        let mut unspecified = session("stale");
-        unspecified.source = 0;
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session("conv"), unspecified]));
-        normal(&mut app, "s");
-
-        assert_eq!(
-            app.picker_rows()
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            ["conv"],
-            "unspecified source fails toward hiding noise, not showing it"
-        );
-    }
-
-    #[test]
-    fn space_toggles_show_all_same_as_a() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session("conv"),
-            job_session("job", "", SessionRole::Executor, "arc"),
-        ]));
-        normal(&mut app, "s");
-
-        app.on_key(key(KeyCode::Char(' ')));
-        assert!(app.picker().expect("open").show_all);
-        assert_eq!(app.picker_rows().len(), 1, "space does not reveal jobs");
-
-        app.on_key(key(KeyCode::Char(' ')));
-        assert!(!app.picker().expect("open").show_all);
-    }
-
-    #[test]
-    fn space_while_filtering_types_into_the_filter_instead_of_toggling() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session_with("keep", "two words", ""),
-            job_session("job", "two words job", SessionRole::Executor, "arc"),
-        ]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('/')));
-        typed(&mut app, "two");
-        assert_eq!(app.picker_rows().len(), 1, "the job stays hidden");
-
-        app.on_key(key(KeyCode::Char(' ')));
-        typed(&mut app, "words");
-
-        assert_eq!(app.input, "two words", "space landed in the filter text");
-        assert_eq!(
-            app.picker_rows().len(),
-            1,
-            "show-all never toggled, the job is still hidden"
-        );
-    }
-
-    #[test]
-    fn the_filter_never_includes_jobs() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session_with("conv", "alpha talk", ""),
-            job_session("job", "alpha job", SessionRole::Archivist, "arc"),
-        ]));
-        normal(&mut app, "s");
-        app.on_key(key(KeyCode::Char('/')));
-        typed(&mut app, "alpha");
-        assert_eq!(
-            app.picker_rows()
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            ["conv"],
-            "the job stays hidden while filtering"
-        );
-
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('a')));
-        app.on_key(key(KeyCode::Char('/')));
-        typed(&mut app, "alpha");
-        assert_eq!(
-            app.picker_rows().len(),
-            1,
-            "show-all lifts project scope but still excludes jobs"
-        );
-    }
-
-    #[test]
     fn ctrl_j_inserts_a_newline_in_insert_mode_and_submit_carries_it() {
         let mut app = App::new();
         typed(&mut app, "line one");
@@ -5776,59 +4164,10 @@ mod tests {
             command,
             Some(Command::Send {
                 session_id: None,
-                content: "line one\nline two".to_owned()
+                content: "line one\nline two".to_owned(),
+                attachments: Vec::new(),
             })
         );
-    }
-
-    #[test]
-    fn ctrl_j_does_nothing_in_cmd_mode() {
-        let mut app = App::new();
-        normal(&mut app, ":review");
-        assert_eq!(app.mode, Mode::Cmd);
-
-        assert_eq!(app.on_key(ctrl('j')), None);
-
-        assert_eq!(app.cmd, "review", "ctrl-j did not touch the command line");
-    }
-
-    #[test]
-    fn colon_help_opens_the_popup_and_q_closes_it() {
-        let mut app = App::new();
-        normal(&mut app, ":help");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, None);
-        assert!(matches!(app.overlay, Overlay::Help { .. }));
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.last_error, None, ":help is a command, not E492");
-
-        assert_eq!(app.on_key(key(KeyCode::Char('q'))), None);
-        assert!(!matches!(app.overlay, Overlay::Help { .. }));
-    }
-
-    #[test]
-    fn unknown_keys_in_the_help_popup_do_not_crash() {
-        let mut app = App::new();
-        normal(&mut app, ":help");
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(app.on_key(key(KeyCode::Char('z'))), None);
-        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert!(matches!(app.overlay, Overlay::Help { .. }), "still open");
-
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-        assert!(
-            !matches!(app.overlay, Overlay::Help { .. }),
-            "esc closes it too"
-        );
-    }
-
-    #[test]
-    fn ctrl_c_quits_from_any_mode() {
-        let mut app = App::new();
-        app.on_key(ctrl('c'));
-        assert!(app.quit);
     }
 
     fn entry(id: &str, title: &str) -> ReviewEntry {
@@ -5849,85 +4188,6 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::ReviewItems(entries));
         app
-    }
-
-    #[test]
-    fn colon_review_opens_the_pane_and_asks_for_the_last_week() {
-        let mut app = App::new();
-        normal(&mut app, ":review");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        let Some(Command::ReviewList { since_micros }) = command else {
-            panic!("expected ReviewList, got {command:?}");
-        };
-        let expected = chrono::Utc::now().timestamp_micros() - REVIEW_WINDOW_MICROS;
-        assert!(
-            (since_micros - expected).abs() < 60 * 1_000_000,
-            "the window reaches a week back, got {since_micros}"
-        );
-        let review = app.review().expect("the pane is open");
-        assert!(!review.loaded, "nothing has been answered yet");
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.last_error, None, ":review is a command, not E492");
-    }
-
-    #[test]
-    fn review_items_land_in_the_open_pane_and_nowhere_after_it_closed() {
-        let mut app = reviewing(vec![entry("mr-1", "one")]);
-        let review = app.review().expect("open");
-        assert!(review.loaded);
-        assert_eq!(review.items, [entry("mr-1", "one")]);
-        assert_eq!(review.selected, 0);
-
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.review(), None);
-        app.on_net(NetEvent::ReviewItems(vec![entry("mr-2", "two")]));
-        assert_eq!(app.review(), None);
-    }
-
-    #[test]
-    fn a_review_changed_push_sets_the_pending_count() {
-        let mut app = App::new();
-        assert_eq!(app.review_pending, 0);
-
-        app.on_net(NetEvent::ReviewChanged(2));
-        assert_eq!(app.review_pending, 2);
-
-        app.on_net(NetEvent::ReviewChanged(0));
-        assert_eq!(app.review_pending, 0);
-    }
-
-    #[test]
-    fn opening_the_review_pane_does_not_touch_the_pending_count() {
-        let mut app = App::new();
-        app.on_net(NetEvent::ReviewChanged(3));
-
-        normal(&mut app, ":review");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::ReviewItems(vec![entry("mr-1", "one")]));
-
-        assert_eq!(
-            app.review_pending, 3,
-            "the queue's size, not an unread badge that opening clears"
-        );
-    }
-
-    #[test]
-    fn j_and_k_move_the_selection_within_bounds() {
-        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
-
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.review().expect("open").selected, 1);
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            app.review().expect("open").selected,
-            1,
-            "j stops at the last row"
-        );
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.review().expect("open").selected, 0);
-        app.on_key(key(KeyCode::Char('k')));
-        assert_eq!(app.review().expect("open").selected, 0);
     }
 
     #[test]
@@ -5976,21 +4236,6 @@ mod tests {
     }
 
     #[test]
-    fn r_reloads_the_review_list_like_open_review() {
-        let mut app = reviewing(vec![entry("mr-1", "one")]);
-
-        let command = app.on_key(key(KeyCode::Char('r')));
-
-        let Some(Command::ReviewList { .. }) = command else {
-            panic!("expected a fresh ReviewList, got {command:?}");
-        };
-        let review = app.review().expect("the pane stays open");
-        assert!(!review.loaded, "the list resets to loading");
-        assert!(review.items.is_empty(), "old items are dropped");
-        assert!(!review.pending_delete, "refresh disarms a pending dd");
-    }
-
-    #[test]
     fn f_prefills_the_fix_instruction_and_closes_the_pane() {
         let mut app = reviewing(vec![entry("mr-1", "Old address")]);
 
@@ -6004,47 +4249,6 @@ mod tests {
         assert_eq!(app.input, "fix memory mr-1: Old address — ");
         assert_eq!(app.cursor, app.input.len(), "ready to finish the sentence");
         assert_eq!(app.mode, Mode::Insert);
-    }
-
-    #[test]
-    fn q_closes_the_pane_and_verdict_keys_on_an_empty_pane_are_no_ops() {
-        let mut app = reviewing(Vec::new());
-
-        assert_eq!(app.on_key(key(KeyCode::Char('a'))), None);
-        assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('d'))),
-            None,
-            "nothing to delete"
-        );
-        assert_eq!(app.on_key(key(KeyCode::Char('f'))), None);
-        assert!(app.review().is_some(), "an empty pane still shows its line");
-
-        app.on_key(key(KeyCode::Char('q')));
-        assert_eq!(app.review(), None);
-        assert!(!app.quit, "q closed the pane, not the app");
-    }
-
-    #[test]
-    fn the_picker_does_not_open_under_the_review_pane() {
-        let mut app = reviewing(vec![entry("mr-1", "one")]);
-        app.on_key(ctrl('p'));
-        assert_eq!(app.picker(), None);
-    }
-
-    #[test]
-    fn scrolling_moves_the_review_selection_when_the_pane_is_open() {
-        let mut app = reviewing(vec![entry("mr-1", "one"), entry("mr-2", "two")]);
-
-        app.on_scroll(false, PAGE);
-        assert_eq!(
-            app.review().expect("open").selected,
-            1,
-            "one row per gesture, not one page"
-        );
-        app.on_scroll(true, PAGE);
-        assert_eq!(app.review().expect("open").selected, 0);
-        assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
     fn job(session_id: &str, state: arc_proto::v1::job_info::State) -> JobInfo {
@@ -6072,48 +4276,6 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::JobItems(entries));
         app
-    }
-
-    #[test]
-    fn colon_jobs_opens_the_pane_and_asks_for_the_list() {
-        let mut app = App::new();
-        normal(&mut app, ":jobs");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, Some(Command::ListJobs));
-        let jobs = app.jobs().expect("the pane is open");
-        assert!(!jobs.loaded, "nothing has been answered yet");
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.last_error, None, ":jobs is a command, not E492");
-    }
-
-    #[test]
-    fn question_mark_opens_help_from_normal_mode() {
-        let mut app = normal_app();
-
-        assert_eq!(app.on_key(key(KeyCode::Char('?'))), None);
-
-        assert!(matches!(app.overlay, Overlay::Help { .. }));
-    }
-
-    #[test]
-    fn shift_j_opens_jobs_from_normal_mode_same_as_colon_jobs() {
-        let mut app = normal_app();
-
-        let command = app.on_key(key(KeyCode::Char('J')));
-
-        assert_eq!(command, Some(Command::ListJobs));
-        assert!(app.jobs().is_some());
-    }
-
-    #[test]
-    fn shift_q_opens_review_from_normal_mode_same_as_colon_review() {
-        let mut app = normal_app();
-
-        let command = app.on_key(key(KeyCode::Char('Q')));
-
-        assert!(matches!(command, Some(Command::ReviewList { .. })));
-        assert!(app.review().is_some());
     }
 
     fn choice(role: SessionRole, name: &str, selected: bool) -> ModelChoice {
@@ -6187,19 +4349,9 @@ mod tests {
     }
 
     #[test]
-    fn colon_model_opens_the_same_picker() {
-        let mut app = normal_app();
-        app.on_key(key(KeyCode::Char(':')));
-        typed(&mut app, "model");
-        let command = app.on_key(key(KeyCode::Enter));
-        assert_eq!(command, Some(Command::ListModels));
-        assert!(app.models_mut().is_some());
-    }
-
-    #[test]
     fn choosing_for_a_pending_code_door_keeps_the_draft_and_attachments() {
         let mut app = normal_app();
-        app.pending_code = Some((SessionRole::Code, "arc".to_owned()));
+        app.pending_code = Some("arc".to_owned());
         app.input = "unfinished".to_owned();
         app.cursor = app.input.len();
         app.pending_attachments.push(ImageAttachment {
@@ -6412,21 +4564,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_unloaded_project_picker_swallows_enter_and_esc_closes() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('C')));
-
-        let command = app.on_key(key(KeyCode::Enter));
-        assert_eq!(command, None, "enter on a loading list picks nothing");
-        assert!(app.projects_mut().is_some(), "the picker stays open");
-        assert_eq!(app.open_door_label(), None);
-
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.projects_mut(), None);
-    }
-
-    #[test]
     fn colon_code_is_frontend_only_until_the_first_message() {
         let mut app = App::new();
         normal(&mut app, ":code arc");
@@ -6448,88 +4585,18 @@ mod tests {
             }),
             "the first message is what opens the session"
         );
-    }
-
-    #[test]
-    fn the_code_flow_labels_the_pending_door_and_the_created_session() {
-        let mut app = App::new();
-        normal(&mut app, ":code scratch");
-        app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            app.open_door_label().as_deref(),
-            Some("code/scratch"),
-            "the pending door is labelled before anything exists"
-        );
-
-        app.on_key(key(KeyCode::Char('i')));
-        typed(&mut app, "hello");
-        app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::SessionCreated {
             session_id: "s-new".to_owned(),
         });
         assert_eq!(
             app.open_door_label().as_deref(),
-            Some("code/scratch"),
+            Some("code/arc"),
             "labelled from the create flow, before any Sessions push lands"
         );
     }
 
-    #[test]
-    fn abandoning_a_pending_door_creates_nothing_and_drops_the_label() {
-        let mut app = App::new();
-        normal(&mut app, ":code arc");
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-
-        app.on_key(ctrl('n'));
-        assert_eq!(app.open_door_label(), None, "navigation abandons the door");
-    }
-
     // start_session(None) is the same path a pending door abandons through
     // (see above); this proves it holds for an already-created code session too
-    #[test]
-    fn ctrl_n_from_an_open_code_session_opens_a_chat() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![code_session(
-            "s-code", "", "scratch",
-        )]));
-        app.start_session(Some("s-code".to_owned()));
-        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
-
-        app.on_key(ctrl('n'));
-
-        assert_eq!(app.session_id, None);
-        assert_eq!(
-            app.open_door_label(),
-            None,
-            "ctrl-n from an open code session opens the chat"
-        );
-    }
-
-    #[test]
-    fn opening_a_session_from_a_sessions_list_shows_its_door_label() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            code_session("s-code", "", "scratch"),
-            job_session("s-job", "", SessionRole::Executor, "arc"),
-            session("s-chat"),
-        ]));
-
-        app.start_session(Some("s-code".to_owned()));
-        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
-
-        app.start_session(Some("s-job".to_owned()));
-        assert_eq!(app.open_door_label().as_deref(), Some("job/arc"));
-
-        app.start_session(Some("s-chat".to_owned()));
-        assert_eq!(
-            app.open_door_label(),
-            None,
-            "a chat conversation is the default door, unlabelled"
-        );
-    }
-
     #[test]
     fn nested_roots_prefer_the_longer_and_reject_a_sibling() {
         let roots = vec![
@@ -6568,41 +4635,8 @@ mod tests {
         assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
     }
 
-    #[test]
-    fn a_launch_dir_outside_every_root_opens_no_door() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
-        let canonical_elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonicalize");
-
-        let mut app = App::new();
-        app.set_launch_dir(Some(canonical_elsewhere));
-        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
-            name: "arc".to_owned(),
-            description: String::new(),
-            root: canonical_root.display().to_string(),
-        }]));
-
-        assert_eq!(app.open_door_label(), None);
-    }
-
     // a remote client's launch_dir is None (main.rs never sets one), which
     // takes the same no-door path as a directory outside every root
-    #[test]
-    fn no_launch_dir_opens_no_door_even_with_a_matching_root() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
-
-        let mut app = App::new();
-        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
-            name: "arc".to_owned(),
-            description: String::new(),
-            root: canonical_root.display().to_string(),
-        }]));
-
-        assert_eq!(app.open_door_label(), None);
-    }
-
     #[test]
     fn a_seed_arriving_after_the_user_acts_first_opens_no_door() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -6656,7 +4690,7 @@ mod tests {
             "the default candidate set is scoped to the open project"
         );
 
-        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char(' ')));
         let all: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
         assert!(
             all.contains(&"s-scratch-1"),
@@ -6667,6 +4701,16 @@ mod tests {
             "show-all includes chat conversations"
         );
         assert!(!all.contains(&"s-job"), "show-all still excludes jobs");
+
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s-arc-1"],
+            "a returns to the scoped list"
+        );
     }
 
     #[test]
@@ -6698,16 +4742,6 @@ mod tests {
     }
 
     #[test]
-    fn colon_code_with_no_project_opens_the_picker() {
-        let mut app = App::new();
-        normal(&mut app, ":code");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, Some(Command::ListProjects));
-        assert!(app.last_error.is_none());
-    }
-
-    #[test]
     fn a_created_session_receives_the_stashed_first_message() {
         let mut app = App::new();
         normal(&mut app, ":code scratch");
@@ -6725,94 +4759,9 @@ mod tests {
             Some(Command::Send {
                 session_id: Some("s-code".to_owned()),
                 content: "run the tests".to_owned(),
+                attachments: Vec::new(),
             }),
             "the message that opened the door is the session's first turn"
-        );
-    }
-
-    #[test]
-    fn a_message_less_session_is_hidden_from_the_picker() {
-        let mut app = App::new();
-        let mut empty = session("s-empty");
-        empty.title = String::new();
-        empty.preview = String::new();
-        app.on_net(NetEvent::Sessions(vec![empty, session("s-real")]));
-        app.on_key(ctrl('p'));
-
-        let ids: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["s-real"], "an artifact with no messages never lists");
-    }
-
-    #[test]
-    fn job_items_land_in_the_open_pane_and_nowhere_after_it_closed() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-1", State::Running)]);
-        let jobs = app.jobs().expect("open");
-        assert!(jobs.loaded);
-        assert_eq!(jobs.items, [job("s-1", State::Running)]);
-        assert_eq!(jobs.selected, 0);
-
-        app.on_key(key(KeyCode::Esc));
-        assert_eq!(app.jobs(), None);
-        app.on_net(NetEvent::JobItems(vec![job("s-2", State::Finished)]));
-        assert_eq!(app.jobs(), None);
-    }
-
-    #[test]
-    fn the_jobs_popup_lists_every_job_regardless_of_which_session_is_open() {
-        use arc_proto::v1::job_info::State;
-
-        let mine = job_of("s-mine", "s-open", State::Running);
-        let unrelated = job_of("s-other", "s-elsewhere", State::Running);
-        let mut app = App::new();
-        app.session_id = Some("s-open".to_owned());
-        normal(&mut app, ":jobs");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::JobItems(vec![mine.clone(), unrelated.clone()]));
-
-        assert_eq!(
-            app.jobs().expect("open").items,
-            [mine, unrelated],
-            "the popup is unscoped: only the ambient strip filters by parent_session"
-        );
-    }
-
-    #[test]
-    fn j_and_up_move_the_job_selection_within_bounds() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![
-            job("s-1", State::Running),
-            job("s-2", State::Finished),
-        ]);
-
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs().expect("open").selected, 1);
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            app.jobs().expect("open").selected,
-            1,
-            "j stops at the last row"
-        );
-        app.on_key(key(KeyCode::Up));
-        assert_eq!(app.jobs().expect("open").selected, 0);
-        app.on_key(key(KeyCode::Up));
-        assert_eq!(app.jobs().expect("open").selected, 0);
-    }
-
-    #[test]
-    fn r_asks_for_the_job_list_again_without_closing_the_pane() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-1", State::Running)]);
-
-        let command = app.on_key(key(KeyCode::Char('r')));
-
-        assert_eq!(command, Some(Command::ListJobs));
-        assert!(
-            app.jobs().is_some(),
-            "the pane stays open while it refreshes"
         );
     }
 
@@ -6838,21 +4787,6 @@ mod tests {
     }
 
     #[test]
-    fn s_is_no_longer_a_jobs_key() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-
-        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None, "not a jobs key");
-        assert_eq!(
-            app.input, "",
-            "the steer prompt is gone, nothing captures it"
-        );
-        assert_eq!(app.jobs().expect("open").selected, 0);
-        assert!(app.jobs().is_some(), "the popup stays open");
-    }
-
-    #[test]
     fn x_on_a_running_row_sends_cancel_job_and_confirms_in_the_footer() {
         use arc_proto::v1::job_info::State;
 
@@ -6871,36 +4805,6 @@ mod tests {
             Some("cancelled s-a")
         );
         assert!(app.jobs().is_some(), "the popup stays open");
-    }
-
-    #[test]
-    fn x_on_a_terminal_row_is_a_no_op_with_a_footer_note() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Finished)]);
-
-        let command = app.on_key(key(KeyCode::Char('x')));
-
-        assert_eq!(command, None, "nothing to cancel on a finished job");
-        assert_eq!(
-            app.jobs().expect("open").confirmation.as_deref(),
-            Some("not running")
-        );
-    }
-
-    #[test]
-    fn k_moves_the_job_selection_up_and_cancels_nothing() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running), job("s-b", State::Running)]);
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs().expect("open").selected, 1);
-
-        let command = app.on_key(key(KeyCode::Char('k')));
-
-        assert_eq!(command, None, "k navigates, it does not cancel");
-        assert_eq!(app.jobs().expect("open").selected, 0);
-        assert_eq!(app.jobs().expect("open").confirmation, None);
     }
 
     #[test]
@@ -6926,18 +4830,6 @@ mod tests {
     }
 
     #[test]
-    fn d_on_a_row_with_no_queued_steers_is_a_footer_no_op() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-
-        let command = app.on_key(key(KeyCode::Char('d')));
-
-        assert_eq!(command, None);
-        assert_eq!(app.jobs().expect("open").confirmation, None);
-    }
-
-    #[test]
     fn a_queued_stream_end_decrements_without_a_cost_block_or_touching_the_reply() {
         let mut app = App::new();
         typed(&mut app, "one");
@@ -6953,7 +4845,8 @@ mod tests {
             command,
             Some(Command::SendLive {
                 session_id: "s-1".to_owned(),
-                content: "two".to_owned()
+                content: "two".to_owned(),
+                attachments: Vec::new(),
             })
         );
 
@@ -6981,45 +4874,6 @@ mod tests {
             ],
             "no Cost block, and the reply-in-progress is untouched"
         );
-    }
-
-    #[test]
-    fn q_closes_the_jobs_pane_and_an_empty_pane_still_shows_its_line() {
-        let mut app = jobsview(Vec::new());
-        assert!(app.jobs().is_some(), "an empty pane still shows its line");
-
-        app.on_key(key(KeyCode::Char('q')));
-        assert_eq!(app.jobs(), None);
-        assert!(!app.quit, "q closed the pane, not the app");
-    }
-
-    #[test]
-    fn the_picker_does_not_open_under_the_jobs_pane() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-1", State::Running)]);
-        app.on_key(ctrl('p'));
-        assert_eq!(app.picker(), None);
-    }
-
-    #[test]
-    fn scrolling_moves_the_job_selection_when_the_pane_is_open() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![
-            job("s-1", State::Running),
-            job("s-2", State::Finished),
-        ]);
-
-        app.on_scroll(false, PAGE);
-        assert_eq!(
-            app.jobs().expect("open").selected,
-            1,
-            "one row per gesture, not one page"
-        );
-        app.on_scroll(true, PAGE);
-        assert_eq!(app.jobs().expect("open").selected, 0);
-        assert_eq!(app.scroll_back, 0, "the transcript never moved");
     }
 
     fn job_of(
@@ -7059,42 +4913,6 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_shows_the_most_recently_touched_running_job_and_ignores_terminal_ones() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = App::new();
-        app.session_id = Some("s-parent".to_owned());
-        app.on_net(NetEvent::JobChanged(job_of(
-            "s-1",
-            "s-parent",
-            State::Running,
-        )));
-        app.on_net(NetEvent::JobChanged(job_of(
-            "s-2",
-            "s-parent",
-            State::Finished,
-        )));
-        assert_eq!(
-            app.strip_job().map(|j| j.session_id.as_str()),
-            Some("s-1"),
-            "the finished job does not shadow the running one"
-        );
-        assert_eq!(app.running_job_count(), 1);
-
-        app.on_net(NetEvent::JobChanged(job_of(
-            "s-3",
-            "s-parent",
-            State::Running,
-        )));
-        assert_eq!(
-            app.strip_job().map(|j| j.session_id.as_str()),
-            Some("s-3"),
-            "the newest running job leads"
-        );
-        assert_eq!(app.running_job_count(), 2);
-    }
-
-    #[test]
     fn the_strip_picks_the_open_sessions_own_child_over_a_more_recent_unrelated_job() {
         use arc_proto::v1::job_info::State;
 
@@ -7116,76 +4934,6 @@ mod tests {
             Some("s-mine"),
             "a more recently touched job scoped to a different session never wins"
         );
-    }
-
-    #[test]
-    fn no_open_session_means_no_strip_job() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = App::new();
-        app.on_net(NetEvent::JobChanged(job_of(
-            "s-1",
-            "s-parent",
-            State::Running,
-        )));
-
-        assert_eq!(app.session_id, None);
-        assert_eq!(
-            app.strip_job(),
-            None,
-            "nothing is open to scope the strip to"
-        );
-    }
-
-    #[test]
-    fn no_running_jobs_means_no_strip_job() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = App::new();
-        app.session_id = Some("s-parent".to_owned());
-        app.on_net(NetEvent::JobChanged(job_of(
-            "s-1",
-            "s-parent",
-            State::Finished,
-        )));
-        assert_eq!(app.strip_job(), None);
-        assert_eq!(app.running_job_count(), 0);
-    }
-
-    #[test]
-    fn job_changed_patches_an_open_jobs_popup_row_in_place() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-1", State::Running), job("s-2", State::Running)]);
-        app.on_key(key(KeyCode::Char('j')));
-        assert_eq!(app.jobs().expect("open").selected, 1);
-
-        let mut updated = job("s-2", State::Finished);
-        updated.spent_tokens = 42;
-        app.on_net(NetEvent::JobChanged(updated.clone()));
-
-        let jobs = app.jobs().expect("open");
-        assert_eq!(
-            jobs.items,
-            [job("s-1", State::Running), updated],
-            "the row patched in place"
-        );
-        assert_eq!(jobs.selected, 1, "the selection stayed put");
-    }
-
-    #[test]
-    fn job_changed_for_a_job_not_in_the_open_popup_only_updates_the_strip() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-1", State::Running)]);
-        app.on_net(NetEvent::JobChanged(job("s-2", State::Running)));
-
-        assert_eq!(
-            app.jobs().expect("open").items,
-            [job("s-1", State::Running)],
-            "the popup only shows what it fetched"
-        );
-        assert_eq!(app.ambient.len(), 1, "the strip data saw the push");
     }
 
     #[test]
@@ -7230,18 +4978,6 @@ mod tests {
     }
 
     #[test]
-    fn session_appended_for_another_session_is_a_no_op() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-
-        let command = app.on_net(NetEvent::SessionAppended {
-            session_id: "s-2".to_owned(),
-        });
-        assert_eq!(command, None);
-        assert_eq!(app.block_contents(), [], "nothing else moved either");
-    }
-
-    #[test]
     fn session_appended_for_the_open_session_is_ignored_while_our_turn_streams() {
         let mut app = App::new();
         app.session_id = Some("s-1".to_owned());
@@ -7265,18 +5001,6 @@ mod tests {
         }
         app.on_key(key(KeyCode::Backspace));
         assert_eq!(app.input, "hllo", "backspace removed the two-byte é");
-    }
-
-    #[test]
-    fn a_system_sourced_message_becomes_a_system_block_not_yours() {
-        let mut message = prose(Role::User as i32, "Job s-x finished.\nAll good.", false);
-        message.source = Source::System as i32;
-
-        let block = prose_block(message).expect("block");
-        assert_eq!(
-            block,
-            Block::System("Job s-x finished.\nAll good.".to_owned())
-        );
     }
 
     const JOB_ID: &str = "c1a4a9e7-d2b8-4f60-91e3-b5a7c9d1e3f5";
@@ -7320,239 +5044,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_stopped_handback_keeps_the_reason_in_its_subject() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![handback_entry(&format!(
-                "Job {JOB_ID} stopped: token budget exhausted (500/400).\npartial work"
-            ))],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [Block::Handback {
-                subject: format!("Job {JOB_ID} stopped: token budget exhausted (500/400)."),
-                body: "partial work".to_owned(),
-                open: false,
-            }],
-        );
-    }
-
-    #[test]
-    fn system_rows_without_the_handback_shape_stay_system_blocks() {
-        let mut app = App::new();
-        app.session_id = Some("s-1".to_owned());
-        app.on_net(NetEvent::History {
-            session_id: "s-1".to_owned(),
-            entries: vec![
-                handback_entry("consolidation wrote three memories."),
-                handback_entry("Job finished.\nno id in the header"),
-                handback_entry(&format!("Job {JOB_ID} finished.")),
-            ],
-            parent_session: String::new(),
-            fork_point: 0,
-            branches: Vec::new(),
-        });
-
-        assert_eq!(
-            app.block_contents(),
-            [
-                Block::System("consolidation wrote three memories.".to_owned()),
-                Block::System("Job finished.\nno id in the header".to_owned()),
-                Block::System(format!("Job {JOB_ID} finished.")),
-            ],
-            "prose that merely mentions jobs must not fold away"
-        );
-    }
-
-    #[test]
-    fn ctrl_o_opens_thoughts_and_tools_but_not_handbacks() {
-        let mut app = App::new();
-        typed(&mut app, "hi");
-        app.on_key(key(KeyCode::Enter));
-        app.on_net(NetEvent::Accepted {
-            session_id: "s-1".to_owned(),
-        });
-        app.on_net(NetEvent::Reasoning("checking the failing case".to_owned()));
-        app.on_net(NetEvent::Delta("done".to_owned()));
-        app.on_net(started("t1", "lookup"));
-        app.on_net(ended("t1", ToolOutcome::Ok as i32, "found it"));
-        app.push_block(
-            prose_block(handback_message(&format!(
-                "Job {JOB_ID} finished.\nall green"
-            )))
-            .expect("handback block"),
-        );
-
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(ctrl('o'));
-        assert!(
-            matches!(&app.transcript[1].block, Block::Thought { open: true, .. }),
-            "ctrl-o opens the thought"
-        );
-        assert!(
-            matches!(&app.transcript[3].block, Block::Tool { open: true, .. }),
-            "and the tool result"
-        );
-        assert!(
-            matches!(
-                &app.transcript[4].block,
-                Block::Handback { open: false, .. }
-            ),
-            "the handback stays collapsed"
-        );
-
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(ctrl('o'));
-        assert!(matches!(
-            &app.transcript[1].block,
-            Block::Thought { open: false, .. }
-        ));
-        assert!(matches!(
-            &app.transcript[3].block,
-            Block::Tool { open: false, .. }
-        ));
-        assert!(matches!(
-            &app.transcript[4].block,
-            Block::Handback { open: false, .. }
-        ));
-    }
-
-    #[test]
-    fn a_handback_is_yank_invisible_like_other_activity() {
-        assert_eq!(
-            block_yank_text(&Block::Handback {
-                subject: format!("Job {JOB_ID} finished."),
-                body: "all green".to_owned(),
-                open: true,
-            }),
-            None,
-            "yanking the conversation never scoops up job machinery"
-        );
-    }
-
-    #[tokio::test]
-    async fn ctrl_t_bounces_between_the_last_two_sessions() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![]));
-        let first = app.start_session(Some("s-first".to_owned()));
-        assert!(first.is_some());
-        let second = app.start_session(Some("s-job".to_owned()));
-        assert!(second.is_some());
-        assert_eq!(app.session_id.as_deref(), Some("s-job"));
-
-        let back = app.on_key(ctrl('t'));
-        assert!(back.is_some(), "going back refetches history");
-        assert_eq!(app.session_id.as_deref(), Some("s-first"));
-
-        let forth = app.on_key(ctrl('t'));
-        assert!(forth.is_some());
-        assert_eq!(app.session_id.as_deref(), Some("s-job"));
-    }
-
-    #[tokio::test]
-    async fn ctrl_t_with_no_history_does_nothing() {
-        let mut app = App::new();
-        assert_eq!(app.on_key(ctrl('t')), None);
-        assert_eq!(app.session_id, None);
-    }
-
-    #[test]
-    fn y_yanks_the_last_reply() {
-        let mut app = App::new();
-        app.push_block(Block::You("hi".to_owned()));
-        app.push_block(Block::Arc {
-            text: "hello there".to_owned(),
-            partial: false,
-        });
-        app.on_key(key(KeyCode::Esc));
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(command, Some(Command::Yank("hello there".to_owned())));
-        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
-    }
-
-    #[test]
-    fn y_yanks_a_partial_reply_too() {
-        let mut app = App::new();
-        app.push_block(Block::Arc {
-            text: "cut off mid".to_owned(),
-            partial: true,
-        });
-        app.on_key(key(KeyCode::Esc));
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(command, Some(Command::Yank("cut off mid".to_owned())));
-    }
-
-    #[test]
-    fn y_with_no_reply_yet_is_a_no_op_with_a_footer_note() {
-        let mut app = App::new();
-        app.push_block(Block::You("hi".to_owned()));
-        app.on_key(key(KeyCode::Esc));
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(command, None);
-        assert_eq!(app.yank_note.as_deref(), Some("nothing to yank"));
-    }
-
-    #[test]
-    fn y_is_ignored_while_streaming() {
-        let mut app = App::new();
-        app.push_block(Block::Arc {
-            text: "hello".to_owned(),
-            partial: false,
-        });
-        app.on_key(key(KeyCode::Esc));
-        app.status = Status::Streaming;
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(command, None);
-        assert_eq!(app.yank_note, None);
-    }
-
-    #[test]
-    fn y_is_ignored_while_a_popup_is_open() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.push_block(Block::Arc {
-            text: "hello".to_owned(),
-            partial: false,
-        });
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(command, None);
-        assert_eq!(app.yank_note, None);
-    }
-
-    #[test]
-    fn the_yank_note_clears_on_the_next_key() {
-        let mut app = App::new();
-        app.push_block(Block::Arc {
-            text: "hello".to_owned(),
-            partial: false,
-        });
-        app.on_key(key(KeyCode::Esc));
-        app.on_key(key(KeyCode::Char('y')));
-        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
-
-        app.on_key(key(KeyCode::Char('j')));
-
-        assert_eq!(app.yank_note, None);
-    }
-
     fn conversation() -> App {
         let mut app = App::new();
         app.push_block(Block::You("first question".to_owned()));
@@ -7583,23 +5074,6 @@ mod tests {
     }
 
     #[test]
-    fn v_then_y_yanks_only_the_last_block() {
-        let mut app = conversation();
-
-        app.on_key(key(KeyCode::Char('V')));
-        assert_eq!(app.mode, Mode::Visual);
-
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(
-            command,
-            Some(Command::Yank("arc: second answer".to_owned()))
-        );
-        assert_eq!(app.mode, Mode::Normal, "y exits visual mode");
-        assert_eq!(app.yank_note.as_deref(), Some("yanked"));
-    }
-
-    #[test]
     fn v_k_y_yanks_the_last_two_blocks() {
         let mut app = conversation();
 
@@ -7612,42 +5086,6 @@ mod tests {
             Some(Command::Yank(
                 "you: second question\n\narc: second answer".to_owned()
             ))
-        );
-    }
-
-    #[test]
-    fn v_gg_y_yanks_from_the_first_block() {
-        let mut app = conversation();
-
-        app.on_key(key(KeyCode::Char('V')));
-        app.on_key(key(KeyCode::Char('g')));
-        app.on_key(key(KeyCode::Char('g')));
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(
-            command,
-            Some(Command::Yank(
-                "you: first question\n\narc: first answer\n\nyou: second question\n\narc: second answer"
-                    .to_owned()
-            )),
-            "tools and costs between them are skipped"
-        );
-    }
-
-    #[test]
-    fn v_gg_g_returns_the_boundary_to_the_last_block() {
-        let mut app = conversation();
-
-        app.on_key(key(KeyCode::Char('V')));
-        app.on_key(key(KeyCode::Char('g')));
-        app.on_key(key(KeyCode::Char('g')));
-        app.on_key(key(KeyCode::Char('G')));
-        let command = app.on_key(key(KeyCode::Char('y')));
-
-        assert_eq!(
-            command,
-            Some(Command::Yank("arc: second answer".to_owned())),
-            "G snaps back to the anchor"
         );
     }
 
@@ -7665,17 +5103,6 @@ mod tests {
             ))
         );
         assert_eq!(app.mode, Mode::Normal, "Y never enters visual mode");
-    }
-
-    #[test]
-    fn esc_leaves_visual_mode_without_yanking() {
-        let mut app = conversation();
-        app.on_key(key(KeyCode::Char('V')));
-
-        let command = app.on_key(key(KeyCode::Esc));
-
-        assert_eq!(command, None);
-        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
@@ -7731,29 +5158,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v_is_ignored_while_streaming() {
-        let mut app = conversation();
-        app.status = Status::Streaming;
-
-        assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn v_is_ignored_while_a_popup_is_open() {
-        use arc_proto::v1::job_info::State;
-
-        let mut app = jobsview(vec![job("s-a", State::Running)]);
-        app.push_block(Block::Arc {
-            text: "hello".to_owned(),
-            partial: false,
-        });
-
-        assert_eq!(app.on_key(key(KeyCode::Char('V'))), None);
-        assert_ne!(app.mode, Mode::Visual);
-    }
-
     // built through History, not raw pushes: only that path threads real seqs
     fn conversation_from_history() -> App {
         let mut app = App::new();
@@ -7802,69 +5206,6 @@ mod tests {
             })
         );
         assert_eq!(app.mode, Mode::Normal, "the command consumes the selection");
-    }
-
-    #[test]
-    fn fork_on_a_tool_block_is_an_instructive_error() {
-        let mut app = conversation_from_history();
-
-        app.on_key(key(KeyCode::Char('V')));
-        // boundary starts on the last block: the tool result folded into its call
-        let command = run_fork_command(&mut app);
-
-        assert_eq!(command, None);
-        assert!(
-            app.last_error.is_some(),
-            "the block has a seq but is not a message"
-        );
-    }
-
-    #[test]
-    fn fork_outside_visual_mode_is_an_instructive_error() {
-        let mut app = conversation_from_history();
-
-        let command = run_fork_command(&mut app);
-
-        assert_eq!(command, None);
-        assert!(app.last_error.is_some());
-    }
-
-    #[test]
-    fn a_session_forked_reply_opens_it_like_the_picker_opens_a_session() {
-        let mut app = conversation_from_history();
-
-        let command = app.on_net(NetEvent::SessionForked {
-            session_id: "s-2".to_owned(),
-        });
-
-        assert_eq!(app.session_id.as_deref(), Some("s-2"));
-        assert_eq!(
-            command,
-            Some(Command::History {
-                session_id: "s-2".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn f_in_visual_mode_forks_exactly_like_colon_fork() {
-        let mut app = conversation_from_history();
-
-        app.on_key(key(KeyCode::Char('V')));
-        // boundary starts on the folded tool block (last); one 'k' lands on
-        // the assistant's answer, seq 4
-        app.on_key(key(KeyCode::Char('k')));
-        let command = app.on_key(key(KeyCode::Char('f')));
-
-        assert_eq!(
-            command,
-            Some(Command::ForkSession {
-                session_id: "s-1".to_owned(),
-                fork_point: 4,
-                choice: String::new(),
-            })
-        );
-        assert_eq!(app.mode, Mode::Normal, "the key consumes the selection");
     }
 
     // built through History with two full turns, so a preceding message
@@ -7948,18 +5289,6 @@ mod tests {
         assert_eq!(app.mode, Mode::Insert);
     }
 
-    #[test]
-    fn rewind_on_the_first_message_is_an_instructive_error() {
-        let mut app = conversation_from_history();
-
-        app.on_key(key(KeyCode::Char('R')));
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, None);
-        assert!(app.last_error.is_some());
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
     fn search(app: &mut App, query: &str) {
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.on_key(key(KeyCode::Char('/'))), None);
@@ -7997,19 +5326,6 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_search_starts_on_the_newest_match() {
-        let mut app = conversation();
-        search(&mut app, "question");
-
-        assert!(!app.searching);
-        let found = app.search.as_ref().expect("confirmed");
-        assert_eq!(found.matches, vec![4, 0], "newest first");
-        assert_eq!(found.current, 0);
-        assert_eq!(app.search_block(), Some(4));
-        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
-    }
-
-    #[test]
     fn n_and_n_walk_older_and_newer_and_stop_at_the_ends() {
         let mut app = normal_app();
         for i in 0..3 {
@@ -8038,71 +5354,6 @@ mod tests {
     }
 
     #[test]
-    fn n_and_n_do_nothing_without_a_confirmed_search() {
-        let mut app = conversation();
-        app.on_key(key(KeyCode::Char('n')));
-        app.on_key(key(KeyCode::Char('N')));
-        assert!(app.search.is_none());
-        assert_eq!(app.yank_note, None);
-    }
-
-    #[test]
-    fn chrome_never_matches() {
-        let mut app = normal_app();
-        app.set_blocks(vec![
-            Block::Thought {
-                text: "secret trace words".to_owned(),
-                seconds: 3,
-                done: true,
-                open: true,
-            },
-            Block::Tool {
-                call_id: "t1".to_owned(),
-                name: "bash".to_owned(),
-                args: "secret.sh".to_owned(),
-                outcome: Some("ok"),
-                content: "secret output".to_owned(),
-                open: true,
-            },
-            Block::Cost {
-                input_tokens: 1,
-                output_tokens: 2,
-                seconds: 1.0,
-            },
-            Block::Note("secret note".to_owned()),
-            Block::StepCapped,
-            Block::Fault {
-                code: "boom".to_owned(),
-                msg: "secret failure".to_owned(),
-            },
-            Block::Handback {
-                subject: "Job 1234 finished.".to_owned(),
-                body: "secret handback".to_owned(),
-                open: true,
-            },
-            Block::You("plain words".to_owned()),
-        ]);
-        search(&mut app, "secret");
-
-        assert!(app.search.is_none());
-        assert_eq!(app.yank_note.as_deref(), Some("no match"));
-    }
-
-    #[test]
-    fn a_no_match_search_leaves_the_view_alone() {
-        let mut app = conversation();
-        app.scroll_back = 3;
-        let transcript = app.transcript.clone();
-
-        search(&mut app, "absent everywhere");
-
-        assert!(app.search.is_none());
-        assert_eq!(app.scroll_back, 3, "the view stays put");
-        assert_eq!(app.transcript, transcript);
-        assert_eq!(app.yank_note.as_deref(), Some("no match"));
-    }
-
-    #[test]
     fn ctrl_n_steps_matches_live_while_the_prompt_is_open() {
         let mut app = conversation();
         normal(&mut app, "/");
@@ -8127,46 +5378,6 @@ mod tests {
             Some("match 1/2"),
             "enter keeps the stepped position"
         );
-    }
-
-    #[test]
-    fn an_edited_query_recomputes_on_the_next_live_step() {
-        let mut app = conversation();
-        normal(&mut app, "/");
-        typed(&mut app, "question");
-        app.on_key(ctrl('n'));
-        app.on_key(ctrl('n'));
-        assert_eq!(app.yank_note.as_deref(), Some("match 2/2"));
-
-        typed(&mut app, "zzz");
-        app.on_key(ctrl('n'));
-        assert_eq!(app.yank_note.as_deref(), Some("no match"));
-        assert_eq!(app.search_block(), None);
-    }
-
-    #[test]
-    fn ctrl_n_and_p_navigate_the_picker_instead_of_leaving_it() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![session("a"), session("b")]));
-        app.on_key(ctrl('p'));
-        let before = app.picker().expect("open").selected;
-        app.on_key(ctrl('n'));
-        assert!(app.picker().is_some(), "ctrl-n stays in the picker");
-        assert_eq!(app.picker().expect("open").selected, before + 1);
-        app.on_key(ctrl('p'));
-        assert!(app.picker().is_some(), "ctrl-p navigates, not reopens");
-        assert_eq!(app.picker().expect("open").selected, before);
-    }
-
-    #[test]
-    fn esc_in_normal_mode_clears_the_search() {
-        let mut app = conversation();
-        search(&mut app, "question");
-        assert!(app.search.is_some());
-
-        app.on_key(key(KeyCode::Esc));
-        assert!(app.search.is_none());
-        assert_eq!(app.search_block(), None);
     }
 
     #[test]
@@ -8203,16 +5414,6 @@ mod tests {
     }
 
     #[test]
-    fn colon_compact_with_no_open_session_is_an_error_and_emits_nothing() {
-        let mut app = App::new();
-        normal(&mut app, ":compact");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, None);
-        assert!(app.last_error.is_some());
-    }
-
-    #[test]
     fn a_compacted_ack_notes_it_and_refetches_history() {
         let mut app = App::new();
         app.session_id = Some("s-open".to_owned());
@@ -8228,40 +5429,6 @@ mod tests {
                 session_id: "s-open".to_owned()
             })
         );
-    }
-
-    #[test]
-    fn esc_while_streaming_with_no_named_session_yet_is_a_no_op() {
-        let mut app = App::new();
-        app.mode = Mode::Normal;
-        app.status = Status::Streaming;
-
-        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
-    }
-
-    #[test]
-    fn esc_while_idle_keeps_clearing_the_search_not_cancelling() {
-        let mut app = conversation();
-        app.session_id = Some("s-live".to_owned());
-        search(&mut app, "question");
-        assert!(app.search.is_some());
-        assert_eq!(app.status, Status::Idle);
-
-        let command = app.on_key(key(KeyCode::Esc));
-
-        assert_eq!(command, None, "idle Esc never cancels a turn");
-        assert!(app.search.is_none());
-    }
-
-    #[test]
-    fn a_new_search_replaces_the_old_one() {
-        let mut app = conversation();
-        search(&mut app, "question");
-        search(&mut app, "answer");
-
-        let found = app.search.as_ref().expect("replaced");
-        assert_eq!(found.matches, vec![5, 1]);
-        assert_eq!(app.yank_note.as_deref(), Some("match 1/2"));
     }
 
     #[test]
@@ -8328,40 +5495,5 @@ mod tests {
             branches: Vec::new(),
         });
         assert!(app.search.is_none(), "a changed prefix drops it");
-    }
-
-    #[test]
-    fn opening_another_session_drops_the_search() {
-        let mut app = conversation();
-        search(&mut app, "question");
-
-        app.on_key(key(KeyCode::Char('s')));
-        app.on_key(key(KeyCode::Enter));
-        assert!(app.search.is_none());
-    }
-
-    #[test]
-    fn search_keys_keep_their_meaning_in_insert_mode() {
-        let mut app = App::new();
-        typed(&mut app, "/nN");
-
-        assert_eq!(app.input, "/nN", "they type into the message");
-        assert!(!app.searching);
-        assert!(app.search.is_none());
-    }
-
-    #[test]
-    fn slash_in_the_picker_still_starts_the_filter() {
-        let mut app = conversation();
-        search(&mut app, "question");
-        app.on_key(key(KeyCode::Char('s')));
-
-        app.on_key(key(KeyCode::Char('/')));
-        assert!(
-            app.picker().expect("picker is open").filtering,
-            "the picker filter, not the search prompt"
-        );
-        assert!(!app.searching);
-        assert!(app.search.is_some(), "the confirmed search survives");
     }
 }

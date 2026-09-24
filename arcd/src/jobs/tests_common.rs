@@ -53,8 +53,6 @@ pub(crate) mod testkit {
         }
     }
 
-    // "test-model": matches what a bootstrap/chat runner's own identity
-    // records for a child, since these engines never configure role_identities
     pub(crate) fn executor_runner(provider: &Arc<ScriptedProvider>) -> Runner {
         Runner {
             role: SessionRole::Executor,
@@ -64,7 +62,6 @@ pub(crate) mod testkit {
             system: None,
             compact_at: None,
             context_window: None,
-            counsel: false,
             editing: arc_core::tool::Editing::Replacement,
         }
     }
@@ -119,8 +116,6 @@ pub(crate) mod testkit {
         )
     }
 
-    /// The next `job_changed` notification, skipping any `session_appended`
-    /// pushes (e.g. from `child_session`'s own durable creation) in between.
     pub(crate) async fn job_changed(
         notifications: &mut broadcast::Receiver<Notification>,
     ) -> JobInfo {
@@ -152,8 +147,6 @@ pub(crate) mod testkit {
             .collect()
     }
 
-    /// Polls the log rather than sleeping a fixed duration: waits for actual
-    /// state, not a guessed timing window.
     pub(crate) async fn wait_for_message_count(
         dir: &std::path::Path,
         session_id: &str,
@@ -168,8 +161,6 @@ pub(crate) mod testkit {
         panic!("timed out waiting for {want} messages in session {session_id}");
     }
 
-    /// Polls the log for a tool call landing, so a test can advance a paused
-    /// clock only once the tool is genuinely dispatched and running.
     pub(crate) async fn wait_for_tool_call_issued(dir: &std::path::Path, session_id: &str) {
         for _ in 0..400 {
             let issued = replay_log(dir).into_iter().any(|event| {
@@ -187,8 +178,6 @@ pub(crate) mod testkit {
         panic!("timed out waiting for a tool call in session {session_id}");
     }
 
-    /// Steers a job the way the TUI does, and reports whether there was a
-    /// task to take it — which is what the tests here actually assert.
     pub(crate) fn steer(supervisor: &Supervisor, session_id: &str, text: &str) -> bool {
         let live = supervisor
             .shared
@@ -198,7 +187,7 @@ pub(crate) mod testkit {
             .contains_key(session_id);
         if live {
             supervisor
-                .send(Some(session_id), text, Source::User, false)
+                .send(Some(session_id), text, Source::User, Vec::new(), false)
                 .expect("send into a live session");
         }
         live

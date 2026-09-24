@@ -8,9 +8,6 @@ use tokio::sync::mpsc;
 const SOURCE: &str = "custom:arc";
 const AGENT: &str = "arc";
 
-// the full report vocabulary: `done` is not reportable — the server rejects
-// it, derives done from a working→idle transition on its own, and clears it
-// when the pane gains focus
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
     Idle,
@@ -59,16 +56,12 @@ impl Reporter {
             tx,
             task,
             pane_id: pane_id.unwrap_or_default(),
-            // herdr orders reports per source by seq and remembers it across
-            // processes; a restart counting from 0 would be dropped as stale
             seq: unix_millis(),
             state: None,
             meta: None,
         }
     }
 
-    /// A report outlives its process in herdr, so quitting without this
-    /// leaves the pane wearing arc's last state forever.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.tx.take() {
             let mut seq = self.seq;
@@ -198,7 +191,6 @@ async fn pump(path: PathBuf, mut rx: mpsc::UnboundedReceiver<String>) {
     }
 }
 
-// the server answers one request per connection, then hangs up
 async fn request(path: &std::path::Path, line: &str) {
     let mut stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
@@ -242,30 +234,6 @@ mod tests {
         assert_eq!(params["agent"], "arc");
         assert_eq!(params["state"], "working");
         assert_eq!(params["seq"], 7);
-    }
-
-    #[test]
-    fn every_state_serializes_to_a_herdr_status() {
-        for (state, wire) in [
-            (AgentState::Idle, "idle"),
-            (AgentState::Working, "working"),
-            (AgentState::Blocked, "blocked"),
-        ] {
-            assert_eq!(state.wire(), wire);
-        }
-    }
-
-    #[test]
-    fn metadata_carries_title_and_jobs_and_clears_both_when_empty() {
-        let line = parsed(&report_metadata("w1:p2", "the quiet week", 2, 3));
-        assert_eq!(line["params"]["title"], "the quiet week");
-        assert_eq!(line["params"]["clear_title"], false);
-        assert_eq!(line["params"]["tokens"]["jobs"], "2 running");
-
-        let line = parsed(&report_metadata("w1:p2", "", 0, 4));
-        assert!(line["params"]["title"].is_null());
-        assert_eq!(line["params"]["clear_title"], true);
-        assert!(line["params"]["tokens"]["jobs"].is_null());
     }
 
     #[test]

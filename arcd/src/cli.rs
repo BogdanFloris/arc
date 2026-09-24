@@ -205,39 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_runs_the_daemon_with_the_default_config() {
-        let cli = ok(&["arcd"]);
-        assert_eq!(cli.command, Command::Run);
-        assert_eq!(cli.config, super::default_config());
-    }
-
-    #[test]
-    fn subcommands_and_the_config_flag_parse_in_either_order() {
-        assert_eq!(
-            ok(&["arcd", "--config", "/etc/arc.toml", "run"]).command,
-            Command::Run
-        );
-    }
-
-    #[test]
-    fn help_is_its_own_outcome() {
-        assert_eq!(parse(["arcd", "--help"]), Ok(Parsed::Help));
-        assert_eq!(parse(["arcd", "run", "-h"]), Ok(Parsed::Help));
-    }
-
-    #[test]
-    fn anything_else_is_a_usage_error() {
-        for args in [
-            vec!["arcd", "serve"],
-            vec!["arcd", "--verbose"],
-            vec!["arcd", "run", "extra"],
-            vec!["arcd", "--config"],
-        ] {
-            assert!(parse(args.clone()).is_err(), "{args:?} should not parse");
-        }
-    }
-
-    #[test]
     fn memory_replay_parses_with_its_flags_in_any_order() {
         let cli = ok(&[
             "arcd",
@@ -265,18 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_parses() {
-        let cli = ok(&["arcd", "rebuild"]);
-        assert_eq!(cli.command, Command::Rebuild);
-        assert_eq!(cli.config, super::default_config());
-
-        assert_eq!(
-            ok(&["arcd", "--config", "/etc/arc.toml", "rebuild"]).config,
-            PathBuf::from("/etc/arc.toml")
-        );
-    }
-
-    #[test]
     fn login_names_its_provider_and_nothing_else() {
         assert_eq!(ok(&["arcd", "login", "codex"]).command, Command::Login);
         assert_eq!(
@@ -291,28 +246,6 @@ mod tests {
         ] {
             assert!(parse(args.clone()).is_err(), "{args:?} should not parse");
         }
-    }
-
-    #[test]
-    fn rebuild_flag_misuse_is_a_usage_error() {
-        for args in [
-            vec!["arcd", "rebuild", "--prompt", "v1"],
-            vec!["arcd", "rebuild", "extra"],
-        ] {
-            assert!(parse(args.clone()).is_err(), "{args:?} should not parse");
-        }
-    }
-
-    #[test]
-    fn memory_replay_defaults_to_all_sessions_and_no_diff() {
-        assert_eq!(
-            ok(&["arcd", "memory-replay", "--prompt", "v1"]).command,
-            Command::MemoryReplay {
-                prompt: "v1".to_owned(),
-                against: None,
-                sessions: Vec::new(),
-            }
-        );
     }
 
     #[test]

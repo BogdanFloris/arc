@@ -136,7 +136,6 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
         system: Some("be terse".to_owned()),
         compact_at: None,
         context_window: None,
-        counsel: false,
         editing: crate::tool::Editing::Replacement,
     }
 }

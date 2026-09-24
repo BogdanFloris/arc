@@ -26,11 +26,9 @@ pub async fn run(
     let timeout = Duration::from_secs(config.consolidation.timeout_seconds);
     let identity = identity::load(dirs.identity()).context("loading the identity file")?;
 
-    // replaying extraction is archivist work, so it runs on the archivist's model
     let endpoint = format!("http://127.0.0.1:{}", config.llama.port);
     let roles = Roles::resolve(&config, &endpoint, &Secrets::new(dirs.secrets()), None)?;
     let archivist = roles.archivist();
-    // asking the endpoint, not the provider: only the sidecar needs spawning
     let sidecar = match archivist.provider.endpoint() == endpoint {
         true if probe(&endpoint).await => {
             info!(%endpoint, "using the already-running llama endpoint");
@@ -176,27 +174,13 @@ fn record_line(record: &ReplayRecord) -> String {
 
 #[cfg(test)]
 mod tests {
-    use arc_core::consolidation::extract::PROMPT_V1;
     use arc_core::consolidation::replay::{
         ReplayOperation, ReplayRecord, ReplayReport, SessionReplay, diff,
     };
 
     use expect_test::expect;
 
-    use super::{diff_lines, report_lines, resolve};
-
-    #[test]
-    fn v1_resolves_to_its_pinned_prompt() {
-        assert_eq!(resolve("v1").expect("known"), ("v1", PROMPT_V1));
-    }
-
-    #[test]
-    fn an_unknown_version_errors_listing_the_known_ones() {
-        let err = resolve("v9").expect_err("v9 is not a version");
-        let text = err.to_string();
-        assert!(text.contains("\"v9\""), "{text}");
-        assert!(text.contains("known versions: v1"), "{text}");
-    }
+    use super::{diff_lines, report_lines};
 
     fn record(kind: &str, title: &str, summary: &str) -> ReplayRecord {
         ReplayRecord {

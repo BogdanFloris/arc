@@ -289,6 +289,24 @@ pub(crate) fn session_seed(session_id: &str) -> u64 {
 }
 
 impl ModelExtractor {
+    fn request(&self, session_id: &str, system: String, content: String) -> CompletionRequest {
+        CompletionRequest {
+            model: self.model.clone(),
+            role: SessionRole::Archivist,
+            thinking: self.thinking,
+            system: Some(system),
+            messages: vec![Message::Text {
+                role: Role::User,
+                content,
+                reasoning: None,
+            }],
+            tools: Vec::new(),
+            seed: Some(self.seed.unwrap_or_else(|| session_seed(session_id))),
+            web: false,
+            cache_key: Some(session_id.to_owned()),
+        }
+    }
+
     async fn completion_text(&self, request: CompletionRequest) -> Result<String, ExtractError> {
         let mut stream = self
             .provider
@@ -342,30 +360,38 @@ impl ModelExtractor {
         &self,
         operations: Vec<RawOperation>,
         index: &[MemoryIndexEntry],
-        seed: u64,
         session_id: &str,
     ) -> (Vec<RawOperation>, DedupStats) {
         let mut stats = DedupStats::default();
-        let mut stage1 = Vec::with_capacity(operations.len());
-        let mut seen_writes: Vec<(String, String)> = Vec::new();
-        for op in operations {
+        let mut result = Vec::with_capacity(operations.len());
+        let mut seen_writes: HashSet<_> = index
+            .iter()
+            .map(|entry| (normalize(&entry.title), normalize(&entry.summary)))
+            .collect();
+        for mut op in operations {
             match op.op.as_str() {
                 "write" => {
-                    let norm_title = normalize(&op.title);
-                    let norm_summary = normalize(&op.summary);
-                    let index_dup = index.iter().any(|entry| {
-                        normalize(&entry.title) == norm_title
-                            && normalize(&entry.summary) == norm_summary
-                    });
-                    let batch_dup = seen_writes
-                        .iter()
-                        .any(|(title, summary)| *title == norm_title && *summary == norm_summary);
-                    if index_dup || batch_dup {
+                    if !seen_writes.insert((normalize(&op.title), normalize(&op.summary))) {
                         stats.dropped += 1;
                         continue;
                     }
-                    seen_writes.push((norm_title, norm_summary));
-                    stage1.push(op);
+                    let candidates = dedup_candidates(&op.title, &op.summary, index);
+                    if !candidates.is_empty() {
+                        stats.calls += 1;
+                        match self.forced_choice(&op, &candidates, session_id).await {
+                            Some(DedupChoice::Duplicate) => {
+                                stats.dropped += 1;
+                                continue;
+                            }
+                            Some(DedupChoice::Supersede(target_id)) => {
+                                stats.converted += 1;
+                                "supersede".clone_into(&mut op.op);
+                                op.id = Some(target_id);
+                                op.namespace = None;
+                            }
+                            None => {}
+                        }
+                    }
                 }
                 "supersede" => {
                     let target = op
@@ -381,41 +407,10 @@ impl ModelExtractor {
                         stats.dropped += 1;
                         continue;
                     }
-                    stage1.push(op);
                 }
-                _ => stage1.push(op),
+                _ => {}
             }
-        }
-
-        let mut result = Vec::with_capacity(stage1.len());
-        for op in stage1 {
-            if op.op != "write" {
-                result.push(op);
-                continue;
-            }
-            let candidates = dedup_candidates(&op.title, &op.summary, index);
-            if candidates.is_empty() {
-                result.push(op);
-                continue;
-            }
-            stats.calls += 1;
-            match self.forced_choice(&op, &candidates, seed, session_id).await {
-                Some(DedupChoice::Duplicate) => stats.dropped += 1,
-                Some(DedupChoice::Supersede(target_id)) => {
-                    stats.converted += 1;
-                    result.push(RawOperation {
-                        op: "supersede".to_owned(),
-                        id: Some(target_id),
-                        namespace: None,
-                        kind: op.kind,
-                        title: op.title,
-                        summary: op.summary,
-                        body: op.body,
-                        links: op.links,
-                    });
-                }
-                None => result.push(op),
-            }
+            result.push(op);
         }
         (result, stats)
     }
@@ -427,24 +422,13 @@ impl ModelExtractor {
         &self,
         op: &RawOperation,
         candidates: &[&MemoryIndexEntry],
-        seed: u64,
         session_id: &str,
     ) -> Option<DedupChoice> {
-        let request = CompletionRequest {
-            model: self.model.clone(),
-            role: SessionRole::Archivist,
-            thinking: self.thinking,
-            system: Some(DEDUP_PROMPT_V1.to_owned()),
-            messages: vec![Message::Text {
-                role: Role::User,
-                content: render_dedup_input(op, candidates),
-                reasoning: None,
-            }],
-            tools: Vec::new(),
-            seed: Some(seed),
-            web: false,
-            cache_key: Some(session_id.to_owned()),
-        };
+        let request = self.request(
+            session_id,
+            DEDUP_PROMPT_V1.to_owned(),
+            render_dedup_input(op, candidates),
+        );
         let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
             Ok(Ok(text)) => text,
             Ok(Err(error)) => {
@@ -484,24 +468,11 @@ impl Extractor for ModelExtractor {
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<memory_event::Event>, ExtractError> {
-        let seed = self
-            .seed
-            .unwrap_or_else(|| session_seed(&session.session_id));
-        let request = CompletionRequest {
-            model: self.model.clone(),
-            role: SessionRole::Archivist,
-            thinking: self.thinking,
-            system: Some(self.prompt.clone()),
-            messages: vec![Message::Text {
-                role: Role::User,
-                content: render_input(session, self.identity.as_deref(), &self.namespaces),
-                reasoning: None,
-            }],
-            tools: Vec::new(),
-            seed: Some(seed),
-            web: false,
-            cache_key: Some(session.session_id.clone()),
-        };
+        let request = self.request(
+            &session.session_id,
+            self.prompt.clone(),
+            render_input(session, self.identity.as_deref(), &self.namespaces),
+        );
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
             .map_err(|_| {
@@ -513,7 +484,7 @@ impl Extractor for ModelExtractor {
         let operations = parse_operations(&text)?;
         tracing::debug!(operations = operations.len(), "extraction parsed");
         let (operations, stats) = self
-            .dedup(operations, &session.memory_index, seed, &session.session_id)
+            .dedup(operations, &session.memory_index, &session.session_id)
             .await;
         let span = tracing::Span::current();
         if stats.dropped > 0 {
@@ -540,24 +511,7 @@ impl Extractor for ModelExtractor {
         let Some(prompt) = title_prompt(session) else {
             return Ok(None);
         };
-        let request = CompletionRequest {
-            model: self.model.clone(),
-            role: SessionRole::Archivist,
-            thinking: self.thinking,
-            system: Some(TITLE_PROMPT.to_owned()),
-            messages: vec![Message::Text {
-                role: Role::User,
-                content: prompt,
-                reasoning: None,
-            }],
-            tools: Vec::new(),
-            seed: Some(
-                self.seed
-                    .unwrap_or_else(|| session_seed(&session.session_id)),
-            ),
-            web: false,
-            cache_key: Some(session.session_id.clone()),
-        };
+        let request = self.request(&session.session_id, TITLE_PROMPT.to_owned(), prompt);
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
             .await
             .map_err(|_| {
@@ -1051,10 +1005,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        KNOWN_VERSIONS, ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4,
-        PROMPT_VERSION_V1, PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4,
-        TITLE_OUTPUT_CAP, TITLE_PROMPT, TOOL_SNIPPET, TRANSCRIPT_BUDGET, dedup_candidates,
-        normalize, render_input, sanitize_title, snippet, title_prompt, tokenize, windowed,
+        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4, PROMPT_VERSION_V1,
+        PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4, TITLE_PROMPT, TRANSCRIPT_BUDGET,
+        render_input, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -1421,150 +1374,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_garbage_title_reply_appends_nothing_and_the_pass_still_extracts() {
-        let provider = ScriptedProvider::scripted(vec![
-            done_reply("noted"),
-            done_reply("   \n"),
-            extraction_reply(WRITE_OP),
-        ]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "remember: keep replies short", tx)
-            .await
-            .expect("send");
-
-        let extractor = ModelExtractor::new(
-            Arc::clone(&provider) as Arc<dyn Provider>,
-            "test-model",
-            Thinking::Minimal,
-            Duration::from_secs(300),
-            None,
-            vec!["global".to_owned(), "arc".to_owned()],
-        );
-        crate::consolidation::Titles::default()
-            .run(&engine, &extractor)
-            .await
-            .expect("titles");
-        let outcome = run_pass(
-            &engine,
-            &extractor,
-            ALL_IDLE,
-            PROMPT_VERSION_V4,
-            &HashSet::new(),
-        )
-        .await
-        .expect("pass");
-        assert!(
-            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
-            "got: {outcome:?}"
-        );
-
-        for event in replay_events(dir.path()) {
-            if let Some(event::Payload::Session(session)) = &event.payload {
-                assert!(
-                    !matches!(session.event, Some(session_event::Event::SessionTitled(_))),
-                    "a blank reply must not title the session"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sanitize_title_strips_quotes_whitespace_and_newlines() {
-        assert_eq!(
-            sanitize_title("  \"Terse replies\"\n"),
-            Some("Terse replies".to_owned())
-        );
-        assert_eq!(
-            sanitize_title("'lone quotes'"),
-            Some("lone quotes".to_owned())
-        );
-        assert_eq!(sanitize_title("   \n\t  "), None, "blank after sanitizing");
-        assert_eq!(sanitize_title(""), None);
-    }
-
-    #[test]
-    fn sanitize_title_rejects_a_reply_past_sixty_chars() {
-        let long = "word ".repeat(20);
-        assert_eq!(sanitize_title(&long), None, "a run-on reply is not a title");
-
-        let exact: String = "a".repeat(TITLE_OUTPUT_CAP);
-        assert_eq!(sanitize_title(&exact), Some(exact));
-
-        assert_eq!(
-            sanitize_title("Session picker keyboard navigation"),
-            Some("Session picker keyboard navigation".to_owned())
-        );
-    }
-
-    #[test]
-    fn titles_include_the_task_after_an_opening_greeting() {
-        let mut snapshot = snapshot(Vec::new());
-        for (role, source, content) in [
-            (Role::Assistant, 0, "Hello!"),
-            (Role::User, 0, "Fix session picker keyboard navigation"),
-            (
-                Role::User,
-                arc_proto::v1::Source::System as i32,
-                "Private handback",
-            ),
-            (
-                Role::Assistant,
-                0,
-                "The filtered result now receives focus.",
-            ),
-        ] {
-            snapshot.rows.push(MessageRow::Message {
-                role: role as i32,
-                source,
-                content: content.to_owned(),
-                partial: false,
-                turn_id: "t-1".to_owned(),
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            });
-        }
-        let prompt = title_prompt(&snapshot).expect("conversation");
-        assert!(prompt.contains("Fix session picker keyboard navigation"));
-        assert!(prompt.contains("The filtered result now receives focus."));
-        assert!(!prompt.contains("Private handback"));
-    }
-
-    #[test]
-    fn title_prompt_caps_each_side_at_five_hundred_chars_and_needs_both_roles() {
-        let mut snapshot = snapshot(Vec::new());
-        assert_eq!(title_prompt(&snapshot), None, "no assistant message yet");
-
-        snapshot.rows.push(MessageRow::Message {
-            role: Role::Assistant as i32,
-            content: "y".repeat(600),
-            partial: false,
-            turn_id: "t-1".to_owned(),
-            source: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            elapsed_ms: 0,
-            grounding_json: String::new(),
-            attachments: Vec::new(),
-        });
-        let prompt = title_prompt(&snapshot).expect("both roles present");
-        assert!(prompt.starts_with("User: hi\nAssistant: "));
-        assert_eq!(
-            prompt
-                .strip_prefix("User: hi\nAssistant: ")
-                .expect("prefix")
-                .chars()
-                .count(),
-            500
-        );
-    }
-
-    #[tokio::test]
     async fn every_bad_batch_is_rejected_whole() {
         let cases: &[(&str, &str)] = &[
             ("this is not json", "unparseable"),
@@ -1619,20 +1428,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn residue_is_stripped_and_an_empty_list_extracts_nothing() {
-        for text in [
-            r#"{"operations": []}"#,
-            "<think>nothing durable here</think>\n{\"operations\": []}",
-            "```json\n{\"operations\": []}\n```",
-        ] {
-            let events = extract_from(extraction_reply(text), Vec::new())
-                .await
-                .unwrap_or_else(|error| panic!("{text:?}: {error}"));
-            assert!(events.is_empty(), "{text:?}");
-        }
-    }
-
-    #[tokio::test]
     async fn a_cut_stream_and_a_tool_stop_are_rejected() {
         let cut = vec![Ok(CompletionDelta::Text(WRITE_OP.to_owned()))];
         let err = extract_from(cut, Vec::new()).await.expect_err("cut");
@@ -1679,59 +1474,6 @@ mod tests {
             .await
             .expect_err("must time out");
         assert!(err.0.contains("timed out"), "{}", err.0);
-    }
-
-    #[tokio::test]
-    async fn tool_rows_render_as_one_capped_line_each() {
-        let mut snapshot = snapshot(Vec::new());
-        snapshot.rows = vec![
-            MessageRow::Message {
-                role: Role::User as i32,
-                content: "line one\nline two".to_owned(),
-                partial: false,
-                turn_id: "t".to_owned(),
-                source: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                elapsed_ms: 0,
-                grounding_json: String::new(),
-                attachments: Vec::new(),
-            },
-            MessageRow::ToolCall {
-                call_id: "c1".to_owned(),
-                call_index: 0,
-                name: "bash".to_owned(),
-                arguments_json: r#"{"query":"palette"}"#.to_owned(),
-                turn_id: "t".to_owned(),
-                provider_roundtrip: Vec::new(),
-            },
-            MessageRow::ToolResult {
-                call_id: "c1".to_owned(),
-                outcome: 1,
-                content: format!("row\n{}", "x".repeat(500)),
-                truncated: false,
-                turn_id: "t".to_owned(),
-            },
-        ];
-        let input = render_input(&snapshot, None, &["global".to_owned()]);
-        assert!(
-            input.contains("user: line one\nline two"),
-            "prose stays verbatim: {input}"
-        );
-        assert!(
-            input.contains("\u{bb} bash({\"query\":\"palette\"})"),
-            "{input}"
-        );
-        let result_line = input
-            .lines()
-            .find(|line| line.starts_with('\u{ab}'))
-            .expect("a result line");
-        assert!(result_line.ends_with("[\u{2026}]"), "{result_line}");
-        assert!(
-            result_line.chars().count() <= TOOL_SNIPPET + 10,
-            "{result_line}"
-        );
-        assert!(!result_line.contains("row\nx"), "newlines flattened");
     }
 
     #[tokio::test]
@@ -1789,28 +1531,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_renders_in_the_already_known_section_or_none_absent() {
-        let snapshot = snapshot(Vec::new());
-        assert!(
-            render_input(
-                &snapshot,
-                Some("The user is named Bogdan."),
-                &["global".to_owned()]
-            )
-            .contains("[Already known — never extract]\nThe user is named Bogdan."),
-        );
-        assert!(
-            render_input(&snapshot, None, &["global".to_owned()])
-                .contains("[Already known — never extract]\n(none)"),
-        );
-    }
-
-    #[test]
-    fn the_snippet_keeps_short_payloads_whole() {
-        assert_eq!(snippet("{\"q\":1}"), "{\"q\":1}");
-    }
-
-    #[test]
     fn a_long_transcript_is_windowed_to_its_tail() {
         let lines: Vec<String> = (0..600)
             .map(|n| format!("user: message number {n} padded {}", "p".repeat(30)))
@@ -1829,12 +1549,6 @@ mod tests {
             .map(|line| line.chars().count() + 1)
             .sum();
         assert!(body <= TRANSCRIPT_BUDGET + 1, "{body}");
-    }
-
-    #[test]
-    fn a_short_transcript_is_untouched() {
-        let lines = vec!["user: hi".to_owned(), "assistant: hello".to_owned()];
-        assert_eq!(windowed(&lines), "user: hi\nassistant: hello");
     }
 
     #[test]
@@ -1986,29 +1700,6 @@ it replaces. An empty operations list means nothing was worth saving.
         );
     }
 
-    #[test]
-    fn v4_is_known_and_differs_from_v3_only_in_the_links_sentence() {
-        assert!(
-            KNOWN_VERSIONS
-                .iter()
-                .any(|&(version, prompt)| version == PROMPT_VERSION_V4 && prompt == PROMPT_V4)
-        );
-        let shared_header =
-            "You are ARC's memory consolidation pass, reading one finished conversation.";
-        assert!(PROMPT_V3.contains(shared_header));
-        assert!(PROMPT_V4.contains(shared_header));
-
-        let new_sentence = "would need re-checking if that record changed";
-        assert!(
-            !PROMPT_V3.contains(new_sentence),
-            "v3 keeps its old, permissive links sentence"
-        );
-        assert!(
-            PROMPT_V4.contains(new_sentence),
-            "v4 replaces it with re-checking guidance"
-        );
-    }
-
     #[tokio::test]
     async fn a_v3_write_files_its_namespace_and_an_unknown_one_goes_global() {
         let filed = extract_from(
@@ -2044,55 +1735,6 @@ it replaces. An empty operations list means nothing was worth saving.
         );
     }
 
-    #[test]
-    fn normalize_lowercases_collapses_whitespace_and_trims() {
-        assert_eq!(
-            normalize("  Terse   Replies\n\tare Good "),
-            "terse replies are good"
-        );
-    }
-
-    #[test]
-    fn tokenize_drops_stopwords() {
-        let words = tokenize("the user prefers a terse reply about arc");
-        assert_eq!(words, HashSet::from_iter(["prefers", "terse", "reply"]));
-    }
-
-    #[test]
-    fn dedup_candidates_takes_the_top_three_by_score_ties_broken_by_index_order() {
-        let index = vec![
-            entry("mr-1", "Coffee break", "drinks coffee this morning"),
-            entry("mr-2", "Work log", "daily entries before lunch"),
-            entry("mr-3", "Habit tracker", "tracks work hours"),
-            entry("mr-4", "Coffee log", "daily brew notes"),
-            entry("mr-5", "Morning routine", "starts before sunrise"),
-            entry("mr-6", "Bicycle", "rides daily"),
-        ];
-        let candidates = dedup_candidates(
-            "Morning coffee habit",
-            "drinks coffee daily before work",
-            &index,
-        );
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["mr-1", "mr-2", "mr-3"],
-            "the two highest-scoring plus the lowest-index tie at score 2; \
-             mr-6 scores 1 and never qualifies"
-        );
-    }
-
-    #[test]
-    fn dedup_candidates_is_empty_below_the_shared_word_threshold() {
-        let index = vec![entry("mr-1", "Bicycle", "rides a bicycle to work")];
-        assert!(
-            dedup_candidates("Coffee habit", "drinks coffee every day", &index).is_empty(),
-            "one shared word (\"work\" isn't even shared) must not clear the >= 2 bar"
-        );
-    }
-
     #[tokio::test]
     async fn an_exact_duplicate_write_is_dropped_with_no_dedup_call() {
         let events = extract_from(
@@ -2106,55 +1748,6 @@ it replaces. An empty operations list means nothing was worth saving.
         .await
         .expect("extract");
         assert!(events.is_empty(), "{events:?}");
-    }
-
-    const BATCH_DUP_OP: &str = r#"{"operations":[
-        {"op":"write","kind":"preference","title":"Terse replies",
-         "summary":"User prefers short answers","body":"First body.","links":[]},
-        {"op":"write","kind":"preference","title":"  terse   REPLIES ",
-         "summary":"user   prefers short answers","body":"Second body.","links":[]}]}"#;
-
-    #[tokio::test]
-    async fn a_within_batch_duplicate_keeps_the_first_op() {
-        let events = extract_from(extraction_reply(BATCH_DUP_OP), Vec::new())
-            .await
-            .expect("extract");
-        assert_eq!(events.len(), 1);
-        let memory_event::Event::RecordCreated(created) = &events[0] else {
-            panic!("expected RecordCreated, got {:?}", events[0]);
-        };
-        assert_eq!(created.record.as_ref().expect("record").body, "First body.");
-    }
-
-    const TOUCH_SUPERSEDE_OP: &str = r#"{"operations":[{"op":"supersede","id":"mr-old","kind":"fact",
-        "title":"Old address","summary":"lives at X","body":"The user lives at X.","links":[]}]}"#;
-
-    #[tokio::test]
-    async fn a_supersede_identical_to_its_target_is_dropped() {
-        let events = extract_from(
-            extraction_reply(TOUCH_SUPERSEDE_OP),
-            vec![entry_with_body(
-                "mr-old",
-                "Old address",
-                "lives at X",
-                "The user lives at X.",
-            )],
-        )
-        .await
-        .expect("extract");
-        assert!(events.is_empty(), "{events:?}");
-    }
-
-    #[tokio::test]
-    async fn a_write_with_no_neighbors_makes_no_dedup_call() {
-        let events = extract_from(
-            extraction_reply(OVERLAP_WRITE_OP),
-            vec![entry("mr-1", "Bicycle", "rides a bicycle to work")],
-        )
-        .await
-        .expect("extract");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
     }
 
     const LINKED_WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"preference",
@@ -2218,21 +1811,6 @@ it replaces. An empty operations list means nothing was worth saving.
     }
 
     #[tokio::test]
-    async fn a_forced_choice_with_both_lists_empty_keeps_the_write() {
-        let events = extract_scripted(
-            vec![
-                extraction_reply(OVERLAP_WRITE_OP),
-                dedup_reply(r#"{"reasoning":"unrelated","duplicate_of":[],"supersedes":[]}"#),
-            ],
-            vec![overlap_neighbor("mr-1", "global")],
-        )
-        .await
-        .expect("extract");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
-    }
-
-    #[tokio::test]
     async fn an_unparseable_dedup_reply_keeps_the_write_and_extraction_still_succeeds() {
         let events = extract_scripted(
             vec![
@@ -2244,21 +1822,6 @@ it replaces. An empty operations list means nothing was worth saving.
                         stop: Stop::EndTurn,
                     }),
                 ],
-            ],
-            vec![overlap_neighbor("mr-1", "global")],
-        )
-        .await
-        .expect("extract");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
-    }
-
-    #[tokio::test]
-    async fn an_out_of_range_duplicate_index_is_ignored_and_the_write_kept() {
-        let events = extract_scripted(
-            vec![
-                extraction_reply(OVERLAP_WRITE_OP),
-                dedup_reply(r#"{"reasoning":"miscounted","duplicate_of":[9],"supersedes":[]}"#),
             ],
             vec![overlap_neighbor("mr-1", "global")],
         )

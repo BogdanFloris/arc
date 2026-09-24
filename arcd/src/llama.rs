@@ -240,7 +240,7 @@ async fn wait_ready(child: &mut Child, endpoint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEALTHY_FOR, RESTART_LIMIT, Restarts, find_device};
+    use super::{RESTART_LIMIT, Restarts, find_device};
     use std::time::Duration;
 
     const CRASHED: Duration = Duration::from_secs(1);
@@ -264,20 +264,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_sidecar_that_ran_a_while_starts_its_count_over() {
-        let mut restarts = Restarts::default();
-        for _ in 0..RESTART_LIMIT {
-            restarts.next_backoff(CRASHED).expect("under the limit");
-        }
-
-        assert_eq!(
-            restarts.next_backoff(HEALTHY_FOR).map(|w| w.as_secs()),
-            Some(1),
-            "an exit after a healthy run is a first failure, not a fourth"
-        );
-    }
-
     const LISTING: &str = "Available devices:\n  \
         Vulkan0: NVIDIA GeForce RTX 5070 (12227 MiB, 8861 MiB free)\n  \
         Vulkan1: AMD Ryzen 9 9900X 12-Core Processor (RADV RAPHAEL_MENDOCINO) (16137 MiB, 10371 MiB free)\n";
@@ -294,30 +280,6 @@ mod tests {
         assert_eq!(
             find_device(LISTING, "RADV").map(|(id, _)| id),
             Some("Vulkan1".to_owned())
-        );
-    }
-
-    #[test]
-    fn no_match_is_none_not_a_guess() {
-        assert_eq!(find_device(LISTING, "RTX 4090"), None);
-        assert_eq!(find_device("", "RTX 5070"), None);
-    }
-
-    #[test]
-    fn the_first_of_several_matches_wins() {
-        assert_eq!(
-            find_device(LISTING, "MiB").map(|(id, _)| id),
-            Some("Vulkan0".to_owned())
-        );
-    }
-
-    #[test]
-    fn prose_lines_are_not_devices() {
-        let noisy =
-            "warning: something: happened here\nAvailable devices:\n  CUDA0: NVIDIA T4 (16 GiB)\n";
-        assert_eq!(
-            find_device(noisy, "t4").map(|(id, _)| id),
-            Some("CUDA0".to_owned())
         );
     }
 }

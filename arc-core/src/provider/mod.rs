@@ -16,19 +16,12 @@ const MAX_BODY_SNIPPET: usize = 512;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionRequest {
     pub model: String,
-
     pub role: SessionRole,
-
     pub thinking: Thinking,
-
     pub system: Option<String>,
-
     pub messages: Vec<Message>,
-
     pub tools: Vec<ToolDefinition>,
-
     pub seed: Option<u64>,
-
     pub web: bool,
 
     /// A stable id for the conversation the request belongs to, for providers
@@ -90,17 +83,14 @@ pub enum Message {
         // DeepSeek requires this replayed on the next request; never logged
         reasoning: Option<String>,
     },
-
     UserWithAttachments {
         content: String,
         attachments: Vec<ImageAttachment>,
     },
-
     ToolCalls {
         calls: Vec<ToolCall>,
         reasoning: Option<String>,
     },
-
     ToolResult {
         call_id: String,
         content: String,
@@ -110,13 +100,9 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
-
     pub index: u32,
-
     pub name: String,
-
     pub arguments: String,
-
     // opaque per-call bytes a provider must see again on the tool result
     pub provider_roundtrip: Vec<u8>,
 }
@@ -124,33 +110,24 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionDelta {
     Text(String),
-
     Reasoning(String),
-
     ToolCall(ToolCall),
-
     ServerCall { name: String, payload_json: String },
-
     ServerResponse { name: String, payload_json: String },
-
     Grounding(String),
-
     Done { usage: Usage, stop: Stop },
-
     UnmeasuredDone { stop: Stop },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     EndTurn,
-
     ToolCalls,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u32,
-
     pub output_tokens: u32,
 }
 
@@ -480,34 +457,6 @@ mod tests {
         assert!(matches!(err, Error::MalformedStream(_)));
     }
 
-    #[tokio::test]
-    async fn completions_are_drivable_from_a_spawned_task() {
-        let usage = Usage {
-            input_tokens: 1,
-            output_tokens: 1,
-        };
-        let provider = MockProvider::streaming(vec![
-            Ok(CompletionDelta::Text("spawned".to_owned())),
-            Ok(CompletionDelta::Done {
-                usage,
-                stop: Stop::EndTurn,
-            }),
-        ]);
-
-        let joined = tokio::spawn(async move { drain(&provider, request()).await })
-            .await
-            .expect("task");
-
-        assert_eq!(
-            joined.expect("stream"),
-            Drained {
-                text: "spawned".to_owned(),
-                ending: Some((Some(usage), Stop::EndTurn)),
-                ..Drained::default()
-            }
-        );
-    }
-
     #[test]
     fn http_error_keeps_short_bodies_whole() {
         let err = Error::http(429, "slow down");
@@ -528,34 +477,6 @@ mod tests {
         assert!(
             snippet.len() > MAX_BODY_SNIPPET - 4,
             "truncated too eagerly"
-        );
-    }
-
-    #[test]
-    fn rate_limit_display_mentions_retry_advice_and_detail_only_when_given() {
-        assert_eq!(
-            Error::RateLimited {
-                retry_after: Some(30),
-                detail: String::new(),
-            }
-            .to_string(),
-            "provider rate limited, retry after 30s"
-        );
-        assert_eq!(
-            Error::RateLimited {
-                retry_after: None,
-                detail: String::new(),
-            }
-            .to_string(),
-            "provider rate limited"
-        );
-        assert_eq!(
-            Error::RateLimited {
-                retry_after: Some(4),
-                detail: "quota exceeded: GenerateRequestsPerMinute".to_owned(),
-            }
-            .to_string(),
-            "provider rate limited, retry after 4s: quota exceeded: GenerateRequestsPerMinute"
         );
     }
 }

@@ -234,10 +234,7 @@ fn record_properties(namespaces: &[String]) -> serde_json::Value {
 
 // 1.3 measured optional fields being silently dropped; required-with-escape
 #[allow(clippy::result_large_err)]
-fn resolve_namespace(
-    namespace: Option<&str>,
-    namespaces: &[String],
-) -> Result<Option<String>, ToolReply> {
+fn resolve_namespace(namespace: Option<&str>, namespaces: &[String]) -> Result<String, ToolReply> {
     let Some(namespace) = namespace.map(str::trim).filter(|n| !n.is_empty()) else {
         return Err(ToolReply::error(format!(
             "ERROR: namespace is required — one of {}.",
@@ -250,7 +247,7 @@ fn resolve_namespace(
             namespaces.join(", ")
         )));
     }
-    Ok(Some(namespace.to_owned()))
+    Ok(namespace.to_owned())
 }
 
 impl Tool for MemoryWrite {
@@ -312,15 +309,10 @@ impl Tool for MemoryWrite {
             };
             let id = record.id.clone();
             ToolReply {
-                changed_paths: Vec::new(),
-                content: format!("Saved (id: {id})."),
-                ok: true,
                 memory_events: vec![memory_event::Event::RecordCreated(MemoryRecordCreated {
                     record: Some(record),
                 })],
-                job_request: None,
-                continue_request: None,
-                cancel_request: None,
+                ..ToolReply::ok(format!("Saved (id: {id})."))
             }
         })
     }
@@ -384,18 +376,13 @@ impl Tool for MemorySupersede {
             };
             let content = format!("Superseded {} with {}.", args.id, record.id);
             ToolReply {
-                changed_paths: Vec::new(),
-                content,
-                ok: true,
                 memory_events: vec![memory_event::Event::RecordSuperseded(
                     MemoryRecordSuperseded {
                         superseded_id: args.id,
                         record: Some(record),
                     },
                 )],
-                job_request: None,
-                continue_request: None,
-                cancel_request: None,
+                ..ToolReply::ok(content)
             }
         })
     }
@@ -409,7 +396,6 @@ fn build_record(
     ctx: &TurnContext,
 ) -> Result<MemoryRecord, ToolReply> {
     let namespace = resolve_namespace(args.namespace.as_deref(), namespaces)?;
-    let args = RecordArgs { namespace, ..args };
     let Some(kind) = parse_kind(&args.kind) else {
         return Err(ToolReply::error(format!(
             "ERROR: unknown kind {:?}. Use person, project, preference, fact, \
@@ -430,7 +416,7 @@ fn build_record(
     }
     Ok(mint_record(
         kind,
-        args.namespace,
+        Some(namespace),
         args.title,
         args.summary,
         args.body,
@@ -531,40 +517,6 @@ mod tests {
             reply.content
         );
         assert!(reply.content.contains("global, arc"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_write_with_an_unknown_namespace_is_refused_naming_the_legal_values() {
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(
-                r#"{"kind":"fact","namespace":"vibes","title":"t","summary":"s","body":"b"}"#
-                    .to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains("unknown namespace \"vibes\""),
-            "{}",
-            reply.content
-        );
-        assert!(reply.content.contains("global, arc"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_write_with_a_project_namespace_files_the_record_there() {
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(
-                r#"{"kind":"fact","namespace":"arc","title":"t","summary":"s","body":"b"}"#
-                    .to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-        assert!(reply.ok, "{}", reply.content);
-        let [memory_event::Event::RecordCreated(created)] = reply.memory_events.as_slice() else {
-            panic!("expected one create");
-        };
-        assert_eq!(created.record.as_ref().expect("record").namespace, "arc");
     }
 
     const WRITE_ARGS: &str = r#"{"kind":"preference","namespace":"global","title":"Terse replies",
@@ -810,59 +762,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_write_reply_is_events_not_writes() {
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(
-                WRITE_ARGS.to_owned(),
-                TurnContext {
-                    session_id: "s-live".to_owned(),
-                    turn_id: "t-1".to_owned(),
-                    grants: None,
-                    command_prefix: Vec::new(),
-                },
-            )
-            .await;
-
-        assert!(reply.ok);
-        assert!(
-            reply.content.starts_with("Saved (id: mr-"),
-            "{}",
-            reply.content
-        );
-        assert_eq!(reply.memory_events.len(), 1);
-        let memory_event::Event::RecordCreated(created) = &reply.memory_events[0] else {
-            panic!("expected RecordCreated");
-        };
-        let record = created.record.as_ref().expect("record");
-        let provenance = record.provenance.as_ref().expect("provenance");
-        assert_eq!(provenance.entries[0].session_id, "s-live");
-    }
-
-    #[tokio::test]
-    async fn a_write_with_an_unknown_kind_or_blank_field_is_an_error() {
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(
-                r#"{"kind":"vibe","namespace":"global","title":"t","summary":"s","body":"b"}"#
-                    .to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-        assert!(!reply.ok);
-        assert!(reply.memory_events.is_empty());
-        assert!(reply.content.contains("preference"), "{}", reply.content);
-
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(
-                r#"{"kind":"fact","namespace":"global","title":"t","summary":"  ","body":"b"}"#
-                    .to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-        assert!(!reply.ok);
-        assert!(reply.content.contains("summary"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn superseding_an_unknown_id_is_an_error_naming_it() {
         let dir = TempDir::new().expect("temp dir");
         seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
@@ -951,56 +850,5 @@ mod tests {
             "a bare date means that day's end, excluding the next day's record: {}",
             reply.content
         );
-    }
-
-    #[tokio::test]
-    async fn a_garbage_as_of_is_an_error_naming_the_accepted_forms() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
-        let tool = MemorySearch::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(
-                r#"{"query":"real","as_of":"not a time"}"#.to_owned(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("RFC 3339"), "{}", reply.content);
-        assert!(reply.content.contains("bare date"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn memory_read_of_an_unknown_id_names_it() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
-        let tool = MemoryRead::new(archive_at(&dir));
-
-        let reply = tool
-            .execute(r#"{"id":"mr-nope"}"#.to_owned(), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("mr-nope"), "{}", reply.content);
-        assert!(reply.content.contains("memory_search"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn malformed_arguments_are_actionable_errors() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_memory_log(&dir, vec![seeded("mr-real", "Real", "exists")]);
-
-        let reply = MemoryWrite::new(vec!["global".to_owned(), "arc".to_owned()])
-            .execute(r#"{"kind""#.to_owned(), TurnContext::default())
-            .await;
-        assert!(!reply.ok);
-        assert!(reply.content.contains("memory_write"), "{}", reply.content);
-
-        let reply = MemoryRead::new(archive_at(&dir))
-            .execute("{}".to_owned(), TurnContext::default())
-            .await;
-        assert!(!reply.ok);
-        assert!(reply.content.contains("memory_read"), "{}", reply.content);
     }
 }

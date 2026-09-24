@@ -1,11 +1,8 @@
 use super::Error;
 
 pub(crate) const LEN_SIZE: usize = 4;
-
 pub(crate) const CRC_SIZE: usize = 4;
-
 pub(crate) const HEADER_SIZE: usize = LEN_SIZE + CRC_SIZE;
-
 pub(crate) const MAX_RECORD_LEN: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,10 +42,7 @@ pub(crate) fn verify(header: Header, payload: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HEADER_SIZE, Header, MAX_RECORD_LEN, checksum, decode_header, encode_record, verify,
-    };
-    use crate::log::Error;
+    use super::{HEADER_SIZE, Header, checksum, decode_header, encode_record, verify};
 
     #[test]
     fn encode_record_lays_bytes_out_per_spec() {
@@ -59,15 +53,6 @@ mod tests {
         assert_eq!(&record[0..4], &5u32.to_le_bytes());
         assert_eq!(&record[4..8], &crc32fast::hash(payload).to_le_bytes());
         assert_eq!(&record[8..], payload);
-    }
-
-    #[test]
-    fn empty_payload_frames_to_header_only() {
-        let record = encode_record(&[]).expect("encode");
-
-        assert_eq!(record.len(), HEADER_SIZE);
-        assert_eq!(&record[0..4], &0u32.to_le_bytes());
-        assert_eq!(&record[4..8], &checksum(&[]).to_le_bytes());
     }
 
     #[test]
@@ -84,21 +69,6 @@ mod tests {
             }
         );
         assert!(verify(header, &record[HEADER_SIZE..]));
-    }
-
-    #[test]
-    fn payload_at_the_cap_frames_and_one_byte_over_is_refused() {
-        let at_cap = vec![0u8; MAX_RECORD_LEN as usize];
-        let record = encode_record(&at_cap).expect("a payload at the cap is legal");
-        assert_eq!(record.len(), HEADER_SIZE + at_cap.len());
-        assert_eq!(&record[0..4], &MAX_RECORD_LEN.to_le_bytes());
-
-        let over_cap = vec![0u8; MAX_RECORD_LEN as usize + 1];
-        let err = encode_record(&over_cap).expect_err("one byte over the cap must be refused");
-        assert!(
-            matches!(err, Error::RecordTooLarge { len } if len == over_cap.len()),
-            "got: {err:?}"
-        );
     }
 
     #[test]

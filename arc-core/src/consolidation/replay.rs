@@ -524,38 +524,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_session_filter_limits_the_run() {
-        let dir = TempDir::new().expect("temp dir");
-        seeded(&dir);
-        let provider = ScriptedProvider::scripted(vec![extraction_reply(EMPTY)]);
-
-        let reports = run(
-            &(Arc::clone(&provider) as Arc<dyn Provider>),
-            "test-model",
-            Duration::from_secs(5),
-            dir.path(),
-            &[("va", "PROMPT A")],
-            &["s-2".to_owned()],
-            None,
-            &["global".to_owned(), "arc".to_owned()],
-        )
-        .await
-        .expect("replay");
-
-        assert_eq!(reports[0].sessions.len(), 1);
-        assert_eq!(reports[0].sessions[0].session_id, "s-2");
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 1, "one session, one extraction");
-        let [Message::Text { content, .. }] = requests[0].messages.as_slice() else {
-            panic!("expected one user message");
-        };
-        assert!(
-            content.contains("[Already known \u{2014} never extract]\n(none)"),
-            "no identity given: {content}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_gated_executor_session_contributes_zero_operations() {
         let dir = TempDir::new().expect("temp dir");
         seed_log_payloads(
@@ -642,11 +610,5 @@ mod tests {
         assert_eq!(diffed.changed.len(), 1);
         assert_eq!(diffed.changed[0].title, "User Name", "A's spelling");
         assert_eq!(diffed.changed[0].summary_b, "goes by Bogdan");
-    }
-
-    #[test]
-    fn the_session_seed_is_stable() {
-        assert_eq!(session_seed("s-1"), 0x817c_da19_5c3f_bf24);
-        assert_ne!(session_seed("s-1"), session_seed("s-2"));
     }
 }

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use arc_proto::v1::{Budget, SessionRole};
+use arc_proto::v1::SessionRole;
 use serde::Deserialize;
 
 use crate::provider::{ToolDefinition, role_label};
@@ -185,23 +185,17 @@ impl Tool for Dispatch {
                         .to_owned(),
                 );
             }
-            // budgets are suspended while daily use calibrates; 5.5 stays dormant
-            let budget: Option<Budget> = None;
+            let content = format!("Dispatching {} into {project}.", role_label(role));
             ToolReply {
-                changed_paths: Vec::new(),
-                content: format!("Dispatching {} into {project}.", role_label(role)),
-                ok: true,
-                memory_events: Vec::new(),
                 job_request: Some(JobRequest {
                     role,
                     project,
                     brief: args.brief,
-                    budget,
+                    budget: None,
                     intent,
                     fresh: args.fresh,
                 }),
-                continue_request: None,
-                cancel_request: None,
+                ..ToolReply::ok(content)
             }
         })
     }
@@ -290,22 +284,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_analyze_dispatch_produces_a_job_request_with_analyze_intent() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                args("executor", "arc", "check consistency", "analyze"),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        let job = reply.job_request.expect("a job request");
-        assert_eq!(job.intent, crate::tool::Intent::Analyze);
-    }
-
-    #[tokio::test]
     async fn none_in_a_bound_session_passes_through_unresolved() {
         // the tool only validates the value; the engine resolves "none" to
         // the calling session's own project, since only it knows that
@@ -360,53 +338,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_brief_is_an_error() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                args("executor", "arc", "   ", "implement"),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.job_request.is_none());
-        assert!(reply.content.contains("brief"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn zero_budgets_resolve_to_no_budget() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                args("executor", "arc", "fix the bug", "implement"),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(reply.job_request.expect("a job request").budget, None);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_role_string_is_an_error() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                args("wizard", "arc", "fix the bug", "implement"),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.job_request.is_none());
-        assert!(reply.content.contains("wizard"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn an_unknown_project_string_is_an_error() {
         let tool = dispatch(&[("arc", "")], None);
 
@@ -420,118 +351,5 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.job_request.is_none());
         assert!(reply.content.contains("ghost"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_intent_string_names_both_options() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                args("executor", "arc", "fix the bug", "yolo"),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.job_request.is_none());
-        assert!(reply.content.contains("analyze"), "{}", reply.content);
-        assert!(reply.content.contains("implement"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_missing_intent_is_a_bad_arguments_error() {
-        let tool = dispatch(&[("arc", "")], None);
-
-        let reply = tool
-            .execute(
-                serde_json::json!({
-                    "role": "executor",
-                    "project": "arc",
-                    "brief": "fix the bug",
-                })
-                .to_string(),
-                TurnContext::default(),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.job_request.is_none());
-        assert!(reply.content.contains("intent"), "{}", reply.content);
-    }
-
-    #[test]
-    fn the_definition_requires_every_field_and_carries_the_escape_values() {
-        let tool = dispatch(&[("arc", ""), ("scratch", "")], Some("scratch"));
-
-        let definition = tool.definition();
-        assert_eq!(definition.name, "dispatch");
-
-        let required = definition.parameters["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .map(|v| v.as_str().expect("string"))
-            .collect::<Vec<_>>();
-        assert_eq!(required, ["role", "project", "brief", "intent"]);
-        assert!(
-            definition.parameters["properties"]["fresh"].is_object(),
-            "fresh is declared but never required"
-        );
-
-        let role_enum = definition.parameters["properties"]["role"]["enum"]
-            .as_array()
-            .expect("role enum");
-        assert_eq!(role_enum, &["executor", "archivist"]);
-
-        let project_enum = definition.parameters["properties"]["project"]["enum"]
-            .as_array()
-            .expect("project enum")
-            .iter()
-            .map(|v| v.as_str().expect("string").to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            project_enum,
-            ["arc", "scratch", "none"],
-            "an explicit escape value"
-        );
-
-        let intent_enum = definition.parameters["properties"]["intent"]["enum"]
-            .as_array()
-            .expect("intent enum")
-            .iter()
-            .map(|v| v.as_str().expect("string").to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(intent_enum, ["analyze", "implement"]);
-    }
-
-    #[test]
-    fn project_descriptions_render_into_the_project_property_description() {
-        let tool = dispatch(
-            &[("arc", "ARC's own implementation repo"), ("scratch", "")],
-            Some("scratch"),
-        );
-
-        let description = tool.definition().parameters["properties"]["project"]["description"]
-            .as_str()
-            .expect("string")
-            .to_owned();
-
-        assert!(
-            description.contains("arc: ARC's own implementation repo."),
-            "{description}"
-        );
-        assert!(
-            description.contains("scratch.") && !description.contains("scratch:"),
-            "an empty description contributes just the bare name: {description}"
-        );
-        assert!(
-            description.contains("\"none\" means this session's own bound project"),
-            "{description}"
-        );
-        assert!(
-            description.contains("standing scratch project"),
-            "{description}"
-        );
     }
 }

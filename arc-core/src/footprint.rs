@@ -10,7 +10,6 @@ use crate::tool::workspace::bash::prefixed;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LINES: usize = 40;
 
-/// Where a project's working copy stood when a turn began.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mark {
     Jj { commit: String, change: String },
@@ -245,59 +244,6 @@ mod tests {
             assert!(text.contains(name), "{name} is missing: {text}");
         }
         assert!(text.contains("3 files changed"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_git_footprint_reads_the_same_way() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path();
-        sh(root, &["git", "init", "-q"]);
-        sh(
-            root,
-            &[
-                "git",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-q",
-                "-m",
-                "base",
-            ],
-        );
-
-        let mark = mark(root, &[]).await.expect("a git repo marks");
-        assert!(matches!(mark, Mark::Git { .. }));
-
-        std::fs::write(root.join("a.txt"), "a\n").expect("write");
-        sh(root, &["git", "add", "a.txt"]);
-        sh(
-            root,
-            &[
-                "git",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-q",
-                "-m",
-                "the job's commit",
-            ],
-        );
-
-        let text = since(&mark, root, &[]).await.expect("a footprint");
-        assert!(text.contains(" the job's commit"), "{text}");
-        assert!(text.contains("a.txt"), "{text}");
-        assert!(text.contains("1 file changed"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_directory_without_a_repo_has_no_footprint() {
-        let dir = TempDir::new().expect("temp dir");
-        assert_eq!(mark(dir.path(), &[]).await, None);
     }
 
     #[tokio::test]

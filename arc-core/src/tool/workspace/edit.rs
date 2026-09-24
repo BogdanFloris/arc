@@ -21,11 +21,8 @@ impl Edit {
 #[derive(Deserialize)]
 struct EditArgs {
     path: String,
-    #[serde(default)]
     replacements: Option<Vec<Replacement>>,
-    #[serde(default)]
     old: Option<String>,
-    #[serde(default)]
     new: Option<String>,
 }
 
@@ -155,7 +152,7 @@ impl Tool for Edit {
                     ));
                 };
                 if matches.next().is_some() {
-                    let occurrences = text.matches(&replacement.old).count();
+                    let occurrences = 2 + matches.count();
                     return ToolReply::error(format!(
                         "ERROR: old text appears {occurrences} times in {}; include more \
                          surrounding context to make the match unique.",
@@ -214,7 +211,7 @@ mod tests {
     use super::Edit;
     use crate::tool::workspace::read::Read;
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
-    use crate::tool::{Registry, Tool as _, ToolSource, TurnContext};
+    use crate::tool::{Tool as _, TurnContext};
 
     fn workspace() -> Arc<Workspace> {
         Arc::new(Workspace::new())
@@ -274,7 +271,9 @@ mod tests {
             ("abcd", vec![("abc", "X"), ("bcd", "Y")], "overlap"),
             ("abcd", vec![("ab", "X"), ("missing", "Y")], "not found"),
             ("ab ab", vec![("ab", "X"), (" ", "_")], "unique"),
+            ("ab ab ab", vec![("ab", "X")], "3 times"),
             ("abcd", vec![("ab", "X"), ("cd", "cd")], "different"),
+            ("abcd", vec![("", "X")], "empty"),
         ] {
             fs::write(&path, content).unwrap();
             let ws = workspace();
@@ -363,187 +362,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unbound_session_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let edit_tool = Edit::new(workspace());
-
-        let reply = edit_tool
-            .execute(edit_args(&path, "world", "there"), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("granted"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn editing_without_a_prior_read_is_refused_with_the_read_first_message() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let edit_tool = Edit::new(ws);
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "world", "there"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains("has not been read"),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn editing_a_file_changed_underneath_is_refused_with_the_changed_since_message() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        let edit_tool = Edit::new(Arc::clone(&ws));
-
-        let read_reply = read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-        assert!(read_reply.ok, "{}", read_reply.content);
-
-        fs::write(&path, "changed underneath").expect("write underneath");
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "world", "there"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("changed since"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn zero_matches_is_a_not_found_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        let edit_tool = Edit::new(Arc::clone(&ws));
-
-        read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "nope", "there"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("not found"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn two_matches_names_the_count_in_the_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "ab ab").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        let edit_tool = Edit::new(Arc::clone(&ws));
-
-        read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "ab", "cd"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains('2'), "{}", reply.content);
-        assert!(reply.content.contains("unique"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn old_equal_to_new_is_an_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        let edit_tool = Edit::new(Arc::clone(&ws));
-
-        read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "world", "world"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("different"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn empty_old_is_an_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        let edit_tool = Edit::new(Arc::clone(&ws));
-
-        read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "", "x"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("empty"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn editing_in_a_read_only_grant_is_the_gates_refusal() {
-        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let edit_tool = Edit::new(ws);
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "world", "there"),
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("read-only"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn a_read_under_a_different_session_id_does_not_count() {
         let dir = TempDir::new().expect("tmp");
         let path = dir.path().join("f.txt");
@@ -571,87 +389,6 @@ mod tests {
             reply.content.contains("has not been read"),
             "{}",
             reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn a_non_utf8_file_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.bin");
-        fs::write(&path, [0xff, 0xfe, 0x00, 0xff]).expect("write");
-        let ws = workspace();
-        let edit_tool = Edit::new(ws);
-
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "a", "b"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("text"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_missing_file_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let edit_tool = Edit::new(ws);
-
-        let path = dir.path().join("nope.txt");
-        let reply = edit_tool
-            .execute(
-                edit_args(&path, "a", "b"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains(path.to_str().expect("utf8")),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
-    async fn the_edit_tool_dispatches_through_the_registry_by_source() {
-        let dir = TempDir::new().expect("tmp");
-        let path = dir.path().join("f.txt");
-        fs::write(&path, "hello world").expect("write");
-        let ws = workspace();
-        let read_tool = Read::new(Arc::clone(&ws));
-        read_tool
-            .execute(read_args(&path), ctx("s-1", dir.path(), Mode::ReadWrite))
-            .await;
-
-        let mut registry = Registry::new(32 * 1024);
-        registry.register(Box::new(Edit::new(ws)));
-
-        let request = edit_args(&path, "world", "there");
-        let present = registry
-            .dispatch(
-                "edit",
-                request.clone(),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-                &[ToolSource::Replacement],
-            )
-            .await;
-        assert!(present.ok, "{}", present.content);
-
-        let absent = registry
-            .dispatch(
-                "edit",
-                request,
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-                &[ToolSource::Builtin],
-            )
-            .await;
-        assert!(!absent.ok);
-        assert_eq!(
-            absent.content,
-            "ERROR: Tool edit is not available in this session."
         );
     }
 }

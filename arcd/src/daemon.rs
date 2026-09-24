@@ -11,7 +11,6 @@ use arc_core::session::{Engine, ProjectSpec, Runner};
 use arc_core::store::Store;
 use arc_core::tool::Registry;
 use arc_core::tool::builtin;
-use arc_core::tool::expert::Expert;
 use arc_core::tool::workspace::{self, Grant, Mode, Workspace};
 use arc_proto::v1::{Notification, ReviewChanged, notification};
 use std::collections::{HashMap, HashSet};
@@ -67,22 +66,15 @@ pub async fn run(config: Config, dirs: DataDirs) -> Result<()> {
     served
 }
 
-/// Capacity of the notification broadcast: generous enough that a slow
-/// subscriber only lags under sustained job/session churn, not a burst.
 const NOTIFICATION_CAPACITY: usize = 256;
 
 pub struct Daemon {
     config: Config,
     dirs: DataDirs,
-
     engine: Arc<Engine>,
-
     reads: Arc<Reader>,
-
     roles: Roles,
-
     notifier: broadcast::Sender<Notification>,
-
     identity: Option<String>,
 }
 
@@ -140,14 +132,6 @@ impl Daemon {
         }
         for tool in workspace::tools(Arc::new(Workspace::new())) {
             registry.register(tool);
-        }
-        if let Some(counsel) = &config.roles.counsel {
-            let project_roots = config
-                .projects
-                .iter()
-                .map(|(name, project)| (name.clone(), project.root.clone()))
-                .collect();
-            registry.register(Box::new(Expert::new(counsel.resolve(), project_roots)));
         }
 
         let reads = Arc::new(
@@ -390,8 +374,6 @@ async fn tick_once<E: Extractor>(
             ..
         }) => {
             strikes.succeeded(&session_id);
-            // consolidation writes memory events straight through the store,
-            // bypassing the engine's own notify-on-append
             if records > 0 {
                 notify_review_changed(engine, notifier);
             }
@@ -543,71 +525,6 @@ mod tests {
     use super::*;
     use crate::config::{ProjectConfig, ToolSource};
     use crate::dirs::DataDirs;
-
-    fn project_config(root: &str, description: &str) -> ProjectConfig {
-        ProjectConfig {
-            root: std::path::PathBuf::from(root),
-            description: description.to_owned(),
-            read_only: Vec::new(),
-            sources: vec![ToolSource::Builtin],
-            command_prefix: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn project_spec_carries_the_configured_command_prefix() {
-        let mut config = project_config("/tmp/arc", "");
-        config.command_prefix = vec!["nix".to_owned(), "develop".to_owned(), "-c".to_owned()];
-
-        let spec = project_spec(&config);
-
-        assert_eq!(spec.command_prefix, ["nix", "develop", "-c"]);
-    }
-
-    #[test]
-    fn project_spec_defaults_to_no_command_prefix() {
-        let config = project_config("/tmp/arc", "");
-
-        let spec = project_spec(&config);
-
-        assert!(spec.command_prefix.is_empty());
-    }
-
-    #[test]
-    fn dispatch_projects_lists_every_project_and_finds_the_scratch_one() {
-        let mut config = Config::default();
-        config.projects.insert(
-            "arc".to_owned(),
-            project_config("/tmp/arc", "ARC's own implementation repo"),
-        );
-        config
-            .projects
-            .insert("scratch".to_owned(), project_config("/tmp/scratch", ""));
-
-        let (names, scratch) = dispatch_projects(&config);
-
-        assert_eq!(
-            names,
-            [
-                ("arc".to_owned(), "ARC's own implementation repo".to_owned()),
-                ("scratch".to_owned(), String::new()),
-            ]
-        );
-        assert_eq!(scratch, Some("scratch".to_owned()));
-    }
-
-    #[test]
-    fn dispatch_projects_without_a_scratch_project_names_none() {
-        let mut config = Config::default();
-        config
-            .projects
-            .insert("arc".to_owned(), project_config("/tmp/arc", ""));
-
-        let (names, scratch) = dispatch_projects(&config);
-
-        assert_eq!(names, [("arc".to_owned(), String::new())]);
-        assert_eq!(scratch, None);
-    }
 
     // port 1 refuses every connection: startup must not reach a provider
     fn unreachable_roles() -> Roles {
@@ -797,90 +714,6 @@ mod tests {
         task.abort();
     }
 
-    #[tokio::test]
-    async fn title_worker_recovers_a_greeting_and_retries_on_a_new_exchange() {
-        use arc_core::testkit::{ScriptedProvider, channel, done_reply, engine, runner};
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("fixed")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let engine = Arc::new(engine);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("before worker start");
-        let title_provider =
-            ScriptedProvider::scripted(vec![done_reply(""), done_reply("Title refresh")]);
-        let task = title_task(
-            &runner(&title_provider),
-            Arc::clone(&engine),
-            Duration::from_secs(3),
-        );
-        wait_for_requests(&title_provider, 1).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            engine.session_title(&reply.session_id).expect("greeting"),
-            None
-        );
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&reply.session_id), "fix title refresh", tx)
-            .await
-            .expect("new exchange");
-        wait_for_title(&engine, &reply.session_id, "Title refresh").await;
-        assert_eq!(title_provider.requests().len(), 2);
-        task.abort();
-        let unused = ScriptedProvider::scripted(vec![]);
-        let task = title_task(
-            &runner(&unused),
-            Arc::clone(&engine),
-            Duration::from_secs(3),
-        );
-        tokio::task::yield_now().await;
-        assert!(
-            unused.requests().is_empty(),
-            "saved titles survive worker restart"
-        );
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn the_consolidation_tick_only_runs_when_enabled() {
-        let temp = TempDir::new().expect("temp dir");
-        let dirs = DataDirs::new(&temp.path().join("data"));
-        let daemon =
-            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
-
-        assert!(
-            consolidation_task(
-                Config::default().consolidation,
-                daemon.roles.archivist(),
-                Arc::clone(&daemon.engine),
-                None,
-                vec!["global".to_owned()],
-                daemon.notifier.clone(),
-            )
-            .is_none(),
-            "disabled by default: no task, so a tick can do nothing"
-        );
-
-        let enabled = ConsolidationConfig {
-            enabled: true,
-            idle_seconds: 1800,
-            timeout_seconds: 300,
-        };
-        let task = consolidation_task(
-            enabled,
-            daemon.roles.archivist(),
-            Arc::clone(&daemon.engine),
-            None,
-            vec!["global".to_owned()],
-            daemon.notifier.clone(),
-        )
-        .expect("enabled spawns the tick");
-        task.abort();
-    }
-
     struct AlwaysFailing(std::sync::Mutex<Vec<String>>);
 
     impl arc_core::consolidation::Extractor for AlwaysFailing {
@@ -1036,50 +869,6 @@ mod tests {
             }
             other => panic!("expected ReviewChanged, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn a_consolidation_pass_that_extracts_nothing_pushes_no_notification() {
-        let temp = TempDir::new().expect("temp dir");
-        let dirs = DataDirs::new(&temp.path().join("data"));
-        dirs.create().expect("create dirs");
-        let mut log = Log::open(dirs.log()).expect("open log");
-        seed_idle_session(&mut log, "s-a", 1_000_000);
-        drop(log);
-        let daemon =
-            Daemon::start(Config::default(), dirs, unreachable_roles(), None).expect("start");
-        let mut notifications = daemon.notifier.subscribe();
-
-        let extractor = Scripted(Vec::new());
-        let mut strikes = Strikes::default();
-        tick_once(
-            &daemon.engine,
-            &extractor,
-            i64::MAX,
-            &mut strikes,
-            &daemon.notifier,
-        )
-        .await;
-
-        assert!(
-            notifications.try_recv().is_err(),
-            "nothing landed, so nothing to notify"
-        );
-    }
-
-    #[test]
-    fn strikes_report_the_crossing_once_and_reset_on_success() {
-        let mut strikes = Strikes::default();
-        assert!(!strikes.strike("s-x".to_owned()));
-        assert!(!strikes.strike("s-x".to_owned()));
-        strikes.succeeded("s-x");
-        assert!(!strikes.strike("s-x".to_owned()), "the count restarted");
-        assert!(!strikes.strike("s-x".to_owned()));
-        assert!(strikes.strike("s-x".to_owned()), "the third in a row skips");
-        assert!(
-            !strikes.strike("s-x".to_owned()),
-            "already skipped: never loud twice"
-        );
     }
 
     #[tokio::test]

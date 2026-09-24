@@ -1,163 +1,62 @@
 # Providers
 
-`DESIGN.md` defines the provider architecture: four roles, session pinning, and counsel as a tool. This file records the current model for each role, its cost, and when to change it. The principles and role definitions are durable; the rest is a dated snapshot. Update it when it no longer matches reality.
-
-**Status:** Current as of 2026-08-28. The target is under $50/month, down from a $100/month Claude subscription, without reducing capability where it matters.
-
----
+[DESIGN §6](DESIGN.md#6-providers) defines roles and session pinning.
+This file records configuration and measurements, not a live price or terms feed.
 
 ## 1. Principles
 
-These outlive any particular plan.
+1. **No vendor lock-in.** Reasoning providers sit behind `Provider`; voice backends are replaceable adapters.
+2. **ToS-clean only.** Use API keys or subscriptions explicitly open to third-party tools. No whitelist workarounds or consumer OAuth by default.
 
-1. **No vendor lock-in.** Every provider sits behind the `Provider` trait and is swappable by config. The expert is an argv template. Voice stages are traits. Nothing in `arc-core` names a vendor.
-2. **ToS-clean only.** API keys, or subscriptions that are explicitly any-tool by design. No consumer OAuth driven from our own harness, no whitelist workarounds, no unpublished endpoints. Learned three times: the Claude OAuth ban of January 2026, Antigravity, the Kimi whitelist.
-
-   **One exception, Codex, amended 2026-09-06.** OpenAI has publicly endorsed third-party harnesses on a ChatGPT plan: an OpenAI executive stated that a ChatGPT account may be used inside third-party harnesses and named pi and OpenCode, and the Codex for Open Source page lists pi, OpenCode, Cline and OpenClaw as supported tools. The Codex harness itself is Apache-2.0 since 2026-08-20. So the "Sign in with ChatGPT" OAuth flow, driven from arc, is permitted for Codex. Anthropic and Google have made no such statement and still prohibit it, so the exception does not extend to them. The endorsement is public statements rather than terms, and Anthropic tolerated the same practice before banning it, so treat Codex OAuth as revocable: it must sit behind the `Provider` trait like everything else, and losing it must cost a config change, not a rewrite.
-3. **Route by role, not difficulty.** Config maps each task type to a model. There is no runtime difficulty classifier.
-4. **Caching matters.** Roughly 96% of the workload is cache reads. Caches are tied to a model and prompt prefix, so switching models makes a session pay for its full context again. Sessions therefore stay on one provider, and counsel is a tool rather than a routing choice.
-5. **Measure cost per completed task, not per token.** A cheaper model that consumes more tokens to finish the same job is not cheaper.
-6. **Permitted models use an allow-list.** Never use a deny-list. Provider lineups change without notice, so unknown models must fail closed.
-
----
+   **Codex exception, decided 2026-09-06:** permit ChatGPT-plan OAuth through Codex, based on OpenAI's public endorsement of third-party harnesses and named support for pi, OpenCode, Cline, and OpenClaw. This decision does not extend to Anthropic or Google. Public endorsement is not a permanent terms guarantee: keep the exception revocable behind `Provider`, and review it when OpenAI's position changes.
+3. **Route by role, not difficulty.** Models are configured, not chosen by a runtime classifier.
+4. **Keep prefixes stable.** Long sessions are dominated by cache reads. Pin models; render identity/index first and put volatile context after them.
+5. **Measure cost per completed task**, not price per token.
+6. **Allow-list models.** Unknown models fail closed.
 
 ## 2. Roles
 
-These roles are stable. The next section records the current model for each one.
+| Role | Optimize for |
+| --- | --- |
+| chat | Latency, voice, vision, judgment. |
+| code | Interactive judgment and collaboration. |
+| executor | Cost per completed delegated task. |
+| archivist | Extraction/compaction quality and bulk cost. |
 
-| Role | Carries | Selection criteria, in order |
-| --- | --- | --- |
-| **chat** | Conversation, recall, job dispatch. Identity file + record index. | Latency, voice, vision, judgment. Volume is small. |
-| **executor** | Job execution. Almost all tokens. | Cost per completed task. Nothing else comes close. |
-| **counsel** | Plans, reviews, and unsticking. Read-only, bounded. | Capability. Called a few times per job, not per turn. |
-| **archivist** | Consolidation, extraction, and titling. | Extraction quality and cost; latency-insensitive. |
+## 3. Recorded configuration — 2026-09-24
 
----
-
-## 3. Current configuration
-
-The live configuration is `~/.config/arc/arc.toml`. Model selections recorded
-in the log override each role's first choice for new sessions.
-
-As configured on 2026-09-24:
+Live configuration is `~/.config/arc/arc.toml`. Durable role selections can override these configured defaults for new sessions; open sessions keep their pins.
 
 | Role | Default preset | Access |
 | --- | --- | --- |
 | chat | astra | Codex |
 | code | sol | Codex |
 | executor | sol | Codex |
-| counsel | fable | Claude CLI, read-only |
 | archivist | luna | Codex |
 
-Compaction uses the selected archivist model, without changing the session's
-pinned model. A rejected summary gets one small repair call; failure is shown
-to the client, not retried against the session model.
+Compaction uses the selected archivist. Only oversized summaries get one bounded shrink call; empty text or failed repair fails visibly, without fallback to the session model. See DESIGN §4.4.
 
-The llama.cpp settings remain available, but no configured role uses them.
-The daemon therefore does not start the sidecar.
+The local llama.cpp configuration remains available but no configured role uses it, so this configuration starts no sidecar.
 
-OpenCode Go requires `x-opencode-session` from 2026-09-06. The OpenAI-compatible
-provider sends ARC's session ID from `CompletionRequest.cache_key` in that
-header and identifies itself as `arc/<version>`. Turns, compaction, titles,
-extraction, and deduplication carry the source session's ID, stable across
-calls and restarts. Standalone probes must supply their own conversation ID.
+### Configuration rules
 
-DeepSeek through Go accepts seeds in `[0, 2^63)`. The OpenAI-compatible
-provider masks off the top bit of ARC's unsigned seed at serialization,
-preserving valid values and keeping retries deterministic.
+Interactive development and workers select independently. With presets already declared:
 
-### Earlier stack and measurements
+```toml
+[roles.code]
+choices = ["astra", "sol"]
 
-The following records the earlier local-archivist setup and its measurements.
-It is historical evidence, not the current model configuration.
+[roles.executor]
+choices = ["sol", "astra"]
+```
 
-| Role | Filled by | Access | Est. monthly |
-| --- | --- | --- | --- |
-| **chat** | Gemini 3.6 Flash, thinking `minimal` (see below — 3.7 lacks `minimal`) | Direct API key | ~$10 |
-| **executor** | OpenCode Go — `deepseek-v4-flash` default; `glm-5.3-flash` in live use since 2026-08-28 | Go subscription | $10 (plan) |
-| ↳ escalation | DeepSeek V4 Pro first; GLM-5.3 for long-horizon multi-file work; Kimi K3 rarely | same | — |
-| **counsel** | Opus via `claude -p`, read-only tools, for both `plan` and `review`. Degrades to Sonnet only under budget pressure | Claude Pro | $20 |
-| **archivist** | Qwen3-8B Q4_K_M on the RTX 5070 | llama.cpp sidecar | $0 |
-| **reserve** | Prepaid Zen credit for Go spillover | — | ~$10 |
-| | | | **~$50** |
+First choice is default until a durable role selection overrides it. The session model menu creates/forks under a preset; changing the role default is a separate action. Omitted `roles.code` inherits the executor menu, not its selection. Legacy sessions retain their role; forks keep that role but choose a new pin.
 
-### Why the earlier chat used Gemini
+Codex defaults to `read`, `bash`, `apply_patch`; other providers to `read`, `bash`, `edit`, `write`. Presets and inline roles may override with `editing = "patch"` or `"replacement"`. The editing interface is pinned at creation too.
 
-Go offers open-weight coding models plus Grok 4.5 and GPT 5.6 Luna. It does not offer Claude or Gemini. The chat uses a separate key for three reasons:
+## 4. Provider-specific operation
 
-- **Cost isolation.** Go meters in dollars. Every conversational turn — and every camera frame, once vision is in the loop — competes with the coding budget.
-- **Latency.** Kimi K3, Go's most general model, runs at about 38 tokens/second and uses a thinking mode. Voice makes time to first audio the limiting constraint.
-- **Vision.** The chat needs it for screenshots now and the pan-tilt camera later, and Google's spatial grounding is the strongest cheap option.
-
-Keep thinking as low as the model allows on the chat. It adds latency, and on Gemini it is also most of the bill.
-
-Measured 2026-08-24. **`minimal` is the only level that stops thinking, and it is a model capability, not an API one** — 3.6, 3.5 and 3-flash-preview have it; 3.7 Flash and `gemini-flash-latest` answer `Thinking level MINIMAL is not supported for this model` on the native and OpenAI-compatible paths alike. That is why the chat runs 3.6 rather than the newer 3.7.
-
-Five runs of one chat turn, output tokens: **3.6 on `minimal` gave 28–33**, 3.7 on `low` gave 31–337, 3.6 on `low` gave 334–410. `low` is a cap the model may use rather than a level it obeys, so it is bimodal and a single turn tells you nothing; `minimal` is flat and predictable, and it takes the thinking latency out of a role that will front a voice client. `none` is not `minimal`: it still thinks.
-
-`extra_body.google.thinking_config.thinking_level` reaches the same control and the two cannot be sent together; we send `reasoning_effort` because it is a flat field and leaves the `extra_body.google` envelope free for `cached_content`.
-
-Thinking is billed and never streamed, so `completion_tokens` under-reports output by about five times. The real figure is `total_tokens - prompt_tokens`, and every estimate in this file predates that correction.
-
-### Measured, 2026-08-26 to 2026-08-28 (task 7.3)
-
-Per-turn usage became durable on 2026-08-27 (row 6.22), so these come from the projection, not estimates. Two days, one of them an unusual arena day (a deliberate 31-minute executor turn); treat as a first calibration, not a steady state.
-
-| Role | Turns | Input | Output | Latency avg / max |
-| --- | --- | --- | --- | --- |
-| executor (glm-5.3-flash, Go) | 28 | 13.4M | 211k | 244s / 1837s |
-| chat (3.6 Flash, minimal) | 45 | 228k | 7.0k | 3.1s / 7.5s |
-| archivist (Qwen3-8B, local) | 34 calls on 08-28 | 24.3k | 214 | — (spans only; not session turns) |
-
-What the numbers settle:
-
-- **The 96%-cache-reads assumption held.** Executor steps log ~99% `cached_tokens` on Go; the 13.4M input is overwhelmingly cache reads. Cached share is in spans and journal, not the projection — 7.3's durable accounting covers totals only.
-- **The chat is noise in the budget.** 228k input over two heavy days extrapolates to ~3.5M/month — at Gemini Flash rates, low single-digit dollars. Latency is flat (7.5s worst), which is the property voice needs.
-- **The executor's monthly shape:** two heavy development days produced ~13.4M in / 211k out. The 19M-output/month planning figure above looks high by an order of magnitude for output; input volume, not output, is the metered mass — and it is almost all cached. Go's own dashboard is the dollar authority; this table is the token truth.
-- **The archivist is free in practice as well as in principle** — the section 8 gates cut its work to titling plus rare extraction.
-
-Re-measure after a full production week on the installed service (7.2); the arena day inflates the executor's average.
-
-### Why the executor uses DeepSeek
-
-Go meters dollars, so the cost leader completes the most work. The expected workload is roughly 19M output tokens a month:
-
-| Candidate | Character | Est. monthly against the workload |
-| --- | --- | --- |
-| **DeepSeek V4 Flash** | The cheaper of the two DeepSeek tiers and the configured default. | see the measured section — Go meters the subscription, so tokens are the honest unit |
-| DeepSeek V4 Pro | Cost leader among the frontier-class models by a wide margin. 80.6% SWE-bench Verified. MIT. First escalation. | ~$17–25 — fits inside the cap with room |
-| GLM-5.3 | Trained for long-horizon agentic tool use. 1M context. ~92 tok/s. | ~$35–45 — fits, tighter |
-| Kimi K3 | Highest intelligence index on the plan. Also a documented heavy token consumer, and 38 tok/s. | ~$70+ — exceeds the monthly cap |
-
-Start on Flash and escalate to Pro when a job fails on it. Kimi K3 is the strongest model in the lineup but cannot be the default: it costs more per token and uses more tokens per task. Reserve it for work that has failed on a cheaper model. Use GLM-5.3 for multi-file jobs where its long-horizon tuning justifies the price.
-
-The latest DeepSeek versions on Go are hosted in China and need an explicit opt-in in the workspace settings, done 2026-08-23. Acceptable for the executor while the retention terms hold; it is the zero-retention agreement below that governs, not the hosting region.
-
-These are published-rate estimates, not measured spend. Phase 3 adds a role label to every trace span. Rewrite this table from traces after a month of data.
-
----
-
-## 4. What each plan actually meters
-
-The relevant operating rules.
-
-**OpenCode Go — $10/month, $5 first month.**
-
-- Limits are **dollar-denominated**: $12 per 5 hours, $30 per week, and $60 per month. The monthly cap is binding; a heavy Saturday can consume half the weekly budget.
-- OpenAI-compatible endpoint at `https://opencode.ai/zen/go/v1`. Model ids are bare — spike 1.1 measured `deepseek-v4-flash`, not `opencode-go/deepseek-v4-flash`. Our existing `provider/openai` reaches it with a base URL and a key. In `arc.toml` the endpoint is `https://opencode.ai/zen/go`: arcd appends `/v1/chat/completions`, and config validation rejects a base that already ends in `/v1` rather than letting it 404 at the first turn.
-- **Spillover:** with "use balance" enabled, requests fall through to prepaid Zen credit instead of blocking at the cap. Auto-reload stays **off**, which makes the ceiling a hard cap by construction. Free models remain available at the cap regardless.
-- It exists because Anthropic blocked third-party tools from subscription credentials. Its key-based, any-client access is the product, not a workaround. Personal ARC meets the own-internal-use terms.
-
-**Excluded on Go, off-config for personal traffic:**
-
-| Model | Reason |
-| --- | --- |
-| Muse Spark 1.2 Contributor | Trains on prompts and completions. Strictly worse than retention. |
-| Grok 4.5, GPT 5.6 Luna | 30-day retention. |
-
-Everything else on the plan has 0-day retention today. DeepSeek's zero-retention agreement has an expiry date; see the review triggers below.
-
-**ChatGPT plan through Codex — in use since 2026-09-06.** `provider = "codex"` on any role. Auth is the Codex CLI's own OAuth client through the device-code flow (`arcd login codex`, headless-friendly, prints a code to enter at `auth.openai.com/codex/device`); the credential is a JSON file under `data/secrets/` named by the role's `key`, refreshed in place before it expires, and the daemon needs a restart after a fresh login. The wire is the Responses API at `https://chatgpt.com/backend-api/codex/responses` with `store: false`, so the encrypted reasoning item is carried on each tool call's roundtrip bytes and replayed ahead of the calls, which is what keeps the model's chain of thought across a tool step. `thinking` maps to `reasoning.effort` with `low` as the floor; `default` sends nothing. A `usage_limit_reached` failure surfaces as a rate limit with the reset time. Plan metering is OpenAI's rolling 5-hour and weekly windows, not dollars, so its place in the stack is decided by a measured week, not by this file. Model ids are the Codex CLI's (`gpt-5.5` and its siblings; 272k context). Config:
+**Codex.** `provider = "codex"`; `key` names the credential under `data/secrets/`. Run `arcd login codex` for device-code login, then restart the daemon after a fresh login. Refresh updates the credential in place. Responses use `store: false`; encrypted reasoning is preserved in tool-call roundtrip bytes. `thinking` maps to reasoning effort with `low` as floor; `default` omits it. Usage-limit errors report reset times. The plan meters rolling allowance windows, not token dollars.
 
 ```toml
 [roles.executor]
@@ -168,86 +67,51 @@ thinking       = "medium"
 context_window = 272000
 ```
 
-Interactive development and workers select models independently. With `astra` and `sol` already declared under `[models]`, use:
+**OpenAI-compatible / OpenCode Go.** Configure the base endpoint without `/v1`; arcd appends `/v1/chat/completions`. Go uses bare model IDs. From the 2026-09-06 integration, requests carry ARC's session ID as `x-opencode-session` and identify as `arc/<version>`. Turns, compaction, titles, extraction, and dedup keep the source session ID stable across calls/restarts; probes supply their own conversation ID. DeepSeek's seed range is `[0, 2^63)`, so serialization masks the unsigned seed's top bit.
 
-```toml
-[roles.code]
-choices = ["astra", "sol"]
+Go spillover can use prepaid Zen credit; keep auto-reload off to preserve a hard spending ceiling. Recheck caps and retention before returning to it as the default. The earlier configuration excluded Muse Spark for training on traffic and Grok/Luna for 30-day retention; that was a dated plan policy, not a current provider-wide claim.
 
-[roles.executor]
-choices = ["sol", "astra"]
-```
+**Gemini.** Direct API key. The August measurements below informed the old chat choice; do not assume those capabilities or rates apply to another model.
 
-The first choice is the default until `:model` records a selection for that role. New `:code` sessions use `code`; dispatch uses `executor`. If `roles.code` is omitted, it inherits the executor menu, not its recorded selection. Existing sessions keep their role and model pin, including older interactive executor sessions. Open a new `:code` session to use the new role; a fork keeps its parent's role.
+## 5. Historical measurements
 
-Codex sessions default to `read`, `bash`, and `apply_patch` (a custom grammar tool). Other providers default to `read`, `bash`, `edit`, and `write`. A model preset or inline role can set `editing = "patch"` or `editing = "replacement"` explicitly. The choice is pinned at session creation; changing the role default does not change existing sessions.
+The earlier budget target was under $50/month: Go workers, Gemini chat, local Qwen archivist. That stack is no longer the recorded configuration above.
 
-**Claude Pro — $20/month.** Used only through `claude -p` as the counsel tool, with read-only tools, in the project directory, by sessions whose model preset says `counsel = true`. First-party CLI, which is the sanctioned path.
+Measured 2026-08-26–28, from durable turn usage (archivist from spans). Two days included an unusual 31-minute arena turn; this is calibration, not a steady-state monthly forecast.
 
-A coding job uses one `plan` and up to *N* `review` calls. Counsel use therefore scales with jobs and review rounds, not conversation. Each call is a short, read-only run over a few files. Measure its use before changing the design.
+| Role/model then | Turns/calls | Input | Output | Latency avg/max |
+| --- | --- | --- | --- | --- |
+| Executor, GLM-5.3-Flash on Go | 28 | 13.4M | 211k | 244s / 1837s |
+| Chat, Gemini 3.6 Flash minimal | 45 | 228k | 7.0k | 3.1s / 7.5s |
+| Archivist, local Qwen3-8B | 34 on August 28 | 24.3k | 214 | unmeasured here |
 
-**Both modes run on Opus.** Review benefits from the strongest available model as much as planning does — finding the real bug is the whole job — so there is no reason to spend the difference on a cheaper reviewer while headroom exists.
+Executor steps showed about 99% cached input in spans/journal; the projection totals did not store the cached share. Provider dashboards remain the authority for actual charges. The old Claude workload was about 4.4M input, 19M output, and 640M cache-read tokens/month; extrapolating that output volume to ARC proved too high.
 
-Sonnet is counsel's fallback. Enter it at roughly 70% of a window's allowance and return to Opus when the window resets. Spike 1.2 determines whether `claude -p` exposes the needed usage signal. Without one, remain on Opus until rate limited, then use Sonnet for the rest of the window.
+**Gemini probe, 2026-08-24:** five runs gave 28–33 output tokens on 3.6 `minimal`, 31–337 on 3.7 `low`, and 334–410 on 3.6 `low`. `minimal` was unsupported on 3.7 in the tested paths. Thinking was billed but not streamed; use `total_tokens - prompt_tokens`, not just `completion_tokens`, when accounting for it. These results supported low-latency chat, not a blanket recommendation for today's model lineup.
 
-**Gemini direct key.** Metered per token, no plan. Cached input is 90% off the base rate, which matters because the chat's prefix — identity file plus record index plus recent history — is the most stable prefix in the system.
+## 6. Rejected options
 
----
-
-## 5. Economics
-
-These decisions use one month of real Claude Code usage: **about 4.4M input tokens, 19M output tokens, and 640M cache reads per month.** Cache reads are about 96% of the workload.
-
-Priced at Opus 5 list rates ($5/$25 per MTok, cache reads at roughly a tenth of input) that workload is about **$800/month**, against $100 paid. The subsidy on the old plan was closer to 8× than the 4× previously assumed — which is why no combination of routing reproduces it at $30, and why the plan is instead to move the bulk of those tokens onto a model that costs an order of magnitude less per token.
-
-The bet is that **most of those 19M output tokens are mechanical**: edits, tool calls, and rereads. A cheaper model can handle them if the harness is strict. The budget works for either DeepSeek tier but not Kimi K3. The key controls are exact edits with a staleness check, a shell tool that runs the test suite, and rewind for bad paths.
-
-Face is inexpensive. At about 700k monthly output tokens, it costs $3–5 on Flash, $4–6 on Haiku 4.5, and $13–17 on Sonnet 5. Voice may increase turns two- to threefold because speaking is easier than typing. That alone supports using Flash.
-
----
-
-## 6. Rejected
-
-Revisit an option only when its reason changes.
+Revisit when the reason changes, not because the old price table looks attractive.
 
 | Option | Reason |
 | --- | --- |
-| Claude / Gemini consumer OAuth driven in-harness | ToS, revocation risk. Principle 2. Codex is the one exception, for the reasons recorded there. |
+| Claude/Gemini consumer OAuth in ARC | No approved exception under principle 2. |
 | Antigravity gateway | Unpublished endpoint; removed after Phase 1. |
-| Native Claude Code replacement at the same cost | Cannot beat an ~8× subscription subsidy. The cost calculation above confirms it. |
-| DevPass (LLM Gateway) — $29/$79/$179, ~3× value, frontier models any-tool | The only option that solves the chat and the executor together with frontier models, and still rejected: cheapest tier alone exceeds the budget, the multiple is half of Go's, and it is the flat-rate-reseller category whose economics are unexplained. Now rejected with a number rather than a feeling. |
-| GLM Coding Plan (Z.ai) | Keys restricted to approved tools — the blocker for ARC specifically. Also loses the DeepSeek cost floor. |
-| Kimi Code plan via the Anthropic surface | The policy is documented but revocable. Do not depend on it. |
-| Other flat-rate resellers | Trust and quantization opacity. |
-| Kimi K3 as the default executor model | Output price times token consumption exceeds Go's monthly cap. Retained as an escalation. |
-| Speech-to-speech APIs for voice | Would own the conversation loop and displace the log as the source of truth. |
+| Approved-tool-only coding plans | ARC is not an approved client. |
+| Unexplained flat-rate resellers | Trust, retention, and quantization uncertainty. |
+| Kimi as the old Go default | Measured/planned token consumption exceeded that budget; escalation only. |
+| Reproducing the old Claude subscription at API rates | Subscription subsidy made the price comparison unrealistic. |
 
----
+The former blanket rejection of speech-to-speech is superseded by DESIGN §7.1's bounded Phase 4 prototype. No voice integration is implied here.
 
 ## 7. Review triggers
 
-Review on events, not a schedule. Three triggers are already dated:
+- Any change to ChatGPT-plan third-party harness permission: re-evaluate principle 2.
+- Provider terms, retention, pricing, or allowance changes; first rate-limit/spend problem on a real task.
+- Reusing Go/DeepSeek: the recorded zero-retention agreement expired August 31, 2026; successor terms are not established by this file.
+- The previously recorded Gemini price change on January 1, 2027, if Gemini returns to the stack; verify rather than rely on the old estimate.
+- A representative week of completed-task measurements, or a GPU upgrade that makes local workers worth retesting.
 
-- **2026-08-31 — DeepSeek zero-retention agreement expires.** This is the default `executor` model. Confirm the successor terms or move the default to GLM-5.3.
-- **2026-08-31 — Sonnet 5 introductory pricing ends** ($2/$10 → $3/$15). Only matters if the chat moves to Sonnet.
-- **2027-01-01 — Gemini Flash prices double.** Re-price the chat; Flash-Lite and Haiku 4.5 are the alternatives.
+## 8. Implementation boundaries
 
-Counsel rate-limiting is a trigger rather than a prediction: if a job ever stalls on it, retune the round bound and severity gate, or split counsel by mode, before moving anything else.
-
-Otherwise: any OpenAI statement or terms change on third-party harness use of a ChatGPT plan, which decides whether the Codex exception in principle 2 stands; any provider ToS or pricing change, Go leaving beta or changing its caps, a GLM-5.5-class release, a GPU upgrade (a 24 GB card makes a local `executor` tier worth re-testing), the first month of real trace data, and the first time Go's monthly cap is actually hit.
-
----
-
-## 8. What this stack requires of `arc-core`
-
-The implementation obligations that follow. These are Phase 3 work.
-
-- **Add a role label to every `CompletionRequest` and trace span.** One central label makes the estimates above replaceable with measurements.
-- **Session-pinned providers.** Role is chosen at session or job creation and does not change for its lifetime.
-- **Prefix stability for the chat.** Identity file and record index render first and byte-identically; anything volatile goes after them. A timestamp near the front of the prompt silently costs the entire cache discount.
-- **A failover chain that distinguishes credit exhaustion from rate limiting.** A 402 at Go's cap is not a retryable 429. Exhaustion falls through to spillover credit if enabled, then to the local model, and says so in the client.
-- **Per-job budgets**, declared at dispatch and enforced by arcd.
-- **The expert as an argv template** — command, working directory, timeout — with read-only enforcement a property of how it is invoked, and one template per mode (`plan`, `review`).
-- **A bounded review loop:** configure the maximum rounds and which severity starts another round. A job with unresolved blocking comments reports that outcome honestly.
-- **An allow-list of permitted models** per role, so a lineup change fails closed.
-- **Cost accounting per completed task**, not per request. That is the metric used to choose a model.
+Role labels, stable prefixes, model allow-lists, explicit provider failures, and pinned sessions are current requirements. Do not revive old plans for automatic model failover or model-authored job budgets: DESIGN governs those decisions.

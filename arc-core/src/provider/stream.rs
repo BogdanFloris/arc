@@ -10,9 +10,7 @@ use crate::provider::{CompletionDelta, CompletionStream, Error, Stop, Usage};
 
 pub(crate) struct Deltas {
     pub items: Vec<CompletionDelta>,
-
     pub usage: Option<Usage>,
-
     pub finished: Option<Stop>,
 }
 
@@ -35,17 +33,11 @@ where
 
 pub(crate) struct DeltaStream<S, P> {
     bytes: S,
-
     frames: FrameDecoder,
-
     parser: P,
-
     pending: VecDeque<CompletionDelta>,
-
     usage: Option<Usage>,
-
     finished: bool,
-
     span: Span,
 }
 

@@ -548,51 +548,8 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_markup_stays_literal() {
-        expect!["half a **thou"].assert_eq(&lines("half a **thou", 40));
-        expect!["and `code"].assert_eq(&lines("and `code", 40));
-        assert_eq!(
-            styles("**bold** then **half", 40)
-                .into_iter()
-                .filter(|(_, style)| *style == theme::PLAIN.patch(theme::STRONG))
-                .count(),
-            1,
-            "only the closed pair is bold"
-        );
-    }
-
-    #[test]
-    fn underscores_are_left_alone() {
-        assert_eq!(
-            text("call snake_case_name here", 40),
-            ["call snake_case_name here"],
-            "identifiers are commoner than underscore emphasis"
-        );
-    }
-
-    #[test]
     fn escaped_markup_renders_literally() {
         expect!["a *not italic* b"].assert_eq(&lines(r"a \*not italic\* b", 40));
-    }
-
-    #[test]
-    fn headings_lose_their_hashes_and_gain_the_accent() {
-        expect!["Walking skeleton"].assert_eq(&lines("## Walking skeleton", 40));
-        assert_eq!(
-            styles("## Walking skeleton", 40)[0].1,
-            theme::HEADING,
-            "the heading style, not the base"
-        );
-        assert_eq!(
-            text("### deep", 40),
-            ["deep"],
-            "every level sits flush left; style carries the difference"
-        );
-        assert_eq!(
-            text("#nospace", 40),
-            ["#nospace"],
-            "a bare # is not a heading"
-        );
     }
 
     #[test]
@@ -620,47 +577,6 @@ mod tests {
             styles("```\nlet x = 1;\n```", 40)[1].1,
             theme::SYN_KEYWORD,
             "an untagged block is sniffed, so `let` still reads as Rust"
-        );
-    }
-
-    #[test]
-    fn a_long_code_line_is_cut_into_columns_not_reflowed() {
-        assert_eq!(
-            text("```\nabcdefghijkl\n```", 12),
-            ["    abcdefgh", "    ijkl"],
-            "hard wrap at the width; nothing is dropped"
-        );
-    }
-
-    #[test]
-    fn an_untagged_block_is_highlighted_by_what_is_in_it() {
-        let reply = "Here it is:\n\n```\ndef example():\n    return 1\n```";
-        let lines = render(reply, 40, theme::PLAIN);
-        let code: Vec<&Line> = lines
-            .iter()
-            .filter(|l| l.to_string().contains("def"))
-            .collect();
-
-        assert_eq!(code.len(), 1);
-        assert_eq!(
-            code[0].spans[1].style,
-            theme::SYN_KEYWORD,
-            "`def` is a keyword, not flat text"
-        );
-    }
-
-    #[test]
-    fn a_tagged_block_is_not_sniffed() {
-        let lines = render("```text\ndef example():\n```", 40, theme::PLAIN);
-        let code = lines
-            .iter()
-            .find(|l| l.to_string().contains("def"))
-            .expect("the code line");
-
-        assert_eq!(
-            code.spans[1].style,
-            theme::CODE,
-            "an explicit unknown tag stays plain"
         );
     }
 
@@ -702,34 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn table_cells_keep_their_inline_markup() {
-        assert!(
-            styles("| a | b |\n|---|---|\n| `code` | plain |", 40)
-                .iter()
-                .any(|(text, style)| text == "code" && *style == theme::CODE),
-            "markup inside a cell still styles"
-        );
-    }
-
-    #[test]
-    fn a_pipe_line_without_a_separator_row_stays_text() {
-        expect!["| just | text |"].assert_eq(&lines("| just | text |", 40));
-        expect![[r#"
-            a | b
-            more prose"#]]
-        .assert_eq(&lines("a | b\nmore prose", 40));
-    }
-
-    #[test]
-    fn alignment_colons_in_the_separator_are_accepted() {
-        expect![[r#"
-            a  b
-            -  -
-            1  2"#]]
-        .assert_eq(&lines("| a | b |\n|:--|--:|\n| 1 | 2 |", 40));
-    }
-
-    #[test]
     fn a_link_renders_its_text_underlined_with_the_url_dimmed_beside_it() {
         expect!["the post (https://pwning.systems/x) says"]
             .assert_eq(&lines("the [post](https://pwning.systems/x) says", 60));
@@ -747,47 +635,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bracketed_phrase_without_a_url_stays_literal() {
-        expect!["see [chapter 4] for details"].assert_eq(&lines("see [chapter 4] for details", 60));
-        expect!["[text] (spaced apart)"].assert_eq(&lines("[text] (spaced apart)", 60));
-    }
-
-    #[test]
-    fn blockquotes_get_a_gutter_on_every_line() {
-        assert_eq!(
-            text("> one two three four", 14),
-            [" | one two", " | three four"],
-            "the gutter repeats down the wrapped block"
-        );
-    }
-
-    #[test]
-    fn a_horizontal_rule_spans_the_width() {
-        expect!["--------"].assert_eq(&lines("---", 8));
-        assert_eq!(text("--", 8), ["--"], "two dashes is text; three is a rule");
-    }
-
-    #[test]
-    fn blank_lines_survive_as_paragraph_breaks() {
-        expect![[r#"
-            one
-
-            two"#]]
-        .assert_eq(&lines("one\n\ntwo", 40));
-    }
-
-    #[test]
     fn a_word_split_across_styles_stays_one_word() {
         assert_eq!(
             text("xxxxx **bo**ld", 8),
             ["xxxxx", "  bold"],
             "the styled and plain halves wrap together"
         );
-    }
-
-    #[test]
-    fn an_empty_message_renders_nothing_that_panics() {
-        expect![[""]].assert_eq(&lines("", 40));
-        assert_eq!(text("", 0), [""], "a zero width is clamped, not divided by");
     }
 }

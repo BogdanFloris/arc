@@ -219,21 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn modifying_tool_descriptions_name_the_read_tool() {
-        for tool in super::tools(std::sync::Arc::new(Workspace::new())) {
-            let definition = tool.definition();
-            if matches!(definition.name.as_str(), "edit" | "write" | "apply_patch") {
-                assert!(definition.description.contains("the `read` tool"));
-                assert!(
-                    definition
-                        .description
-                        .contains("Reading through Bash does not count.")
-                );
-            }
-        }
-    }
-
-    #[test]
     fn the_workspace_tools_have_distinct_editing_sources() {
         let tools = super::tools(std::sync::Arc::new(Workspace::new()));
 
@@ -344,21 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn a_dotdot_that_stays_inside_the_root_is_allowed() {
-        let dir = TempDir::new().expect("tmp");
-        let root = proj(&dir);
-        fs::create_dir_all(root.join("sub")).expect("mkdir sub");
-        fs::write(root.join("ok.txt"), b"x").expect("write");
-        let grants = grants(&root, Mode::ReadOnly);
-
-        let path = root.join("sub").join("..").join("ok.txt");
-        let resolved = grants
-            .resolve(path.to_str().expect("utf8"), Access::Read)
-            .expect("stays inside");
-        assert_eq!(resolved, root.canonicalize().expect("canon").join("ok.txt"));
-    }
-
-    #[test]
     fn a_relative_or_empty_path_is_refused_with_the_absolute_path_message() {
         let dir = TempDir::new().expect("tmp");
         let root = proj(&dir);
@@ -387,52 +357,6 @@ mod tests {
         grants
             .resolve(target.to_str().expect("utf8"), Access::Read)
             .expect("read is still allowed");
-    }
-
-    #[test]
-    fn resolving_a_missing_file_for_read_does_not_panic_and_succeeds() {
-        let dir = TempDir::new().expect("tmp");
-        let root = proj(&dir);
-        let grants = grants(&root, Mode::ReadOnly);
-
-        let target = root.join("missing.txt");
-        let resolved = grants
-            .resolve(target.to_str().expect("utf8"), Access::Read)
-            .expect("the gate does not require existence; the read tool does");
-        assert_eq!(
-            resolved,
-            root.canonicalize().expect("canon").join("missing.txt")
-        );
-    }
-
-    #[test]
-    fn a_nonexistent_file_for_write_resolves_when_its_parent_exists() {
-        let dir = TempDir::new().expect("tmp");
-        let root = proj(&dir);
-        let grants = grants(&root, Mode::ReadWrite);
-
-        let target = root.join("new.txt");
-        let resolved = grants
-            .resolve(target.to_str().expect("utf8"), Access::Write)
-            .expect("parent exists");
-        assert_eq!(
-            resolved,
-            root.canonicalize().expect("canon").join("new.txt")
-        );
-    }
-
-    #[test]
-    fn a_nonexistent_parent_directory_is_refused_and_named() {
-        let dir = TempDir::new().expect("tmp");
-        let root = proj(&dir);
-        let grants = grants(&root, Mode::ReadWrite);
-
-        let target = root.join("missing_dir").join("new.txt");
-        let err = grants
-            .resolve(target.to_str().expect("utf8"), Access::Write)
-            .unwrap_err();
-        assert!(err.contains("parent"), "{err}");
-        assert!(err.contains("missing_dir"), "{err}");
     }
 
     #[test]

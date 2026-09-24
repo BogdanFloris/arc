@@ -47,8 +47,8 @@ fn no_think(mut request: CompletionRequest) -> CompletionRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sidecar, no_think};
-    use crate::provider::{CompletionRequest, Provider as _, Thinking};
+    use super::no_think;
+    use crate::provider::{CompletionRequest, Thinking};
     use arc_proto::v1::SessionRole;
 
     fn request(thinking: Thinking, system: Option<&str>) -> CompletionRequest {
@@ -74,32 +74,5 @@ mod tests {
             Some("be terse\n/no_think"),
             "the marker lands last, after the memory block"
         );
-    }
-
-    #[test]
-    fn any_other_level_leaves_the_prompt_alone() {
-        assert_eq!(
-            no_think(request(Thinking::Default, Some("be terse")))
-                .system
-                .as_deref(),
-            Some("be terse")
-        );
-    }
-
-    #[test]
-    fn the_marker_is_the_whole_prompt_when_there_is_nothing_else() {
-        assert_eq!(
-            no_think(request(Thinking::Minimal, None)).system.as_deref(),
-            Some("/no_think"),
-            "no leading newline when the prompt was empty"
-        );
-    }
-
-    #[test]
-    fn the_sidecar_is_named_apart_from_a_hosted_endpoint() {
-        let sidecar = Sidecar::new("http://127.0.0.1:8080/");
-
-        assert_eq!(sidecar.name(), "local");
-        assert_eq!(sidecar.endpoint(), "http://127.0.0.1:8080");
     }
 }

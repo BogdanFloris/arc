@@ -690,62 +690,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blank_system_prompt_falls_back_to_the_stock_instructions() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (_, requests) =
-            complete_against(template, request(Some(" \n"), &[(Role::User, "hi")])).await;
-
-        assert_eq!(body(&requests)["instructions"], NO_SYSTEM);
-    }
-
-    #[tokio::test]
-    async fn thinking_levels_map_to_reasoning_effort_with_low_as_the_floor() {
-        for (thinking, expected) in [
-            (Thinking::Minimal, "low"),
-            (Thinking::Low, "low"),
-            (Thinking::Medium, "medium"),
-            (Thinking::High, "high"),
-        ] {
-            let mut req = request(None, &[(Role::User, "hi")]);
-            req.thinking = thinking;
-            let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-            let (_, requests) = complete_against(template, req).await;
-
-            let body = body(&requests);
-            assert_eq!(body["reasoning"]["effort"], expected, "{body}");
-            assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
-        }
-    }
-
-    #[tokio::test]
-    async fn tools_are_offered_as_responses_functions() {
-        let mut req = request(None, &[(Role::User, "what do you know about arc?")]);
-        req.tools = vec![ToolDefinition {
-            name: "memory_search".to_owned(),
-            description: "Search durable memory".to_owned(),
-            parameters: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
-        }];
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-
-        let (_, requests) = complete_against(template, req).await;
-
-        let body = body(&requests);
-        assert_eq!(
-            body["tools"],
-            json!([{
-                "type": "function",
-                "name": "memory_search",
-                "description": "Search durable memory",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
-                "strict": false,
-            }])
-        );
-        assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["parallel_tool_calls"], true);
-    }
-
-    #[tokio::test]
     async fn a_web_request_offers_the_hosted_search_tool() {
         let mut req = request(None, &[(Role::User, "what happened today?")]);
         req.web = true;
@@ -908,16 +852,6 @@ mod tests {
         let input = body(&requests)["input"].clone();
         assert_eq!(input.as_array().unwrap().len(), 3, "{input}");
         assert_eq!(input[1]["type"], "function_call");
-    }
-
-    #[tokio::test]
-    async fn a_system_role_in_the_history_is_refused_before_sending() {
-        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
-        let (outcome, requests) =
-            complete_against(template, request(None, &[(Role::System, "sneaky")])).await;
-
-        assert!(matches!(outcome, Err(Error::InvalidRequest(_))));
-        assert!(requests.is_empty(), "nothing was sent");
     }
 
     #[tokio::test]

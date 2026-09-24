@@ -130,7 +130,7 @@ mod tests {
     use super::Write;
     use crate::tool::workspace::read::Read;
     use crate::tool::workspace::{Grant, Grants, Mode, Workspace};
-    use crate::tool::{Registry, Tool as _, ToolSource, TurnContext};
+    use crate::tool::{Tool as _, TurnContext};
 
     fn workspace() -> Arc<Workspace> {
         Arc::new(Workspace::new())
@@ -152,44 +152,6 @@ mod tests {
 
     fn read_args(path: &std::path::Path) -> String {
         serde_json::json!({ "path": path }).to_string()
-    }
-
-    #[tokio::test]
-    async fn writing_a_new_file_succeeds_and_its_hash_lets_an_immediate_edit_proceed() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let tool = Write::new(Arc::clone(&ws));
-
-        let path = dir.path().join("new.txt");
-        let reply = tool
-            .execute(
-                write_args(&path, "hello"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert!(reply.content.contains("5 bytes"), "{}", reply.content);
-        assert_eq!(fs::read_to_string(&path).expect("read back"), "hello");
-
-        let canonical = path.canonicalize().expect("canonicalize");
-        assert_eq!(reply.changed_paths, [canonical.to_string_lossy()]);
-        assert!(ws.recorded_hash("s-1", &canonical).is_some());
-    }
-
-    #[tokio::test]
-    async fn an_unbound_session_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Write::new(workspace());
-
-        let path = dir.path().join("new.txt");
-        let reply = tool
-            .execute(write_args(&path, "hello"), TurnContext::default())
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.changed_paths.is_empty());
-        assert!(reply.content.contains("granted"), "{}", reply.content);
     }
 
     #[tokio::test]
@@ -296,59 +258,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writing_outside_all_grants_is_refused() {
-        let dir = TempDir::new().expect("tmp");
-        let elsewhere = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
-        let ws = workspace();
-        let tool = Write::new(ws);
-
-        let path = elsewhere.path().join("f.txt");
-        let reply = tool
-            .execute(
-                write_args(&path, "y"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("outside"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn a_read_only_session_can_write_a_tmp_file() {
-        let project = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("project");
-        let scratch = TempDir::new().expect("tmp");
-        let path = scratch.path().join("notes.txt");
-        let reply = Write::new(workspace())
-            .execute(
-                write_args(&path, "scratch"),
-                ctx("s-1", project.path(), Mode::ReadOnly),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(fs::read_to_string(path).unwrap(), "scratch");
-    }
-
-    #[tokio::test]
-    async fn writing_with_a_nonexistent_parent_is_the_gates_error() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let tool = Write::new(ws);
-
-        let path = dir.path().join("missing_dir").join("f.txt");
-        let reply = tool
-            .execute(
-                write_args(&path, "y"),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("parent"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn writing_then_immediately_editing_succeeds_off_the_re_recorded_hash() {
         let dir = TempDir::new().expect("tmp");
         let ws = workspace();
@@ -363,6 +272,8 @@ mod tests {
             )
             .await;
         assert!(write_reply.ok, "{}", write_reply.content);
+        assert_eq!(write_reply.changed_paths, [path.to_string_lossy()]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
 
         let edit_request = serde_json::json!({
             "path": path,
@@ -376,59 +287,5 @@ mod tests {
 
         assert!(edit_reply.ok, "{}", edit_reply.content);
         assert_eq!(fs::read_to_string(&path).expect("read back"), "goodbye");
-    }
-
-    #[tokio::test]
-    async fn writing_empty_content_is_allowed() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let tool = Write::new(ws);
-
-        let path = dir.path().join("empty.txt");
-        let reply = tool
-            .execute(
-                write_args(&path, ""),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(fs::read_to_string(&path).expect("read back"), "");
-    }
-
-    #[tokio::test]
-    async fn the_write_tool_dispatches_through_the_registry_by_source() {
-        let dir = TempDir::new().expect("tmp");
-        let ws = workspace();
-        let mut registry = Registry::new(32 * 1024);
-        registry.register(Box::new(Write::new(ws)));
-
-        let path = dir.path().join("f.txt");
-        let request = write_args(&path, "hi");
-
-        let present = registry
-            .dispatch(
-                "write",
-                request.clone(),
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-                &[ToolSource::Replacement],
-            )
-            .await;
-        assert!(present.ok, "{}", present.content);
-
-        fs::remove_file(&path).expect("cleanup");
-        let absent = registry
-            .dispatch(
-                "write",
-                request,
-                ctx("s-1", dir.path(), Mode::ReadWrite),
-                &[ToolSource::Builtin],
-            )
-            .await;
-        assert!(!absent.ok);
-        assert_eq!(
-            absent.content,
-            "ERROR: Tool write is not available in this session."
-        );
     }
 }

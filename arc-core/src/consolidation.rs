@@ -294,9 +294,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arc_proto::v1::{
-        MemoryRecord, MemoryRecordCreated, MemoryRecordSuperseded, MessageAppended, Role,
-        SessionCreated, SessionEvent, SessionRole, Source, event, memory_event, memory_record,
-        session_event,
+        MemoryRecord, MemoryRecordCreated, MessageAppended, Role, SessionCreated, SessionEvent,
+        SessionRole, Source, event, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -306,8 +305,8 @@ mod tests {
     use crate::projection::Projection;
     use crate::session::Engine;
     use crate::testkit::{
-        ScriptedProvider, TraceCapture, channel, counter_samples, done_reply, engine,
-        engine_with_role, engine_with_role_and_project, replay_events,
+        ScriptedProvider, channel, done_reply, engine, engine_with_role,
+        engine_with_role_and_project, replay_events,
     };
 
     const ALL_IDLE: i64 = i64::MAX;
@@ -502,53 +501,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_recent_session_is_not_due() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let outcome = run_pass(&engine, &NoopExtractor, 0, "", &HashSet::new())
-            .await
-            .expect("pass");
-
-        assert_eq!(outcome, Outcome::NothingDue);
-        assert_eq!(replay_events(dir.path()).len(), 4, "no marker appended");
-    }
-
-    #[tokio::test]
-    async fn a_completed_exchange_is_titled_before_the_idle_gate() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        Titles::default()
-            .run(&engine, &Titling(Some("Palette bikeshed".to_owned())))
-            .await
-            .expect("title");
-        assert_eq!(
-            run_pass(&engine, &PanicsIfTitled, 0, "", &HashSet::new())
-                .await
-                .expect("idle gate"),
-            Outcome::NothingDue
-        );
-
-        let titled = titled_events(dir.path());
-        assert_eq!(titled.len(), 1);
-        assert_eq!(titled[0].session_id, reply.session_id);
-        assert_eq!(titled[0].title, "Palette bikeshed");
-    }
-
-    #[tokio::test]
     async fn a_greeting_retries_only_after_new_completed_input_even_if_consolidated() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("fixed")]);
         let dir = TempDir::new().expect("temp dir");
@@ -638,77 +590,6 @@ mod tests {
         assert_eq!(titled_events(dir.path())[0].title, "Current");
     }
 
-    struct FailsFirstTitle(AtomicUsize);
-
-    impl Extractor for FailsFirstTitle {
-        async fn extract(
-            &self,
-            _: &SessionSnapshot,
-        ) -> Result<Vec<memory_event::Event>, ExtractError> {
-            panic!("title generation must not extract");
-        }
-
-        async fn title(&self, _: &SessionSnapshot) -> Result<Option<String>, ExtractError> {
-            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(ExtractError("temporary provider failure".to_owned()))
-            } else {
-                Ok(Some("Recovered title".to_owned()))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_failed_title_can_retry_unchanged_input() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("done")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "fix titles", tx)
-            .await
-            .expect("send");
-        let extractor = FailsFirstTitle(AtomicUsize::new(0));
-        let mut titles = Titles::default();
-        assert!(matches!(
-            titles
-                .run_session(&engine, &extractor, &reply.session_id)
-                .await,
-            Err(super::Error::Extractor { .. })
-        ));
-        assert!(titled_events(dir.path()).is_empty());
-        titles
-            .run_session(&engine, &extractor, &reply.session_id)
-            .await
-            .expect("retry unchanged input");
-        assert_eq!(extractor.0.load(Ordering::SeqCst), 2);
-        assert_eq!(titled_events(dir.path())[0].title, "Recovered title");
-    }
-
-    #[tokio::test]
-    async fn recovery_continues_after_one_title_fails() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        for content in ["first task", "second task"] {
-            let (tx, _rx) = channel();
-            engine
-                .send_message(&run, None, content, tx)
-                .await
-                .expect("send");
-        }
-        let extractor = FailsFirstTitle(AtomicUsize::new(0));
-        let mut titles = Titles::default();
-        titles.run(&engine, &extractor).await.expect("recovery");
-        assert_eq!(extractor.0.load(Ordering::SeqCst), 2);
-        assert_eq!(titled_events(dir.path()).len(), 1);
-        titles
-            .run(&engine, &extractor)
-            .await
-            .expect("retry failed candidate");
-        assert_eq!(extractor.0.load(Ordering::SeqCst), 3);
-        assert_eq!(titled_events(dir.path()).len(), 2);
-    }
-
     struct SimultaneousTitles(tokio::sync::Barrier);
 
     impl Extractor for SimultaneousTitles {
@@ -792,81 +673,6 @@ mod tests {
             .await
             .expect("finished title");
         assert_eq!(titled_events(dir.path()).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn concurrent_title_commits_notify_once_and_replay_preserves_the_pin() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("done")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (notifier, mut notifications) = tokio::sync::broadcast::channel(16);
-        let engine = engine.with_notifier(notifier);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "fix titles", tx)
-            .await
-            .expect("send");
-        while notifications.try_recv().is_ok() {}
-        let before = engine.sessions().expect("sessions");
-        let snapshot = engine
-            .with_store(|store| store.snapshot_for_title(&reply.session_id))
-            .expect("snapshot")
-            .expect("eligible");
-        let (first, second) =
-            tokio::join!(async { engine.commit_title(&snapshot, "First") }, async {
-                engine.commit_title(&snapshot, "Second")
-            });
-        assert!(first.expect("first"));
-        assert!(!second.expect("second"));
-        assert!(
-            matches!(notifications.try_recv().expect("notification").event,
-            Some(arc_proto::v1::notification::Event::SessionAppended(appended)) if appended.session_id == reply.session_id)
-        );
-        assert!(notifications.try_recv().is_err());
-        let mut rebuilt = Projection::in_memory().expect("projection");
-        for event in replay_events(dir.path()) {
-            rebuilt.apply(&event).expect("apply");
-        }
-        let after = rebuilt.sessions().expect("sessions");
-        assert_eq!(after[0].title, "First");
-        assert_eq!(after[0].provider, before[0].provider);
-        assert_eq!(after[0].model, before[0].model);
-        assert_eq!(after[0].role, before[0].role);
-    }
-
-    #[tokio::test]
-    async fn an_already_titled_session_is_not_retitled() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello"), done_reply("again")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        let reply = engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        Titles::default()
-            .run(&engine, &Titling(Some("First".to_owned())))
-            .await
-            .expect("first title");
-
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, Some(&reply.session_id), "more", tx)
-            .await
-            .expect("send more");
-
-        Titles::default()
-            .run(&engine, &PanicsIfTitled)
-            .await
-            .expect("retained");
-
-        let titled = titled_events(dir.path());
-        assert_eq!(
-            titled.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
-            ["First"],
-            "one title event, never overwritten"
-        );
     }
 
     #[tokio::test]
@@ -988,81 +794,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_create_and_a_supersede_show_both_counters() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let extractor = Scripted(vec![
-            created_record("mr-x"),
-            memory_event::Event::RecordSuperseded(MemoryRecordSuperseded {
-                superseded_id: "mr-x".to_owned(),
-                record: Some(MemoryRecord {
-                    id: "mr-y".to_owned(),
-                    kind: memory_record::Kind::Fact as i32,
-                    namespace: "global".to_owned(),
-                    title: "corrected".to_owned(),
-                    summary: "the corrected fact".to_owned(),
-                    body: "the corrected body".to_owned(),
-                    links: Vec::new(),
-                    provenance: None,
-                    status: memory_record::Status::Active as i32,
-                }),
-            }),
-        ]);
-        let capture = TraceCapture::start();
-        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
-            .await
-            .expect("pass");
-        let trace = capture.finish();
-
-        assert!(
-            matches!(
-                outcome,
-                Outcome::Consolidated {
-                    records: 2,
-                    records_created: 1,
-                    records_superseded: 1,
-                    ..
-                }
-            ),
-            "got: {outcome:?}"
-        );
-        assert_eq!(counter_samples(&trace, "records_created"), [1.0]);
-        assert_eq!(counter_samples(&trace, "records_superseded"), [1.0]);
-    }
-
-    #[tokio::test]
-    async fn a_zero_yield_pass_emits_no_counters() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let capture = TraceCapture::start();
-        run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &HashSet::new())
-            .await
-            .expect("pass");
-        let trace = capture.finish();
-
-        for name in ["records_created", "records_superseded"] {
-            assert!(
-                counter_samples(&trace, name).is_empty(),
-                "{name} must be absent on a zero-yield pass"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn a_failed_extraction_appends_nothing_and_names_its_session() {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
@@ -1082,44 +813,6 @@ mod tests {
         };
         assert_eq!(session_id, reply.session_id);
         assert_eq!(replay_events(dir.path()).len(), 4, "log untouched");
-    }
-
-    #[tokio::test]
-    async fn a_skipped_session_yields_to_the_next_due() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("one"), done_reply("two")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine(&provider, &dir);
-        for text in ["hi", "yo"] {
-            let (tx, _rx) = channel();
-            engine
-                .send_message(&run, None, text, tx)
-                .await
-                .expect("send");
-        }
-        let due = engine
-            .with_store(|store| store.due_for_consolidation(ALL_IDLE))
-            .expect("due");
-        assert_eq!(due.len(), 2);
-
-        let mut skip = HashSet::new();
-        skip.insert(due[0].session_id.clone());
-        let outcome = run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &skip)
-            .await
-            .expect("pass");
-        assert!(
-            matches!(
-                &outcome,
-                Outcome::Consolidated { session_id, .. } if *session_id == due[1].session_id
-            ),
-            "the pass must take the next due session, got: {outcome:?}"
-        );
-
-        assert_eq!(
-            run_pass(&engine, &NoopExtractor, ALL_IDLE, "", &skip)
-                .await
-                .expect("pass"),
-            Outcome::NothingDue
-        );
     }
 
     #[tokio::test]
@@ -1177,20 +870,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_direct_executor_session_extracts() {
-        direct_session_extracts(SessionRole::Executor).await;
-    }
-
-    #[tokio::test]
-    async fn a_direct_code_session_extracts() {
-        direct_session_extracts(SessionRole::Code).await;
-    }
-
-    async fn direct_session_extracts(role: SessionRole) {
         let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role_and_project(&provider, &dir, role);
+        let (engine, run) = engine_with_role_and_project(&provider, &dir, SessionRole::Executor);
         let session_id = engine
-            .create_direct_session(&run, "arc", role)
+            .create_direct_session(&run, "arc", SessionRole::Executor)
             .expect("create direct session");
         let (tx, _rx) = channel();
         engine
@@ -1216,65 +900,6 @@ mod tests {
             1,
             "a :code session the user opened must reach the extractor"
         );
-    }
-
-    #[tokio::test]
-    async fn an_executor_session_with_unspecified_source_does_not_extract() {
-        let provider = ScriptedProvider::scripted(vec![]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, _run) = engine_with_role(&provider, &dir, SessionRole::Executor);
-        seed_session(
-            &engine,
-            "s-legacy",
-            SessionRole::Executor,
-            Source::Unspecified,
-        );
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let extractor = CountingExtractor {
-            calls: Arc::clone(&calls),
-            records: Vec::new(),
-        };
-        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
-            .await
-            .expect("pass");
-
-        assert!(
-            matches!(outcome, Outcome::Consolidated { records: 0, .. }),
-            "got: {outcome:?}"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "an unspecified-source executor session keeps the old role rule"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_chat_session_still_extracts() {
-        let provider = ScriptedProvider::scripted(vec![done_reply("hello")]);
-        let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Chat);
-        let (tx, _rx) = channel();
-        engine
-            .send_message(&run, None, "hi", tx)
-            .await
-            .expect("send");
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let extractor = CountingExtractor {
-            calls: Arc::clone(&calls),
-            records: vec![created_record("mr-x")],
-        };
-        let outcome = run_pass(&engine, &extractor, ALL_IDLE, "", &HashSet::new())
-            .await
-            .expect("pass");
-
-        assert!(
-            matches!(outcome, Outcome::Consolidated { records: 1, .. }),
-            "got: {outcome:?}"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

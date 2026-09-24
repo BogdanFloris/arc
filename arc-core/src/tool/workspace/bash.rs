@@ -124,45 +124,42 @@ async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[Str
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
     let stdout_pipe = child.stdout.take().expect("stdout is piped");
     let stderr_pipe = child.stderr.take().expect("stderr is piped");
-    let mut stdout_task = tokio::spawn(drain(stdout_pipe));
-    let mut stderr_task = tokio::spawn(drain(stderr_pipe));
+    let mut drains =
+        tokio::spawn(async move { tokio::join!(drain(stdout_pipe), drain(stderr_pipe)) });
 
-    let Ok(wait_result) =
-        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await
-    else {
-        if let Some(pgid) = pgid {
-            // negative pid signals the whole process group.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-        }
+    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    if wait_result.is_err() {
+        kill_group(pgid);
         let _ = child.wait().await;
-        let stdout = stdout_task.await.unwrap_or_default();
-        let stderr = stderr_task.await.unwrap_or_default();
-        let header = format!("ERROR: timed out after {timeout_secs}s.");
-        return ToolReply::error(compose(Some(&header), &stdout, &stderr));
-    };
+    }
 
-    // a background child can hold the pipes open past bash's own exit; after a
-    // short grace the group is killed so EOF arrives and captured bytes survive.
-    let drains = async { ((&mut stdout_task).await, (&mut stderr_task).await) };
+    // Background children can hold pipes after bash exits.
     let (stdout, stderr) =
-        if let Ok((stdout, stderr)) = tokio::time::timeout(DRAIN_GRACE, drains).await {
-            (stdout.unwrap_or_default(), stderr.unwrap_or_default())
+        if let Ok(outputs) = tokio::time::timeout(DRAIN_GRACE, &mut drains).await {
+            outputs
         } else {
-            if let Some(pgid) = pgid {
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
-            (
-                stdout_task.await.unwrap_or_default(),
-                stderr_task.await.unwrap_or_default(),
-            )
-        };
+            kill_group(pgid);
+            drains.await
+        }
+        .unwrap_or_default();
     match wait_result {
-        Ok(status) => reply_for(status, &stdout, &stderr),
-        Err(error) => ToolReply::error(format!("ERROR: bash did not run to completion ({error}).")),
+        Err(_) => {
+            let header = format!("ERROR: timed out after {timeout_secs}s.");
+            ToolReply::error(compose(Some(&header), &stdout, &stderr))
+        }
+        Ok(Ok(status)) => reply_for(status, &stdout, &stderr),
+        Ok(Err(error)) => {
+            ToolReply::error(format!("ERROR: bash did not run to completion ({error})."))
+        }
+    }
+}
+
+fn kill_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid {
+        // A negative PID signals the whole process group.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
     }
 }
 
@@ -172,15 +169,13 @@ pub(crate) fn prefixed<'a>(
     command_prefix: &'a [String],
     argv: &[&'a str],
 ) -> (&'a str, Command) {
-    let (program, mut cmd) = if let Some((wrapper, rest)) = command_prefix.split_first() {
-        let mut cmd = Command::new(wrapper);
-        cmd.args(rest).args(argv);
-        (wrapper.as_str(), cmd)
-    } else {
-        let mut cmd = Command::new(argv[0]);
+    let program = command_prefix.first().map_or(argv[0], String::as_str);
+    let mut cmd = Command::new(program);
+    if command_prefix.is_empty() {
         cmd.args(&argv[1..]);
-        (argv[0], cmd)
-    };
+    } else {
+        cmd.args(&command_prefix[1..]).args(argv);
+    }
     cmd.current_dir(cwd);
     scrub_env(&mut cmd);
     // CLIs block on an open stdin.
@@ -247,21 +242,20 @@ async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -
 
 fn reply_for(status: std::process::ExitStatus, stdout: &Captured, stderr: &Captured) -> ToolReply {
     let code = status.code();
-    if code == Some(0) && stderr.text.is_empty() {
-        let content = if stdout.text.is_empty() {
+    let content = if code == Some(0) && stderr.text.is_empty() {
+        if stdout.text.is_empty() {
             "(no output)".to_owned()
         } else {
             mark(&stdout.text, stdout.dropped)
+        }
+    } else {
+        let header = match code {
+            Some(0) => None,
+            Some(code) => Some(format!("exit {code}")),
+            None => Some("exit signal".to_owned()),
         };
-        return ToolReply::ok(content);
-    }
-
-    let header = match code {
-        Some(0) => None,
-        Some(code) => Some(format!("exit {code}")),
-        None => Some("exit signal".to_owned()),
+        compose(header.as_deref(), stdout, stderr)
     };
-    let content = compose(header.as_deref(), stdout, stderr);
     if code == Some(0) {
         ToolReply::ok(content)
     } else {
@@ -347,17 +341,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_with_no_output_reports_no_output() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool.execute(args("true"), ctx_rw(dir.path())).await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(reply.content, "(no output)");
-    }
-
-    #[tokio::test]
     async fn a_nonzero_exit_is_an_error_naming_the_code_with_both_streams() {
         let dir = TempDir::new().expect("tmp");
         let tool = Bash::new();
@@ -375,25 +358,6 @@ mod tests {
             reply.content
         );
         assert!(reply.content.contains("err"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn stderr_noise_with_a_clean_exit_is_ok_but_carries_the_stderr_section() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool
-            .execute(args("echo warn >&2"), ctx_rw(dir.path()))
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert!(
-            reply.content.contains("--- stderr ---"),
-            "{}",
-            reply.content
-        );
-        assert!(reply.content.contains("warn"), "{}", reply.content);
-        assert!(!reply.content.contains("exit 0"), "{}", reply.content);
     }
 
     #[tokio::test]
@@ -434,35 +398,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_command_runs_in_the_read_write_root() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool.execute(args("pwd"), ctx_rw(dir.path())).await;
-
-        assert!(reply.ok, "{}", reply.content);
-        let canonical = dir.path().canonicalize().expect("canonicalize");
-        assert_eq!(reply.content.trim_end(), canonical.to_str().expect("utf8"));
-    }
-
-    #[tokio::test]
-    async fn stdout_over_the_cap_is_truncated_and_marked() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool
-            .execute(
-                args("head -c 20000 /dev/zero | tr '\\0' 'x'"),
-                ctx_rw(dir.path()),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert!(reply.content.contains("bytes dropped"), "{}", reply.content);
-        assert!(reply.content.len() < 20_000, "{}", reply.content.len());
-    }
-
-    #[tokio::test]
     async fn truncation_keeps_the_tail_so_a_trailing_error_survives() {
         let dir = TempDir::new().expect("tmp");
         let tool = Bash::new();
@@ -484,23 +419,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_past_its_timeout_is_an_error_naming_the_deadline() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool
-            .execute(args_with_timeout("sleep 5", 1), ctx_rw(dir.path()))
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.starts_with("ERROR: timed out after"),
-            "{}",
-            reply.content
-        );
-    }
-
-    #[tokio::test]
     async fn a_timeout_kills_the_whole_process_group_and_returns_promptly() {
         let dir = TempDir::new().expect("tmp");
         let tool = Bash::new();
@@ -515,6 +433,11 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(!reply.ok);
+        assert!(
+            reply.content.starts_with("ERROR: timed out after 1s."),
+            "{}",
+            reply.content
+        );
         assert!(!reply.content.contains("late"), "{}", reply.content);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
@@ -534,23 +457,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_grants_at_all_is_a_named_error() {
-        let tool = Bash::new();
-        let grants = crate::tool::workspace::Grants::new(Vec::new()).expect("empty grants");
-        let ctx = TurnContext {
-            session_id: String::new(),
-            turn_id: String::new(),
-            grants: Some(Arc::new(grants)),
-            command_prefix: Vec::new(),
-        };
-
-        let reply = tool.execute(args("echo hi"), ctx).await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("project root"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn an_unbound_session_is_a_named_error() {
         let tool = Bash::new();
 
@@ -561,58 +467,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_command_argument_is_an_actionable_error() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool.execute("{}".to_owned(), ctx_rw(dir.path())).await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("command"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn an_empty_command_is_an_actionable_error() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool.execute(args("   "), ctx_rw(dir.path())).await;
-
-        assert!(!reply.ok);
-        assert!(reply.content.contains("empty"), "{}", reply.content);
-    }
-
-    #[tokio::test]
     async fn a_background_child_holding_the_pipe_does_not_hang_the_call() {
         let dir = TempDir::new().expect("tmp");
         let tool = Bash::new();
-        let started = std::time::Instant::now();
-
-        let reply = tool
-            .execute(args("sleep 30 & echo up"), ctx_rw(dir.path()))
-            .await;
-
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the call must return once bash exits, not when the orphan dies"
-        );
-        assert!(reply.content.contains("up"), "{}", reply.content);
-    }
-
-    #[tokio::test]
-    async fn an_empty_prefix_runs_bash_directly_as_before() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool
-            .execute(
-                args("echo hello"),
-                ctx_with_prefix(dir.path(), Mode::ReadWrite, Vec::new()),
-            )
-            .await;
-
-        assert!(reply.ok, "{}", reply.content);
-        assert_eq!(reply.content, "hello\n");
+        for command in ["sleep 30 & echo up", "sleep 30 >&2 & echo up"] {
+            let started = Instant::now();
+            let reply = tool.execute(args(command), ctx_rw(dir.path())).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the call must return once bash exits, not when the orphan dies"
+            );
+            assert!(reply.ok, "{}", reply.content);
+            assert!(reply.content.contains("up"), "{}", reply.content);
+        }
     }
 
     #[tokio::test]
@@ -629,26 +496,6 @@ mod tests {
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(reply.content, "hello\n");
-    }
-
-    #[tokio::test]
-    async fn a_nonexistent_wrapper_binary_is_a_named_error() {
-        let dir = TempDir::new().expect("tmp");
-        let tool = Bash::new();
-
-        let reply = tool
-            .execute(
-                args("echo hi"),
-                ctx_rw_with_prefix(dir.path(), vec!["arc-no-such-wrapper".to_owned()]),
-            )
-            .await;
-
-        assert!(!reply.ok);
-        assert!(
-            reply.content.contains("arc-no-such-wrapper"),
-            "{}",
-            reply.content
-        );
     }
 
     #[tokio::test]

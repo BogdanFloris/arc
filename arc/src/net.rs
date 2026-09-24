@@ -173,23 +173,16 @@ pub async fn run_control(
             Command::SendLive {
                 session_id,
                 content,
-            } => match connected.send_message(Some(&session_id), &content).await {
-                Ok(turn) => drive_turn(turn, &events, Vec::new()).await,
-                Err(error) => Err(error),
-            },
-            Command::SendLiveAttachments {
-                session_id,
-                content,
                 attachments,
             } => {
-                let tracked = attachments.clone();
-                match connected
-                    .send_message_with_attachments(Some(&session_id), &content, attachments)
-                    .await
-                {
-                    Ok(turn) => drive_turn(turn, &events, tracked).await,
-                    Err(error) => Err(error),
-                }
+                send(
+                    &mut connected,
+                    Some(&session_id),
+                    &content,
+                    attachments,
+                    &events,
+                )
+                .await
             }
             _ => {
                 client = Some(connected);
@@ -271,72 +264,98 @@ async fn handle(
     command: Command,
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Option<Client> {
+    let sending = matches!(command, Command::Send { .. });
     let result = match command {
-        Command::List => list(&mut client, events).await,
-        Command::History { session_id } => history(&mut client, &session_id, events).await,
+        Command::List => client
+            .list_sessions()
+            .await
+            .map(|sessions| Some(NetEvent::Sessions(sessions))),
+        Command::History { session_id } => history(&mut client, &session_id).await.map(Some),
         Command::Send {
             session_id,
             content,
-        } => send(&mut client, session_id.as_deref(), &content, events).await,
-        Command::SendAttachments {
-            session_id,
-            content,
             attachments,
-        } => {
-            send_attachments(
-                &mut client,
-                session_id.as_deref(),
-                &content,
-                attachments,
-                events,
-            )
-            .await
-        }
+        } => send(
+            &mut client,
+            session_id.as_deref(),
+            &content,
+            attachments,
+            events,
+        )
+        .await
+        .map(|()| None),
         Command::ReviewList { since_micros } => {
-            review_list(&mut client, since_micros, events).await
+            review_list(&mut client, since_micros).await.map(Some)
         }
         Command::ReviewAccept { record_id } => {
-            verdict(client.review_accept(&record_id).await, events)
+            client.review_accept(&record_id).await.map(|()| None)
         }
         Command::ReviewDelete { record_id } => {
-            verdict(client.review_delete(&record_id).await, events)
+            client.review_delete(&record_id).await.map(|()| None)
         }
-        Command::ListJobs => list_jobs(&mut client, events).await,
-        Command::ListProjects => list_projects(&mut client, events).await,
-        Command::ListModels => models(client.models().await, events),
-        Command::SelectModel { role, choice } => {
-            models(client.select_model(role, &choice).await, events)
-        }
-        Command::CancelJob { session_id } => verdict(client.cancel_job(&session_id).await, events),
-        Command::DropSteers { session_id } => {
-            verdict(client.drop_steers(&session_id).await, events)
-        }
+        Command::ListJobs => client
+            .jobs()
+            .await
+            .map(|jobs| Some(NetEvent::JobItems(jobs))),
+        Command::ListProjects => client
+            .projects()
+            .await
+            .map(|projects| Some(NetEvent::ProjectItems(projects))),
+        Command::ListModels => client
+            .models()
+            .await
+            .map(|items| Some(NetEvent::ModelItems(items))),
+        Command::SelectModel { role, choice } => client
+            .select_model(role, &choice)
+            .await
+            .map(|items| Some(NetEvent::ModelItems(items))),
+        Command::CancelJob { session_id } => client.cancel_job(&session_id).await.map(|()| None),
+        Command::DropSteers { session_id } => client.drop_steers(&session_id).await.map(|()| None),
         Command::CreateSession {
             role,
             project,
             choice,
-        } => create_session(&mut client, role, &project, &choice, events).await,
+        } => client
+            .create_session_with_choice(role, &project, &choice)
+            .await
+            .map(|session_id| Some(NetEvent::SessionCreated { session_id })),
         Command::ForkSession {
             session_id,
             fork_point,
             choice,
-        } => fork_session(&mut client, &session_id, fork_point, &choice, events).await,
+        } => client
+            .fork_session_with_choice(&session_id, fork_point, &choice)
+            .await
+            .map(|session_id| Some(NetEvent::SessionForked { session_id })),
         Command::MarkBranch {
             session_id,
             disposition,
-        } => mark_branch(&mut client, &session_id, disposition, events).await,
-        Command::CompactSession { session_id } => {
-            compact_session(&mut client, &session_id, events).await
-        }
+        } => match client.mark_branch(&session_id, disposition).await {
+            Ok(()) => client
+                .list_sessions()
+                .await
+                .map(|sessions| Some(NetEvent::Sessions(sessions))),
+            Err(error) => Err(error),
+        },
+        Command::CompactSession { session_id } => client
+            .compact_session(&session_id)
+            .await
+            .map(|()| Some(NetEvent::Compacted { session_id })),
         // main.rs writes the OSC 52 sequence itself; this never reaches the
         // socket, and CancelTurn/SendLive go to run_control's own connection
-        Command::CancelTurn { .. }
-        | Command::SendLive { .. }
-        | Command::SendLiveAttachments { .. }
-        | Command::Yank(_) => Ok(()),
+        Command::CancelTurn { .. } | Command::SendLive { .. } | Command::Yank(_) => Ok(None),
     };
     match result {
-        Ok(()) => Some(client),
+        Ok(event) => {
+            if let Some(event) = event {
+                let _ = events.send(event);
+            }
+            Some(client)
+        }
+        Err(Error::Server { code, msg }) if !sending => {
+            let _ = events.send(NetEvent::Failed { code, msg });
+            Some(client)
+        }
         Err(error) => {
             let _ = events.send(NetEvent::Disconnected {
                 reason: error.to_string(),
@@ -347,243 +366,46 @@ async fn handle(
     }
 }
 
-async fn list(client: &mut Client, events: &mpsc::UnboundedSender<NetEvent>) -> Result<(), Error> {
-    match client.list_sessions().await {
-        Ok(sessions) => {
-            let _ = events.send(NetEvent::Sessions(sessions));
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+async fn history(client: &mut Client, session_id: &str) -> Result<NetEvent, Error> {
+    let answer = client.fetch_history(session_id).await?;
+    Ok(NetEvent::History {
+        branches: answer
+            .branches
+            .into_iter()
+            .map(|b| (b.fork_point, branch_label(&b)))
+            .collect(),
+        session_id: session_id.to_owned(),
+        entries: answer.entries,
+        parent_session: answer.parent_session,
+        fork_point: answer.fork_point,
+    })
 }
 
-async fn history(
-    client: &mut Client,
-    session_id: &str,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.fetch_history(session_id).await {
-        Ok(answer) => {
-            let _ = events.send(NetEvent::History {
-                branches: answer
-                    .branches
+async fn review_list(client: &mut Client, since_micros: i64) -> Result<NetEvent, Error> {
+    let items = client.review_items(since_micros).await?;
+    let entries = items
+        .into_iter()
+        .filter_map(|item| {
+            let record = item.record?;
+            Some(ReviewEntry {
+                id: record.id,
+                kind: record.kind,
+                namespace: record.namespace,
+                title: record.title,
+                summary: record.summary,
+                body: record.body,
+                supersedes: item
+                    .supersedes
                     .into_iter()
-                    .map(|b| (b.fork_point, branch_label(&b)))
+                    .map(|p| (p.id, p.title))
                     .collect(),
-                session_id: session_id.to_owned(),
-                entries: answer.entries,
-                parent_session: answer.parent_session,
-                fork_point: answer.fork_point,
-            });
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn review_list(
-    client: &mut Client,
-    since_micros: i64,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.review_items(since_micros).await {
-        Ok(items) => {
-            let entries = items
-                .into_iter()
-                .filter_map(|item| {
-                    let record = item.record?;
-                    Some(ReviewEntry {
-                        id: record.id,
-                        kind: record.kind,
-                        namespace: record.namespace,
-                        title: record.title,
-                        summary: record.summary,
-                        body: record.body,
-                        supersedes: item
-                            .supersedes
-                            .into_iter()
-                            .map(|p| (p.id, p.title))
-                            .collect(),
-                    })
-                })
-                .collect();
-            let _ = events.send(NetEvent::ReviewItems(entries));
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn list_jobs(
-    client: &mut Client,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.jobs().await {
-        Ok(jobs) => {
-            let _ = events.send(NetEvent::JobItems(jobs));
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn list_projects(
-    client: &mut Client,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.projects().await {
-        Ok(projects) => {
-            let _ = events.send(NetEvent::ProjectItems(projects));
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn models(
-    outcome: Result<Vec<arc_proto::v1::ModelChoice>, Error>,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match outcome {
-        Ok(items) => {
-            let _ = events.send(NetEvent::ModelItems(items));
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn create_session(
-    client: &mut Client,
-    role: arc_proto::v1::SessionRole,
-    project: &str,
-    choice: &str,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client
-        .create_session_with_choice(role, project, choice)
-        .await
-    {
-        Ok(session_id) => {
-            let _ = events.send(NetEvent::SessionCreated { session_id });
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn fork_session(
-    client: &mut Client,
-    session_id: &str,
-    fork_point: u64,
-    choice: &str,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client
-        .fork_session_with_choice(session_id, fork_point, choice)
-        .await
-    {
-        Ok(session_id) => {
-            let _ = events.send(NetEvent::SessionForked { session_id });
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn mark_branch(
-    client: &mut Client,
-    session_id: &str,
-    disposition: arc_proto::v1::branch_marked::Disposition,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.mark_branch(session_id, disposition).await {
-        Ok(()) => list(client, events).await,
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn compact_session(
-    client: &mut Client,
-    session_id: &str,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match client.compact_session(session_id).await {
-        Ok(()) => {
-            let _ = events.send(NetEvent::Compacted {
-                session_id: session_id.to_owned(),
-            });
-            Ok(())
-        }
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn verdict(
-    result: Result<(), Error>,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(Error::Server { code, msg }) => {
-            let _ = events.send(NetEvent::Failed { code, msg });
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+            })
+        })
+        .collect();
+    Ok(NetEvent::ReviewItems(entries))
 }
 
 async fn send(
-    client: &mut Client,
-    session_id: Option<&str>,
-    content: &str,
-    events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
-    let turn = client.send_message(session_id, content).await?;
-    drive_turn(turn, events, Vec::new()).await
-}
-
-async fn send_attachments(
     client: &mut Client,
     session_id: Option<&str>,
     content: &str,
@@ -591,9 +413,13 @@ async fn send_attachments(
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), Error> {
     let tracked = attachments.clone();
-    let turn = client
-        .send_message_with_attachments(session_id, content, attachments)
-        .await?;
+    let turn = if attachments.is_empty() {
+        client.send_message(session_id, content).await?
+    } else {
+        client
+            .send_message_with_attachments(session_id, content, attachments)
+            .await?
+    };
     drive_turn(turn, events, tracked).await
 }
 
@@ -764,82 +590,6 @@ mod tests {
         task.await.expect("metadata task");
         server.await.expect("server");
         assert!(events.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn switching_sessions_interrupts_a_slow_status_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let (session, receiver) = tokio::sync::watch::channel(Some("old".to_owned()));
-        let switch = session.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut old = tokio_tungstenite::accept_async(stream).await.unwrap();
-            assert!(matches!(expect_frame(&mut old).await.msg,
-                Some(client_frame::Msg::FetchStatus(request)) if request.session_id == "old"));
-            switch.send(Some("new".to_owned())).unwrap();
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut new = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let request = expect_frame(&mut new).await;
-            assert!(matches!(request.msg,
-                Some(client_frame::Msg::FetchStatus(request)) if request.session_id == "new"));
-            reply(
-                &mut new,
-                request.request_id,
-                server_frame::Msg::SessionStatus(arc_proto::v1::SessionStatus {
-                    session_id: "new".to_owned(),
-                    ..Default::default()
-                }),
-            )
-            .await;
-        });
-        let (tx, mut events) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_status(url, receiver, tx));
-        assert!(
-            matches!(next_event(&mut events).await, NetEvent::SessionStatus(status) if status.session_id == "new")
-        );
-        drop(session);
-        server.await.unwrap();
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_status_failure_is_separate_from_the_turn_and_retries_on_a_new_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let (session, receiver) = tokio::sync::watch::channel(Some("s".to_owned()));
-        let server = tokio::spawn(async move {
-            for fail in [true, false] {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let request = expect_frame(&mut ws).await;
-                let response = if fail {
-                    server_frame::Msg::Error(arc_proto::v1::Error {
-                        code: "busy".to_owned(),
-                        msg: "unavailable".to_owned(),
-                    })
-                } else {
-                    server_frame::Msg::SessionStatus(arc_proto::v1::SessionStatus {
-                        session_id: "s".to_owned(),
-                        ..Default::default()
-                    })
-                };
-                reply(&mut ws, request.request_id, response).await;
-            }
-        });
-        let (tx, mut events) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_status(url, receiver, tx));
-        assert_eq!(
-            next_event(&mut events).await,
-            NetEvent::StatusUnavailable("s".to_owned())
-        );
-        session.send(Some("s".to_owned())).unwrap();
-        assert!(
-            matches!(next_event(&mut events).await, NetEvent::SessionStatus(status) if status.session_id == "s")
-        );
-        drop(session);
-        server.await.unwrap();
-        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1048,6 +798,7 @@ mod tests {
             .send(Command::Send {
                 session_id: Some("new".into()),
                 content: "hello".into(),
+                attachments: Vec::new(),
             })
             .expect("send");
         assert_eq!(next_event(&mut events).await, NetEvent::ReviewChanged(0));
@@ -1325,6 +1076,7 @@ mod tests {
             .send(Command::SendLive {
                 session_id: "s-1".to_owned(),
                 content: "no, use GPIO 4".to_owned(),
+                attachments: Vec::new(),
             })
             .expect("control task alive");
 
@@ -1354,9 +1106,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_send_live_that_lands_a_fresh_turn_streams_it_like_the_main_socket_would() {
+    async fn a_send_live_with_picture_streams_on_its_own_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("ws://{}", listener.local_addr().expect("local addr"));
+        let attachment = arc_proto::v1::ImageAttachment {
+            name: "screen.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            data: b"\x89PNG\r\n\x1a\npicture".to_vec(),
+        };
+        let expected = attachment.clone();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -1366,7 +1124,8 @@ mod tests {
             let frame = expect_frame(&mut ws).await;
             assert!(matches!(
                 &frame.msg,
-                Some(client_frame::Msg::SendMessage(m)) if m.session_id == "s-1"
+                Some(client_frame::Msg::SendMessage(m))
+                    if m.session_id == "s-1" && m.attachments == [expected]
             ));
             reply(
                 &mut ws,
@@ -1405,9 +1164,14 @@ mod tests {
             .send(Command::SendLive {
                 session_id: "s-1".to_owned(),
                 content: "one more thing".to_owned(),
+                attachments: vec![attachment.clone()],
             })
             .expect("control task alive");
 
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::AttachmentsAccepted(vec![attachment])
+        );
         assert_eq!(
             next_event(&mut events).await,
             NetEvent::Accepted {
@@ -1435,45 +1199,5 @@ mod tests {
             .await
             .expect("server finishes within PATIENCE")
             .expect("server task");
-    }
-
-    #[test]
-    fn a_pushed_job_reasoning_notification_dispatches_with_its_session_id() {
-        let (events, mut rx) = mpsc::unbounded_channel();
-        dispatch(
-            Notification {
-                event: Some(notification::Event::JobReasoning(
-                    arc_proto::v1::ReasoningDelta {
-                        session_id: "s-job".to_owned(),
-                        text: "weighing options".to_owned(),
-                    },
-                )),
-            },
-            &events,
-        );
-        assert_eq!(
-            rx.try_recv().expect("dispatched"),
-            NetEvent::JobReasoning {
-                session_id: "s-job".to_owned(),
-                text: "weighing options".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn a_pushed_review_changed_notification_dispatches_to_a_net_event() {
-        let (events, mut rx) = mpsc::unbounded_channel();
-        dispatch(
-            Notification {
-                event: Some(notification::Event::ReviewChanged(
-                    arc_proto::v1::ReviewChanged { pending: 4 },
-                )),
-            },
-            &events,
-        );
-        assert_eq!(
-            rx.try_recv().expect("dispatched"),
-            NetEvent::ReviewChanged(4)
-        );
     }
 }

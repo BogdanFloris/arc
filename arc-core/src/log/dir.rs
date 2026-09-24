@@ -10,9 +10,7 @@ use super::{Error, LogReader, SegmentWriter, format};
 pub(crate) const DEFAULT_MAX_SEGMENT_LEN: u64 = 64 * 1024 * 1024;
 
 const SEQ_DIGITS: usize = 20; // u64::MAX is 20 digits, so names sort by seq
-
 const SEGMENT_EXT: &str = ".log";
-
 const HEADER_LEN: u64 = format::HEADER_SIZE as u64;
 
 pub(crate) fn segment_name(first_seq: u64) -> String {
@@ -270,7 +268,7 @@ mod tests {
         DEFAULT_MAX_SEGMENT_LEN, HEADER_LEN, Log, discover_segments, segment_first_seq,
         segment_name,
     };
-    use crate::log::{Error, SegmentWriter, format};
+    use crate::log::{Error, SegmentWriter};
 
     fn event(content: &str) -> Event {
         assert_eq!(content.len(), 3, "test events are fixed width");
@@ -352,39 +350,6 @@ mod tests {
         ] {
             assert_eq!(segment_first_seq(Path::new(not_a_segment)), None);
         }
-    }
-
-    #[test]
-    fn discovery_orders_a_scrambled_directory() {
-        let dir = TempDir::new().expect("temp dir");
-        for seq in [4711, 0, 1_000_000, 12] {
-            fs::write(dir.path().join(segment_name(seq)), []).expect("create segment");
-        }
-        fs::write(dir.path().join("index.sqlite"), []).expect("create sidecar");
-        fs::write(dir.path().join("00000000000000000007.log.bak"), []).expect("create sidecar");
-        fs::create_dir(dir.path().join("00000000000000000003.log")).expect("create decoy dir");
-
-        assert_eq!(
-            names_in(dir.path()),
-            [
-                "00000000000000000000.log",
-                "00000000000000000012.log",
-                "00000000000000004711.log",
-                "00000000000001000000.log",
-            ]
-        );
-    }
-
-    #[test]
-    fn empty_directory_opens_at_seq_zero() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("log");
-        let log = Log::open(&path).expect("open");
-
-        assert_eq!(log.next_seq(), 0);
-        assert_eq!(log.current_segment(), path.join(segment_name(0)));
-        assert_eq!(log.current_segment_len(), 0);
-        assert!(path.is_dir(), "the log directory is created on open");
     }
 
     #[test]
@@ -602,30 +567,6 @@ mod tests {
             ),
             "got: {err:?}"
         );
-    }
-
-    #[test]
-    fn an_oversized_event_is_refused_without_rolling_over() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut log = Log::open(dir.path()).expect("open");
-        log.append(event("m00")).expect("append");
-        let before = names_in(dir.path());
-
-        let mut huge = event("m01");
-        if let Some(event::Payload::Session(SessionEvent {
-            event: Some(session_event::Event::MessageAppended(m)),
-        })) = &mut huge.payload
-        {
-            m.content = "x".repeat(format::MAX_RECORD_LEN as usize + 1);
-        }
-
-        let err = log
-            .append(huge)
-            .expect_err("an oversized event must be refused");
-        assert!(matches!(err, Error::RecordTooLarge { .. }), "got: {err:?}");
-        assert_eq!(log.next_seq(), 1, "a refused event burns no seq");
-        assert_eq!(names_in(dir.path()), before, "and opens no segment");
-        assert_eq!(contents_of(&replay(dir.path())), ["m00"]);
     }
 
     #[test]

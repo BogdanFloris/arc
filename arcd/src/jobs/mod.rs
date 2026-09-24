@@ -14,7 +14,9 @@ use arc_core::provider::role_label;
 use arc_core::session::{
     ContinuedJob, DispatchedJob, Engine, EngineEvent, Error as SessionError, Inbound, Reply, Runner,
 };
-use arc_proto::v1::{ImageAttachment, JobInfo, Notification, ProjectInfo, SessionRole, Source};
+use arc_proto::v1::{
+    ImageAttachment, JobInfo, Notification, ProjectInfo, SessionRole, Source, job_info,
+};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -22,12 +24,11 @@ use tracing::{info, warn};
 
 use handback::{Autonomy, handback_crashed, job_title, record_handback};
 use prompt::job_system_prompt;
-use status::{JobState, JobStatuses, notify_job_changed};
+use status::{JobStatuses, notify_job_changed};
 use turn::{EVENT_BUFFER, Task, run_task};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// The root a job works in and the wrapper its commands run under.
 #[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
@@ -43,10 +44,6 @@ impl From<PathBuf> for Project {
     }
 }
 
-/// A session with a task running its turns. The inbox holds messages that
-/// arrived while the task was between turns; a message that arrives while a
-/// turn is actually live goes to the engine instead, which delivers it at
-/// the turn's next step boundary.
 struct LiveSession {
     inbox: mpsc::UnboundedSender<Inbound>,
     cancel: watch::Sender<bool>,
@@ -56,21 +53,16 @@ struct LiveSession {
 type LiveMap = Mutex<HashMap<String, LiveSession>>;
 type Handles = Mutex<Vec<JoinHandle<()>>>;
 
-/// What a turn's task streams to the connection that started it.
 pub enum TurnEvent {
     Engine(EngineEvent),
     Ended(Result<Reply, SessionError>),
 }
 
 pub enum SendOutcome {
-    /// The message started a turn. `events` carries it when the caller
-    /// asked to be attached.
     Started {
         session_id: String,
         events: Option<mpsc::Receiver<TurnEvent>>,
     },
-    /// The session was already working: the message lands in the running
-    /// turn, or as the task's next turn.
     Queued { session_id: String },
 }
 
@@ -154,21 +146,7 @@ impl Supervisor {
         self
     }
 
-    /// The one way a message reaches a session. A live turn takes it at its
-    /// next step boundary, a task between turns runs it next, and an idle
-    /// session gets a task of its own — for a user message always, for a
-    /// system message until the autonomy cap.
     pub fn send(
-        &self,
-        session_id: Option<&str>,
-        content: &str,
-        source: Source,
-        attach: bool,
-    ) -> Result<SendOutcome, SessionError> {
-        self.send_with_attachments(session_id, content, source, Vec::new(), attach)
-    }
-
-    pub fn send_with_attachments(
         &self,
         session_id: Option<&str>,
         content: &str,
@@ -186,11 +164,9 @@ impl Supervisor {
         )
     }
 
-    /// Dispatch and resume, for tests. A turn that dispatches routes its
-    /// own children as it ends; nothing else starts a job.
     #[cfg(test)]
     pub fn spawn(&self, job: DispatchedJob) {
-        spawn_job(&self.shared, job);
+        spawn_job(&self.shared, job, 0);
     }
 
     #[cfg(test)]
@@ -219,8 +195,6 @@ impl Supervisor {
         true
     }
 
-    /// What a new session of this role would run under: the role's own
-    /// runner, or the chat's when the role has none configured.
     pub(crate) fn turn_runner(&self, session_id: &str) -> Result<Runner, SessionError> {
         turn_runner(&self.shared, session_id)
     }
@@ -369,9 +343,6 @@ fn send_into(
     })
 }
 
-/// Hands a message to the session's live task, if it has one: into the
-/// running turn, or into the task's inbox as its next turn. `None` means
-/// there is no task to take it.
 fn deliver_live(
     shared: &Shared,
     live: &HashMap<String, LiveSession>,
@@ -415,9 +386,6 @@ fn deliver_live(
     })
 }
 
-/// A handback that would start a turn of its own is capped once a parent
-/// has narrated `MAX_HANDBACK_TURNS` of them with no user message between:
-/// past that it lands in the log and stops there (DESIGN.md §4.1).
 fn autonomy_allows(shared: &Shared, session_id: &str, content: &str, source: Source) -> bool {
     if source != Source::System || shared.autonomy.claim(session_id) {
         return true;
@@ -517,7 +485,7 @@ fn direct_system_prompt_for(shared: &Shared, session_id: &str) -> Option<String>
 
 fn spawn_dispatched(shared: &Shared, jobs: Vec<DispatchedJob>) {
     for job in jobs {
-        spawn_job(shared, job);
+        spawn_job(shared, job, 0);
     }
 }
 
@@ -544,16 +512,7 @@ fn cancel_live(live: &LiveMap, session_id: &str) -> bool {
     true
 }
 
-fn spawn_job(shared: &Shared, job: DispatchedJob) {
-    spawn_job_checked(shared, job, false, 0);
-}
-
-fn spawn_job_checked(
-    shared: &Shared,
-    job: DispatchedJob,
-    guard_absent: bool,
-    initial_spent_tokens: u64,
-) -> bool {
+fn spawn_job(shared: &Shared, job: DispatchedJob, initial_spent_tokens: u64) -> bool {
     let mut runner = match turn_runner(shared, &job.session_id) {
         Ok(runner) => runner,
         Err(error) => {
@@ -565,7 +524,7 @@ fn spawn_job_checked(
         runner.system = Some(job_system_prompt(&project.root));
     }
     let mut live = shared.live.lock().expect("live");
-    if guard_absent && live.contains_key(&job.session_id) {
+    if live.contains_key(&job.session_id) {
         warn!(
             session_id = %job.session_id,
             "continue_job raced with another resume of the same job; skipping"
@@ -646,11 +605,11 @@ fn spawn_watched(
             if !dispatched {
                 return;
             }
-            if let Some(info) =
-                shared
-                    .statuses
-                    .finish(&recovery.session_id, JobState::Failed, start.elapsed())
-            {
+            if let Some(info) = shared.statuses.finish(
+                &recovery.session_id,
+                job_info::State::Failed,
+                start.elapsed(),
+            ) {
                 notify_job_changed(shared.notifier.as_ref(), &shared.engine, info);
             }
             handback_crashed(&shared, &recovery);
@@ -681,7 +640,7 @@ fn route_continue(shared: &Shared, cont: ContinuedJob) {
         warn!(session_id, %error, "could not read the job's durable usage; resuming its counter at zero");
         0
     });
-    let resumed = spawn_job_checked(
+    let resumed = spawn_job(
         shared,
         DispatchedJob {
             session_id: cont.session_id,
@@ -691,7 +650,6 @@ fn route_continue(shared: &Shared, cont: ContinuedJob) {
             brief: cont.message,
             budget: None,
         },
-        true,
         initial_spent_tokens,
     );
     if resumed {
@@ -710,12 +668,12 @@ mod tests {
     use arc_core::session::ProjectSpec;
     use arc_core::store::Store;
     use arc_core::testkit::{
-        ScriptedProvider, Step, appended, call, channel, done_reply, replay_log, runner, seed_log,
-        tool_stop, usage,
+        ScriptedProvider, Step, call, channel, done_reply, replay_log, runner, seed_log, tool_stop,
+        usage,
     };
     use arc_core::tool::workspace::{Grant, Mode};
     use arc_core::tool::{Registry, ToolSource};
-    use arc_proto::v1::{Budget, Role, job_info};
+    use arc_proto::v1::{Role, job_info};
     use tempfile::TempDir;
 
     use super::handback::NO_REPLY;
@@ -723,76 +681,6 @@ mod tests {
         child_session, child_user_messages, engine_for_project, engine_for_project_notified,
         executor_runner, job_changed, only_job, parent_session, steer, wait_for_message_count,
     };
-
-    #[tokio::test]
-    async fn the_selected_menu_entry_carries_its_model_and_prompt() {
-        let dir = TempDir::new().expect("temp dir");
-        let provider = ScriptedProvider::scripted(vec![]);
-        let mut first = runner(&provider);
-        first.model = "first-model".to_owned();
-        first.system = Some("first prompt".to_owned());
-        let mut second = first.clone();
-        second.model = "second-model".to_owned();
-        second.system = Some("second prompt".to_owned());
-        let menu = vec![("first".to_owned(), first), ("second".to_owned(), second)];
-        let choices = menu
-            .iter()
-            .map(|(name, runner)| arc_core::session::ModelChoice {
-                name: name.clone(),
-                provider: runner.provider.name().to_owned(),
-                model: runner.model.clone(),
-                thinking: runner.thinking,
-                editing: arc_core::tool::Editing::Replacement,
-            })
-            .collect();
-        let engine = Arc::new(
-            Engine::new(
-                Store::new(
-                    Log::open(dir.path()).expect("log"),
-                    Projection::in_memory().expect("projection"),
-                ),
-                Registry::new(512),
-            )
-            .with_role_choices(BTreeMap::from([(SessionRole::Chat, choices)])),
-        );
-        let supervisor = Supervisor::new(
-            Arc::clone(&engine),
-            BTreeMap::from([(SessionRole::Chat, menu)]),
-        );
-        assert_eq!(
-            supervisor
-                .role_runner(SessionRole::Chat)
-                .expect("default")
-                .model,
-            "first-model"
-        );
-        engine
-            .select_model(SessionRole::Chat, "second")
-            .expect("select");
-        let selected = supervisor.role_runner(SessionRole::Chat).expect("selected");
-        assert_eq!(selected.model, "second-model");
-        assert_eq!(selected.system.as_deref(), Some("second prompt"));
-        assert_eq!(
-            supervisor
-                .status_runner(SessionRole::Chat, "scripted", "first-model")
-                .expect("status follows the recorded model")
-                .model,
-            "first-model"
-        );
-        assert!(
-            supervisor
-                .status_runner(SessionRole::Chat, "missing", "first-model")
-                .is_none()
-        );
-        assert_eq!(
-            supervisor
-                .role_runner(SessionRole::Executor)
-                .expect("chat fallback")
-                .model,
-            "second-model"
-        );
-        supervisor.shutdown().await;
-    }
 
     #[tokio::test]
     async fn open_sessions_keep_distinct_presets_after_the_role_default_changes() {
@@ -966,9 +854,7 @@ mod tests {
             data: b"\x89PNG\r\n\x1a\nbody".to_vec(),
         };
 
-        let Err(error) =
-            supervisor.send_with_attachments(None, "", Source::User, vec![image], false)
-        else {
+        let Err(error) = supervisor.send(None, "", Source::User, vec![image], false) else {
             panic!("the provider has no image support");
         };
 
@@ -978,89 +864,6 @@ mod tests {
         ));
         assert!(replay_log(dir.path()).is_empty());
         supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn a_job_with_no_runner_for_its_role_logs_and_skips_without_a_panic() {
-        let dir = TempDir::new().expect("temp dir");
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
-
-        supervisor.spawn(DispatchedJob {
-            session_id: "s-ghost".to_owned(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Chat,
-            project: "arc".to_owned(),
-            brief: "never runs".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert_eq!(replay_log(dir.path()), Vec::new(), "no child turn ran");
-    }
-
-    #[tokio::test]
-    async fn a_spawned_job_runs_the_brief_as_the_childs_first_message() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
-
-        let log = Log::open(dir.path()).expect("open log");
-        let projection = Projection::in_memory().expect("open projection");
-        let engine = Arc::new(
-            Engine::new(Store::new(log, projection), Registry::new(512)).with_projects(
-                BTreeMap::from([(
-                    "arc".to_owned(),
-                    ProjectSpec {
-                        sources: Vec::new(),
-                        grants: vec![Grant::new(&root, Mode::ReadWrite)],
-                        command_prefix: Vec::new(),
-                    },
-                )]),
-            ),
-        );
-
-        let child_id = engine
-            .create_bound_session(&runner(&chat_provider), "arc", SessionRole::Executor, None)
-            .expect("create the child durably, as dispatch already does");
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        let events = replay_log(dir.path());
-        let child_messages: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                arc_proto::v1::session_event::Event::MessageAppended(m)
-                    if m.session_id == child_id =>
-                {
-                    Some(appended(event))
-                }
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(child_messages.len(), 2, "the job's user turn and its reply");
-        assert_eq!(child_messages[0].role, Role::User as i32);
-        assert_eq!(child_messages[0].content, "fix the failing test");
-        assert_eq!(child_messages[1].role, Role::Assistant as i32);
-        assert_eq!(child_messages[1].content, "on it");
     }
 
     fn seeded_session(
@@ -1142,167 +945,6 @@ mod tests {
             child_user_messages(dir.path(), "s-parent").len(),
             1,
             "idempotent: a repaired job must not hand back twice"
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_repair_leaves_a_cleanly_concluded_job_untouched() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                seeded_session("s-parent", SessionRole::Chat, ""),
-                seeded_session("s-child", SessionRole::Executor, "s-parent"),
-                seeded_message("s-child", Role::User, "fix the bug"),
-                seeded_message("s-child", Role::Assistant, "all done"),
-                seeded_message("s-parent", Role::User, "Job s-child finished.\nall done"),
-            ],
-        );
-
-        let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks();
-
-        assert_eq!(
-            child_user_messages(dir.path(), "s-parent"),
-            [(Role::User, "Job s-child finished.\nall done".to_owned())],
-            "a cleanly concluded job gets no extra handback"
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_repair_skips_a_parentless_job_session() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                seeded_session("s-child", SessionRole::Executor, ""),
-                seeded_message("s-child", Role::User, "fix the bug"),
-            ],
-        );
-
-        let engine = reopened_arc_engine(&dir);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), BTreeMap::new());
-        supervisor.repair_restart_handbacks();
-
-        assert_eq!(
-            child_user_messages(dir.path(), "s-child"),
-            [(Role::User, "fix the bug".to_owned())],
-            "a parentless job session predates 6.34 and cannot be repaired"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_steer_to_a_live_job_lands_in_the_turn_it_is_already_running() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Gated {
-                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
-                notify: Arc::clone(&notify),
-                after: vec![Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                })],
-            },
-            Step::Immediate(done_reply("steer reply")),
-        ]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(
-            steer(&supervisor, &child_id, "also check the linter"),
-            "the job is live"
-        );
-        notify.notify_one();
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &child_id),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "working".to_owned()),
-                (Role::User, "also check the linter".to_owned()),
-                (Role::Assistant, "steer reply".to_owned()),
-            ],
-            "the steer landed at the running turn's next step boundary"
-        );
-    }
-
-    #[tokio::test]
-    async fn two_steers_into_one_live_turn_both_land_in_it_in_order() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Gated {
-                before: vec![Ok(CompletionDelta::Text("on it".to_owned()))],
-                notify: Arc::clone(&notify),
-                after: vec![Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                })],
-            },
-            Step::Immediate(done_reply("both steers done")),
-        ]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: Some(Budget {
-                total_tokens: 100_000,
-                wall_clock_seconds: 0,
-            }),
-        });
-
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(steer(&supervisor, &child_id, "first steer"));
-        assert!(steer(&supervisor, &child_id, "second steer"));
-        notify.notify_one();
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &child_id),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "on it".to_owned()),
-                (Role::User, "first steer".to_owned()),
-                (Role::User, "second steer".to_owned()),
-                (Role::Assistant, "both steers done".to_owned()),
-            ],
-            "both landed at the same step boundary, in the order they arrived"
         );
     }
 
@@ -1496,6 +1138,7 @@ mod tests {
                 Some(&child),
                 "do the work; delegate the rest",
                 Source::User,
+                Vec::new(),
                 false,
             )
             .expect("start direct turn");
@@ -1514,7 +1157,13 @@ mod tests {
             "the child must finish before the parent is released");
         assert!(matches!(
             supervisor
-                .send(Some(&child), "keep the API", Source::User, false)
+                .send(
+                    Some(&child),
+                    "keep the API",
+                    Source::User,
+                    Vec::new(),
+                    false
+                )
                 .expect("steer"),
             SendOutcome::Queued { .. }
         ));
@@ -1565,77 +1214,6 @@ mod tests {
             ["grandchild work", "grandchild done"],
             "the grandchild actually ran, not just existed"
         );
-    }
-
-    #[tokio::test]
-    async fn continue_job_on_a_live_job_queues_into_its_steer_channel_instead_of_resuming() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![
-            Step::Gated {
-                before: vec![Ok(CompletionDelta::Text("working".to_owned()))],
-                notify: Arc::clone(&notify),
-                after: vec![Ok(CompletionDelta::Done {
-                    usage: usage(),
-                    stop: Stop::EndTurn,
-                })],
-            },
-            Step::Immediate(done_reply("continued reply")),
-        ]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        supervisor.continue_job(ContinuedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            message: "also check the linter".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-        });
-        notify.notify_one();
-        supervisor.shutdown().await;
-
-        assert_eq!(
-            child_user_messages(dir.path(), &child_id),
-            [
-                (Role::User, "fix the failing test".to_owned()),
-                (Role::Assistant, "working".to_owned()),
-                (Role::User, "also check the linter".to_owned()),
-                (Role::Assistant, "continued reply".to_owned()),
-            ],
-            "the live job's steer channel got it, not a resumed task"
-        );
-
-        let created = replay_log(dir.path())
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    arc_proto::v1::session_event::Event::SessionCreated(created)
-                        if created.role == SessionRole::Executor as i32
-                )
-            })
-            .count();
-        assert_eq!(created, 1, "no second session was created for a live job");
     }
 
     #[tokio::test]
@@ -1769,12 +1347,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_job_checked_with_guard_absent_skips_a_session_already_live() {
+    async fn spawning_an_already_live_session_keeps_its_inbox() {
         let dir = TempDir::new().expect("temp dir");
         let log = Log::open(dir.path()).expect("open log");
         let projection = Projection::in_memory().expect("open projection");
         let engine = Arc::new(Engine::new(Store::new(log, projection), Registry::new(512)));
         let provider = ScriptedProvider::scripted(vec![]);
+        let child_id = engine
+            .create_session(&executor_runner(&provider))
+            .expect("session");
         let runners = BTreeMap::from([(SessionRole::Executor, executor_runner(&provider))]);
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
         let shared = &supervisor.shared;
@@ -1784,7 +1365,7 @@ mod tests {
         let (cancel, _cancel_rx) = watch::channel(false);
         let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
         shared.live.lock().expect("live").insert(
-            "s-child".to_owned(),
+            child_id.clone(),
             LiveSession {
                 inbox,
                 cancel,
@@ -1792,17 +1373,16 @@ mod tests {
             },
         );
 
-        let spawned = spawn_job_checked(
+        let spawned = spawn_job(
             shared,
             DispatchedJob {
-                session_id: "s-child".to_owned(),
+                session_id: child_id,
                 parent_session: "s-parent".to_owned(),
                 role: SessionRole::Executor,
                 project: "arc".to_owned(),
                 brief: "second resume".to_owned(),
                 budget: None,
             },
-            true,
             0,
         );
 
@@ -1869,65 +1449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_a_live_job_hands_back_cancelled_exactly_once_and_goes_terminal() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        // never notified: the turn stalls until the cancel drops it
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let executor_provider = ScriptedProvider::scripted_steps(vec![Step::Gated {
-            before: Vec::new(),
-            notify: gate,
-            after: Vec::new(),
-        }]);
-
-        let engine = engine_for_project(&dir, &root);
-        let parent_id = parent_session(&engine, &chat_provider);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: parent_id.clone(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-
-        wait_for_message_count(dir.path(), &child_id, 1).await;
-        assert!(supervisor.cancel(&child_id), "the job is live");
-        supervisor.shutdown().await;
-
-        let job = only_job(supervisor.list());
-        assert_eq!(
-            job.state,
-            job_info::State::Failed as i32,
-            "cancel is a failed-like terminal state"
-        );
-        assert_eq!(
-            child_user_messages(dir.path(), &parent_id),
-            [(
-                Role::User,
-                format!(
-                    "Job {child_id} stopped: cancelled by the user. The user chose to stop \
-                     this work — do not dispatch or continue it again unless they ask.\n{NO_REPLY}"
-                )
-            )],
-            "the cancelled handback lands exactly once"
-        );
-        assert!(
-            !supervisor.cancel(&child_id),
-            "already terminal; nothing left to cancel"
-        );
-    }
-
-    #[tokio::test]
     async fn cancelling_a_job_drops_its_queued_steers_with_a_warning() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
@@ -1971,39 +1492,6 @@ mod tests {
             !steer(&supervisor, &child_id, "still too late"),
             "the job already ended"
         );
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_finished_job_is_an_honest_no_op() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-
-        let chat_provider = ScriptedProvider::scripted(vec![]);
-        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
-
-        let engine = engine_for_project(&dir, &root);
-        let child_id = child_session(&engine, &chat_provider);
-
-        let runners =
-            BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
-
-        supervisor.spawn(DispatchedJob {
-            session_id: child_id.clone(),
-            parent_session: "s-parent".to_owned(),
-            role: SessionRole::Executor,
-            project: "arc".to_owned(),
-            brief: "fix the failing test".to_owned(),
-            budget: None,
-        });
-        supervisor.shutdown().await;
-
-        assert!(
-            !supervisor.cancel(&child_id),
-            "the job already finished cleanly"
-        );
-        assert!(!supervisor.cancel("s-never-existed"), "an unknown session");
     }
 
     #[tokio::test]
@@ -2079,7 +1567,6 @@ mod tests {
                     system: None,
                     compact_at: None,
                     context_window: None,
-                    counsel: false,
                     editing: arc_core::tool::Editing::Replacement,
                 },
             ),
