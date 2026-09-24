@@ -645,6 +645,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 })),
             })),
         })
@@ -914,6 +915,7 @@ mod tests {
                 grants: Vec::new(),
                 dispatched_by: String::new(),
                 choice: String::new(),
+                editing: String::new(),
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),

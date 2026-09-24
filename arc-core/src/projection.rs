@@ -27,7 +27,7 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 22;
+pub(crate) const SCHEMA_VERSION: u32 = 23;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     provider       TEXT,
     model          TEXT,
     choice         TEXT,
+    editing        TEXT,
     source         INTEGER NOT NULL DEFAULT 0,
     disposition    INTEGER
 );
@@ -626,6 +627,18 @@ impl Projection {
         Ok(choice.flatten().filter(|choice| !choice.is_empty()))
     }
 
+    pub(crate) fn session_editing(&self, session_id: &str) -> Result<Option<String>, Error> {
+        let editing: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT editing FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(editing.flatten().filter(|editing| !editing.is_empty()))
+    }
+
     pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
         let title: Option<String> = self
             .conn
@@ -1108,7 +1121,7 @@ const REBUILD_TABLES: &[TableSpec] = &[
         table: "sessions",
         key_columns: 1,
         select: "SELECT id, parent_session, fork_point, dispatched_by, project, title, \
-                 started_at, consolidated_through, role, provider, model, choice, source, disposition \
+                 started_at, consolidated_through, role, provider, model, choice, editing, source, disposition \
                  FROM sessions ORDER BY id",
     },
     TableSpec {
@@ -1745,8 +1758,8 @@ fn insert_session(
     tx.execute(
         "INSERT INTO sessions
              (id, parent_session, fork_point, dispatched_by, project, title, started_at,
-              role, provider, model, choice, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              role, provider, model, choice, editing, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         (
             &created.session_id,
             (!created.parent_session.is_empty()).then_some(&created.parent_session),
@@ -1759,6 +1772,7 @@ fn insert_session(
             (!created.provider.is_empty()).then_some(&created.provider),
             (!created.model.is_empty()).then_some(&created.model),
             (!created.choice.is_empty()).then_some(&created.choice),
+            (!created.editing.is_empty()).then_some(&created.editing),
             event.source,
         ),
     )?;
@@ -2468,6 +2482,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 })),
             })),
         }
@@ -3988,6 +4003,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 })),
             })),
         }

@@ -244,7 +244,7 @@ One registry has three sources in Phase 3. A tool reaches the model identically 
 
 - **builtin** — memory and archive (§5.5)
 - **web** — read-only, no grants; provided by the model's own provider where it has one, and empty where it does not
-- **workspace** — `read`, `write`, `edit`, `bash`; only in a bound session (§4.2)
+- **workspace** — `read`, `bash`, and one editing interface: `apply_patch` for Codex sessions, or `edit` and `write` for other providers; only in a bound session (§4.2). `edit` accepts multiple non-overlapping, unique replacements in one file against its original contents. A single replacement keeps its legacy call shape. A model preset or inline role may explicitly set `editing = "patch"` or `editing = "replacement"`; otherwise Codex defaults to patch and other providers to replacement. The chosen interface is recorded in the session creation event and replayed, not read from the role default on each turn. Existing sessions without a recorded editing interface use their pinned provider (Codex selects patch); legacy unpinned sessions use their serving provider. Both advertised and executable tools obey the choice. Patch hunks are preflighted before writes, but filesystem failures during sequential writes may leave a partial patch; the result names completed paths.
 
 Expert and MCP tools are deferred. Add a source only when that tool type is ready to ship; a future source is not a current registry requirement.
 

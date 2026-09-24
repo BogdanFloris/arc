@@ -234,15 +234,20 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_source_is_bash_edit_read_write_and_apply_patch() {
+    fn the_workspace_tools_have_distinct_editing_sources() {
         let tools = super::tools(std::sync::Arc::new(Workspace::new()));
 
         let names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
         assert_eq!(names, ["bash", "edit", "read", "write", "apply_patch"]);
-        assert!(
-            tools
-                .iter()
-                .all(|tool| tool.source() == ToolSource::Workspace)
+        assert_eq!(
+            tools.iter().map(|tool| tool.source()).collect::<Vec<_>>(),
+            [
+                ToolSource::Workspace,
+                ToolSource::Replacement,
+                ToolSource::Workspace,
+                ToolSource::Replacement,
+                ToolSource::Patch,
+            ]
         );
     }
 

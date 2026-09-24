@@ -159,6 +159,7 @@ impl Roles {
                             provider: runner.provider.name().to_owned(),
                             model: runner.model,
                             thinking: runner.thinking,
+                            editing: runner.editing,
                         })
                         .collect(),
                 )
@@ -208,6 +209,7 @@ impl<'a> Built<'a> {
                 compact_at: None,
                 context_window: None,
                 counsel: false,
+                editing: arc_core::tool::Editing::Replacement,
             };
             return Ok(vec![(runner.model.clone(), runner)]);
         };
@@ -251,6 +253,9 @@ impl<'a> Built<'a> {
             .context_window
             .map(|window| compact_at_for(window, config.compaction.fraction));
         let (provider, model) = self.provider_for(name, configured, config)?;
+        let editing = configured
+            .editing
+            .unwrap_or_else(|| arc_core::tool::Editing::for_provider(provider.name()));
         Ok(Runner {
             role,
             provider,
@@ -260,6 +265,7 @@ impl<'a> Built<'a> {
             compact_at,
             context_window: configured.context_window,
             counsel: configured.counsel,
+            editing,
         })
     }
 
@@ -484,7 +490,21 @@ choices = ["sol", "astra"]
             assert_eq!(role.provider.endpoint(), SIDECAR);
             assert_eq!(role.model, Config::default().model());
             assert_eq!(role.compact_at, None, "no context_window, no compaction");
+            assert_eq!(role.editing, arc_core::tool::Editing::Replacement);
         }
+    }
+
+    #[test]
+    fn model_preset_overrides_the_provider_editing_default() {
+        let roles = resolved(
+            "[models.patch_local]\nprovider = \"local\"\nediting = \"patch\"\n\
+             [roles.executor]\nchoices = [\"patch_local\"]\n",
+        );
+        assert_eq!(roles.executor().editing, arc_core::tool::Editing::Patch);
+        assert_eq!(
+            roles.choices()[&arc_proto::v1::SessionRole::Executor][0].editing,
+            arc_core::tool::Editing::Patch
+        );
     }
 
     #[test]

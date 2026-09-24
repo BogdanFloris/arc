@@ -226,6 +226,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: String::new(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 

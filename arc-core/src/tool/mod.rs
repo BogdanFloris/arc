@@ -95,15 +95,50 @@ pub enum ToolSource {
     Jobs,
     Web,
     Workspace,
+    Patch,
+    Replacement,
     Expert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Editing {
+    Patch,
+    Replacement,
+}
+
+impl Editing {
+    pub fn for_provider(provider: &str) -> Self {
+        if provider == "codex" {
+            Self::Patch
+        } else {
+            Self::Replacement
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Replacement => "replacement",
+        }
+    }
+
+    pub fn source(self) -> ToolSource {
+        match self {
+            Self::Patch => ToolSource::Patch,
+            Self::Replacement => ToolSource::Replacement,
+        }
+    }
+}
+
 impl ToolSource {
-    pub const ALL: [ToolSource; 5] = [
+    pub const ALL: [ToolSource; 7] = [
         ToolSource::Builtin,
         ToolSource::Jobs,
         ToolSource::Web,
         ToolSource::Workspace,
+        ToolSource::Patch,
+        ToolSource::Replacement,
         ToolSource::Expert,
     ];
 }
@@ -221,10 +256,17 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchOutcome, Registry, Tool, ToolReply, ToolSource, TurnContext};
+    use super::{DispatchOutcome, Editing, Registry, Tool, ToolReply, ToolSource, TurnContext};
     use crate::provider::ToolDefinition;
     use std::future::Future;
     use std::pin::Pin;
+
+    #[test]
+    fn editing_defaults_follow_provider_not_model_name() {
+        assert_eq!(Editing::for_provider("codex"), Editing::Patch);
+        assert_eq!(Editing::for_provider("openai-compat"), Editing::Replacement);
+        assert_eq!(Editing::for_provider("local"), Editing::Replacement);
+    }
 
     struct Scripted {
         name: &'static str,
@@ -251,7 +293,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                &[ToolSource::Workspace],
+                &[ToolSource::Replacement],
             )
             .await;
         assert!(outcome.ok);

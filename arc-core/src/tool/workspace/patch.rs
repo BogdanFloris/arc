@@ -39,7 +39,10 @@ impl Tool for ApplyPatch {
                           ` `, `-`, `+` lines. Paths are relative to the project root or \
                           absolute. Updating or deleting a file requires having read it using \
                           the `read` tool in this session, with no changes since. Reading through \
-                          Bash does not count. A patch applies whole or not at all."
+                          Bash does not count. Hunks are checked before writes; filesystem \
+                          errors during sequential writes may leave earlier changes applied. \
+                          A failed result lists completed operations; a failed write may also \
+                          have modified its target."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -52,7 +55,7 @@ impl Tool for ApplyPatch {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Workspace
+        ToolSource::Patch
     }
 
     fn execute(
@@ -93,8 +96,9 @@ impl Tool for ApplyPatch {
                 {
                     reply.ok = false;
                     reply.content = format!(
-                        "ERROR: {reason} Earlier hunks of this patch were already applied; \
-                         read the files again before retrying."
+                        "ERROR: {reason} This patch may be partly applied. The changed paths \
+                         list contains completed writes and deletes, but a failed write may also \
+                         have modified its target. Read files again before retrying."
                     );
                     return reply;
                 }
@@ -767,6 +771,12 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: a\n+first\n*** Add File: a/child\n+second\n*** End Patch";
         let reply = tool.execute(args(patch), ctx(root, Mode::ReadWrite)).await;
         assert!(!reply.ok);
+        assert!(reply.content.contains("partly applied"));
+        assert!(
+            tool.definition()
+                .description
+                .contains("failed write may also")
+        );
         assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "first\n");
         assert_eq!(reply.changed_paths, [root.join("a").to_string_lossy()]);
     }

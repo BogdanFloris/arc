@@ -1153,6 +1153,7 @@ mod tests {
                 compact_at: None,
                 context_window: None,
                 counsel: false,
+                editing: arc_core::tool::Editing::Replacement,
             };
             Self::with_seed(
                 script,
@@ -1241,6 +1242,7 @@ mod tests {
                 compact_at: None,
                 context_window: None,
                 counsel: false,
+                editing: arc_core::tool::Editing::Replacement,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -1303,6 +1305,7 @@ mod tests {
                 compact_at: None,
                 context_window: None,
                 counsel: false,
+                editing: arc_core::tool::Editing::Replacement,
             };
             let reads = Arc::new(Reader::open(&index).expect("open reads"));
             let supervisor = Arc::new(
@@ -1940,6 +1943,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 })),
             })),
         };
@@ -4008,6 +4012,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: arc_core::tool::Editing::Replacement,
         };
         let executor_runner = Runner {
             role: SessionRole::Executor,
@@ -4018,6 +4023,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: arc_core::tool::Editing::Replacement,
         };
         let supervisor = Arc::new(
             Supervisor::for_test(

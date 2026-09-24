@@ -742,6 +742,7 @@ mod tests {
                 provider: runner.provider.name().to_owned(),
                 model: runner.model.clone(),
                 thinking: runner.thinking,
+                editing: arc_core::tool::Editing::Replacement,
             })
             .collect();
         let engine = Arc::new(
@@ -812,6 +813,7 @@ mod tests {
                 provider: runner.provider.name().to_owned(),
                 model: runner.model.clone(),
                 thinking: runner.thinking,
+                editing: arc_core::tool::Editing::Replacement,
             })
             .collect();
         let engine = Arc::new(
@@ -892,6 +894,7 @@ mod tests {
                     provider: first.provider.name().to_owned(),
                     model: first.model.clone(),
                     thinking: first.thinking,
+                    editing: arc_core::tool::Editing::Replacement,
                 }],
             )])),
         );
@@ -1078,6 +1081,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: dispatched_by.to_owned(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 
@@ -2076,6 +2080,7 @@ mod tests {
                     compact_at: None,
                     context_window: None,
                     counsel: false,
+                    editing: arc_core::tool::Editing::Replacement,
                 },
             ),
         ]);

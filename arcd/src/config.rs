@@ -150,6 +150,8 @@ pub struct RoleConfig {
     /// a second mind is for models that need one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub counsel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing: Option<arc_core::tool::Editing>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -220,7 +222,8 @@ impl RoleConfig {
                     && self.key.is_none()
                     && self.context_window.is_none()
                     && self.thinking == Thinking::Default
-                    && !self.counsel,
+                    && !self.counsel
+                    && self.editing.is_none(),
                 "role `{name}` lists choices, so it declares nothing else inline; the presets carry it"
             );
             for choice in &self.choices {
@@ -602,6 +605,7 @@ choices = ["hosted"]
                     thinking: Thinking::Medium,
                     context_window: Some(128_000),
                     counsel: false,
+                    editing: None,
                 }),
                 chat: Some(RoleConfig {
                     provider: Some(RoleProvider::Gemini),
@@ -612,6 +616,7 @@ choices = ["hosted"]
                     thinking: Thinking::Low,
                     context_window: None,
                     counsel: false,
+                    editing: None,
                 }),
                 executor: Some(RoleConfig {
                     provider: Some(RoleProvider::OpenAiCompat),
@@ -622,6 +627,7 @@ choices = ["hosted"]
                     thinking: Thinking::Default,
                     context_window: Some(128_000),
                     counsel: false,
+                    editing: None,
                 }),
                 archivist: Some(RoleConfig {
                     provider: Some(RoleProvider::Local),
@@ -632,6 +638,7 @@ choices = ["hosted"]
                     thinking: Thinking::Minimal,
                     context_window: None,
                     counsel: false,
+                    editing: None,
                 }),
                 counsel: Some(super::CounselConfig {
                     command: super::CounselCommand::Claude,

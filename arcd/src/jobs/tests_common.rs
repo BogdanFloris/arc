@@ -65,6 +65,7 @@ pub(crate) mod testkit {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: arc_core::tool::Editing::Replacement,
         }
     }
 

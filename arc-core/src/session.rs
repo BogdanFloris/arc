@@ -62,6 +62,7 @@ pub struct Runner {
     /// Whether sessions on this model hold `consult_expert` (§6.2): a
     /// property of the model preset, not the role.
     pub counsel: bool,
+    pub editing: crate::tool::Editing,
 }
 
 // never held across an .await: it fences a single append batch or
@@ -73,6 +74,7 @@ pub struct ModelChoice {
     pub provider: String,
     pub model: String,
     pub thinking: Thinking,
+    pub editing: crate::tool::Editing,
 }
 
 pub struct Engine {
@@ -392,6 +394,7 @@ impl Engine {
                         role,
                         vec![ModelChoice {
                             name: model.clone(),
+                            editing: crate::tool::Editing::for_provider(&provider),
                             provider,
                             model,
                             thinking: Thinking::Default,
@@ -546,6 +549,11 @@ impl Engine {
                 budget: None,
                 grants: Vec::new(),
                 dispatched_by: String::new(),
+                editing: selected
+                    .as_ref()
+                    .map_or(runner.editing, |pick| pick.editing)
+                    .as_str()
+                    .to_owned(),
                 choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
@@ -645,6 +653,11 @@ impl Engine {
                     })
                     .collect(),
                 dispatched_by: dispatched_by.unwrap_or_default().to_owned(),
+                editing: selected
+                    .as_ref()
+                    .map_or(runner.editing, |pick| pick.editing)
+                    .as_str()
+                    .to_owned(),
                 choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
@@ -701,6 +714,16 @@ impl Engine {
                 .with_store(|store| store.projection().session_identity(parent_id))?
                 .unwrap_or_default(),
         };
+        let editing = match &selected {
+            Some(pick) => pick.editing.as_str().to_owned(),
+            None => self
+                .with_store(|store| store.projection().session_editing(parent_id))?
+                .unwrap_or_else(|| {
+                    crate::tool::Editing::for_provider(&provider)
+                        .as_str()
+                        .to_owned()
+                }),
+        };
         let project = self
             .with_store(|store| store.projection().session_project(parent_id))?
             .unwrap_or_default();
@@ -724,6 +747,7 @@ impl Engine {
                     .map(|(root, read_write)| WorkspaceGrant { root, read_write })
                     .collect(),
                 dispatched_by: String::new(),
+                editing,
                 choice: selected.map_or_else(String::new, |pick| pick.name),
             }),
         )?;
@@ -1105,6 +1129,34 @@ impl Engine {
                 }
             }
         };
+        if sources.contains(&ToolSource::Workspace) {
+            let editing = if new_session {
+                runner.editing
+            } else {
+                let recorded =
+                    self.with_store(|store| store.projection().session_editing(session_id))?;
+                match recorded.as_deref() {
+                    Some("patch") => crate::tool::Editing::Patch,
+                    Some("replacement") => crate::tool::Editing::Replacement,
+                    _ => {
+                        let provider = self
+                            .with_store(|store| store.projection().session_identity(session_id))?
+                            .map_or_else(
+                                || runner.provider.name().to_owned(),
+                                |pin| {
+                                    if pin.0.is_empty() {
+                                        runner.provider.name().to_owned()
+                                    } else {
+                                        pin.0
+                                    }
+                                },
+                            );
+                        crate::tool::Editing::for_provider(&provider)
+                    }
+                }
+            };
+            sources.push(editing.source());
+        }
         if source != Some(Source::Model as i32) {
             sources.push(ToolSource::Jobs);
         }
@@ -1289,6 +1341,7 @@ impl Engine {
                     budget: None,
                     grants: Vec::new(),
                     dispatched_by: String::new(),
+                    editing: runner.editing.as_str().to_owned(),
                     choice: self
                         .role_choices
                         .get(&runner.role)
@@ -3103,6 +3156,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -3143,6 +3197,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: String::new(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 
@@ -3255,6 +3310,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: String::new(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 
@@ -3452,6 +3508,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -3997,6 +4054,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 }),
             )
             .expect("record");
@@ -4956,6 +5014,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -4988,6 +5047,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
 
         let (tx, _rx) = channel();
@@ -5204,6 +5264,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -5554,6 +5615,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -6248,6 +6310,7 @@ mod tests {
                                 provider: "scripted".to_owned(),
                                 model: name.to_owned(),
                                 thinking: Thinking::Default,
+                                editing: crate::tool::Editing::Replacement,
                             })
                             .collect(),
                     )
@@ -6363,6 +6426,7 @@ mod tests {
             provider: "codex".to_owned(),
             model: model.to_owned(),
             thinking: Thinking::Default,
+            editing: crate::tool::Editing::Replacement,
         };
 
         let provider = ScriptedProvider::scripted(vec![]);
@@ -6444,6 +6508,7 @@ mod tests {
                 provider: "scripted".to_owned(),
                 model: name.to_owned(),
                 thinking: Thinking::Default,
+                editing: crate::tool::Editing::Replacement,
             })
             .collect();
         let engine = engine.with_role_choices(BTreeMap::from([(SessionRole::Chat, choices)]));
@@ -7334,6 +7399,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (child_engine, _) = reopened_engine(&executor_provider, &dir, Registry::new(512));
         let child_engine = child_engine.with_projects(projects_with(
@@ -7974,6 +8040,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: String::new(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 
@@ -7996,6 +8063,7 @@ mod tests {
             grants: Vec::new(),
             dispatched_by: String::new(),
             choice: String::new(),
+            editing: String::new(),
         })
     }
 
@@ -8023,6 +8091,7 @@ mod tests {
                         provider: "scripted".to_owned(),
                         model: name.to_owned(),
                         thinking: Thinking::Default,
+                        editing: crate::tool::Editing::Replacement,
                     })
                     .collect(),
             )]));
@@ -8091,6 +8160,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -8127,6 +8197,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -8159,6 +8230,7 @@ mod tests {
             compact_at: None,
             context_window: None,
             counsel: false,
+            editing: crate::tool::Editing::Replacement,
         };
         let (tx, _rx) = channel();
 
@@ -8552,6 +8624,7 @@ mod tests {
                     grants: Vec::new(),
                     dispatched_by: String::new(),
                     choice: String::new(),
+                    editing: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -9408,12 +9481,14 @@ mod tests {
                         provider: unused.name().to_owned(),
                         model: "unused-model".to_owned(),
                         thinking: Thinking::Default,
+                        editing: crate::tool::Editing::Replacement,
                     },
                     super::ModelChoice {
                         name: "cheap".to_owned(),
                         provider: archivist.name().to_owned(),
                         model: "archivist-model".to_owned(),
                         thinking: Thinking::Low,
+                        editing: crate::tool::Editing::Replacement,
                     },
                 ],
             )]))
@@ -9466,5 +9541,157 @@ mod tests {
         let (provider_name, model) = engine.session_identity(&first.session_id).unwrap().unwrap();
         assert_eq!(provider_name, provider.name());
         assert_eq!(model, "test-model");
+    }
+
+    #[tokio::test]
+    async fn editing_interface_is_pinned_and_filters_both_schemas_and_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let provider = ScriptedProvider::scripted(vec![]);
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let projects = projects_with(
+            "arc",
+            vec![ToolSource::Builtin, ToolSource::Workspace],
+            vec![Grant::new(&root, Mode::ReadWrite)],
+        );
+        let (engine, mut run) = engine_with_tools(&provider, &dir, registry);
+        let engine = engine.with_projects(projects.clone());
+        run.editing = crate::tool::Editing::Patch;
+        let session = engine
+            .create_bound_session(&run, "arc", SessionRole::Code, None)
+            .unwrap();
+        let patch_sources = engine.sources(&session, false, &run).unwrap();
+        let names = engine
+            .registry
+            .definitions(&patch_sources)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"bash".to_owned()));
+        assert!(names.contains(&"read".to_owned()));
+        assert!(names.contains(&"apply_patch".to_owned()));
+        assert!(!names.contains(&"edit".to_owned()));
+        assert!(!names.contains(&"write".to_owned()));
+        let denied = engine
+            .registry
+            .dispatch(
+                "write",
+                serde_json::json!({"path": root.join("not-created"), "content": "no"}).to_string(),
+                TurnContext::default(),
+                &patch_sources,
+            )
+            .await;
+        assert!(!denied.ok && denied.content.contains("not available"));
+        assert!(!root.join("not-created").exists());
+        let applied = engine
+            .registry
+            .dispatch(
+                "apply_patch",
+                serde_json::json!({"input": format!(
+                    "*** Begin Patch\n*** Add File: {}\n+patch\n*** End Patch",
+                    root.join("patched").display()
+                )})
+                .to_string(),
+                TurnContext {
+                    session_id: session.clone(),
+                    grants: engine.grants(&session, false).unwrap(),
+                    ..Default::default()
+                },
+                &patch_sources,
+            )
+            .await;
+        assert!(applied.ok, "{}", applied.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("patched")).unwrap(),
+            "patch\n"
+        );
+        drop(engine);
+
+        let mut registry = Registry::new(512);
+        for tool in workspace::tools(Arc::new(Workspace::new())) {
+            registry.register(tool);
+        }
+        let (reopened, mut changed_default) = reopened_engine(&provider, &dir, registry);
+        changed_default.editing = crate::tool::Editing::Replacement;
+        let reopened = reopened.with_projects(projects);
+        assert_eq!(
+            reopened
+                .with_store(|store| store.projection().session_editing(&session))
+                .unwrap(),
+            Some("patch".to_owned())
+        );
+        let resumed = reopened.sources(&session, false, &changed_default).unwrap();
+        assert!(resumed.contains(&ToolSource::Patch));
+        assert!(!resumed.contains(&ToolSource::Replacement));
+
+        let legacy = reopened
+            .create_bound_session(&changed_default, "arc", SessionRole::Code, None)
+            .unwrap();
+        let replacement = reopened.sources(&legacy, false, &changed_default).unwrap();
+        assert!(replacement.contains(&ToolSource::Replacement));
+        assert!(!replacement.contains(&ToolSource::Patch));
+        let names = reopened
+            .registry
+            .definitions(&replacement)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read".to_owned()));
+        assert!(names.contains(&"bash".to_owned()));
+        assert!(names.contains(&"write".to_owned()));
+        assert!(names.contains(&"edit".to_owned()));
+        assert!(!names.contains(&"apply_patch".to_owned()));
+        let denied = reopened
+            .registry
+            .dispatch(
+                "apply_patch",
+                "{}".to_owned(),
+                TurnContext::default(),
+                &replacement,
+            )
+            .await;
+        assert!(!denied.ok && denied.content.contains("not available"));
+        let written = reopened
+            .registry
+            .dispatch(
+                "write",
+                serde_json::json!({"path": root.join("written"), "content": "replacement"})
+                    .to_string(),
+                TurnContext {
+                    session_id: legacy.clone(),
+                    grants: reopened.grants(&legacy, false).unwrap(),
+                    ..Default::default()
+                },
+                &replacement,
+            )
+            .await;
+        assert!(written.ok, "{}", written.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("written")).unwrap(),
+            "replacement"
+        );
+
+        reopened
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: "legacy-codex".to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "older".to_owned(),
+                    role: SessionRole::Code as i32,
+                    project: "arc".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let old_sources = reopened
+            .sources("legacy-codex", false, &changed_default)
+            .unwrap();
+        assert!(old_sources.contains(&ToolSource::Patch));
+        assert!(!old_sources.contains(&ToolSource::Replacement));
     }
 }

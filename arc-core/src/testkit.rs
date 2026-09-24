@@ -137,6 +137,7 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
         compact_at: None,
         context_window: None,
         counsel: false,
+        editing: crate::tool::Editing::Replacement,
     }
 }
 
@@ -149,6 +150,7 @@ fn with_test_compaction(engine: Engine, provider: &Arc<ScriptedProvider>) -> Eng
                 provider: provider.name().to_owned(),
                 model: "test-model".to_owned(),
                 thinking: Thinking::Default,
+                editing: crate::tool::Editing::Replacement,
             }],
         )]))
         .with_compaction_runners(vec![(

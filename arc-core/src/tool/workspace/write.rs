@@ -45,7 +45,7 @@ impl Tool for Write {
     }
 
     fn source(&self) -> ToolSource {
-        ToolSource::Workspace
+        ToolSource::Replacement
     }
 
     fn execute(
@@ -411,7 +411,7 @@ mod tests {
                 "write",
                 request.clone(),
                 ctx("s-1", dir.path(), Mode::ReadWrite),
-                &[ToolSource::Workspace],
+                &[ToolSource::Replacement],
             )
             .await;
         assert!(present.ok, "{}", present.content);
