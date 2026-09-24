@@ -2231,27 +2231,8 @@ impl Engine {
         }
         let original_rows =
             self.with_store(|store| store.projection().original_lineage_rows(session_id))?;
-        let users_words: Vec<&str> = original_rows
-            .iter()
-            .filter(|(seq, _)| *seq <= through_seq)
-            .filter_map(|(_, row)| match row {
-                MessageRow::Message {
-                    role,
-                    content,
-                    source,
-                    ..
-                } if *role == Role::User as i32 && *source == Source::User as i32 => {
-                    Some(content.as_str())
-                }
-                _ => None,
-            })
-            .collect();
+        let users_words = recent_user_words(&original_rows, through_seq);
         let preserved_bytes = render_compaction_summary("", &users_words).len();
-        if preserved_bytes >= MAX_COMPACTION_SUMMARY_BYTES {
-            return Err(Error::CompactionFailed {
-                reason: "verbatim user messages exceed the 32 KiB summary cap".to_owned(),
-            });
-        }
 
         let choice = self
             .current_choice(SessionRole::Archivist)?
@@ -2271,7 +2252,7 @@ impl Engine {
             model: compact_runner.model.clone(),
             role: compact_runner.role,
             thinking: compact_runner.thinking,
-            system: Some(COMPACTION_PROMPT_V1.to_owned()),
+            system: Some(COMPACTION_PROMPT_V3.to_owned()),
             messages: rebuild_transcript(&prefix),
             tools: Vec::new(),
             seed: None,
@@ -2289,9 +2270,16 @@ impl Engine {
             })?;
         span.record("input_tokens", usage.input_tokens);
         span.record("output_tokens", usage.output_tokens);
+        tracing::info!(draft_bytes = model_text.len(), "compaction draft received");
 
         let mut summary = render_compaction_summary(&model_text, &users_words);
-        if let Err(reason) = validate_compaction_summary(&summary) {
+        if let Err(reason) = validate_compaction_summary(&model_text, &summary) {
+            if model_text.trim().is_empty() {
+                span.record("outcome", "empty_draft");
+                return Err(Error::CompactionFailed {
+                    reason: reason.to_owned(),
+                });
+            }
             let mut draft_end = model_text.len().min(MAX_COMPACTION_SUMMARY_BYTES);
             while !model_text.is_char_boundary(draft_end) {
                 draft_end -= 1;
@@ -2300,7 +2288,7 @@ impl Engine {
                 model: compact_runner.model.clone(),
                 role: compact_runner.role,
                 thinking: compact_runner.thinking,
-                system: Some(COMPACTION_REPAIR_PROMPT_V1.to_owned()),
+                system: Some(COMPACTION_REPAIR_PROMPT_V2.to_owned()),
                 messages: vec![Message::Text {
                     role: Role::User,
                     content: format!(
@@ -2325,8 +2313,12 @@ impl Engine {
                     tracing::warn!(session_id, %reason, "compaction repair failed");
                     Error::CompactionFailed { reason }
                 })?;
+            tracing::info!(
+                repair_bytes = model_text.len(),
+                "compaction repair received"
+            );
             summary = render_compaction_summary(&model_text, &users_words);
-            validate_compaction_summary(&summary).map_err(|reason| {
+            validate_compaction_summary(&model_text, &summary).map_err(|reason| {
                 span.record("outcome", "invalid_repair");
                 tracing::warn!(session_id, reason, "compaction repair failed validation");
                 Error::CompactionFailed {
@@ -2494,48 +2486,58 @@ impl Engine {
     }
 }
 
-pub const COMPACTION_PROMPT_VERSION: &str = "v1";
+pub const COMPACTION_PROMPT_VERSION: &str = "v3";
 
-pub const COMPACTION_PROMPT_V1: &str = r#"You are ARC's compaction pass. A conversation has outgrown its context
+pub const COMPACTION_PROMPT_V3: &str = r#"You are ARC's compaction pass. A conversation has outgrown its context
 window; your summary replaces everything before it, and the rest of the
 conversation continues after it. Whatever you leave out is gone.
 
-Read the conversation that follows and answer with a summary under
-exactly these headings, in this order:
+Summarize the user's goal, what has been completed, what remains open,
+and the facts needed to continue: decisions, corrections, file paths,
+commands, and errors. Include older forks. Do not assume any user message
+is copied: ARC may append up to two recent messages verbatim when they fit.
+Summarize tool output; never quote it. Answer directly in under 24 KiB.
+Organize the summary as you see fit."#;
 
-Goal
-One or two sentences: what the user is trying to get done.
+const COMPACTION_REPAIR_PROMPT_V2: &str = "Shorten this compaction draft to fit \
+the byte limit supplied with it. Preserve decisions, corrections, and open \
+work. Return only the summary; ARC may append a recent user tail separately.";
 
-Done so far
-What has actually been finished, as concrete claims, not narration of
-the conversation.
-
-Open
-What is still unresolved: outstanding questions, next steps, anything
-started but not closed.
-
-Facts to keep
-File paths, commands, decisions, and errors seen, the specifics a
-continuation needs and would otherwise have to rediscover.
-
-Summarize tool output; never quote it. Do not write a section
-for the user's own words, is appended separately, exactly as
-written. Start your reply with the "Goal" heading and nothing before it."#;
-
-const COMPACTION_REPAIR_PROMPT_V1: &str = "Repair this compaction draft. Return only the \
-summary under the headings Goal, Done so far, Open, Facts to keep, in that order. \
-Start with Goal. Keep the entire reply below 24 KiB. Do not add the user's words; \
-ARC appends them separately. Preserve concrete decisions and open work.";
-
-const COMPACTION_GOAL_HEADING: &str = "Goal";
-
-const USERS_WORDS_HEADING: &str = "User's words";
+const USERS_WORDS_HEADING: &str = "Recent user's words";
 
 const MAX_COMPACTION_SUMMARY_BYTES: usize = 32 * 1024;
+const MAX_COPIED_USER_BYTES: usize = 8 * 1024;
 
-/// Appends the code-owned `User's words` section: every user-authored
-/// message in the compacted range, verbatim, in the order it was sent. The
-/// model never sees or writes this part (§4.4).
+fn recent_user_words(rows: &[(u64, MessageRow)], through_seq: u64) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut bytes = 0;
+    for (_, row) in rows.iter().filter(|(seq, _)| *seq <= through_seq).rev() {
+        let MessageRow::Message {
+            role,
+            content,
+            source,
+            ..
+        } = row
+        else {
+            continue;
+        };
+        if *role != Role::User as i32 || *source != Source::User as i32 {
+            continue;
+        }
+        let next = content.len() + 2;
+        if bytes + next > MAX_COPIED_USER_BYTES {
+            break;
+        }
+        words.push(content.as_str());
+        bytes += next;
+        if words.len() == 2 {
+            break;
+        }
+    }
+    words.reverse();
+    words
+}
+
 fn render_compaction_summary(model_text: &str, users_words: &[&str]) -> String {
     let mut summary = model_text.trim().to_owned();
     summary.push_str("\n\n");
@@ -2553,12 +2555,9 @@ fn render_compaction_summary(model_text: &str, users_words: &[&str]) -> String {
     summary
 }
 
-fn validate_compaction_summary(summary: &str) -> Result<(), &'static str> {
-    if summary.trim().is_empty() {
-        return Err("empty");
-    }
-    if !summary.trim_start().starts_with(COMPACTION_GOAL_HEADING) {
-        return Err("missing the Goal heading");
+fn validate_compaction_summary(model_text: &str, summary: &str) -> Result<(), &'static str> {
+    if model_text.trim().is_empty() {
+        return Err("empty model summary");
     }
     if summary.len() > MAX_COMPACTION_SUMMARY_BYTES {
         return Err("exceeds the 32 KiB cap");
@@ -2878,11 +2877,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        COMPACTION_PROMPT_V1, ContinuedJob, DispatchedJob, Engine, EngineEvent, Error,
+        COMPACTION_PROMPT_V3, ContinuedJob, DispatchedJob, Engine, EngineEvent, Error,
         MAX_TOOL_STEPS, MemoryCounters, ProjectSpec, Runner, branch_marked,
     };
     use crate::log::Log;
-    use crate::projection::Projection;
+    use crate::projection::{MessageRow, Projection};
     use crate::provider::{
         CompletionDelta, Error as ProviderError, Message, Provider, Stop, Thinking, ToolCall, Usage,
     };
@@ -8921,6 +8920,115 @@ mod tests {
         })
     }
 
+    #[test]
+    fn copied_user_tail_is_contiguous_and_bounded() {
+        fn user(content: String) -> MessageRow {
+            MessageRow::Message {
+                role: Role::User as i32,
+                content,
+                partial: false,
+                turn_id: String::new(),
+                source: Source::User as i32,
+                input_tokens: 0,
+                output_tokens: 0,
+                elapsed_ms: 0,
+                grounding_json: String::new(),
+                attachments: Vec::new(),
+            }
+        }
+        let unicode = "🙂".repeat(1000);
+        let rows = vec![
+            (1, user("old".to_owned())),
+            (2, user("x".repeat(super::MAX_COPIED_USER_BYTES))),
+            (3, user("recent".to_owned())),
+            (4, user(unicode.clone())),
+            (5, user("after cutoff".to_owned())),
+        ];
+        assert_eq!(
+            super::recent_user_words(&rows, 4),
+            ["recent", unicode.as_str()],
+        );
+        assert_eq!(super::recent_user_words(&rows, 3), ["recent"]);
+        assert!(super::recent_user_words(&rows, 2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fork_with_oversized_user_history_compacts_and_replays() {
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("root 1"),
+            done_reply("root 2"),
+            done_reply("root 3"),
+            done_reply("root 4"),
+            done_reply("branch 1"),
+            done_reply("branch 2"),
+            done_reply(
+                "Goal\nOlder requests and decisions summarized.\nDone so far\nOpen\nFacts to keep",
+            ),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let mut root = String::new();
+        let mut fork_point = 0;
+        for index in 0..4 {
+            let (tx, _rx) = channel();
+            let reply = engine
+                .send_message(
+                    &run,
+                    (!root.is_empty()).then_some(root.as_str()),
+                    &format!("old request {index}: {}", "x".repeat(24 * 1024)),
+                    tx,
+                )
+                .await
+                .expect("root turn");
+            root = reply.session_id;
+            fork_point = reply.seq;
+        }
+        let branch = engine.fork_session(&root, fork_point).expect("fork");
+        for message in ["keep this", "and this"] {
+            let (tx, _rx) = channel();
+            engine
+                .send_message(&run, Some(&branch), message, tx)
+                .await
+                .expect("branch turn");
+        }
+        assert!(
+            engine.compact(&run, &branch, "manual").await.unwrap(),
+            "large inherited user history no longer blocks compaction"
+        );
+        assert_eq!(provider.requests().len(), 7);
+
+        let logged = replay_events(dir.path());
+        let compacted = logged
+            .iter()
+            .find_map(|event| match &event.payload {
+                Some(arc_proto::v1::event::Payload::Session(session)) => {
+                    match session.event.as_ref() {
+                        Some(session_event::Event::SessionCompacted(compacted)) => Some(compacted),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("compaction event");
+        assert_eq!(compacted.prompt_version, super::COMPACTION_PROMPT_VERSION);
+        assert!(compacted.summary.contains("keep this"));
+        assert!(
+            !compacted.summary.contains("old request 0:"),
+            "older user text is summarized rather than copied"
+        );
+        assert!(compacted.summary.len() <= super::MAX_COMPACTION_SUMMARY_BYTES);
+        let mut replay = Projection::in_memory().expect("projection");
+        for event in logged {
+            replay.apply(&event).expect("replay");
+        }
+        assert_eq!(
+            replay.lineage_messages(&branch).unwrap(),
+            engine
+                .with_store(|store| store.projection().lineage_messages(&branch))
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn a_step_at_the_limit_compacts_and_the_next_request_carries_the_summary() {
         const LIMIT: u32 = 42;
@@ -8937,7 +9045,7 @@ mod tests {
                     stop: Stop::ToolCalls,
                 }),
             ],
-            done_reply("Goal\nDone so far\nOpen\nFacts to keep"),
+            done_reply("Continue with the pending implementation."),
             done_reply("final answer"),
         ]);
         let dir = TempDir::new().expect("temp dir");
@@ -8979,7 +9087,7 @@ mod tests {
         let compaction_request = &requests[3];
         assert_eq!(
             compaction_request.system.as_deref(),
-            Some(COMPACTION_PROMPT_V1)
+            Some(COMPACTION_PROMPT_V3)
         );
         assert!(
             compaction_request.tools.is_empty(),
@@ -8989,7 +9097,9 @@ mod tests {
         let logged = conversation_log(dir.path());
         let compacted = compacted_event(&logged).expect("a SessionCompacted event landed");
         assert!(
-            compacted.summary.starts_with("Goal"),
+            compacted
+                .summary
+                .starts_with("Continue with the pending implementation."),
             "{}",
             compacted.summary
         );
@@ -9001,7 +9111,10 @@ mod tests {
 
         let (role, content) = turn(&requests[4].messages[0]);
         assert_eq!(role, Role::User);
-        assert!(content.starts_with("Goal"), "{content}");
+        assert!(
+            content.starts_with("Continue with the pending implementation."),
+            "{content}"
+        );
     }
 
     #[tokio::test]
@@ -9183,8 +9296,8 @@ mod tests {
                     stop: Stop::ToolCalls,
                 }),
             ],
-            done_reply("not a heading at all"),
-            done_reply("still not a heading"),
+            done_reply(&"x".repeat(super::MAX_COMPACTION_SUMMARY_BYTES + 1)),
+            done_reply(&"x".repeat(super::MAX_COMPACTION_SUMMARY_BYTES + 1)),
         ]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, _) =
@@ -9215,16 +9328,49 @@ mod tests {
         drain(&mut rx);
 
         assert!(matches!(error, Error::CompactionFailed { .. }));
-        assert_eq!(provider.requests().len(), 5);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
         assert_eq!(
-            provider.requests()[4].system.as_deref(),
-            Some(super::COMPACTION_REPAIR_PROMPT_V1)
+            requests[4].system.as_deref(),
+            Some(super::COMPACTION_REPAIR_PROMPT_V2)
         );
-        assert_eq!(provider.requests()[4].messages.len(), 1);
+        assert_eq!(requests[4].messages.len(), 1);
+        let (_, repair_input) = turn(&requests[4].messages[0]);
+        assert!(
+            repair_input.len() < super::MAX_COMPACTION_SUMMARY_BYTES + 256,
+            "the repair request never repeats the history or an unbounded draft"
+        );
         assert!(
             compacted_event(&conversation_log(dir.path())).is_none(),
             "an invalid summary writes nothing to the log"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_summary_fails_without_a_repair_call() {
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("first"),
+            done_reply("second"),
+            done_reply(" \n "),
+        ]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, run) = engine(&provider, &dir);
+        let (tx, _rx) = channel();
+        let first = engine.send_message(&run, None, "one", tx).await.unwrap();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&first.session_id), "two", tx)
+            .await
+            .unwrap();
+        let error = engine
+            .compact(&run, &first.session_id, "manual")
+            .await
+            .expect_err("a copied user tail is not a model summary");
+        assert!(
+            matches!(error, Error::CompactionFailed { ref reason } if reason == "empty model summary")
+        );
+        assert_eq!(provider.requests().len(), 3, "no repair without a draft");
+        assert!(compacted_event(&conversation_log(dir.path())).is_none());
     }
 
     #[tokio::test]
@@ -9246,8 +9392,8 @@ mod tests {
             done_reply("final answer"),
         ]);
         let archivist = ScriptedProvider::scripted(vec![
-            done_reply("missing heading"),
-            done_reply("Goal\nKeep working\nDone so far\nOpen\nFacts to keep"),
+            done_reply(&"x".repeat(super::MAX_COMPACTION_SUMMARY_BYTES + 1)),
+            done_reply("Keep working on the open tasks."),
         ]);
         let unused = ScriptedProvider::scripted(vec![]);
         let dir = TempDir::new().expect("temp dir");
