@@ -81,6 +81,7 @@ pub struct Engine {
     projects: BTreeMap<String, ProjectSpec>,
     // per role, in config order: the first is the default when nothing is selected
     role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
+    compaction_runners: Vec<(String, Runner)>,
     // one guard per session, held for a whole turn: turns in the same
     // session serialize, turns in different sessions run concurrently
     turns: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -205,6 +206,9 @@ pub enum Error {
     #[error("the model produced no reply")]
     EmptyReply,
 
+    #[error("compaction failed: {reason}; no summary was saved")]
+    CompactionFailed { reason: String },
+
     #[error("the turn was cancelled before it produced anything durable")]
     Cancelled,
 
@@ -251,6 +255,7 @@ impl Engine {
             registry,
             projects: BTreeMap::new(),
             role_choices: BTreeMap::new(),
+            compaction_runners: Vec::new(),
             turns: StdMutex::new(HashMap::new()),
             live_turns: StdMutex::new(HashMap::new()),
             notifier: None,
@@ -363,6 +368,12 @@ impl Engine {
         role_choices: BTreeMap<SessionRole, Vec<ModelChoice>>,
     ) -> Self {
         self.role_choices = role_choices;
+        self
+    }
+
+    #[must_use]
+    pub fn with_compaction_runners(mut self, runners: Vec<(String, Runner)>) -> Self {
+        self.compaction_runners = runners;
         self
     }
 
@@ -2185,6 +2196,7 @@ impl Engine {
             session_id,
             turn_id = %turn_id,
             through_seq = tracing::field::Empty,
+            model = tracing::field::Empty,
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -2234,11 +2246,31 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        let preserved_bytes = render_compaction_summary("", &users_words).len();
+        if preserved_bytes >= MAX_COMPACTION_SUMMARY_BYTES {
+            return Err(Error::CompactionFailed {
+                reason: "verbatim user messages exceed the 32 KiB summary cap".to_owned(),
+            });
+        }
 
+        let choice = self
+            .current_choice(SessionRole::Archivist)?
+            .ok_or_else(|| Error::NoRunner {
+                role: "archivist".to_owned(),
+            })?;
+        let compact_runner = self
+            .compaction_runners
+            .iter()
+            .find(|(name, _)| *name == choice.name)
+            .map(|(_, runner)| runner)
+            .ok_or_else(|| Error::NoRunner {
+                role: "archivist compaction".to_owned(),
+            })?;
+        span.record("model", &compact_runner.model);
         let request = CompletionRequest {
-            model: runner.model.clone(),
-            role: runner.role,
-            thinking: runner.thinking,
+            model: compact_runner.model.clone(),
+            role: compact_runner.role,
+            thinking: compact_runner.thinking,
             system: Some(COMPACTION_PROMPT_V1.to_owned()),
             messages: rebuild_transcript(&prefix),
             tools: Vec::new(),
@@ -2247,30 +2279,60 @@ impl Engine {
             cache_key: Some(session_id.to_owned()),
         };
 
-        let (model_text, usage) = match self.compaction_completion(runner, request).await {
-            Ok(pair) => pair,
-            Err(reason) => {
-                tracing::warn!(
-                    session_id,
-                    reason = %reason,
-                    "compaction call failed; the turn continues uncompacted"
-                );
+        let (mut model_text, usage) = self
+            .compaction_completion(compact_runner, request)
+            .await
+            .map_err(|reason| {
                 span.record("outcome", "provider_error");
-                return Ok(false);
-            }
-        };
+                tracing::warn!(session_id, %reason, "compaction call failed");
+                Error::CompactionFailed { reason }
+            })?;
         span.record("input_tokens", usage.input_tokens);
         span.record("output_tokens", usage.output_tokens);
 
-        let summary = render_compaction_summary(&model_text, &users_words);
+        let mut summary = render_compaction_summary(&model_text, &users_words);
         if let Err(reason) = validate_compaction_summary(&summary) {
-            tracing::warn!(
-                session_id,
-                reason,
-                "compaction summary failed validation; nothing appended"
-            );
-            span.record("outcome", "invalid_summary");
-            return Ok(false);
+            let mut draft_end = model_text.len().min(MAX_COMPACTION_SUMMARY_BYTES);
+            while !model_text.is_char_boundary(draft_end) {
+                draft_end -= 1;
+            }
+            let repair = CompletionRequest {
+                model: compact_runner.model.clone(),
+                role: compact_runner.role,
+                thinking: compact_runner.thinking,
+                system: Some(COMPACTION_REPAIR_PROMPT_V1.to_owned()),
+                messages: vec![Message::Text {
+                    role: Role::User,
+                    content: format!(
+                        "Validation error: {reason}\n\
+                         Maximum summary bytes before ARC appends user messages: {}\n\n\
+                         Draft:\n{}",
+                        MAX_COMPACTION_SUMMARY_BYTES - preserved_bytes,
+                        &model_text[..draft_end]
+                    ),
+                    reasoning: None,
+                }],
+                tools: Vec::new(),
+                seed: None,
+                web: false,
+                cache_key: Some(session_id.to_owned()),
+            };
+            (model_text, _) = self
+                .compaction_completion(compact_runner, repair)
+                .await
+                .map_err(|reason| {
+                    span.record("outcome", "repair_error");
+                    tracing::warn!(session_id, %reason, "compaction repair failed");
+                    Error::CompactionFailed { reason }
+                })?;
+            summary = render_compaction_summary(&model_text, &users_words);
+            validate_compaction_summary(&summary).map_err(|reason| {
+                span.record("outcome", "invalid_repair");
+                tracing::warn!(session_id, reason, "compaction repair failed validation");
+                Error::CompactionFailed {
+                    reason: reason.to_owned(),
+                }
+            })?;
         }
 
         self.record(
@@ -2280,7 +2342,7 @@ impl Engine {
                 through_seq,
                 summary,
                 prompt_version: COMPACTION_PROMPT_VERSION.to_owned(),
-                model: runner.model.clone(),
+                model: compact_runner.model.clone(),
             }),
         )?;
         span.record("outcome", "compacted");
@@ -2459,6 +2521,11 @@ continuation needs and would otherwise have to rediscover.
 Summarize tool output; never quote it. Do not write a section
 for the user's own words, is appended separately, exactly as
 written. Start your reply with the "Goal" heading and nothing before it."#;
+
+const COMPACTION_REPAIR_PROMPT_V1: &str = "Repair this compaction draft. Return only the \
+summary under the headings Goal, Done so far, Open, Facts to keep, in that order. \
+Start with Goal. Keep the entire reply below 24 KiB. Do not add the user's words; \
+ARC appends them separately. Preserve concrete decisions and open work.";
 
 const COMPACTION_GOAL_HEADING: &str = "Goal";
 
@@ -9101,7 +9168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_summary_missing_the_goal_heading_appends_nothing_and_the_turn_finishes_normally() {
+    async fn a_failed_compaction_repairs_once_then_surfaces_an_error() {
         const LIMIT: u32 = 42;
         let provider = ScriptedProvider::scripted(vec![
             done_reply("reply1"),
@@ -9117,7 +9184,7 @@ mod tests {
                 }),
             ],
             done_reply("not a heading at all"),
-            done_reply("final answer"),
+            done_reply("still not a heading"),
         ]);
         let dir = TempDir::new().expect("temp dir");
         let (engine, _) =
@@ -9141,16 +9208,117 @@ mod tests {
             .await
             .expect("turn 2");
         let (tx, mut rx) = channel();
-        let reply = engine
+        let error = engine
             .send_message(&run, Some(&session_id), "third question", tx)
             .await
-            .expect("the turn finishes normally, uncompacted");
+            .expect_err("the turn stops rather than retrying an expensive prefix");
         drain(&mut rx);
 
-        assert!(!reply.partial);
+        assert!(matches!(error, Error::CompactionFailed { .. }));
+        assert_eq!(provider.requests().len(), 5);
+        assert_eq!(
+            provider.requests()[4].system.as_deref(),
+            Some(super::COMPACTION_REPAIR_PROMPT_V1)
+        );
+        assert_eq!(provider.requests()[4].messages.len(), 1);
         assert!(
             compacted_event(&conversation_log(dir.path())).is_none(),
             "an invalid summary writes nothing to the log"
         );
+    }
+
+    #[tokio::test]
+    async fn archivist_repairs_compaction_without_changing_the_session_model() {
+        const LIMIT: u32 = 42;
+        let provider = ScriptedProvider::scripted(vec![
+            done_reply("reply1"),
+            done_reply("reply2"),
+            vec![
+                Ok(call("c1", 0, "lookup", "{}")),
+                Ok(CompletionDelta::Done {
+                    usage: Usage {
+                        input_tokens: LIMIT,
+                        output_tokens: 5,
+                    },
+                    stop: Stop::ToolCalls,
+                }),
+            ],
+            done_reply("final answer"),
+        ]);
+        let archivist = ScriptedProvider::scripted(vec![
+            done_reply("missing heading"),
+            done_reply("Goal\nKeep working\nDone so far\nOpen\nFacts to keep"),
+        ]);
+        let unused = ScriptedProvider::scripted(vec![]);
+        let dir = TempDir::new().expect("temp dir");
+        let (engine, _) =
+            engine_with_tools(&provider, &dir, tools(&[("lookup", "found it", true)]));
+        let engine = engine
+            .with_role_choices(BTreeMap::from([(
+                SessionRole::Archivist,
+                vec![
+                    super::ModelChoice {
+                        name: "unused".to_owned(),
+                        provider: unused.name().to_owned(),
+                        model: "unused-model".to_owned(),
+                        thinking: Thinking::Default,
+                    },
+                    super::ModelChoice {
+                        name: "cheap".to_owned(),
+                        provider: archivist.name().to_owned(),
+                        model: "archivist-model".to_owned(),
+                        thinking: Thinking::Low,
+                    },
+                ],
+            )]))
+            .with_compaction_runners(vec![
+                (
+                    "unused".to_owned(),
+                    runner_with_role(&unused, SessionRole::Archivist),
+                ),
+                (
+                    "cheap".to_owned(),
+                    Runner {
+                        model: "archivist-model".to_owned(),
+                        thinking: Thinking::Low,
+                        ..runner_with_role(&archivist, SessionRole::Archivist)
+                    },
+                ),
+            ]);
+        engine
+            .select_model(SessionRole::Archivist, "cheap")
+            .expect("selected archivist is used at compaction time");
+        let run = Runner {
+            compact_at: Some(LIMIT),
+            ..runner_with_role(&provider, SessionRole::Executor)
+        };
+        let (tx, _rx) = channel();
+        let first = engine.send_message(&run, None, "hi", tx).await.unwrap();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&first.session_id), "more", tx)
+            .await
+            .unwrap();
+        let (tx, _rx) = channel();
+        engine
+            .send_message(&run, Some(&first.session_id), "third", tx)
+            .await
+            .expect("repair succeeded");
+
+        assert_eq!(provider.requests().len(), 4, "only turns use executor");
+        assert!(unused.requests().is_empty());
+        assert_eq!(archivist.requests().len(), 2);
+        let repair = &archivist.requests()[1];
+        assert_eq!(repair.role, SessionRole::Archivist);
+        assert_eq!(repair.model, "archivist-model");
+        assert_eq!(repair.messages.len(), 1, "repair does not resend history");
+        let compacted = compacted_event(&conversation_log(dir.path()))
+            .expect("repaired compaction is durable")
+            .clone();
+        assert_eq!(compacted.model, "archivist-model");
+        assert!(compacted.summary.contains("hi"));
+        let (provider_name, model) = engine.session_identity(&first.session_id).unwrap().unwrap();
+        assert_eq!(provider_name, provider.name());
+        assert_eq!(model, "test-model");
     }
 }

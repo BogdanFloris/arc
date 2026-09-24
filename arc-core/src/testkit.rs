@@ -18,7 +18,7 @@ use crate::provider::{
     CompletionDelta, CompletionRequest, CompletionStream, Error as ProviderError, Message,
     Provider, Stop, Thinking, ToolCall, ToolDefinition, Usage,
 };
-use crate::session::{Engine, EngineEvent, Runner};
+use crate::session::{Engine, EngineEvent, ModelChoice, Runner};
 use crate::store::Store;
 use crate::tool::{Registry, Tool, ToolReply, ToolSource, TurnContext};
 
@@ -140,6 +140,23 @@ pub fn runner_with_role(provider: &Arc<ScriptedProvider>, role: SessionRole) -> 
     }
 }
 
+fn with_test_compaction(engine: Engine, provider: &Arc<ScriptedProvider>) -> Engine {
+    engine
+        .with_role_choices(BTreeMap::from([(
+            SessionRole::Archivist,
+            vec![ModelChoice {
+                name: "test-archivist".to_owned(),
+                provider: provider.name().to_owned(),
+                model: "test-model".to_owned(),
+                thinking: Thinking::Default,
+            }],
+        )]))
+        .with_compaction_runners(vec![(
+            "test-archivist".to_owned(),
+            runner_with_role(provider, SessionRole::Archivist),
+        )])
+}
+
 pub fn engine(provider: &Arc<ScriptedProvider>, dir: &TempDir) -> (Engine, Runner) {
     engine_with_tools(provider, dir, Registry::new(512))
 }
@@ -152,7 +169,10 @@ pub fn engine_with_role(
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::in_memory().expect("open projection");
     (
-        Engine::new(Store::new(log, projection), Registry::new(512)),
+        with_test_compaction(
+            Engine::new(Store::new(log, projection), Registry::new(512)),
+            provider,
+        ),
         runner_with_role(provider, role),
     )
 }
@@ -177,7 +197,7 @@ pub fn engine_with_tools(
     let log = Log::open(dir.path()).expect("open log");
     let projection = Projection::in_memory().expect("open projection");
     (
-        Engine::new(Store::new(log, projection), registry),
+        with_test_compaction(Engine::new(Store::new(log, projection), registry), provider),
         runner(provider),
     )
 }
@@ -191,7 +211,7 @@ pub fn engine_with_tools_at(
     let mut projection = Projection::open(&dir.path().join("index.db")).expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     (
-        Engine::new(Store::new(log, projection), registry),
+        with_test_compaction(Engine::new(Store::new(log, projection), registry), provider),
         runner(provider),
     )
 }
@@ -205,7 +225,7 @@ pub fn reopened_engine(
     let mut projection = Projection::in_memory().expect("open projection");
     crate::projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
     (
-        Engine::new(Store::new(log, projection), registry),
+        with_test_compaction(Engine::new(Store::new(log, projection), registry), provider),
         runner(provider),
     )
 }

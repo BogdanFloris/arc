@@ -39,14 +39,19 @@ These roles are stable. The next section records the current model for each one.
 The live configuration is `~/.config/arc/arc.toml`. Model selections recorded
 in the log override each role's first choice for new sessions.
 
-As configured on 2026-09-06:
+As configured on 2026-09-24:
 
 | Role | Default preset | Access |
 | --- | --- | --- |
 | chat | astra | Codex |
+| code | sol | Codex |
 | executor | sol | Codex |
 | counsel | fable | Claude CLI, read-only |
-| archivist | deepseek-flash | OpenCode Go |
+| archivist | luna | Codex |
+
+Compaction uses the selected archivist model, without changing the session's
+pinned model. A rejected summary gets one small repair call; failure is shown
+to the client, not retried against the session model.
 
 The llama.cpp settings remain available, but no configured role uses them.
 The daemon therefore does not start the sidecar.

@@ -161,9 +161,14 @@ impl Daemon {
             .map(|(name, project)| (name.clone(), project_spec(project)))
             .collect();
         let (notifier, _receiver) = broadcast::channel(NOTIFICATION_CAPACITY);
+        let compaction_runners = roles
+            .menus()
+            .remove(&arc_proto::v1::SessionRole::Archivist)
+            .expect("archivist role is configured");
         let engine = Engine::new(store, registry)
             .with_projects(projects)
             .with_role_choices(roles.choices())
+            .with_compaction_runners(compaction_runners)
             .with_notifier(notifier.clone());
 
         Ok(Self {

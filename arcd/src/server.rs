@@ -889,6 +889,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::AttachmentsUnsupported { .. } => "unsupported_attachment",
         SessionError::NoRunner { .. } => "no_runner",
         SessionError::EmptyReply => "empty_reply",
+        SessionError::CompactionFailed { .. } => "compaction_failed",
         SessionError::Cancelled => "cancelled",
         SessionError::RoleMismatch { .. } => "role_mismatch",
         SessionError::ModelMismatch { .. } => "model_mismatch",
