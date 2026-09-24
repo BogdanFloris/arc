@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_into_a_read_only_grant_is_the_gates_refusal() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
         fs::write(dir.path().join("f.txt"), "x").expect("write");
         let ws = workspace();
         let tool = Write::new(ws);
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn writing_outside_all_grants_is_refused() {
         let dir = TempDir::new().expect("tmp");
-        let elsewhere = TempDir::new().expect("tmp2");
+        let elsewhere = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
         let ws = workspace();
         let tool = Write::new(ws);
 
@@ -312,6 +312,22 @@ mod tests {
 
         assert!(!reply.ok);
         assert!(reply.content.contains("outside"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_can_write_a_tmp_file() {
+        let project = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("project");
+        let scratch = TempDir::new().expect("tmp");
+        let path = scratch.path().join("notes.txt");
+        let reply = Write::new(workspace())
+            .execute(
+                write_args(&path, "scratch"),
+                ctx("s-1", project.path(), Mode::ReadOnly),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(path).unwrap(), "scratch");
     }
 
     #[tokio::test]

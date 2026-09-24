@@ -228,11 +228,11 @@ Coding is the first job kind, not a privileged one. Its loop is deliberately sma
 
 ### 4.2 Workspaces
 
-A session may be bound to a project: `sessions.project` plus a set of granted roots on disk. The project's own root is granted read-write. Anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. The binding scopes the workspace tools, and every path those tools resolve must sit under one of the grants.
+A session may be bound to a project: `sessions.project` plus a set of granted roots on disk. The project's own root is granted read-write. Anything else the session should reach — notes, dotfiles, a reference checkout — is a separate read-only grant. The binding scopes the workspace tools: every path they resolve must sit under a grant, except `/tmp`, which is always available read-write to bound sessions as scratch space.
 
 Grants list what is reachable. They are never a list of what is forbidden. A deny list fails open the first time an entry is forgotten; a grant list fails closed, so arcd's own state directory is unreachable because nobody granted it rather than because it was banned. This is the same argument as the model allow-list.
 
-Grants are session-scoped and durable. Replay has to be able to say what a tool call was allowed to see.
+Grants are session-scoped and durable. Replay has to be able to say what a tool call was allowed to see. The fixed `/tmp` exception is tool policy, not a session grant; it applies to existing sessions too. Read-only analyze jobs can write scratch files there but not in projects outside `/tmp`.
 
 **Projects are configuration and only a human writes them.** A session or a job names one; it never composes roots and modes of its own. A grant list fails closed because a person authored it, not because of its shape. A model that can write its own grants asks for whatever the task needs and gets it, which is a deny list with extra steps.
 
@@ -268,7 +268,7 @@ The web source is that rule's exception rather than a break from it. A session w
 
 The cost is a pin. A chat whose web access comes from its provider is tied to that provider for a capability, not merely for price and latency, and changing it costs a feature rather than a line of configuration. That is the trade, taken knowingly. It also imports the provider's attribution terms into the clients: a grounded answer generally carries a display obligation, which the text client can meet and an audio-only client cannot, so the voice work has to answer that before it does anything else with the web.
 
-**Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants — `..`, symlinks, and absolute paths outside them are the obvious cases. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in `resolve()`, not the caller, so every tool that touches a path goes through the same gate.
+**Confinement.** Every path resolves to canonical form and is accepted only if it sits under one of the session's grants or under `/tmp` — `..`, symlinks, and absolute paths outside them are the obvious cases. `/tmp` is always read-write; symlinks from it to elsewhere do not inherit that permission. `write` and `edit` additionally refuse a path whose grant is read-only, so a session can read notes it cannot change. The check lives in `resolve()`, not the caller, so every tool that touches a path goes through the same gate.
 
 **Edits are strict.** `edit` matches exactly one occurrence and refuses if the file changed since it was last read. A cheap model's most common failure is a plausible wrong edit; a strict tool turns that into a retryable error instead of silent damage. This is the highest-leverage rule in the section, because §6's economics depend on a cheap model doing the bulk of the work.
 

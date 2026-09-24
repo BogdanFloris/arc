@@ -820,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_only_root_an_escape_and_an_existing_add_target_are_refused() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
         let root = dir.path();
         fs::write(root.join("a.txt"), "a\n").expect("write");
         let ws = Arc::new(Workspace::new());

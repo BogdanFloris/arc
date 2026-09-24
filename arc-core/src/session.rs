@@ -804,7 +804,7 @@ impl Engine {
                      each message costs the job a full turn.",
                     provider::role_label(role),
                     match intent {
-                        Intent::Analyze => "analyze: read-only, it reports but cannot edit",
+                        Intent::Analyze => "analyze: project read-only, /tmp writable",
                         Intent::Implement => "implement: read-write",
                     }
                 ),
@@ -957,8 +957,9 @@ impl Engine {
                 let tail = if read_only {
                     format!(
                         "For follow-ups about anything this job read, continue_job \
-                         {child_session} keeps its context but stays read-only — a change \
-                         needs a fresh implement dispatch; a new dispatch starts from nothing."
+                         {child_session} keeps its context but its project stays read-only \
+                         (/tmp is writable) — a project change needs a fresh implement \
+                         dispatch; a new dispatch starts from nothing."
                     )
                 } else {
                     format!(
@@ -6627,7 +6628,7 @@ mod tests {
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
         std::fs::write(root.join("inside.txt"), "hi").expect("write");
-        let elsewhere = TempDir::new().expect("temp dir 2");
+        let elsewhere = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("temp dir outside /tmp");
         std::fs::write(elsewhere.path().join("outside.txt"), "nope").expect("write");
 
         let mut registry = Registry::new(512);
@@ -7389,7 +7390,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_analyze_dispatch_records_the_root_grant_read_only_but_still_allows_read() {
-        let dir = TempDir::new().expect("temp dir");
+        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("temp dir outside /tmp");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
         std::fs::write(root.join("f.txt"), b"x").expect("write f.txt");
@@ -7445,7 +7446,7 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("(analyze: read-only, it reports but cannot edit)"),
+                .contains("(analyze: project read-only, /tmp writable)"),
             "{}",
             result.content
         );
@@ -8276,8 +8277,9 @@ mod tests {
             content,
             format!(
                 "Job {child_id} finished.\nfound the bug\nFor follow-ups about anything this \
-                 job read, continue_job {child_id} keeps its context but stays read-only — a \
-                 change needs a fresh implement dispatch; a new dispatch starts from nothing."
+                 job read, continue_job {child_id} keeps its context but its project stays \
+                 read-only (/tmp is writable) — a project change needs a fresh implement \
+                 dispatch; a new dispatch starts from nothing."
             )
         );
     }

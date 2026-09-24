@@ -91,15 +91,19 @@ impl Grants {
             canonical_parent.join(file_name)
         };
 
-        let Some((_, mode)) = self
-            .roots
-            .iter()
-            .find(|(root, _)| canonical.starts_with(root))
-        else {
-            return Err("that path is outside the session's granted roots.".to_owned());
-        };
+        let mode = std::fs::canonicalize("/tmp")
+            .ok()
+            .filter(|tmp| canonical.starts_with(tmp))
+            .map(|_| Mode::ReadWrite)
+            .or_else(|| {
+                self.roots
+                    .iter()
+                    .find(|(root, _)| canonical.starts_with(root))
+                    .map(|(_, mode)| *mode)
+            })
+            .ok_or_else(|| "that path is outside the session's granted roots.".to_owned())?;
 
-        if access == Access::Write && *mode == Mode::ReadOnly {
+        if access == Access::Write && mode == Mode::ReadOnly {
             return Err(format!(
                 "{} is read-only in this session.",
                 canonical.display()
@@ -248,13 +252,17 @@ mod tests {
         root
     }
 
+    fn non_tmp_dir() -> TempDir {
+        TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("temp dir outside /tmp")
+    }
+
     fn grants(root: &std::path::Path, mode: Mode) -> Grants {
         Grants::new(vec![Grant::new(root, mode)]).expect("canonicalize grant")
     }
 
     #[test]
     fn a_dotdot_escape_is_refused() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         fs::write(dir.path().join("outside.txt"), b"secret").expect("write");
         let grants = grants(&root, Mode::ReadOnly);
@@ -270,7 +278,7 @@ mod tests {
     fn an_absolute_path_under_no_grant_is_refused() {
         let dir = TempDir::new().expect("tmp");
         let root = proj(&dir);
-        let elsewhere = TempDir::new().expect("tmp2");
+        let elsewhere = non_tmp_dir();
         fs::write(elsewhere.path().join("f.txt"), b"x").expect("write");
         let grants = grants(&root, Mode::ReadOnly);
 
@@ -283,7 +291,7 @@ mod tests {
 
     #[test]
     fn a_symlink_inside_the_root_pointing_outside_is_refused() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         let outside = dir.path().join("secret.txt");
         fs::write(&outside, b"secret").expect("write");
@@ -299,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_path_through_a_symlinked_directory_leading_outside_is_refused() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         let outside_dir = dir.path().join("outside_dir");
         fs::create_dir_all(&outside_dir).expect("mkdir");
@@ -316,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_sibling_directory_with_a_matching_prefix_is_refused() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         let evil = dir.path().join("proj-evil");
         fs::create_dir_all(&evil).expect("mkdir");
@@ -360,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_write_against_a_read_only_grant_is_refused_but_read_is_allowed() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         fs::write(root.join("f.txt"), b"x").expect("write");
         let grants = grants(&root, Mode::ReadOnly);
@@ -424,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_final_component_symlink_pointing_outside_is_refused_for_write() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = non_tmp_dir();
         let root = proj(&dir);
         let outside = dir.path().join("secret.txt");
         fs::write(&outside, b"secret").expect("write");
@@ -436,5 +444,56 @@ mod tests {
             .resolve(target.to_str().expect("utf8"), Access::Write)
             .unwrap_err();
         assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn recorded_read_only_grants_allow_tmp_without_changing_the_project() {
+        let project = non_tmp_dir();
+        let scratch = TempDir::new().expect("tmp");
+        let grants = Grants::from_recorded(vec![(
+            project.path().canonicalize().expect("canon"),
+            Mode::ReadOnly,
+        )]);
+
+        let scratch_file = scratch.path().join("new.txt");
+        assert_eq!(
+            grants
+                .resolve(scratch_file.to_str().unwrap(), Access::Write)
+                .expect("scratch is writable"),
+            scratch_file
+        );
+        let project_file = project.path().join("new.txt");
+        assert!(
+            grants
+                .resolve(project_file.to_str().unwrap(), Access::Write)
+                .unwrap_err()
+                .contains("read-only")
+        );
+    }
+
+    #[test]
+    fn tmp_symlinks_outside_tmp_do_not_gain_write_access() {
+        let project = non_tmp_dir();
+        let scratch = TempDir::new().expect("tmp");
+        let elsewhere = non_tmp_dir();
+        let file = elsewhere.path().join("file.txt");
+        fs::write(&file, "untouched").expect("write");
+        symlink(&file, scratch.path().join("link.txt")).expect("symlink");
+        symlink(elsewhere.path(), scratch.path().join("dir")).expect("symlink");
+        let grants = grants(project.path(), Mode::ReadWrite);
+
+        for path in [
+            scratch.path().join("link.txt"),
+            scratch.path().join("dir/new.txt"),
+        ] {
+            assert!(
+                grants
+                    .resolve(path.to_str().unwrap(), Access::Write)
+                    .unwrap_err()
+                    .contains("outside"),
+                "{}",
+                path.display()
+            );
+        }
     }
 }

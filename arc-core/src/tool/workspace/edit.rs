@@ -389,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn editing_in_a_read_only_grant_is_the_gates_refusal() {
-        let dir = TempDir::new().expect("tmp");
+        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
         let path = dir.path().join("f.txt");
         fs::write(&path, "hello world").expect("write");
         let ws = workspace();
