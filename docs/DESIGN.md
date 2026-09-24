@@ -4,6 +4,8 @@
 
 **Status:** v1, governs initial implementation. Amend this file before diverging from it.
 
+Editable overview: [ARC architecture](diagrams/arc-architecture.excalidraw). Open the file in Excalidraw; the text below remains authoritative.
+
 ---
 
 ## 1. What ARC is
