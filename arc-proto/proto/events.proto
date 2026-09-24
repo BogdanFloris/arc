@@ -57,6 +57,8 @@ message SessionCreated {
   string dispatched_by = 11;
   // the configured preset picked for this session; empty in older events
   string choice = 12;
+  // Empty legacy values use the pinned provider.
+  string editing = 13;
 }
 
 // A branch's standing, latest wins on replay: unmarked is scratch and never
