@@ -400,6 +400,8 @@ Memory access is tools, not silent RAG injection. The model calls:
 
 One pattern throughout: search cheap, read targeted. Lookups appear in traces and debug like any other tool call. Nothing enters context automatically except the identity file and the record index.
 
+Archive range reads are pages, not transcript dumps: at most 8 KiB of JSON and 20 messages per call. A continuation gives the next sequence and UTF-8 byte offset within that message; keep the original end sequence when resuming. Long messages split losslessly across pages. Search previews and bookends stay clipped. Tool guidance prefers a narrow range around the search anchor and stops retrieval once the question is answered.
+
 These five are the **builtin** source in §4.3's registry. Web and workspace tools use the same registry and events. Future expert and device tools must do the same when they are introduced.
 
 ## 6. Providers

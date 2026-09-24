@@ -22,7 +22,9 @@ const WINDOW_RADIUS: usize = 2;
 
 const BOOKEND_LEN: usize = 2;
 
-const MAX_RANGE_ROWS: usize = 50;
+const MAX_RANGE_ROWS: usize = 20;
+
+const MAX_READ_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,6 +40,9 @@ pub enum Error {
 
     #[error("archive index: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("invalid session read: {0}")]
+    Read(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +82,14 @@ pub(crate) struct ReadReply {
     pub messages: Vec<ProseMessage>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub clipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<ReadCursor>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReadCursor {
+    pub start_seq: i64,
+    pub start_offset: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,13 +259,20 @@ impl Archive {
     #[tracing::instrument(
         name = "archive.read",
         skip_all,
-        fields(session_id = %session_id, shape = "range", rows = tracing::field::Empty)
+        fields(
+            session_id = %session_id,
+            shape = "range",
+            rows = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            clipped = tracing::field::Empty,
+        )
     )]
     pub(crate) fn read_range(
         &self,
         session_id: &str,
         start_seq: i64,
         end_seq: i64,
+        start_offset: usize,
     ) -> Result<Option<ReadReply>, Error> {
         let conn = self.lock();
         if !session_exists(&conn, session_id)? {
@@ -273,18 +293,96 @@ impl Archive {
             ],
             prose_row,
         )?;
-        let mut messages = Vec::new();
+        let mut rows = Vec::new();
         for row in mapped {
-            messages.push(row?);
+            rows.push(row?);
         }
-        let clipped = messages.len() > MAX_RANGE_ROWS;
-        messages.truncate(MAX_RANGE_ROWS);
-        tracing::Span::current().record("rows", messages.len());
-        Ok(Some(ReadReply {
+        if start_offset != 0
+            && !rows.first().is_some_and(|row| {
+                row.seq == start_seq
+                    && start_offset < row.content.len()
+                    && row.content.is_char_boundary(start_offset)
+            })
+        {
+            return Err(Error::Read(
+                "start_offset must point inside the message at start_seq, on a UTF-8 boundary. \
+                 Use the next cursor from the previous page."
+                    .to_owned(),
+            ));
+        }
+        let mut reply = ReadReply {
             session_id: session_id.to_owned(),
-            messages,
-            clipped,
-        }))
+            messages: Vec::new(),
+            clipped: false,
+            next: None,
+        };
+        let mut rows = rows.into_iter().peekable();
+        while let Some(mut message) = rows.next() {
+            let offset = if message.seq == start_seq {
+                start_offset
+            } else {
+                0
+            };
+            let content = message.content.split_off(offset);
+            message.content.clear();
+            let seq = message.seq;
+            reply.messages.push(message);
+            reply.next = rows.peek().map(|row| ReadCursor {
+                start_seq: row.seq,
+                start_offset: 0,
+            });
+            reply.clipped = reply.next.is_some();
+            if content.len() <= MAX_READ_BYTES {
+                reply
+                    .messages
+                    .last_mut()
+                    .expect("current message")
+                    .content
+                    .clone_from(&content);
+                if read_reply_bytes(&reply) <= MAX_READ_BYTES {
+                    if reply.messages.len() == MAX_RANGE_ROWS {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            let mut low = 0;
+            let mut high = content.len().saturating_sub(1).min(MAX_READ_BYTES);
+            while !content.is_char_boundary(high) {
+                high -= 1;
+            }
+            while low < high {
+                let mut cut = low + (high - low).div_ceil(2);
+                while !content.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                set_read_fragment(&mut reply, &content, seq, offset, cut);
+                if read_reply_bytes(&reply) <= MAX_READ_BYTES {
+                    low = cut;
+                } else {
+                    high = cut - 1;
+                    while !content.is_char_boundary(high) {
+                        high -= 1;
+                    }
+                }
+            }
+            set_read_fragment(&mut reply, &content, seq, offset, low);
+            if low == 0 {
+                reply.messages.pop();
+                if reply.messages.is_empty() {
+                    return Err(Error::Read(
+                        "page metadata exceeds the read budget".to_owned(),
+                    ));
+                }
+            }
+            break;
+        }
+        let span = tracing::Span::current();
+        span.record("rows", reply.messages.len());
+        span.record("bytes", read_reply_bytes(&reply));
+        span.record("clipped", reply.clipped);
+        Ok(Some(reply))
     }
 
     #[tracing::instrument(
@@ -621,6 +719,21 @@ fn bookends(
         first.into_iter().map(clip_message).collect(),
         last.into_iter().map(clip_message).collect(),
     ))
+}
+
+fn read_reply_bytes(reply: &ReadReply) -> usize {
+    serde_json::to_vec(reply)
+        .expect("archive replies serialize")
+        .len()
+}
+
+fn set_read_fragment(reply: &mut ReadReply, content: &str, seq: i64, offset: usize, cut: usize) {
+    content[..cut].clone_into(&mut reply.messages.last_mut().expect("current message").content);
+    reply.clipped = true;
+    reply.next = Some(ReadCursor {
+        start_seq: seq,
+        start_offset: offset + cut,
+    });
 }
 
 fn clip_message(mut message: ProseMessage) -> ProseMessage {
@@ -1009,12 +1122,13 @@ mod tests {
         ]);
 
         let reply = archive
-            .read_range("s-01", 1, 3)
+            .read_range("s-01", 1, 3, 0)
             .expect("read")
             .expect("session exists");
 
         assert_eq!(reply.session_id, "s-01");
         assert!(!reply.clipped);
+        assert!(reply.next.is_none());
         let rows: Vec<(i64, &str, &str)> = reply
             .messages
             .iter()
@@ -1036,12 +1150,144 @@ mod tests {
         let (_dir, archive) = archive_over(events);
 
         let reply = archive
-            .read_range("s-01", 0, 1000)
+            .read_range("s-01", 0, 1000, 0)
             .expect("read")
             .expect("session exists");
 
-        assert_eq!(reply.messages.len(), 50);
+        assert_eq!(reply.messages.len(), super::MAX_RANGE_ROWS);
         assert!(reply.clipped);
+        let next = reply.next.expect("continuation");
+        let following = archive
+            .read_range("s-01", next.start_seq, 1000, next.start_offset)
+            .expect("read")
+            .expect("session exists");
+        assert!(following.messages[0].seq > reply.messages.last().expect("last").seq);
+        assert_eq!(following.messages[0].content, "message 20");
+    }
+
+    #[test]
+    fn read_pages_preserve_mixed_messages_and_stop_at_the_requested_end() {
+        let originals: Vec<String> = [
+            String::new(),
+            "a".repeat(7900),
+            "b".repeat(8000),
+            "🦀".repeat(2100),
+            "\"\\\n\u{0000}".repeat(2000),
+            "c".repeat(32 * 1024),
+            "last".to_owned(),
+        ]
+        .into_iter()
+        .cycle()
+        .take(28)
+        .collect();
+        let mut events = vec![created("s-01", "")];
+        for content in &originals {
+            events.push(tool_answered("s-01", "not prose"));
+            events.push(said("s-01", Role::Assistant, content));
+        }
+        let last_seq = i64::try_from(events.len() - 1).expect("small fixture");
+        events.push(said("s-01", Role::User, "outside the requested range"));
+        let (_dir, archive) = archive_over(events);
+        let mut cursor = super::ReadCursor {
+            start_seq: 0,
+            start_offset: 0,
+        };
+        let mut restored: Vec<super::ProseMessage> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let reply = archive
+                .read_range("s-01", cursor.start_seq, last_seq, cursor.start_offset)
+                .expect("read")
+                .expect("session exists");
+            assert!(super::read_reply_bytes(&reply) <= super::MAX_READ_BYTES);
+            assert!(reply.messages.len() <= super::MAX_RANGE_ROWS);
+            assert!(!reply.messages.is_empty());
+            for message in reply.messages {
+                assert_eq!(message.role, "assistant");
+                if let Some(last) = restored.last_mut().filter(|last| last.seq == message.seq) {
+                    last.content.push_str(&message.content);
+                } else {
+                    assert!(restored.last().is_none_or(|last| last.seq < message.seq));
+                    restored.push(message);
+                }
+            }
+            pages += 1;
+            assert!(pages < 100, "pagination terminates");
+            let Some(next) = reply.next else {
+                assert!(!reply.clipped);
+                break;
+            };
+            assert!(reply.clipped);
+            assert!(
+                (next.start_seq, next.start_offset) > (cursor.start_seq, cursor.start_offset),
+                "every continuation moves forward"
+            );
+            cursor = next;
+        }
+        assert!(pages > 1);
+        assert_eq!(
+            restored.into_iter().map(|m| m.content).collect::<Vec<_>>(),
+            originals
+        );
+    }
+
+    #[test]
+    fn a_read_exactly_at_the_byte_limit_needs_no_continuation() {
+        let (_dir, archive) = archive_over(vec![created("s-01", ""), said("s-01", Role::User, "")]);
+        let empty = archive
+            .read_range("s-01", 0, i64::MAX, 0)
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(empty.messages.len(), 1);
+        let content = "x".repeat(super::MAX_READ_BYTES - super::read_reply_bytes(&empty));
+        let (_dir, archive) = archive_over(vec![
+            created("s-01", ""),
+            said("s-01", Role::User, &content),
+        ]);
+        let reply = archive
+            .read_range("s-01", 0, i64::MAX, 0)
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(super::read_reply_bytes(&reply), super::MAX_READ_BYTES);
+        assert_eq!(reply.messages[0].content, content);
+        assert!(!reply.clipped);
+        assert!(reply.next.is_none());
+    }
+
+    #[test]
+    fn read_offsets_must_point_inside_the_exact_message_on_a_utf8_boundary() {
+        let content = "é🦀tail";
+        let (_dir, archive) = archive_over(vec![
+            created("s-01", ""),
+            said("s-01", Role::User, content),
+            tool_answered("s-01", "not prose"),
+            said("s-01", Role::User, "after the tool"),
+        ]);
+        let reply = archive
+            .read_range("s-01", 0, i64::MAX, 0)
+            .expect("read")
+            .expect("session exists");
+        let seq = reply.messages[0].seq;
+        for (start_seq, offset) in [
+            (seq, 1),
+            (seq, 3),
+            (seq, content.len()),
+            (seq, usize::MAX),
+            (seq - 1, 1),
+            (seq + 1, 1),
+            (i64::MAX, 1),
+        ] {
+            assert!(matches!(
+                archive.read_range("s-01", start_seq, i64::MAX, offset),
+                Err(Error::Read(_))
+            ));
+        }
+        let tail = archive
+            .read_range("s-01", seq, seq, "é🦀".len())
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(tail.messages[0].content, "tail");
+        assert!(!tail.clipped);
     }
 
     #[test]
@@ -1072,7 +1318,12 @@ mod tests {
     fn an_unknown_session_reads_as_none() {
         let (_dir, archive) = archive_over(vec![created("s-01", "")]);
 
-        assert!(archive.read_range("s-none", 0, 10).expect("read").is_none());
+        assert!(
+            archive
+                .read_range("s-none", 0, 10, 0)
+                .expect("read")
+                .is_none()
+        );
         assert!(archive.ends("s-none").expect("ends").is_none());
     }
 

@@ -32,7 +32,9 @@ impl Tool for SessionsSearch {
             description: "Search the archive of all past conversations. Use whenever the user \
                           asks about themselves, their preferences, or anything discussed in \
                           an earlier session — search before saying you do not know. Returns \
-                          sessions with snippets and an anchor_seq for session_read."
+                          sessions with snippets and an anchor_seq for session_read. \
+                          Use the previews first; read a narrow range around the anchor \
+                          only if needed. Stop once the question is answered."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -102,6 +104,8 @@ struct ReadArgs {
     start_seq: Option<i64>,
     end_seq: Option<i64>,
     #[serde(default)]
+    start_offset: usize,
+    #[serde(default)]
     ends: bool,
 }
 
@@ -109,9 +113,13 @@ impl Tool for SessionRead {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "session_read".to_owned(),
-            description: "Pull exact past context from one session by seq range \
-                          (anchor_seq comes from sessions_search), or its opening \
-                          and closing messages with ends."
+            description: "Read a small page of past context by seq range (at most \
+                          8 KiB of JSON and 20 messages), or clipped opening/closing \
+                          previews with ends. Prefer a narrow range around the \
+                          sessions_search anchor. A next cursor gives start_seq and \
+                          start_offset for continuation; keep the same end_seq. \
+                          Long messages split across pages without losing text. \
+                          Continue only if the answer needs more context."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -119,6 +127,11 @@ impl Tool for SessionRead {
                     "session_id": {"type": "string"},
                     "start_seq": {"type": "integer", "description": "First seq to read."},
                     "end_seq": {"type": "integer", "description": "Last seq to read."},
+                    "start_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "UTF-8 byte offset within start_seq. Default 0; use the previous page's next cursor."
+                    },
                     "ends": {
                         "type": "boolean",
                         "description": "Return the session's first and last messages \
@@ -152,6 +165,11 @@ impl Tool for SessionRead {
             };
 
             if args.ends {
+                if args.start_seq.is_some() || args.end_seq.is_some() || args.start_offset != 0 {
+                    return ToolReply::error(
+                        "ERROR: ends cannot be combined with a range or start_offset.".to_owned(),
+                    );
+                }
                 return match self.archive.ends(&args.session_id) {
                     Ok(Some(reply)) => ToolReply::ok(to_json(&reply)),
                     Ok(None) => unknown_session(&args.session_id),
@@ -173,7 +191,7 @@ impl Tool for SessionRead {
             }
             match self
                 .archive
-                .read_range(&args.session_id, start_seq, end_seq)
+                .read_range(&args.session_id, start_seq, end_seq, args.start_offset)
             {
                 Ok(Some(reply)) if reply.messages.is_empty() => ToolReply::ok(format!(
                     "No messages between seq {start_seq} and {end_seq} in session {}.",
@@ -513,6 +531,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_read_pages_a_long_message_through_the_registry_without_loss() {
+        let dir = TempDir::new().expect("temp dir");
+        let original = "exact text: 🦀é漢字\n\"\\\u{0000}".repeat(2000);
+        seed_log(
+            &dir,
+            vec![created("s-01", ""), said("s-01", Role::User, &original)],
+        );
+        let mut registry = Registry::new(8 * 1024);
+        registry.register(Box::new(SessionRead::new(archive_at(&dir))));
+        let mut args = serde_json::json!({
+            "session_id": "s-01",
+            "start_seq": 0,
+            "end_seq": i64::MAX,
+        });
+        let mut restored = String::new();
+        let mut pages = 0;
+        loop {
+            let reply = registry
+                .dispatch(
+                    "session_read",
+                    args.to_string(),
+                    TurnContext::default(),
+                    &[crate::tool::ToolSource::Builtin],
+                )
+                .await;
+            assert!(reply.ok, "{}", reply.content);
+            assert!(!reply.truncated);
+            assert!(reply.content.len() <= 8 * 1024);
+            let page: serde_json::Value = serde_json::from_str(&reply.content).expect("valid JSON");
+            let messages = page["messages"].as_array().expect("messages");
+            assert_eq!(messages.len(), 1);
+            let fragment = messages[0]["content"].as_str().expect("fragment");
+            assert!(!fragment.is_empty(), "every page makes progress");
+            restored.push_str(fragment);
+            pages += 1;
+            assert!(pages < 100, "pagination terminates");
+            if page["next"].is_null() {
+                assert!(page["clipped"].is_null());
+                break;
+            }
+            assert_eq!(page["clipped"], true);
+            assert_eq!(
+                usize::try_from(page["next"]["start_offset"].as_u64().expect("offset"))
+                    .expect("small offset"),
+                restored.len()
+            );
+            args["start_seq"] = page["next"]["start_seq"].clone();
+            args["start_offset"] = page["next"]["start_offset"].clone();
+        }
+        assert!(pages > 1);
+        assert_eq!(restored, original);
+    }
+
+    #[tokio::test]
     async fn session_read_ends_returns_the_bookends_shape() {
         let dir = seeded_dir();
         let tool = SessionRead::new(archive_at(&dir));
@@ -561,6 +633,22 @@ mod tests {
 
         assert!(!reply.ok);
         assert!(reply.content.contains("start_seq 9"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn session_read_rejects_invalid_offsets_and_mixed_read_modes() {
+        let dir = seeded_dir();
+        let tool = SessionRead::new(archive_at(&dir));
+        for args in [
+            serde_json::json!({"session_id": "s-01", "start_seq": 1, "end_seq": 2, "start_offset": -1}),
+            serde_json::json!({"session_id": "s-01", "start_seq": 1, "end_seq": 2, "start_offset": 1000}),
+            serde_json::json!({"session_id": "s-01", "ends": true, "start_seq": 1, "end_seq": 2}),
+            serde_json::json!({"session_id": "s-01", "ends": true, "start_offset": 1}),
+        ] {
+            let reply = tool.execute(args.to_string(), TurnContext::default()).await;
+            assert!(!reply.ok, "{args}: {}", reply.content);
+            assert!(reply.content.contains("ERROR:"), "{}", reply.content);
+        }
     }
 
     #[tokio::test]
