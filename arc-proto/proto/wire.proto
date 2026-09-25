@@ -54,6 +54,16 @@ message SessionStatus {
   repeated AllowanceWindow allowance = 5;
   int64 allowance_observed_at = 6;
   bool allowance_stale = 7;
+  // Empty means the effective level is unknown (legacy session).
+  string effective_thinking = 8;
+  // Supported labels for the session's pinned model.
+  repeated string supported_thinking = 9;
+}
+
+// Appends SessionThinkingSelected. Answered with the updated SessionStatus.
+message SetSessionThinking {
+  string session_id = 1;
+  string thinking = 2;
 }
 
 message FetchHistory {
@@ -102,6 +112,7 @@ message ClientFrame {
     ListModels list_models = 28;
     FetchStatus fetch_status = 29;
     ListMemoryRecords list_memory_records = 30;
+    SetSessionThinking set_session_thinking = 31;
   }
 }
 

@@ -59,6 +59,8 @@ message SessionCreated {
   string editing = 13;
   // Local launch directory, when known; not a permission boundary.
   string working_directory = 14;
+  // Preset's initial thinking effort; empty means legacy unknown.
+  string thinking = 15;
 }
 
 // A branch's standing, latest wins on replay: unmarked is scratch and never
@@ -162,6 +164,11 @@ message ContextMeasured {
   optional uint32 compact_at = 4;
 }
 
+message SessionThinkingSelected {
+  string session_id = 1;
+  string thinking = 2;
+}
+
 message SessionEvent {
   oneof event {
     SessionCreated session_created = 1;
@@ -174,6 +181,7 @@ message SessionEvent {
     BranchMarked branch_marked = 9;
     SessionCompacted session_compacted = 10;
     ContextMeasured context_measured = 11;
+    SessionThinkingSelected session_thinking_selected = 12;
   }
   reserved 5;  // a reasoning event; streamed-only by decision
 }

@@ -58,6 +58,7 @@ fn session_created_event() -> Event {
                 choice: "gemini-pro".to_owned(),
                 editing: "replacement".to_owned(),
                 working_directory: "/home/bogdan/arc".to_owned(),
+                thinking: "high".to_owned(),
             })),
         })),
     }
