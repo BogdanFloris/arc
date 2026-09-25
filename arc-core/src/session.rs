@@ -187,6 +187,9 @@ pub enum Error {
     #[error("the model produced no reply")]
     EmptyReply,
 
+    #[error("thinking update position exceeds transcript length")]
+    InvalidThinkingPosition,
+
     #[error("compaction failed: {reason}; no summary was saved")]
     CompactionFailed { reason: String },
 
@@ -218,6 +221,16 @@ pub enum Error {
 
     #[error("session {session_id} does not exist; nothing to fork")]
     UnknownSession { session_id: String },
+
+    #[error("unsupported thinking level {thinking} for {provider}/{model}")]
+    UnsupportedThinking {
+        thinking: String,
+        provider: String,
+        model: String,
+    },
+
+    #[error("session {session_id} has an active turn")]
+    ThinkingWhileBusy { session_id: String },
 
     #[error("session {session_id} uses the retired code role; start a new assistant session")]
     HistoricalSession { session_id: String },
@@ -518,6 +531,63 @@ impl Engine {
         Ok(session_id)
     }
 
+    pub fn session_thinking(
+        &self,
+        session_id: &str,
+        fallback: Thinking,
+    ) -> Result<Thinking, Error> {
+        let (value, known) = self.with_store(|store| {
+            let projection = store.projection();
+            Ok::<_, Error>((
+                projection.session_thinking(session_id)?,
+                projection.session_identity(session_id)?.is_some(),
+            ))
+        })?;
+        match value {
+            None if known => Ok(fallback),
+            None => Err(Error::UnknownSession {
+                session_id: session_id.to_owned(),
+            }),
+            Some(label) => Ok(Thinking::from_label(&label).unwrap_or(fallback)),
+        }
+    }
+
+    pub fn set_session_thinking(&self, session_id: &str, label: &str) -> Result<(), Error> {
+        let thinking = Thinking::from_label(label).ok_or_else(|| Error::UnsupportedThinking {
+            thinking: label.to_owned(),
+            provider: String::new(),
+            model: String::new(),
+        })?;
+        let (provider, model) = self
+            .with_store(|store| {
+                let projection = store.projection();
+                let identity = projection.session_identity(session_id)?;
+                Ok::<_, Error>(identity)
+            })?
+            .ok_or_else(|| Error::UnknownSession {
+                session_id: session_id.to_owned(),
+            })?;
+        if !provider::supported_thinking(&provider, &model).contains(&thinking) {
+            return Err(Error::UnsupportedThinking {
+                thinking: label.to_owned(),
+                provider,
+                model,
+            });
+        }
+        let guard = self.turn_guard(session_id);
+        let _turn = guard.try_lock().map_err(|_| Error::ThinkingWhileBusy {
+            session_id: session_id.to_owned(),
+        })?;
+        self.record(
+            Source::User,
+            session_event::Event::SessionThinkingSelected(arc_proto::v1::SessionThinkingSelected {
+                session_id: session_id.to_owned(),
+                thinking: label.to_owned(),
+            }),
+        )?;
+        Ok(())
+    }
+
     fn record_unbound_session(
         &self,
         session_id: &str,
@@ -539,6 +609,11 @@ impl Engine {
                 editing: editing.as_str().to_owned(),
                 choice: selected.map_or_else(String::new, |pick| pick.name.clone()),
                 working_directory,
+                thinking: selected
+                    .as_ref()
+                    .map_or(runner.thinking, |pick| pick.thinking)
+                    .label()
+                    .to_owned(),
                 ..Default::default()
             }),
         )?;
@@ -609,6 +684,9 @@ impl Engine {
             || (runner.provider.name().to_owned(), runner.model.clone()),
             |pick| (pick.provider.clone(), pick.model.clone()),
         );
+        let thinking = selected
+            .as_ref()
+            .map_or(runner.thinking, |pick| pick.thinking);
         self.record(
             source,
             session_event::Event::SessionCreated(SessionCreated {
@@ -632,6 +710,7 @@ impl Engine {
                     .as_str()
                     .to_owned(),
                 choice: selected.map_or_else(String::new, |pick| pick.name),
+                thinking: thinking.label().to_owned(),
             }),
         )?;
         Ok(session_id)
@@ -647,61 +726,71 @@ impl Engine {
         fork_point: u64,
         choice: &str,
     ) -> Result<String, Error> {
-        let (parent_id, role, identity, recorded_editing, project, grants, working_directory) =
-            self.with_store(|store| -> Result<_, Error> {
-                let projection = store.projection();
-                let role =
-                    projection
-                        .session_role(parent_id)?
-                        .ok_or_else(|| Error::UnknownSession {
-                            session_id: parent_id.to_owned(),
-                        })?;
-                if role == provider::LEGACY_DIRECT_ROLE {
-                    return Err(Error::HistoricalSession {
+        let (
+            parent_id,
+            role,
+            identity,
+            recorded_editing,
+            project,
+            grants,
+            working_directory,
+            inherited_thinking,
+        ) = self.with_store(|store| -> Result<_, Error> {
+            let projection = store.projection();
+            let role =
+                projection
+                    .session_role(parent_id)?
+                    .ok_or_else(|| Error::UnknownSession {
                         session_id: parent_id.to_owned(),
+                    })?;
+            if role == provider::LEGACY_DIRECT_ROLE {
+                return Err(Error::HistoricalSession {
+                    session_id: parent_id.to_owned(),
+                });
+            }
+            let owner = projection.message_owner(fork_point)?;
+            let owner_id = match owner {
+                Some((owner_id, projection::KIND_MESSAGE))
+                    if owner_id == parent_id
+                        || projection.ancestors(parent_id)?.contains(&owner_id) =>
+                {
+                    owner_id
+                }
+                _ => {
+                    return Err(Error::InvalidForkPoint {
+                        session_id: parent_id.to_owned(),
+                        fork_point,
                     });
                 }
-                let owner = projection.message_owner(fork_point)?;
-                let owner_id = match owner {
-                    Some((owner_id, projection::KIND_MESSAGE))
-                        if owner_id == parent_id
-                            || projection.ancestors(parent_id)?.contains(&owner_id) =>
-                    {
-                        owner_id
-                    }
-                    _ => {
-                        return Err(Error::InvalidForkPoint {
-                            session_id: parent_id.to_owned(),
-                            fork_point,
-                        });
-                    }
-                };
-                let role = if owner_id == parent_id {
-                    role
-                } else {
-                    projection
-                        .session_role(&owner_id)?
-                        .ok_or_else(|| Error::UnknownSession {
-                            session_id: owner_id.clone(),
-                        })?
-                };
-                let identity = projection.session_identity(&owner_id)?;
-                let editing = projection.session_editing(&owner_id)?;
-                let project = projection.session_project(&owner_id)?.unwrap_or_default();
-                let grants = projection.session_grants(&owner_id)?;
-                let working_directory = projection
-                    .session_working_directory(&owner_id)?
-                    .unwrap_or_default();
-                Ok((
-                    owner_id,
-                    role,
-                    identity,
-                    editing,
-                    project,
-                    grants,
-                    working_directory,
-                ))
-            })?;
+            };
+            let role = if owner_id == parent_id {
+                role
+            } else {
+                projection
+                    .session_role(&owner_id)?
+                    .ok_or_else(|| Error::UnknownSession {
+                        session_id: owner_id.clone(),
+                    })?
+            };
+            let identity = projection.session_identity(&owner_id)?;
+            let editing = projection.session_editing(&owner_id)?;
+            let project = projection.session_project(&owner_id)?.unwrap_or_default();
+            let grants = projection.session_grants(&owner_id)?;
+            let working_directory = projection
+                .session_working_directory(&owner_id)?
+                .unwrap_or_default();
+            let inherited_thinking = projection.session_thinking_at(&owner_id, fork_point)?;
+            Ok((
+                owner_id,
+                role,
+                identity,
+                editing,
+                project,
+                grants,
+                working_directory,
+                inherited_thinking,
+            ))
+        })?;
         if role == provider::LEGACY_DIRECT_ROLE {
             return Err(Error::HistoricalSession {
                 session_id: parent_id,
@@ -713,7 +802,7 @@ impl Engine {
         )?;
         let (provider, model) = match &selected {
             Some(pick) => (pick.provider.clone(), pick.model.clone()),
-            None => identity.unwrap_or_default(),
+            None => identity.clone().unwrap_or_default(),
         };
         let editing = match &selected {
             Some(pick) => pick.editing.as_str().to_owned(),
@@ -722,6 +811,22 @@ impl Engine {
                     .as_str()
                     .to_owned()
             }),
+        };
+        let thinking = match &selected {
+            Some(pick)
+                if choice.is_empty()
+                    && identity
+                        .as_ref()
+                        .is_some_and(|(p, m)| p == &pick.provider && m == &pick.model) =>
+            {
+                inherited_thinking
+                    .and_then(|label| Thinking::from_label(&label))
+                    .unwrap_or(pick.thinking)
+            }
+            Some(pick) => pick.thinking,
+            None => inherited_thinking
+                .and_then(|label| Thinking::from_label(&label))
+                .unwrap_or(Thinking::Default),
         };
 
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -745,6 +850,7 @@ impl Engine {
                 dispatched_by: String::new(),
                 editing,
                 choice: selected.map_or_else(String::new, |pick| pick.name),
+                thinking: thinking.label().to_owned(),
             }),
         )?;
         Ok(session_id)
@@ -1415,7 +1521,7 @@ impl Engine {
                 transcript.clone(),
                 last_step,
                 sources,
-            );
+            )?;
 
             let (ending, text, reasoning, calls, step_usage) = self
                 .run_completion(
@@ -2198,6 +2304,7 @@ impl Engine {
             model: compact_runner.model.clone(),
             role: compact_runner.role,
             thinking: compact_runner.thinking,
+            thinking_updates: Vec::new(),
             system: Some(COMPACTION_PROMPT_V3.to_owned()),
             messages: rebuild_transcript(&prefix),
             tools: Vec::new(),
@@ -2234,6 +2341,7 @@ impl Engine {
                 model: compact_runner.model.clone(),
                 role: compact_runner.role,
                 thinking: compact_runner.thinking,
+                thinking_updates: Vec::new(),
                 system: Some(COMPACTION_REPAIR_PROMPT_V2.to_owned()),
                 messages: vec![Message::Text {
                     role: Role::User,
@@ -2405,11 +2513,98 @@ impl Engine {
         messages: Vec<Message>,
         last_step: bool,
         sources: &[ToolSource],
-    ) -> CompletionRequest {
-        CompletionRequest {
+    ) -> Result<CompletionRequest, Error> {
+        let effective = self.session_thinking(session_id, runner.thinking)?;
+        let codex = runner.provider.name() == "codex";
+        let (thinking, thinking_updates, messages) = if codex {
+            let (rows, changes, initial) = self.with_store(|store| {
+                Ok::<_, projection::Error>((
+                    store.projection().lineage_messages_with_seq(session_id)?,
+                    store
+                        .projection()
+                        .lineage_thinking_changes_with_seq(session_id)?,
+                    store.projection().session_thinking_at(session_id, 0)?,
+                ))
+            })?;
+            let messages =
+                rebuild_transcript(&rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>());
+            let thinking = match initial.as_deref() {
+                Some(label) => {
+                    Thinking::from_label(label).ok_or_else(|| Error::UnsupportedThinking {
+                        thinking: label.to_owned(),
+                        provider: runner.provider.name().to_owned(),
+                        model: runner.model.clone(),
+                    })?
+                }
+                None => runner.thinking,
+            };
+            let summary_seq = rows.iter().find_map(|(seq, row)| match row {
+                MessageRow::Message {
+                    role,
+                    source,
+                    turn_id,
+                    ..
+                } if *role == Role::User as i32
+                    && *source == Source::Model as i32
+                    && turn_id.is_empty() =>
+                {
+                    Some(*seq)
+                }
+                _ => None,
+            });
+            let mut updates = Vec::new();
+            let mut current = thinking;
+            let mut summary_effort = thinking;
+            for (seq, label) in changes {
+                let level =
+                    Thinking::from_label(&label).ok_or_else(|| Error::UnsupportedThinking {
+                        thinking: label,
+                        provider: runner.provider.name().to_owned(),
+                        model: runner.model.clone(),
+                    })?;
+                if summary_seq.is_some_and(|summary_seq| seq <= summary_seq) {
+                    summary_effort = level;
+                    current = level;
+                    continue;
+                }
+                let prefix_rows: Vec<_> = rows
+                    .iter()
+                    .take_while(|(row_seq, _)| *row_seq < seq)
+                    .map(|(_, row)| row.clone())
+                    .collect();
+                let position = rebuild_transcript(&prefix_rows).len();
+                if position > messages.len() {
+                    return Err(Error::InvalidThinkingPosition);
+                }
+                if current != level {
+                    updates.push((position, level));
+                }
+                current = level;
+            }
+            if summary_seq.is_some() && summary_effort != thinking {
+                let summary_position = rows
+                    .iter()
+                    .position(|(seq, _)| Some(*seq) == summary_seq)
+                    .map_or(0, |index| {
+                        rebuild_transcript(
+                            &rows[..=index]
+                                .iter()
+                                .map(|(_, row)| row.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .len()
+                    });
+                updates.insert(0, (summary_position, summary_effort));
+            }
+            (thinking, updates, messages)
+        } else {
+            (effective, Vec::new(), messages)
+        };
+        Ok(CompletionRequest {
             model: runner.model.clone(),
             role: runner.role,
-            thinking: runner.thinking,
+            thinking,
+            thinking_updates,
             system,
             messages,
             tools: if last_step {
@@ -2420,7 +2615,7 @@ impl Engine {
             seed: None,
             web: sources.contains(&ToolSource::Web),
             cache_key: Some(session_id.to_owned()),
-        }
+        })
     }
 }
 
@@ -2547,6 +2742,7 @@ fn session_id_of(event: &session_event::Event) -> &str {
         session_event::Event::SessionTitled(e) => &e.session_id,
         session_event::Event::SessionCompacted(e) => &e.session_id,
         session_event::Event::ContextMeasured(e) => &e.session_id,
+        session_event::Event::SessionThinkingSelected(e) => &e.session_id,
     }
 }
 
@@ -2801,8 +2997,8 @@ mod tests {
 
     use arc_proto::v1::{
         HistoryEntry, HistoryMessage, ImageAttachment, MemoryRecord, MemoryRecordCreated,
-        MemoryRecordSuperseded, Role, SessionRole, Source, ToolOutcome, history_entry,
-        memory_event, memory_record, session_event,
+        MemoryRecordSuperseded, Role, SessionCompacted, SessionRole, Source, ToolOutcome,
+        history_entry, memory_event, memory_record, session_event,
     };
     use tempfile::TempDir;
 
@@ -2832,6 +3028,293 @@ mod tests {
             .into_iter()
             .filter(|event| !matches!(event, session_event::Event::ContextMeasured(_)))
             .collect()
+    }
+
+    #[test]
+    fn created_sessions_snapshot_initial_thinking_and_legacy_sessions_use_fallback() {
+        let dir = TempDir::new().unwrap();
+        let provider = ScriptedProvider::scripted(Vec::new());
+        let (engine, run) = engine(&provider, &dir);
+        let id = engine.create_session(&run).unwrap();
+        let created = conversation_log(dir.path())
+            .into_iter()
+            .find_map(|event| {
+                if let session_event::Event::SessionCreated(created) = event {
+                    Some(created)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(created.thinking, run.thinking.label());
+        assert_eq!(
+            engine.session_thinking(&id, Thinking::High).unwrap(),
+            run.thinking
+        );
+        assert!(matches!(
+            engine.session_thinking("missing", Thinking::High),
+            Err(Error::UnknownSession { .. })
+        ));
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: "legacy-thinking".to_owned(),
+                    provider: "scripted".to_owned(),
+                    model: "test-model".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .session_thinking("legacy-thinking", Thinking::High)
+                .unwrap(),
+            Thinking::High
+        );
+    }
+
+    #[test]
+    fn thinking_selection_rejects_invalid_and_unsupported_values() {
+        let dir = TempDir::new().unwrap();
+        let provider = ScriptedProvider::scripted(Vec::new());
+        let (engine, run) = engine(&provider, &dir);
+        let id = engine.create_session(&run).unwrap();
+        assert!(matches!(
+            engine.set_session_thinking(&id, "nonsense"),
+            Err(Error::UnsupportedThinking { .. })
+        ));
+        assert!(matches!(
+            engine.set_session_thinking(&id, "high"),
+            Err(Error::UnsupportedThinking { .. })
+        ));
+    }
+
+    #[test]
+    fn thinking_updates_replay_and_forks_inherit_the_fork_point() {
+        let dir = TempDir::new().unwrap();
+        let provider = ScriptedProvider::scripted(Vec::new());
+        let (engine, _run) = engine(&provider, &dir);
+        let id = "thinking-fork";
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: id.to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "gpt-6-astra".to_owned(),
+                    role: SessionRole::Chat as i32,
+                    thinking: "high".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let user = engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: id.to_owned(),
+                    role: Role::User as i32,
+                    content: "fork here".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine.set_session_thinking(id, "low").unwrap();
+        let fork = engine.fork_session(id, user).unwrap();
+        assert_eq!(
+            engine.session_thinking(&fork, Thinking::Default).unwrap(),
+            Thinking::High
+        );
+        assert_eq!(
+            engine.session_thinking(id, Thinking::Default).unwrap(),
+            Thinking::Low
+        );
+    }
+
+    #[test]
+    fn codex_request_keeps_initial_effort_and_places_session_update() {
+        let dir = TempDir::new().unwrap();
+        let scripted = ScriptedProvider::scripted(Vec::new());
+        let (engine, mut run) = engine(&scripted, &dir);
+        run.thinking = Thinking::Low;
+        let id = "thinking-request";
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: id.to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "gpt-6-astra".to_owned(),
+                    role: SessionRole::Chat as i32,
+                    thinking: "low".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine.set_session_thinking(id, "high").unwrap();
+        engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: id.to_owned(),
+                    role: Role::User as i32,
+                    content: "next".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        run.provider = Arc::new(CodexThinkingProvider);
+        let request = engine
+            .completion_request(&run, id, None, Vec::new(), true, &[])
+            .unwrap();
+
+        assert_eq!(request.thinking, Thinking::Low);
+        assert_eq!(request.thinking_updates, vec![(0, Thinking::High)]);
+    }
+
+    #[test]
+    fn codex_thinking_updates_survive_compaction_and_later_changes() {
+        let dir = TempDir::new().unwrap();
+        let scripted = ScriptedProvider::scripted(Vec::new());
+        let (engine, mut run) = engine(&scripted, &dir);
+        run.thinking = Thinking::Low;
+        let id = "thinking-compaction";
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: id.to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "gpt-6-astra".to_owned(),
+                    role: SessionRole::Chat as i32,
+                    thinking: "low".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: id.to_owned(),
+                    role: Role::User as i32,
+                    content: "first".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine.set_session_thinking(id, "high").unwrap();
+        assert_eq!(
+            engine
+                .with_store(|store| store.projection().session_thinking_at(id, 2))
+                .unwrap()
+                .as_deref(),
+            Some("high"),
+        );
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCompacted(SessionCompacted {
+                    session_id: id.to_owned(),
+                    through_seq: 2,
+                    summary: "summary".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: id.to_owned(),
+                    role: Role::User as i32,
+                    content: "after summary".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        engine.set_session_thinking(id, "max").unwrap();
+        engine
+            .record(
+                Source::User,
+                session_event::Event::MessageAppended(arc_proto::v1::MessageAppended {
+                    session_id: id.to_owned(),
+                    role: Role::User as i32,
+                    content: "last".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        run.provider = Arc::new(CodexThinkingProvider);
+        let check = |engine: &Engine, run: &Runner| {
+            engine
+                .completion_request(run, id, None, Vec::new(), true, &[])
+                .unwrap()
+        };
+        let request = check(&engine, &run);
+        assert_eq!(request.thinking, Thinking::Low);
+        assert!(matches!(
+            &request.messages[0],
+            Message::Text { content, .. } if content == "summary"
+        ));
+        assert_eq!(
+            request.thinking_updates,
+            vec![(1, Thinking::High), (2, Thinking::Max)]
+        );
+
+        let (reopened, _) = reopened_engine(&scripted, &dir, Registry::new(4));
+        let reopened_request = check(&reopened, &run);
+        assert_eq!(reopened_request.thinking, request.thinking);
+        assert_eq!(reopened_request.messages, request.messages);
+        assert_eq!(reopened_request.thinking_updates, request.thinking_updates);
+
+        run.provider = Arc::clone(&scripted) as Arc<dyn Provider>;
+        let non_codex = check(&engine, &run);
+        assert_eq!(non_codex.thinking, Thinking::Max);
+        assert!(non_codex.thinking_updates.is_empty());
+    }
+
+    #[derive(Debug)]
+    struct CodexThinkingProvider;
+
+    impl Provider for CodexThinkingProvider {
+        fn name(&self) -> &'static str {
+            "codex"
+        }
+
+        fn complete(
+            &self,
+            _request: crate::provider::CompletionRequest,
+        ) -> futures::future::BoxFuture<'_, Result<crate::provider::CompletionStream, ProviderError>>
+        {
+            Box::pin(async { panic!("test provider must not make requests") })
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_selection_rejects_an_active_turn() {
+        let dir = TempDir::new().unwrap();
+        let provider = ScriptedProvider::scripted(Vec::new());
+        let (engine, _) = engine(&provider, &dir);
+        let id = "thinking-busy";
+        engine
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: id.to_owned(),
+                    provider: "codex".to_owned(),
+                    model: "gpt-6-astra".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let guard = engine.turn_guard(id);
+        let _held = guard.lock().await;
+        assert!(matches!(
+            engine.set_session_thinking(id, "high"),
+            Err(Error::ThinkingWhileBusy { .. })
+        ));
     }
 
     #[derive(Debug)]
@@ -3075,6 +3558,7 @@ mod tests {
             choice: String::new(),
             editing: String::new(),
             working_directory: String::new(),
+            thinking: String::new(),
         })
     }
 
@@ -3152,6 +3636,7 @@ mod tests {
             choice: String::new(),
             editing: String::new(),
             working_directory: String::new(),
+            thinking: String::new(),
         })
     }
 
@@ -3265,6 +3750,7 @@ mod tests {
                     choice: String::new(),
                     editing: String::new(),
                     working_directory: String::new(),
+                    thinking: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -5496,6 +5982,7 @@ mod tests {
             choice: String::new(),
             editing: String::new(),
             working_directory: String::new(),
+            thinking: String::new(),
         })
     }
 

@@ -221,10 +221,12 @@ impl<'a> Payload<'a> {
 fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
     match thinking {
         Thinking::Default => None,
-        Thinking::Minimal => Some("none"),
+        Thinking::Minimal | Thinking::None => Some("none"),
         Thinking::Low => Some("low"),
         Thinking::Medium => Some("medium"),
         Thinking::High => Some("high"),
+        Thinking::Xhigh => Some("xhigh"),
+        Thinking::Max => Some("max"),
     }
 }
 
@@ -328,6 +330,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             thinking: Thinking::Default,
+            thinking_updates: Vec::new(),
             web: false,
             cache_key: None,
         }

@@ -216,6 +216,12 @@ impl<'a> Payload<'a> {
             Thinking::Low => Some("LOW"),
             Thinking::Medium => Some("MEDIUM"),
             Thinking::High => Some("HIGH"),
+            Thinking::None | Thinking::Xhigh | Thinking::Max => {
+                return Err(Error::InvalidRequest(format!(
+                    "Gemini does not support {} thinking",
+                    request.thinking.label()
+                )));
+            }
         }
         .map(|thinking_level| ThinkingConfig { thinking_level });
 
@@ -381,6 +387,7 @@ mod tests {
             model: "gemini-3.6-flash".to_owned(),
             role: SessionRole::Chat,
             thinking: Thinking::Minimal,
+            thinking_updates: Vec::new(),
             system: Some("Be terse.".to_owned()),
             messages,
             tools: Vec::new(),

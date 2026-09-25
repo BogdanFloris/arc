@@ -193,7 +193,8 @@ struct Payload<'a> {
 #[derive(Serialize)]
 struct Reasoning {
     effort: &'static str,
-    summary: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -242,6 +243,12 @@ enum Item<'a> {
         kind: &'static str,
         call_id: &'a str,
         output: &'a str,
+    },
+
+    ConfigurationUpdate {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        reasoning: Reasoning,
     },
 }
 
@@ -299,10 +306,52 @@ struct Grammar {
 
 impl<'a> Payload<'a> {
     fn new(request: &'a CompletionRequest) -> Result<Self, Error> {
-        let mut input = Vec::with_capacity(request.messages.len());
+        if request
+            .thinking_updates
+            .iter()
+            .any(|(index, _)| *index > request.messages.len())
+            || request
+                .thinking_updates
+                .windows(2)
+                .any(|pair| pair[0].0 > pair[1].0)
+            || request
+                .thinking_updates
+                .iter()
+                .any(|(_, level)| *level == Thinking::Default)
+        {
+            return Err(Error::InvalidRequest(
+                "thinking updates must be sorted message positions".to_owned(),
+            ));
+        }
+        let mut input = Vec::with_capacity(request.messages.len() + request.thinking_updates.len());
         let mut custom_calls = std::collections::HashSet::new();
-        for message in &request.messages {
+        let mut updates = request.thinking_updates.iter().peekable();
+        for (index, message) in request.messages.iter().enumerate() {
+            if updates.peek().is_some_and(|(at, _)| *at == index) {
+                let mut level = None;
+                while updates.peek().is_some_and(|(at, _)| *at == index) {
+                    level = Some(updates.next().expect("peeked update").1);
+                }
+                input.push(configuration_update(
+                    level.expect("update group is nonempty"),
+                )?);
+            }
             items(message, &mut input, &mut custom_calls)?;
+        }
+        while updates
+            .peek()
+            .is_some_and(|(at, _)| *at == request.messages.len())
+        {
+            let mut level = None;
+            while updates
+                .peek()
+                .is_some_and(|(at, _)| *at == request.messages.len())
+            {
+                level = Some(updates.next().expect("peeked update").1);
+            }
+            input.push(configuration_update(
+                level.expect("update group is nonempty"),
+            )?);
         }
         let mut tools: Vec<WireTool> = request
             .tools
@@ -350,7 +399,7 @@ impl<'a> Payload<'a> {
             parallel_tool_calls: has_tools.then_some(true),
             reasoning: effort(request.thinking).map(|effort| Reasoning {
                 effort,
-                summary: "auto",
+                summary: Some("auto"),
             }),
             prompt_cache_key: request.cache_key.as_deref(),
         })
@@ -363,9 +412,24 @@ fn effort(thinking: Thinking) -> Option<&'static str> {
     match thinking {
         Thinking::Default => None,
         Thinking::Minimal | Thinking::Low => Some("low"),
+        Thinking::None => Some("none"),
         Thinking::Medium => Some("medium"),
         Thinking::High => Some("high"),
+        Thinking::Xhigh => Some("xhigh"),
+        Thinking::Max => Some("max"),
     }
+}
+
+fn configuration_update(level: Thinking) -> Result<Item<'static>, Error> {
+    Ok(Item::ConfigurationUpdate {
+        kind: "configuration_update",
+        reasoning: Reasoning {
+            effort: effort(level).ok_or_else(|| {
+                Error::InvalidRequest("default is not a configuration update effort".to_owned())
+            })?,
+            summary: None,
+        },
+    })
 }
 
 fn items<'a>(
@@ -504,6 +568,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             thinking: Thinking::Default,
+            thinking_updates: Vec::new(),
             web: false,
             cache_key: None,
         }
@@ -568,6 +633,41 @@ mod tests {
 
     fn body(requests: &[Request]) -> Value {
         serde_json::from_slice(&requests[0].body).expect("json body")
+    }
+
+    #[test]
+    fn thinking_updates_keep_initial_effort_and_coalesce_positions() {
+        assert_eq!(effort(Thinking::Minimal), Some("low"));
+        let mut req = request(None, &[(Role::User, "first"), (Role::Assistant, "reply")]);
+        req.thinking = Thinking::High;
+        req.thinking_updates = vec![
+            (0, Thinking::Low),
+            (0, Thinking::Medium),
+            (1, Thinking::Xhigh),
+            (2, Thinking::Max),
+            (2, Thinking::None),
+        ];
+
+        let payload = serde_json::to_value(Payload::new(&req).expect("payload")).expect("json");
+
+        assert_eq!(
+            payload["reasoning"],
+            json!({"effort": "high", "summary": "auto"})
+        );
+        assert_eq!(
+            payload["input"],
+            json!([
+                {"type": "configuration_update", "reasoning": {"effort": "medium"}},
+                {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "configuration_update", "reasoning": {"effort": "xhigh"}},
+                {"type": "message", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "reply", "annotations": []}]},
+                {"type": "configuration_update", "reasoning": {"effort": "none"}},
+            ])
+        );
+
+        req.thinking_updates = vec![(0, Thinking::Default)];
+        assert!(matches!(Payload::new(&req), Err(Error::InvalidRequest(_))));
     }
 
     #[tokio::test]

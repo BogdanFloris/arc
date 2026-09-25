@@ -8,8 +8,9 @@ use arc_proto::v1::{
     MemoryRecordDeleted, MemoryRecordReviewed, MemoryRecordSuperseded, MemoryRecordUpdated,
     MessageAppended, Provenance, ProvenanceEntry, Role, RoleEvent, RoleModelSelected,
     ServerCallRecorded, SessionCompacted, SessionConsolidated, SessionCreated, SessionEvent,
-    SessionRole, SessionTitled, Source, ToolCallIssued, ToolResultRecorded, event, history_entry,
-    memory_event, memory_record, role_event, session_event,
+    SessionRole, SessionThinkingSelected, SessionTitled, Source, ToolCallIssued,
+    ToolResultRecorded, event, history_entry, memory_event, memory_record, role_event,
+    session_event,
 };
 use prost_types::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
@@ -27,7 +28,7 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 24;
+pub(crate) const SCHEMA_VERSION: u32 = 25;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model          TEXT,
     choice         TEXT,
     editing        TEXT,
+    thinking       TEXT,
     source         INTEGER NOT NULL DEFAULT 0,
     disposition    INTEGER
 );
@@ -91,6 +93,15 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages (session_id, seq);
+
+CREATE TABLE IF NOT EXISTS thinking_changes (
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    label TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS thinking_changes_by_session
+    ON thinking_changes (session_id, seq);
 
 CREATE TABLE IF NOT EXISTS message_attachments (
     session_id  TEXT NOT NULL,
@@ -457,6 +468,9 @@ impl Projection {
                 session_event::Event::SessionTitled(titled) => {
                     mark_titled(&tx, event, titled)?;
                 }
+                session_event::Event::SessionThinkingSelected(selected) => {
+                    select_session_thinking(&tx, event, selected)?;
+                }
                 session_event::Event::ToolResultRecorded(result) => {
                     insert_tool_result(&tx, event, result)?;
                 }
@@ -641,6 +655,41 @@ impl Projection {
             )
             .optional()?;
         Ok(editing.flatten().filter(|editing| !editing.is_empty()))
+    }
+
+    pub(crate) fn session_thinking(&self, session_id: &str) -> Result<Option<String>, Error> {
+        self.session_thinking_at(session_id, i64::MAX as u64)
+    }
+
+    pub(crate) fn session_thinking_at(
+        &self,
+        session_id: &str,
+        seq: u64,
+    ) -> Result<Option<String>, Error> {
+        let initial: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT thinking FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(initial) = initial else {
+            return Ok(None);
+        };
+        let change: Option<String> = self.conn.query_row(
+            "SELECT label FROM thinking_changes WHERE session_id = ?1 AND seq <= ?2 ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![session_id, seq_param(seq)?],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(change.or(initial).filter(|value| !value.is_empty()))
+    }
+
+    pub(crate) fn lineage_thinking_changes_with_seq(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(u64, String)>, Error> {
+        lineage_thinking_changes(&self.conn, session_id)
     }
 
     pub(crate) fn session_title(&self, session_id: &str) -> Result<Option<String>, Error> {
@@ -1361,6 +1410,48 @@ fn lineage_rows(conn: &Connection, session_id: &str) -> Result<Vec<(u64, Message
     collect_lineage_rows(conn, session_id, true)
 }
 
+fn lineage_thinking_changes(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<(u64, String)>, Error> {
+    let mut chain: Vec<(String, Option<u64>)> = Vec::new();
+    let mut visited = HashSet::from([session_id.to_owned()]);
+    let mut current = session_id.to_owned();
+    loop {
+        let Some((parent, fork_point)) = session_parent(conn, &current)? else {
+            break;
+        };
+        if !visited.insert(parent.clone()) {
+            tracing::warn!(session_id = %parent, "lineage cycle detected; stopping the walk");
+            break;
+        }
+        chain.push((parent.clone(), Some(fork_point)));
+        current = parent;
+    }
+    chain.reverse();
+    chain.push((session_id.to_owned(), None));
+    let mut changes = Vec::new();
+    for (id, bound) in chain {
+        let bound = bound.map(seq_param).transpose()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, label FROM thinking_changes
+             WHERE session_id = ?1 AND (?2 IS NULL OR seq <= ?2) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id, bound], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (seq, label) = row?;
+            changes.push((
+                u64::try_from(seq).map_err(|_| bad_column(0, "seq out of range"))?,
+                label,
+            ));
+        }
+    }
+    changes.sort_by_key(|(seq, _)| *seq);
+    Ok(changes)
+}
+
 fn collect_lineage_rows(
     conn: &Connection,
     session_id: &str,
@@ -1693,6 +1784,7 @@ fn event_kind(payload: &event::Payload) -> &'static str {
             session_event::Event::BranchMarked(_) => "branch_marked",
             session_event::Event::SessionConsolidated(_) => "session_consolidated",
             session_event::Event::SessionTitled(_) => "session_titled",
+            session_event::Event::SessionThinkingSelected(_) => "session_thinking_selected",
             session_event::Event::SessionCompacted(_) => "session_compacted",
             session_event::Event::ContextMeasured(_) => "context_measured",
         },
@@ -1755,8 +1847,8 @@ fn insert_session(
     tx.execute(
         "INSERT INTO sessions
              (id, parent_session, fork_point, dispatched_by, project, working_directory, title, started_at,
-              role, provider, model, choice, editing, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              role, provider, model, choice, editing, source, thinking)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
             &created.session_id,
             (!created.parent_session.is_empty()).then_some(&created.parent_session),
@@ -1772,6 +1864,7 @@ fn insert_session(
             (!created.choice.is_empty()).then_some(&created.choice),
             (!created.editing.is_empty()).then_some(&created.editing),
             event.source,
+            (!created.thinking.is_empty()).then_some(&created.thinking),
         ),
     )?;
     for grant in &created.grants {
@@ -1780,6 +1873,22 @@ fn insert_session(
             (&created.session_id, &grant.root, grant.read_write),
         )?;
     }
+    Ok(())
+}
+
+fn select_session_thinking(
+    tx: &Transaction<'_>,
+    event: &Event,
+    selected: &SessionThinkingSelected,
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO thinking_changes (session_id, seq, label) VALUES (?1, ?2, ?3)",
+        (
+            &selected.session_id,
+            seq_param(event.seq)?,
+            &selected.thinking,
+        ),
+    )?;
     Ok(())
 }
 
@@ -2379,6 +2488,113 @@ mod tests {
     }
 
     #[test]
+    fn thinking_replay_preserves_initial_snapshot_fork_cutoff_and_compaction() {
+        let selected = |seq, session_id: &str, thinking: &str| Event {
+            seq,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionThinkingSelected(
+                    arc_proto::v1::SessionThinkingSelected {
+                        session_id: session_id.to_owned(),
+                        thinking: thinking.to_owned(),
+                    },
+                )),
+            })),
+        };
+        let mut initial = session_created(1);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = &mut initial.payload
+        {
+            created.thinking = "low".to_owned();
+        } else {
+            panic!("session");
+        }
+        let mut fork = session_created(5);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = &mut fork.payload
+        {
+            created.session_id = "child".to_owned();
+            created.parent_session = "s-01".to_owned();
+            created.fork_point = 3;
+            created.thinking = "low".to_owned();
+        } else {
+            panic!("session");
+        }
+        let compacted = Event {
+            seq: 6,
+            ts: Some(timestamp()),
+            source: Source::System as i32,
+            payload: Some(event::Payload::Session(SessionEvent {
+                event: Some(session_event::Event::SessionCompacted(SessionCompacted {
+                    session_id: "s-01".to_owned(),
+                    through_seq: 3,
+                    summary: "summary".to_owned(),
+                    prompt_version: String::new(),
+                    model: String::new(),
+                })),
+            })),
+        };
+        let events = [
+            initial,
+            selected(2, "s-01", "medium"),
+            selected(3, "s-01", "high"),
+            selected(4, "s-01", "max"),
+            fork,
+            compacted,
+        ];
+        for _ in 0..2 {
+            let mut projection = Projection::in_memory().unwrap();
+            for event in &events {
+                projection.apply(event).unwrap();
+            }
+            assert_eq!(
+                projection
+                    .session_thinking_at("s-01", 1)
+                    .unwrap()
+                    .as_deref(),
+                Some("low")
+            );
+            assert_eq!(
+                projection
+                    .session_thinking_at("s-01", 2)
+                    .unwrap()
+                    .as_deref(),
+                Some("medium")
+            );
+            assert_eq!(
+                projection
+                    .session_thinking_at("s-01", 3)
+                    .unwrap()
+                    .as_deref(),
+                Some("high")
+            );
+            assert_eq!(
+                projection.session_thinking("s-01").unwrap().as_deref(),
+                Some("max")
+            );
+            assert_eq!(
+                projection
+                    .lineage_thinking_changes_with_seq("s-01")
+                    .unwrap(),
+                vec![
+                    (2, "medium".to_owned()),
+                    (3, "high".to_owned()),
+                    (4, "max".to_owned())
+                ]
+            );
+            assert_eq!(
+                projection
+                    .lineage_thinking_changes_with_seq("child")
+                    .unwrap(),
+                vec![(2, "medium".to_owned()), (3, "high".to_owned())]
+            );
+        }
+    }
+
+    #[test]
     fn context_replay_keeps_only_the_last_step_and_compaction_invalidates_it() {
         let measured = |seq, tokens| Event {
             seq,
@@ -2479,6 +2695,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    thinking: String::new(),
                     working_directory: String::new(),
                 })),
             })),
@@ -2585,6 +2802,7 @@ mod tests {
             "role_selections",
             "session_grants",
             "sessions",
+            "thinking_changes",
             "tool_changed_paths",
         ]
         .into_iter()
@@ -3115,6 +3333,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    thinking: String::new(),
                     working_directory: String::new(),
                 })),
             })),

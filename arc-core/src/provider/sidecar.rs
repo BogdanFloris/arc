@@ -56,6 +56,7 @@ mod tests {
             model: "qwen3-8b".to_owned(),
             role: SessionRole::Archivist,
             thinking,
+            thinking_updates: Vec::new(),
             system: system.map(str::to_owned),
             messages: Vec::new(),
             tools: Vec::new(),

@@ -5,8 +5,8 @@ use arc_proto::v1::{
     ForkSession, ImageAttachment, JobInfo, ListJobs, ListMemoryRecords, ListModels, ListProjects,
     ListSessions, MarkBranch, MemoryRecord, MemoryReviewAccept, MemoryReviewDelete,
     MemoryReviewItem, MemoryReviewList, ModelChoice, Notification, ProjectInfo, SelectModel,
-    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe, branch_marked,
-    client_frame, server_frame,
+    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionRole, SetSessionThinking,
+    Subscribe, branch_marked, client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -133,6 +133,24 @@ impl Client {
         match self
             .request(client_frame::Msg::FetchStatus(arc_proto::v1::FetchStatus {
                 session_id: session_id.to_owned(),
+            }))
+            .await?
+        {
+            server_frame::Msg::SessionStatus(status) => Ok(status),
+            other => Err(unexpected("SessionStatus", &other)),
+        }
+    }
+
+    #[tracing::instrument(name = "client.set_session_thinking", skip_all, fields(session_id))]
+    pub async fn set_session_thinking(
+        &mut self,
+        session_id: &str,
+        thinking: &str,
+    ) -> Result<arc_proto::v1::SessionStatus, Error> {
+        match self
+            .request(client_frame::Msg::SetSessionThinking(SetSessionThinking {
+                session_id: session_id.to_owned(),
+                thinking: thinking.to_owned(),
             }))
             .await?
         {

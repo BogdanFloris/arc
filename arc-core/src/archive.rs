@@ -817,6 +817,7 @@ mod tests {
             choice: String::new(),
             editing: String::new(),
             working_directory: String::new(),
+            thinking: String::new(),
         })
     }
 

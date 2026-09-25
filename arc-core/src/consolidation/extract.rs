@@ -102,6 +102,7 @@ impl ModelExtractor {
             model: self.model.clone(),
             role: SessionRole::Archivist,
             thinking: self.thinking,
+            thinking_updates: Vec::new(),
             system: Some(system),
             messages: vec![Message::Text {
                 role: Role::User,

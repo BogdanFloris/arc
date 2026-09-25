@@ -18,6 +18,7 @@ pub struct CompletionRequest {
     pub model: String,
     pub role: SessionRole,
     pub thinking: Thinking,
+    pub thinking_updates: Vec<(usize, Thinking)>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
@@ -42,6 +43,9 @@ pub enum Thinking {
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
+    None,
 }
 
 impl Thinking {
@@ -52,7 +56,57 @@ impl Thinking {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::None => "none",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "default" => Self::Default,
+            "minimal" => Self::Minimal,
+            "none" => Self::None,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
+}
+
+pub fn supported_thinking(provider: &str, model: &str) -> &'static [Thinking] {
+    const NONE: &[Thinking] = &[];
+    const ASTRA: &[Thinking] = &[
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+        Thinking::Xhigh,
+        Thinking::Max,
+    ];
+    const SOL: &[Thinking] = &[
+        Thinking::None,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+        Thinking::Xhigh,
+        Thinking::Max,
+    ];
+    const GEMINI36: &[Thinking] = &[
+        Thinking::Minimal,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+    ];
+    const GEMINI37: &[Thinking] = &[Thinking::Low, Thinking::Medium, Thinking::High];
+    match (provider, model) {
+        ("codex", "gpt-6-astra") => ASTRA,
+        ("codex", "gpt-6-sol" | "gpt-6-luna") => SOL,
+        ("gemini", "gemini-3.6-flash") => GEMINI36,
+        ("gemini", "gemini-3.7-flash") => GEMINI37,
+        _ => NONE,
     }
 }
 
@@ -331,6 +385,7 @@ mod tests {
             tools: Vec::new(),
             seed: None,
             thinking: Thinking::Default,
+            thinking_updates: Vec::new(),
             web: false,
             cache_key: None,
         }
