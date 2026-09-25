@@ -200,6 +200,8 @@ Snapshot under the engine lock, run the model unlocked, then recheck idleness an
 
 Review verdicts have source USER: accept appends `MemoryRecordReviewed`, fix supersedes, delete appends deletion. `changed_at`/`reviewed_at` selects records changed in the window and not reviewed since. Fixing prefills a conversational instruction; the UI never mutates memory directly. See [Hermes notes](prior-art-hermes.md) for curation lessons.
 
+`:memory` browses all currently active records, including reviewed and older ones, separately from the weekly `:review` queue. Its `dd` deletion uses the same confirmed, event-driven delete path; browsing does not mark records reviewed.
+
 ### 5.5 Retrieval
 
 Memory is tools, not silent RAG: `memory_read`, `memory_search`, `memory_write`, `memory_supersede`, `sessions_search`, and `session_read`. Nothing is automatically injected except identity and the record index.

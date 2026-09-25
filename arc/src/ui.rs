@@ -1121,14 +1121,18 @@ fn draw_review(frame: &mut Frame, full: Rect, review: &crate::app::Review) {
         full,
         72,
         u16::try_from(rows + detail + 2).unwrap_or(u16::MAX),
-        "review",
+        if review.all { "memory" } else { "review" },
     );
     let width = area.width;
 
     let mut lines = Vec::new();
     if review.items.is_empty() {
         let word = if review.loaded {
-            "nothing to review"
+            if review.all {
+                "no memories"
+            } else {
+                "nothing to review"
+            }
         } else {
             "loading"
         };
@@ -1203,6 +1207,8 @@ fn review_rule(width: u16) -> Line<'static> {
 fn review_footer(review: &crate::app::Review) -> Line<'static> {
     if review.pending_delete {
         Line::styled("   dd deletes the selected record", theme::ERROR)
+    } else if review.all {
+        Line::styled("   dd delete · r refresh · q close", theme::DIM)
     } else {
         Line::styled(
             "   a accept · dd delete · f fix · r refresh · q close",
@@ -1422,6 +1428,7 @@ const HELP: &[(&str, &[&str])] = &[
         &[
             ":q :q! :qa :quit  quit",
             ":review           open the review pane",
+            ":memory           browse all active memories",
             ":jobs             open the jobs pane",
             ":model            open the session model picker",
             ":model-default    change a role's default model",
@@ -1444,6 +1451,15 @@ const HELP: &[(&str, &[&str])] = &[
             "X                 mark the selected branch abandoned",
             "enter             open the selected session",
             "q esc             close (esc also clears an active filter)",
+        ],
+    ),
+    (
+        "memory keys",
+        &[
+            "j k               move selection",
+            "dd                delete the selected record",
+            "r                 refresh the list",
+            "q esc             close",
         ],
     ),
     (
@@ -2340,6 +2356,7 @@ mod tests {
             selected: 0,
             loaded: true,
             pending_delete: false,
+            all: false,
         });
 
         let text = plain_text(&rendered(&mut app));
@@ -2358,6 +2375,28 @@ mod tests {
             text.contains("dd deletes the selected record"),
             "the armed state replaces the hint in the footer, got: {text:?}"
         );
+    }
+
+    #[test]
+    fn the_memory_browser_shows_active_record_detail_and_delete_confirmation() {
+        let mut app = App::new();
+        app.overlay = Overlay::Review(crate::app::Review {
+            items: vec![review_entry("mr-older", "the full remembered detail")],
+            selected: 0,
+            loaded: true,
+            pending_delete: false,
+            all: true,
+        });
+        let text = plain_text(&rendered(&mut app));
+        println!("MEMORY BROWSER\n{text}");
+        assert!(text.contains("memory"), "{text}");
+        assert!(text.contains("the full remembered detail"), "{text}");
+        assert!(text.contains("dd delete · r refresh · q close"), "{text}");
+        assert!(!text.contains("a accept"), "{text}");
+
+        app.review_mut().expect("open").pending_delete = true;
+        let armed = plain_text(&rendered(&mut app));
+        assert!(armed.contains("dd deletes the selected record"), "{armed}");
     }
 
     #[test]
@@ -2380,6 +2419,7 @@ mod tests {
             selected: 0,
             loaded: true,
             pending_delete: false,
+            all: false,
         });
 
         let text = plain_text(&rendered(&mut app));
@@ -2425,6 +2465,7 @@ mod tests {
             selected: 0,
             loaded: true,
             pending_delete: false,
+            all: false,
         });
 
         let short = footer_row(&plain_text(&rendered(&mut app)));

@@ -65,6 +65,12 @@ message MemoryReviewList {
   int64 since_micros = 1;
 }
 
+message ListMemoryRecords {}
+
+message MemoryRecords {
+  repeated MemoryRecord records = 1;
+}
+
 message MemoryReviewAccept {
   string record_id = 1;
 }
@@ -95,6 +101,7 @@ message ClientFrame {
     SelectModel select_model = 27;
     ListModels list_models = 28;
     FetchStatus fetch_status = 29;
+    ListMemoryRecords list_memory_records = 30;
   }
 }
 
@@ -410,5 +417,6 @@ message ServerFrame {
     ProjectList project_list = 22;
     ModelList model_list = 23;
     SessionStatus session_status = 24;
+    MemoryRecords memory_records = 25;
   }
 }

@@ -9,11 +9,11 @@ use arc_core::provider::role_label;
 use arc_core::session::{Engine, EngineEvent, Error as SessionError, Reply};
 use arc_core::store::Error as StoreError;
 use arc_proto::v1::{
-    ClientFrame, CreateSession, Delta, Error as WireError, JobList, MemoryReviewItem,
-    MemoryReviewItems, MessageAccepted, Notification, ProjectList, ReasoningDelta,
-    ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionList,
-    SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked, client_frame,
-    server_frame,
+    ClientFrame, CreateSession, Delta, Error as WireError, JobList, MemoryRecords,
+    MemoryReviewItem, MemoryReviewItems, MessageAccepted, Notification, ProjectList,
+    ReasoningDelta, ReviewPredecessor, SendMessage, ServerFrame, SessionHistory, SessionInfo,
+    SessionList, SessionRole, Source, StreamEnd, ToolCallEnded, ToolCallStarted, branch_marked,
+    client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -247,6 +247,10 @@ async fn request(
                     items: items.into_iter().map(review_item).collect(),
                 })
             })
+            .map_err(SessionError::from),
+        Some(client_frame::Msg::ListMemoryRecords(_)) => reads
+            .active_memory_records()
+            .map(|records| server_frame::Msg::MemoryRecords(MemoryRecords { records }))
             .map_err(SessionError::from),
         Some(client_frame::Msg::MemoryReviewAccept(accept)) => engine
             .review_accept(&accept.record_id)
@@ -675,6 +679,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::FetchHistory(_)) => "fetch_history",
         Some(client_frame::Msg::FetchStatus(_)) => "fetch_status",
         Some(client_frame::Msg::MemoryReviewList(_)) => "memory_review_list",
+        Some(client_frame::Msg::ListMemoryRecords(_)) => "list_memory_records",
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
         Some(client_frame::Msg::MemoryReviewDelete(_)) => "memory_review_delete",
         Some(client_frame::Msg::ListJobs(_)) => "list_jobs",
@@ -742,10 +747,10 @@ mod tests {
     use arc_proto::v1::{
         CancelJob, CancelTurn, CompactSession, DropSteers, Event, FetchHistory, ForkSession,
         HistoryEntry, HistoryMessage, HistoryToolCall, HistoryToolResult, ImageAttachment,
-        ListModels, ListSessions, MarkBranch, MemoryEvent, MemoryRecord, MemoryRecordCreated,
-        MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList, Notification, ProjectInfo, Role,
-        SelectModel, SessionRole, Subscribe, ToolOutcome, event, job_info, memory_event,
-        memory_record, notification, session_event,
+        ListMemoryRecords, ListModels, ListSessions, MarkBranch, MemoryEvent, MemoryRecord,
+        MemoryRecordCreated, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewList,
+        Notification, ProjectInfo, Role, SelectModel, SessionRole, Subscribe, ToolOutcome, event,
+        job_info, memory_event, memory_record, notification, session_event,
     };
     use futures::stream;
     use tempfile::TempDir;
@@ -1788,6 +1793,52 @@ mod tests {
             .collect();
         assert_eq!(remaining, ["m-b"], "the accepted record left the queue");
 
+        send(
+            &mut ws,
+            5,
+            client_frame::Msg::ListMemoryRecords(ListMemoryRecords {}),
+        )
+        .await;
+        let active = next_frame(&mut ws).await;
+        assert_eq!(active.request_id, 5);
+        match active.msg {
+            Some(server_frame::Msg::MemoryRecords(records)) => {
+                assert_eq!(
+                    records
+                        .records
+                        .into_iter()
+                        .map(|record| record.id)
+                        .collect::<Vec<_>>(),
+                    ["m-a", "m-b"],
+                    "accepting a record does not remove it from the browser"
+                );
+            }
+            other => panic!("expected MemoryRecords, got {other:?}"),
+        }
+
+        send(
+            &mut ws,
+            6,
+            client_frame::Msg::MemoryReviewDelete(MemoryReviewDelete {
+                record_id: "m-a".to_owned(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            next_frame(&mut ws).await.msg,
+            Some(server_frame::Msg::MessageAccepted(_))
+        ));
+        send(
+            &mut ws,
+            7,
+            client_frame::Msg::ListMemoryRecords(ListMemoryRecords {}),
+        )
+        .await;
+        assert!(matches!(
+            next_frame(&mut ws).await.msg,
+            Some(server_frame::Msg::MemoryRecords(records)) if records.records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>() == ["m-b"]
+        ));
+
         harness.stop().await;
     }
 
@@ -1817,6 +1868,16 @@ mod tests {
             "got: {frame:?}"
         );
         assert_eq!(review_list(&mut ws, 2, 0).await, [], "the record is gone");
+        send(
+            &mut ws,
+            5,
+            client_frame::Msg::ListMemoryRecords(ListMemoryRecords {}),
+        )
+        .await;
+        assert!(
+            matches!(next_frame(&mut ws).await.msg, Some(server_frame::Msg::MemoryRecords(records)) if records.records.is_empty()),
+            "the active browser also excludes deleted records"
+        );
 
         send(
             &mut ws,

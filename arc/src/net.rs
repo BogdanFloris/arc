@@ -286,6 +286,7 @@ async fn handle(
         Command::ReviewList { since_micros } => {
             review_list(&mut client, since_micros).await.map(Some)
         }
+        Command::MemoryList => memory_list(&mut client).await.map(Some),
         Command::ReviewAccept { record_id } => {
             client.review_accept(&record_id).await.map(|()| None)
         }
@@ -399,6 +400,24 @@ async fn review_list(client: &mut Client, since_micros: i64) -> Result<NetEvent,
         })
         .collect();
     Ok(NetEvent::ReviewItems(entries))
+}
+
+async fn memory_list(client: &mut Client) -> Result<NetEvent, Error> {
+    let entries = client
+        .active_memory_records()
+        .await?
+        .into_iter()
+        .map(|record| ReviewEntry {
+            id: record.id,
+            kind: record.kind,
+            namespace: record.namespace,
+            title: record.title,
+            summary: record.summary,
+            body: record.body,
+            supersedes: Vec::new(),
+        })
+        .collect();
+    Ok(NetEvent::MemoryItems(entries))
 }
 
 async fn send(

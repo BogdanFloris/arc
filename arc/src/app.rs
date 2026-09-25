@@ -30,6 +30,7 @@ pub enum Command {
     ReviewList {
         since_micros: i64,
     },
+    MemoryList,
     ReviewAccept {
         record_id: String,
     },
@@ -117,6 +118,7 @@ pub enum NetEvent {
         reason: String,
     },
     ReviewItems(Vec<ReviewEntry>),
+    MemoryItems(Vec<ReviewEntry>),
     ReviewChanged(u32),
     JobItems(Vec<JobInfo>),
     ProjectsSeeded(Vec<ProjectInfo>),
@@ -157,6 +159,7 @@ pub struct Review {
     pub selected: usize,
     pub loaded: bool,
     pub pending_delete: bool,
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1072,6 +1075,7 @@ impl App {
                 match cmd.as_str() {
                     "q" | "q!" | "qa" | "quit" => self.quit = true,
                     "review" => return Some(self.open_review()),
+                    "memory" => return Some(self.open_memory()),
                     "jobs" => return Some(self.open_jobs()),
                     "model" => return self.open_models(false),
                     "model-default" => return self.open_models(true),
@@ -1204,19 +1208,35 @@ impl App {
             selected: 0,
             loaded: false,
             pending_delete: false,
+            all: false,
         });
         Command::ReviewList {
             since_micros: chrono::Utc::now().timestamp_micros() - REVIEW_WINDOW_MICROS,
         }
     }
 
+    fn open_memory(&mut self) -> Command {
+        self.overlay = Overlay::Review(Review {
+            items: Vec::new(),
+            selected: 0,
+            loaded: false,
+            pending_delete: false,
+            all: true,
+        });
+        Command::MemoryList
+    }
+
     fn on_review_key(&mut self, code: KeyCode) -> Option<Command> {
         if code == KeyCode::Char('r') {
-            return Some(self.open_review());
+            return Some(if self.review().expect("open").all {
+                self.open_memory()
+            } else {
+                self.open_review()
+            });
         }
         let review = self.review_mut().expect("review is open");
         match code {
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !review.all => {
                 review.pending_delete = false;
                 return Self::take_verdict(review)
                     .map(|record_id| Command::ReviewAccept { record_id });
@@ -1229,7 +1249,7 @@ impl App {
             KeyCode::Char('d') => {
                 review.pending_delete = !review.items.is_empty();
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('f') if !review.all => {
                 if let Some(entry) = review.items.get(review.selected) {
                     self.input = format!("fix memory {}: {} — ", entry.id, entry.title);
                     self.cursor = self.input.len();
@@ -2172,10 +2192,23 @@ impl App {
             }
             NetEvent::ReviewItems(items) => {
                 if let Some(review) = self.review_mut() {
-                    review.items = items;
-                    review.selected = 0;
-                    review.loaded = true;
-                    review.pending_delete = false;
+                    if !review.all {
+                        review.items = items;
+                        review.selected = 0;
+                        review.loaded = true;
+                        review.pending_delete = false;
+                    }
+                }
+                None
+            }
+            NetEvent::MemoryItems(items) => {
+                if let Some(review) = self.review_mut() {
+                    if review.all {
+                        review.items = items;
+                        review.selected = 0;
+                        review.loaded = true;
+                        review.pending_delete = false;
+                    }
                 }
                 None
             }
@@ -3965,6 +3998,56 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::ReviewItems(entries));
         app
+    }
+
+    fn browsing_memory(entries: Vec<ReviewEntry>) -> App {
+        let mut app = App::new();
+        normal(&mut app, ":memory");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Command::MemoryList));
+        app.on_net(NetEvent::MemoryItems(entries));
+        app
+    }
+
+    #[test]
+    fn memory_browse_deletes_with_dd_without_changing_review_behavior() {
+        let mut app = browsing_memory(vec![
+            entry("mr-1", "one"),
+            entry("mr-2", "two"),
+            entry("mr-3", "three"),
+        ]);
+        app.on_net(NetEvent::ReviewItems(vec![entry("mr-other", "other")]));
+        assert_eq!(app.review().expect("memory").items.len(), 3);
+        assert_eq!(app.on_key(key(KeyCode::Char('a'))), None);
+        assert_eq!(app.on_key(key(KeyCode::Char('f'))), None);
+        assert_eq!(app.input, "");
+
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.on_key(key(KeyCode::Char('d'))), None);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('d'))),
+            Some(Command::ReviewDelete {
+                record_id: "mr-3".to_owned()
+            })
+        );
+        assert_eq!(app.review().expect("memory").selected, 1);
+        assert_eq!(app.review().expect("memory").items.len(), 2);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r'))),
+            Some(Command::MemoryList)
+        );
+        assert!(app.review().expect("memory").all);
+
+        let mut review = reviewing(vec![entry("mr-1", "one")]);
+        review.on_net(NetEvent::MemoryItems(vec![entry("mr-other", "other")]));
+        assert_eq!(
+            review.review().expect("review").items,
+            [entry("mr-1", "one")]
+        );
+        assert!(matches!(
+            review.on_key(key(KeyCode::Char('r'))),
+            Some(Command::ReviewList { .. })
+        ));
     }
 
     #[test]

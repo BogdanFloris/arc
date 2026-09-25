@@ -941,6 +941,10 @@ impl Projection {
         review_items(&self.conn, since_micros)
     }
 
+    pub fn active_memory_records(&self) -> Result<Vec<MemoryRecord>, Error> {
+        active_memory_records(&self.conn)
+    }
+
     pub fn memory_active_at(&self, at_micros: i64) -> Result<Vec<MemoryRecord>, Error> {
         memory_active_at(&self.conn, at_micros)
     }
@@ -1039,6 +1043,10 @@ impl Reader {
 
     pub fn review_items(&self, since_micros: i64) -> Result<Vec<ReviewItem>, Error> {
         review_items(&self.conn(), since_micros)
+    }
+
+    pub fn active_memory_records(&self) -> Result<Vec<MemoryRecord>, Error> {
+        active_memory_records(&self.conn())
     }
 
     pub fn memory_active_at(&self, at_micros: i64) -> Result<Vec<MemoryRecord>, Error> {
@@ -1568,6 +1576,30 @@ pub(crate) fn review_items(conn: &Connection, since_micros: i64) -> Result<Vec<R
         item.supersedes = rows.collect::<Result<_, _>>()?;
     }
     Ok(items)
+}
+
+fn active_memory_records(conn: &Connection) -> Result<Vec<MemoryRecord>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, namespace, title, summary, body, links, provenance, status
+         FROM memory_records WHERE status = ?1
+         ORDER BY namespace, kind, title, id",
+    )?;
+    let rows = stmt.query_map([memory_record::Status::Active as i32], |row| {
+        Ok(MemoryRecord {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            namespace: row.get(2)?,
+            title: row.get(3)?,
+            summary: row.get(4)?,
+            body: row.get(5)?,
+            links: links_from_json(&row.get::<_, String>(6)?)
+                .map_err(|e| bad_json_column(6, &e))?,
+            provenance: provenance_from_json(row.get::<_, Option<String>>(7)?.as_deref())
+                .map_err(|e| bad_json_column(7, &e))?,
+            status: row.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// The records held at `at_micros`, each in its last-known form: a record
@@ -3879,6 +3911,49 @@ mod tests {
             .into_iter()
             .map(|item| item.record.id)
             .collect()
+    }
+
+    #[test]
+    fn memory_browser_lists_old_and_reviewed_active_records_without_retired_ones() {
+        let mut projection = Projection::in_memory().expect("open");
+        for (seq, at, id) in [
+            (0, 10, "mr-old"),
+            (1, 20, "mr-accepted"),
+            (2, 200, "mr-new"),
+        ] {
+            projection
+                .apply(&memory_at(
+                    seq,
+                    at,
+                    memory_payload(mem_created(seq, record(id, id, id))),
+                ))
+                .expect("apply");
+        }
+        projection
+            .apply(&reviewed(3, 250, "mr-accepted"))
+            .expect("apply");
+        projection
+            .apply(&memory_at(
+                4,
+                300,
+                memory_payload(mem_superseded(
+                    4,
+                    "mr-old",
+                    record("mr-replacement", "replacement", "replacement"),
+                )),
+            ))
+            .expect("apply");
+        assert_eq!(
+            projection
+                .active_memory_records()
+                .expect("records")
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            ["mr-accepted", "mr-new", "mr-replacement"]
+        );
+        assert_eq!(review_ids(&projection, 150), ["mr-new", "mr-replacement"]);
+        assert_eq!(review_ids(&projection, 350), Vec::<String>::new());
     }
 
     #[test]

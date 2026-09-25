@@ -2,10 +2,11 @@ use std::collections::VecDeque;
 
 use arc_proto::v1::{
     CancelJob, CancelTurn, ClientFrame, CompactSession, CreateSession, DropSteers, FetchHistory,
-    ForkSession, ImageAttachment, JobInfo, ListJobs, ListModels, ListProjects, ListSessions,
-    MarkBranch, MemoryReviewAccept, MemoryReviewDelete, MemoryReviewItem, MemoryReviewList,
-    ModelChoice, Notification, ProjectInfo, SelectModel, SendMessage, ServerFrame, SessionHistory,
-    SessionInfo, SessionRole, Subscribe, branch_marked, client_frame, server_frame,
+    ForkSession, ImageAttachment, JobInfo, ListJobs, ListMemoryRecords, ListModels, ListProjects,
+    ListSessions, MarkBranch, MemoryRecord, MemoryReviewAccept, MemoryReviewDelete,
+    MemoryReviewItem, MemoryReviewList, ModelChoice, Notification, ProjectInfo, SelectModel,
+    SendMessage, ServerFrame, SessionHistory, SessionInfo, SessionRole, Subscribe, branch_marked,
+    client_frame, server_frame,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
@@ -166,6 +167,17 @@ impl Client {
         {
             server_frame::Msg::MemoryReviewItems(items) => Ok(items.items),
             other => Err(unexpected("MemoryReviewItems", &other)),
+        }
+    }
+
+    #[tracing::instrument(name = "client.active_memory_records", skip_all)]
+    pub async fn active_memory_records(&mut self) -> Result<Vec<MemoryRecord>, Error> {
+        match self
+            .request(client_frame::Msg::ListMemoryRecords(ListMemoryRecords {}))
+            .await?
+        {
+            server_frame::Msg::MemoryRecords(records) => Ok(records.records),
+            other => Err(unexpected("MemoryRecords", &other)),
         }
     }
 
@@ -512,6 +524,7 @@ impl Turn<'_> {
             other @ (server_frame::Msg::SessionList(_)
             | server_frame::Msg::SessionHistory(_)
             | server_frame::Msg::MemoryReviewItems(_)
+            | server_frame::Msg::MemoryRecords(_)
             | server_frame::Msg::JobList(_)
             | server_frame::Msg::ProjectList(_)
             | server_frame::Msg::ModelList(_)
@@ -537,6 +550,7 @@ fn unexpected(wanted: &str, got: &server_frame::Msg) -> Error {
         server_frame::Msg::ToolCallStarted(_) => "ToolCallStarted",
         server_frame::Msg::ToolCallEnded(_) => "ToolCallEnded",
         server_frame::Msg::MemoryReviewItems(_) => "MemoryReviewItems",
+        server_frame::Msg::MemoryRecords(_) => "MemoryRecords",
         server_frame::Msg::JobList(_) => "JobList",
         server_frame::Msg::ProjectList(_) => "ProjectList",
         server_frame::Msg::ModelList(_) => "ModelList",
@@ -723,6 +737,29 @@ mod tests {
             }
             other => panic!("expected MemoryReviewList, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn active_memory_records_round_trip_separately_from_review() {
+        let record = arc_proto::v1::MemoryRecord {
+            id: "m-accepted".to_owned(),
+            ..Default::default()
+        };
+        let response = server_frame::Msg::MemoryRecords(arc_proto::v1::MemoryRecords {
+            records: vec![record.clone()],
+        });
+        let (url, handle) = server(vec![vec![echo(response)]]).await;
+
+        let mut client = Client::connect(&url).await.expect("connect");
+        assert_eq!(
+            client.active_memory_records().await.expect("list"),
+            [record]
+        );
+        let frames = received(handle).await;
+        assert!(matches!(
+            frames[0].msg,
+            Some(client_frame::Msg::ListMemoryRecords(_))
+        ));
     }
 
     #[tokio::test]
