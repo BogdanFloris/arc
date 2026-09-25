@@ -555,6 +555,7 @@ mod tests {
                     choice: String::new(),
                     editing: String::new(),
                     working_directory: String::new(),
+                    thinking: String::new(),
                 })),
             })),
         })
@@ -742,6 +743,7 @@ mod tests {
                 choice: String::new(),
                 editing: String::new(),
                 working_directory: String::new(),
+                thinking: String::new(),
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),

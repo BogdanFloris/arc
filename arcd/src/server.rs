@@ -235,11 +235,20 @@ async fn request(
             .map(server_frame::Msg::SessionHistory)
             .map_err(SessionError::from),
         Some(client_frame::Msg::FetchStatus(fetch)) => Ok(
-            match session_status(reads, supervisor, &fetch.session_id).await {
+            match session_status(reads, supervisor, engine, &fetch.session_id).await {
                 Ok(status) => server_frame::Msg::SessionStatus(status),
                 Err(error) => error_frame("status_unavailable", &error),
             },
         ),
+        Some(client_frame::Msg::SetSessionThinking(set)) => {
+            match engine.set_session_thinking(&set.session_id, &set.thinking) {
+                Ok(()) => match session_status(reads, supervisor, engine, &set.session_id).await {
+                    Ok(status) => Ok(server_frame::Msg::SessionStatus(status)),
+                    Err(error) => Ok(error_frame("status_unavailable", &error)),
+                },
+                Err(error) => Err(error),
+            }
+        }
         Some(client_frame::Msg::MemoryReviewList(list)) => reads
             .review_items(list.since_micros)
             .map(|items| {
@@ -452,6 +461,7 @@ async fn forward(
 async fn session_status(
     reads: &Reader,
     supervisor: &Supervisor,
+    engine: &Engine,
     session_id: &str,
 ) -> anyhow::Result<arc_proto::v1::SessionStatus> {
     let session = reads
@@ -464,6 +474,24 @@ async fn session_status(
         codex: session.provider == "codex",
         ..Default::default()
     };
+    let fallback = supervisor
+        .status_runner(
+            SessionRole::try_from(session.role).unwrap_or_default(),
+            &session.provider,
+            &session.model,
+        )
+        .map_or(arc_core::provider::Thinking::Default, |runner| {
+            runner.thinking
+        });
+    engine
+        .session_thinking(session_id, fallback)?
+        .label()
+        .clone_into(&mut status.effective_thinking);
+    status.supported_thinking =
+        arc_core::provider::supported_thinking(&session.provider, &session.model)
+            .iter()
+            .map(|thinking| thinking.label().to_owned())
+            .collect();
     if let Some((context, observed_at)) = reads.context_status(session_id)? {
         status.context = Some(context);
         status.context_observed_at = observed_at;
@@ -662,6 +690,9 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::UnknownProject { .. } => "unknown_project",
         SessionError::UnknownChoice { .. } => "unknown_choice",
         SessionError::UnknownSession { .. } => "unknown_session",
+        SessionError::UnsupportedThinking { .. } => "unsupported_thinking",
+        SessionError::ThinkingWhileBusy { .. } => "thinking_while_busy",
+        SessionError::InvalidThinkingPosition => "invalid_thinking_position",
         SessionError::HistoricalSession { .. } => "historical_session",
         SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
         SessionError::NotABranch { .. } => "not_a_branch",
@@ -678,6 +709,7 @@ fn kind(frame: &ClientFrame) -> &'static str {
         Some(client_frame::Msg::ListSessions(_)) => "list_sessions",
         Some(client_frame::Msg::FetchHistory(_)) => "fetch_history",
         Some(client_frame::Msg::FetchStatus(_)) => "fetch_status",
+        Some(client_frame::Msg::SetSessionThinking(_)) => "set_session_thinking",
         Some(client_frame::Msg::MemoryReviewList(_)) => "memory_review_list",
         Some(client_frame::Msg::ListMemoryRecords(_)) => "list_memory_records",
         Some(client_frame::Msg::MemoryReviewAccept(_)) => "memory_review_accept",
