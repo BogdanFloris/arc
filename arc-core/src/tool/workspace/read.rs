@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Access, Workspace};
+use super::{Workspace, resolve_path};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -69,12 +69,7 @@ impl Tool for Read {
                 }
             };
 
-            let Some(grants) = &ctx.grants else {
-                return ToolReply::error(
-                    "ERROR: no workspace is granted in this session.".to_owned(),
-                );
-            };
-            let resolved = match grants.resolve(&args.path, Access::Read) {
+            let resolved = match resolve_path(&args.path) {
                 Ok(path) => path,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
             };

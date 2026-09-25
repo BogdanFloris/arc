@@ -282,10 +282,22 @@ impl Client {
         project: &str,
         choice: &str,
     ) -> Result<String, Error> {
+        self.create_session_in_directory(role, project, choice, "")
+            .await
+    }
+
+    pub async fn create_session_in_directory(
+        &mut self,
+        role: SessionRole,
+        project: &str,
+        choice: &str,
+        working_directory: &str,
+    ) -> Result<String, Error> {
         self.accepted(client_frame::Msg::CreateSession(CreateSession {
             role: role as i32,
             project: project.to_owned(),
             choice: choice.to_owned(),
+            working_directory: working_directory.to_owned(),
         }))
         .await
     }

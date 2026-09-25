@@ -897,7 +897,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "a :code session the user opened must reach the extractor"
+            "a user-opened session must reach the extractor"
         );
     }
 

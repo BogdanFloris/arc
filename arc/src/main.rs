@@ -42,8 +42,8 @@ options:
 
 keys:
   insert mode    enter sends; ctrl-j adds a newline; esc leaves
-  normal mode    tab switches chat/code; :chat opens chat; :code picks a project
-                 ctrl-p sessions; / filters; enter opens the match
+  normal mode    ctrl-n new session; ctrl-p sessions
+                 / filters; enter opens the match
                  v/V selects; y yanks; R rewinds; :compact compacts
                  j/k scroll; ctrl-u/ctrl-d page; gg/G top/end
                  M models; J jobs; Q review; ? help
@@ -78,8 +78,6 @@ fn url_from_args() -> Result<Option<String>> {
     }
 }
 
-// a remote daemon's directory means nothing here, so only a loopback host
-// gets a door guessed from where the client was started
 fn is_local(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host = match rest.strip_prefix('[') {
@@ -301,8 +299,6 @@ mod tests {
         ));
     }
 
-    // a remote address never guesses a door: its directory means nothing
-    // to the daemon, whatever the client's own cwd happens to be
     #[test]
     fn a_remote_address_yields_no_launch_dir() {
         assert_eq!(launch_dir("ws://100.64.0.1:8787"), None);

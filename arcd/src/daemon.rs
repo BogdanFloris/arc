@@ -214,7 +214,7 @@ impl Daemon {
                     name.clone(),
                     crate::jobs::Project {
                         root: project.root.clone(),
-                        command_prefix: project.command_prefix.clone(),
+                        command_prefix: Vec::new(),
                     },
                 )
             })
@@ -450,22 +450,14 @@ fn dispatch_projects(config: &Config) -> (Vec<(String, String)>, Option<String>)
 }
 
 fn project_spec(project: &crate::config::ProjectConfig) -> ProjectSpec {
-    let sources = project
-        .sources
-        .iter()
-        .map(|source| source.resolve())
-        .collect();
-    let mut grants = vec![Grant::new(project.root.clone(), Mode::ReadWrite)];
-    grants.extend(
-        project
-            .read_only
-            .iter()
-            .map(|root| Grant::new(root.clone(), Mode::ReadOnly)),
-    );
     ProjectSpec {
-        sources,
-        grants,
-        command_prefix: project.command_prefix.clone(),
+        sources: vec![
+            arc_core::tool::ToolSource::Builtin,
+            arc_core::tool::ToolSource::Workspace,
+        ],
+        grants: vec![Grant::new(project.root.clone(), Mode::ReadWrite)],
+        command_prefix: Vec::new(),
+        description: project.description.clone(),
     }
 }
 
@@ -522,7 +514,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::{ProjectConfig, ToolSource};
+    use crate::config::ProjectConfig;
     use crate::dirs::DataDirs;
 
     // port 1 refuses every connection: startup must not reach a provider
@@ -562,6 +554,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    working_directory: String::new(),
                 })),
             })),
         })
@@ -748,6 +741,7 @@ mod tests {
                 dispatched_by: String::new(),
                 choice: String::new(),
                 editing: String::new(),
+                working_directory: String::new(),
             }),
             session_event::Event::MessageAppended(MessageAppended {
                 session_id: session_id.to_owned(),
@@ -871,12 +865,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bound_session_gets_the_configured_projects_grants() {
+    async fn a_project_session_records_its_name_without_permissions() {
         let temp = TempDir::new().expect("temp dir");
         let project_root = temp.path().join("proj");
         std::fs::create_dir_all(&project_root).expect("mkdir proj");
-        let notes_root = temp.path().join("notes");
-        std::fs::create_dir_all(&notes_root).expect("mkdir notes");
 
         let mut config = Config::default();
         config.projects.insert(
@@ -884,9 +876,6 @@ mod tests {
             ProjectConfig {
                 root: project_root.clone(),
                 description: String::new(),
-                read_only: vec![notes_root.clone()],
-                sources: vec![ToolSource::Builtin, ToolSource::Workspace],
-                command_prefix: Vec::new(),
             },
         );
         let dirs = DataDirs::new(&temp.path().join("data"));
@@ -911,20 +900,7 @@ mod tests {
             })
             .expect("the bound session was recorded");
 
-        let root = project_root.canonicalize().expect("canon");
-        let notes = notes_root.canonicalize().expect("canon");
-        assert_eq!(
-            created.grants,
-            [
-                arc_proto::v1::WorkspaceGrant {
-                    root: root.to_string_lossy().into_owned(),
-                    read_write: true,
-                },
-                arc_proto::v1::WorkspaceGrant {
-                    root: notes.to_string_lossy().into_owned(),
-                    read_write: false,
-                },
-            ]
-        );
+        assert_eq!(created.project, "arc");
+        assert!(created.grants.is_empty());
     }
 }

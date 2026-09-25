@@ -57,6 +57,7 @@ fn session_created_event() -> Event {
                 dispatched_by: "s-parent".to_string(),
                 choice: "gemini-pro".to_owned(),
                 editing: "replacement".to_owned(),
+                working_directory: "/home/bogdan/arc".to_owned(),
             })),
         })),
     }
@@ -176,6 +177,21 @@ fn memory_payload_event(seq: u64, source: Source, event: memory_event::Event) ->
 #[test]
 fn event_session_created_round_trips() {
     round_trip(&session_created_event());
+}
+
+#[test]
+fn historical_direct_role_number_survives_decoding() {
+    let mut event = session_created_event();
+    let Some(event::Payload::Session(SessionEvent {
+        event: Some(session_event::Event::SessionCreated(created)),
+    })) = &mut event.payload
+    else {
+        unreachable!()
+    };
+    created.role = 4;
+    assert!(SessionRole::try_from(created.role).is_err());
+    let decoded = Event::decode(event.encode_to_vec().as_slice()).expect("decode");
+    assert_eq!(decoded, event);
 }
 
 #[test]

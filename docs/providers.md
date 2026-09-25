@@ -18,19 +18,17 @@ This file records configuration and measurements, not a live price or terms feed
 
 | Role | Optimize for |
 | --- | --- |
-| chat | Latency, voice, vision, judgment. |
-| code | Interactive judgment and collaboration. |
+| assistant | All interactive sessions. |
 | executor | Cost per completed delegated task. |
 | archivist | Extraction/compaction quality and bulk cost. |
 
-## 3. Recorded configuration — 2026-09-24
+## 3. Recorded configuration — 2026-09-25
 
 Live configuration is `~/.config/arc/arc.toml`. Durable role selections can override these configured defaults for new sessions; open sessions keep their pins.
 
 | Role | Default preset | Access |
 | --- | --- | --- |
-| chat | astra | Codex |
-| code | sol | Codex |
+| assistant | astra | Codex |
 | executor | sol | Codex |
 | archivist | luna | Codex |
 
@@ -43,14 +41,14 @@ The local llama.cpp configuration remains available but no configured role uses 
 Interactive development and workers select independently. With presets already declared:
 
 ```toml
-[roles.code]
+[roles.assistant]
 choices = ["astra", "sol"]
 
 [roles.executor]
 choices = ["sol", "astra"]
 ```
 
-First choice is default until a durable role selection overrides it. The session model menu creates/forks under a preset; changing the role default is a separate action. Omitted `roles.code` inherits the executor menu, not its selection. Legacy sessions retain their role; forks keep that role but choose a new pin.
+First choice is default until a durable role selection overrides it. The session model menu creates/forks under a preset; changing the role default is a separate action. Historical code sessions cannot be opened or forked.
 
 Codex defaults to `read`, `bash`, `apply_patch`; other providers to `read`, `bash`, `edit`, `write`. Presets and inline roles may override with `editing = "patch"` or `"replacement"`. The editing interface is pinned at creation too.
 

@@ -25,13 +25,12 @@ use crate::store::{self, Store, now_ts};
 use crate::tool::workspace::{Grant, Grants, Mode};
 use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource, TurnContext};
 
-const MAX_TOOL_STEPS: usize = 8;
 const MAX_EXECUTOR_TOOL_STEPS: usize = 256;
 
 fn max_tool_steps(role: SessionRole) -> usize {
     match role {
-        SessionRole::Code | SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
-        _ => MAX_TOOL_STEPS,
+        SessionRole::Chat | SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
+        _ => 8,
     }
 }
 
@@ -44,6 +43,7 @@ pub struct ProjectSpec {
     pub sources: Vec<ToolSource>,
     pub grants: Vec<Grant>,
     pub command_prefix: Vec<String>,
+    pub description: String,
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +218,9 @@ pub enum Error {
 
     #[error("session {session_id} does not exist; nothing to fork")]
     UnknownSession { session_id: String },
+
+    #[error("session {session_id} uses the retired code role; start a new assistant session")]
+    HistoricalSession { session_id: String },
 
     #[error(
         "fork_point {fork_point} is not a message in session {session_id}; fork from a \
@@ -486,12 +489,32 @@ impl Engine {
         runner: &Runner,
         choice: &str,
     ) -> Result<String, Error> {
+        self.create_session_with_directory(runner, choice, "")
+    }
+
+    pub fn create_session_with_directory(
+        &self,
+        runner: &Runner,
+        choice: &str,
+        directory: &str,
+    ) -> Result<String, Error> {
         let selected = self.choice_for(runner.role, choice)?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let editing = selected
             .as_ref()
             .map_or(runner.editing, |pick| pick.editing);
-        self.record_unbound_session(&session_id, runner, selected.as_ref(), editing)?;
+        let directory = if directory.is_empty() {
+            String::new()
+        } else {
+            std::fs::canonicalize(directory)
+                .map_err(|source| Error::Grants {
+                    project: directory.to_owned(),
+                    source,
+                })?
+                .to_string_lossy()
+                .into_owned()
+        };
+        self.record_unbound_session(&session_id, runner, selected.as_ref(), editing, directory)?;
         Ok(session_id)
     }
 
@@ -501,6 +524,7 @@ impl Engine {
         runner: &Runner,
         selected: Option<&ModelChoice>,
         editing: crate::tool::Editing,
+        working_directory: String,
     ) -> Result<(), Error> {
         self.record(
             Source::User,
@@ -514,6 +538,7 @@ impl Engine {
                 role: runner.role as i32,
                 editing: editing.as_str().to_owned(),
                 choice: selected.map_or_else(String::new, |pick| pick.name.clone()),
+                working_directory,
                 ..Default::default()
             }),
         )?;
@@ -561,7 +586,7 @@ impl Engine {
         project: &str,
         role: SessionRole,
         budget: Option<Budget>,
-        intent: Intent,
+        _intent: Intent,
         dispatched_by: Option<&str>,
         source: Source,
         choice: &str,
@@ -572,13 +597,7 @@ impl Engine {
             .ok_or_else(|| Error::UnknownProject {
                 project: project.to_owned(),
             })?;
-        let mut grant_specs = spec.grants.clone();
-        if intent == Intent::Analyze {
-            for grant in &mut grant_specs {
-                grant.mode = Mode::ReadOnly;
-            }
-        }
-        let grants = Grants::new(grant_specs).map_err(|source| Error::Grants {
+        let grants = Grants::new(spec.grants.clone()).map_err(|source| Error::Grants {
             project: project.to_owned(),
             source,
         })?;
@@ -602,14 +621,10 @@ impl Engine {
                 role: role as i32,
                 project: project.to_owned(),
                 budget,
-                grants: grants
-                    .canonical_roots()
-                    .iter()
-                    .map(|(root, mode)| WorkspaceGrant {
-                        root: root.to_string_lossy().into_owned(),
-                        read_write: *mode == Mode::ReadWrite,
-                    })
-                    .collect(),
+                grants: Vec::new(),
+                working_directory: grants
+                    .project_root()
+                    .map_or_else(String::new, |root| root.to_string_lossy().into_owned()),
                 dispatched_by: dispatched_by.unwrap_or_default().to_owned(),
                 editing: selected
                     .as_ref()
@@ -632,7 +647,7 @@ impl Engine {
         fork_point: u64,
         choice: &str,
     ) -> Result<String, Error> {
-        let (parent_id, role, identity, recorded_editing, project, grants) =
+        let (parent_id, role, identity, recorded_editing, project, grants, working_directory) =
             self.with_store(|store| -> Result<_, Error> {
                 let projection = store.projection();
                 let role =
@@ -641,6 +656,11 @@ impl Engine {
                         .ok_or_else(|| Error::UnknownSession {
                             session_id: parent_id.to_owned(),
                         })?;
+                if role == provider::LEGACY_DIRECT_ROLE {
+                    return Err(Error::HistoricalSession {
+                        session_id: parent_id.to_owned(),
+                    });
+                }
                 let owner = projection.message_owner(fork_point)?;
                 let owner_id = match owner {
                     Some((owner_id, projection::KIND_MESSAGE))
@@ -669,8 +689,24 @@ impl Engine {
                 let editing = projection.session_editing(&owner_id)?;
                 let project = projection.session_project(&owner_id)?.unwrap_or_default();
                 let grants = projection.session_grants(&owner_id)?;
-                Ok((owner_id, role, identity, editing, project, grants))
+                let working_directory = projection
+                    .session_working_directory(&owner_id)?
+                    .unwrap_or_default();
+                Ok((
+                    owner_id,
+                    role,
+                    identity,
+                    editing,
+                    project,
+                    grants,
+                    working_directory,
+                ))
             })?;
+        if role == provider::LEGACY_DIRECT_ROLE {
+            return Err(Error::HistoricalSession {
+                session_id: parent_id,
+            });
+        }
         let selected = self.choice_for(
             SessionRole::try_from(role).unwrap_or(SessionRole::Unspecified),
             choice,
@@ -705,6 +741,7 @@ impl Engine {
                     .into_iter()
                     .map(|(root, read_write)| WorkspaceGrant { root, read_write })
                     .collect(),
+                working_directory,
                 dispatched_by: String::new(),
                 editing,
                 choice: selected.map_or_else(String::new, |pick| pick.name),
@@ -798,8 +835,8 @@ impl Engine {
                      each message costs the job a full turn.",
                     provider::role_label(role),
                     match intent {
-                        Intent::Analyze => "analyze: project read-only, /tmp writable",
-                        Intent::Implement => "implement: read-write",
+                        Intent::Analyze => "analyze",
+                        Intent::Implement => "implement",
                     }
                 ),
                 Some(DispatchedJob {
@@ -820,7 +857,7 @@ impl Engine {
         parent_session: &str,
         project: &str,
         role: SessionRole,
-        intent: Intent,
+        _intent: Intent,
     ) -> Option<String> {
         let candidate = self
             .with_store(|store| {
@@ -830,15 +867,6 @@ impl Engine {
             })
             .ok()
             .flatten()?;
-        if intent == Intent::Implement {
-            let grants = self
-                .with_store(|store| store.projection().session_grants(&candidate))
-                .ok()?;
-            let read_only = !grants.is_empty() && grants.iter().all(|(_, read_write)| !read_write);
-            if read_only {
-                return None;
-            }
-        }
         Some(candidate)
     }
 
@@ -940,22 +968,10 @@ impl Engine {
             .unwrap_or_default();
         let content = match reason {
             None => {
-                let grants =
-                    self.with_store(|store| store.projection().session_grants(child_session))?;
-                let read_only = !grants.is_empty() && grants.iter().all(|(_, rw)| !*rw);
-                let tail = if read_only {
-                    format!(
-                        "For follow-ups about anything this job read, continue_job \
-                         {child_session} keeps its context but its project stays read-only \
-                         (/tmp is writable) — a project change needs a fresh implement \
-                         dispatch; a new dispatch starts from nothing."
-                    )
-                } else {
-                    format!(
-                        "For follow-ups about anything this job read or did, continue_job \
-                         {child_session} keeps its context; a new dispatch starts from nothing."
-                    )
-                };
+                let tail = format!(
+                    "For follow-ups about anything this job read or did, continue_job \
+                     {child_session} keeps its context; a new dispatch starts from nothing."
+                );
                 format!("Job {child_session} finished.\n{summary}{footprint}\n{tail}")
             }
             Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}{footprint}"),
@@ -997,6 +1013,11 @@ impl Engine {
 
     pub fn session_role(&self, session_id: &str) -> Result<Option<SessionRole>, Error> {
         let raw = self.with_store(|store| store.projection().session_role(session_id))?;
+        if raw == Some(provider::LEGACY_DIRECT_ROLE) {
+            return Err(Error::HistoricalSession {
+                session_id: session_id.to_owned(),
+            });
+        }
         Ok(raw.and_then(|role| SessionRole::try_from(role).ok()))
     }
 
@@ -1019,6 +1040,16 @@ impl Engine {
 
     pub fn session_project(&self, session_id: &str) -> Result<Option<String>, Error> {
         Ok(self.with_store(|store| store.projection().session_project(session_id))?)
+    }
+
+    pub fn session_working_directory(&self, session_id: &str) -> Result<Option<String>, Error> {
+        Ok(self.with_store(|store| store.projection().session_working_directory(session_id))?)
+    }
+
+    pub fn project_description(&self, name: &str) -> Option<&str> {
+        self.projects
+            .get(name)
+            .map(|spec| spec.description.as_str())
     }
 
     pub fn session_usage_tokens(&self, session_id: &str) -> Result<u64, Error> {
@@ -1068,19 +1099,12 @@ impl Engine {
                 ))
             })?
         };
-        let (mut sources, command_prefix) = match project {
-            None => (vec![ToolSource::Builtin], Vec::new()),
-            Some(name) => {
-                if let Some(spec) = self.projects.get(&name) {
-                    (spec.sources.clone(), spec.command_prefix.clone())
-                } else {
-                    // fail closed: a project gone from config grants nothing
-                    tracing::warn!(project = %name, "session names a project that is not configured");
-                    (vec![ToolSource::Builtin], Vec::new())
-                }
-            }
-        };
-        if sources.contains(&ToolSource::Workspace) {
+        let mut sources = vec![ToolSource::Builtin, ToolSource::Workspace];
+        let command_prefix = project
+            .as_deref()
+            .and_then(|name| self.projects.get(name))
+            .map_or_else(Vec::new, |spec| spec.command_prefix.clone());
+        {
             let editing = if new_session {
                 runner.editing
             } else {
@@ -1111,17 +1135,40 @@ impl Engine {
         if source != Some(Source::Model as i32) {
             sources.push(ToolSource::Jobs);
         }
-        if matches!(role, SessionRole::Chat | SessionRole::Code) {
+        if role == SessionRole::Chat {
             sources.push(ToolSource::Web);
         }
         Ok((sources, command_prefix))
     }
 
     fn grants(&self, session_id: &str, new_session: bool) -> Result<Option<Arc<Grants>>, Error> {
-        if new_session {
-            return Ok(None);
+        let project = (!new_session)
+            .then(|| self.with_store(|store| store.projection().session_project(session_id)))
+            .transpose()?
+            .flatten();
+        if let Some(spec) = project.as_deref().and_then(|name| self.projects.get(name)) {
+            return Ok(Some(Arc::new(Grants::new(spec.grants.clone()).map_err(
+                |source| Error::Grants {
+                    project: project.unwrap(),
+                    source,
+                },
+            )?)));
         }
-        let recorded = self.with_store(|store| store.projection().session_grants(session_id))?;
+        if !new_session {
+            if let Some(directory) =
+                self.with_store(|store| store.projection().session_working_directory(session_id))?
+            {
+                return Ok(Some(Arc::new(Grants::from_recorded(vec![(
+                    PathBuf::from(directory),
+                    Mode::ReadWrite,
+                )]))));
+            }
+        }
+        let recorded = if new_session {
+            Vec::new()
+        } else {
+            self.with_store(|store| store.projection().session_grants(session_id))?
+        };
         if recorded.is_empty() {
             return Ok(None);
         }
@@ -1310,7 +1357,13 @@ impl Engine {
                         && choice.thinking == runner.thinking
                 })
             });
-            self.record_unbound_session(&session_id, runner, selected, runner.editing)?;
+            self.record_unbound_session(
+                &session_id,
+                runner,
+                selected,
+                runner.editing,
+                String::new(),
+            )?;
         }
         if let Some(message) = message {
             self.record(
@@ -1908,6 +1961,11 @@ impl Engine {
 
     fn enforce_pin(&self, runner: &Runner, session_id: &str) -> Result<(), Error> {
         match self.with_store(|store| store.projection().session_role(session_id))? {
+            Some(provider::LEGACY_DIRECT_ROLE) => {
+                return Err(Error::HistoricalSession {
+                    session_id: session_id.to_owned(),
+                });
+            }
             // sessions logged before roles exist stay unpinned
             Some(pinned) if pinned == SessionRole::Unspecified as i32 => return Ok(()),
             Some(pinned) if pinned != runner.role as i32 => {
@@ -1947,17 +2005,10 @@ impl Engine {
 
     // stable first, volatile after: everything here is prefix the provider caches,
     // so anything that changes per turn has to go in the messages instead
-    fn system_prompt(
-        runner: &Runner,
-        start_date: Option<&str>,
-        memory_index: Option<&str>,
-    ) -> Option<String> {
+    fn system_prompt(runner: &Runner, memory_index: Option<&str>) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &runner.system {
             parts.push(identity);
-        }
-        if let Some(date) = start_date {
-            parts.push(date);
         }
         if let Some(index) = memory_index {
             parts.push(index);
@@ -2376,21 +2427,13 @@ impl Engine {
         runner: &Runner,
         session_id: &str,
     ) -> Result<(Vec<Message>, Option<String>), Error> {
-        let (rows, memory_index, started_at) = self.with_store(|store| {
+        let (rows, memory_index) = self.with_store(|store| {
             Ok::<_, Error>((
                 store.projection().lineage_messages(session_id)?,
                 store.projection().memory_index()?,
-                store.projection().session_started_at(session_id)?,
             ))
         })?;
-        let start_date = (runner.role == SessionRole::Chat)
-            .then(|| started_at.and_then(start_date_line))
-            .flatten();
-        let system = Self::system_prompt(
-            runner,
-            start_date.as_deref(),
-            render_memory_index(&memory_index).as_deref(),
-        );
+        let system = Self::system_prompt(runner, render_memory_index(&memory_index).as_deref());
         Ok((rebuild_transcript(&rows), system))
     }
 
@@ -2498,14 +2541,6 @@ fn validate_compaction_summary(model_text: &str, summary: &str) -> Result<(), &'
         return Err("exceeds the 32 KiB cap");
     }
     Ok(())
-}
-
-// frozen at session start so the prefix stays byte-stable across turns
-fn start_date_line(micros: i64) -> Option<String> {
-    let date = chrono::DateTime::from_timestamp_micros(micros)?
-        .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d");
-    Some(format!("This conversation started on {date}."))
 }
 
 const MAX_HANDBACK_SUMMARY_BYTES: usize = 16 * 1024;
@@ -2812,8 +2847,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, MAX_TOOL_STEPS, ProjectSpec,
-        Runner,
+        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, ProjectSpec, Runner,
+        max_tool_steps,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -3079,6 +3114,7 @@ mod tests {
             dispatched_by: String::new(),
             choice: String::new(),
             editing: String::new(),
+            working_directory: String::new(),
         })
     }
 
@@ -3155,6 +3191,7 @@ mod tests {
             dispatched_by: String::new(),
             choice: String::new(),
             editing: String::new(),
+            working_directory: String::new(),
         })
     }
 
@@ -3267,6 +3304,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    working_directory: String::new(),
                 }),
                 seeded_message(Role::User, "earlier"),
             ],
@@ -3283,7 +3321,7 @@ mod tests {
         assert!(matches!(err, Error::RoleMismatch { .. }), "got: {err:?}");
         let msg = err.to_string();
         assert!(
-            msg.contains("executor") && msg.contains("chat"),
+            msg.contains("executor") && msg.contains("assistant"),
             "the refusal names both roles: {msg}"
         );
         assert_eq!(
@@ -4102,7 +4140,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_step_cap_forces_a_final_completion_without_tools() {
-        let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..MAX_TOOL_STEPS)
+        let steps = max_tool_steps(SessionRole::Archivist);
+        let mut script: Vec<Vec<Result<CompletionDelta, ProviderError>>> = (0..steps)
             .map(|step| {
                 vec![
                     Ok(call(&format!("c{step}"), 0, "alpha", "{}")),
@@ -4113,7 +4152,8 @@ mod tests {
         script.push(done_reply("enough"));
         let provider = ScriptedProvider::scripted(script);
         let dir = TempDir::new().expect("temp dir");
-        let (engine, run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        let (engine, mut run) = engine_with_tools(&provider, &dir, tools(&[("alpha", "A", true)]));
+        run.role = SessionRole::Archivist;
         let (tx, _rx) = channel();
 
         let reply = engine
@@ -4122,14 +4162,10 @@ mod tests {
             .expect("send");
 
         let requests = provider.requests();
-        assert_eq!(requests.len(), MAX_TOOL_STEPS + 1);
+        assert_eq!(requests.len(), steps + 1);
+        assert!(requests[..steps].iter().all(|r| !r.tools.is_empty()));
         assert!(
-            requests[..MAX_TOOL_STEPS]
-                .iter()
-                .all(|r| !r.tools.is_empty())
-        );
-        assert!(
-            requests[MAX_TOOL_STEPS].tools.is_empty(),
+            requests[steps].tools.is_empty(),
             "the final completion offers no tools"
         );
         let events = conversation_log(dir.path());
@@ -4197,10 +4233,6 @@ mod tests {
                 "the palette everywhere",
             ),
         ]
-    }
-
-    fn today_line() -> String {
-        super::start_date_line(chrono::Local::now().timestamp_micros()).expect("valid now")
     }
 
     fn seeded_block() -> String {
@@ -4285,11 +4317,7 @@ mod tests {
 
         assert_eq!(
             provider.requests()[0].system,
-            Some(format!(
-                "be terse\n\n{}\n\n{}",
-                today_line(),
-                seeded_block()
-            ))
+            Some(format!("be terse\n\n{}", seeded_block()))
         );
     }
 
@@ -4513,6 +4541,7 @@ mod tests {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
                 command_prefix: Vec::new(),
+                description: String::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -4536,11 +4565,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unbound_session_denies_a_workspace_tool_and_the_turn_still_completes() {
+    async fn an_unbound_session_can_use_a_workspace_tool() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("c1", 0, "ws_read", "{}")), Ok(tool_stop())],
-            done_reply("no access, sorry"),
+            done_reply("done"),
         ]);
         let mut registry = Registry::new(512);
         registry.register(workspace_tool("ws_read", "workspace file"));
@@ -4551,6 +4580,7 @@ mod tests {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
                 command_prefix: Vec::new(),
+                description: String::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -4559,32 +4589,28 @@ mod tests {
         let reply = engine
             .send_message(&run, None, "read it", tx)
             .await
-            .expect("the turn still completes after a denied tool call");
+            .expect("unbound workspace tool");
 
         assert!(!reply.partial);
         let requests = provider.requests();
         assert!(
-            requests[0].tools.iter().all(|def| def.name != "ws_read"),
-            "an unbound session must not be offered a workspace tool: {:?}",
+            requests[0].tools.iter().any(|def| def.name == "ws_read"),
+            "an unbound session has workspace tools: {:?}",
             requests[0].tools
         );
         let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(
-            result.content.contains("not available in this session"),
-            "{}",
-            result.content
-        );
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(result.content, "workspace file");
     }
 
     #[tokio::test]
-    async fn a_session_naming_an_unconfigured_project_fails_closed_to_builtin() {
+    async fn a_session_naming_an_unconfigured_project_keeps_workspace_tools() {
         let dir = TempDir::new().expect("temp dir");
         seed_log(&dir, vec![seeded_session_with_project("vanished")]);
         let provider = ScriptedProvider::scripted(vec![
             vec![Ok(call("c1", 0, "ws_read", "{}")), Ok(tool_stop())],
-            done_reply("no access, sorry"),
+            done_reply("done"),
         ]);
         let mut registry = Registry::new(512);
         registry.register(workspace_tool("ws_read", "workspace file"));
@@ -4595,6 +4621,7 @@ mod tests {
                 sources: vec![ToolSource::Builtin, ToolSource::Workspace],
                 grants: Vec::new(),
                 command_prefix: Vec::new(),
+                description: String::new(),
             },
         );
         let (engine, run) = reopened_engine_with_projects(&provider, &dir, registry, projects);
@@ -4603,17 +4630,13 @@ mod tests {
         let reply = engine
             .send_message(&run, Some("s-01"), "read it", tx)
             .await
-            .expect("a project missing from config still gets builtin only");
+            .expect("project metadata is not a tool permission");
 
         assert!(!reply.partial);
         let events = conversation_log(dir.path());
         let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(
-            result.content.contains("not available in this session"),
-            "{}",
-            result.content
-        );
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert_eq!(result.content, "workspace file");
     }
 
     #[tokio::test]
@@ -4722,28 +4745,24 @@ mod tests {
                 sources,
                 grants,
                 command_prefix: Vec::new(),
+                description: String::new(),
             },
         );
         projects
     }
 
     #[tokio::test]
-    async fn create_bound_session_records_the_project_and_canonical_grants() {
+    async fn create_bound_session_records_the_project_without_permissions() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
-        let notes = dir.path().join("notes");
-        std::fs::create_dir_all(&notes).expect("mkdir notes");
 
         let provider = ScriptedProvider::scripted(vec![]);
         let (mut engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
         engine = engine.with_projects(projects_with(
             "arc",
             vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![
-                Grant::new(&root, Mode::ReadWrite),
-                Grant::new(&notes, Mode::ReadOnly),
-            ],
+            vec![Grant::new(&root, Mode::ReadWrite)],
         ));
 
         let session_id = engine
@@ -4759,150 +4778,55 @@ mod tests {
         assert_eq!(created.role, SessionRole::Chat as i32);
         assert_eq!(created.provider, "scripted");
         assert_eq!(created.model, "test-model");
-        assert_eq!(
-            created.grants,
-            [
-                arc_proto::v1::WorkspaceGrant {
-                    root: root
-                        .canonicalize()
-                        .expect("canon")
-                        .to_string_lossy()
-                        .into_owned(),
-                    read_write: true,
-                },
-                arc_proto::v1::WorkspaceGrant {
-                    root: notes
-                        .canonicalize()
-                        .expect("canon")
-                        .to_string_lossy()
-                        .into_owned(),
-                    read_write: false,
-                },
-            ]
-        );
+        assert!(created.grants.is_empty());
     }
 
     #[tokio::test]
-    async fn code_and_executor_selections_replay_independently_and_preserve_existing_pins() {
+    async fn historical_code_sessions_replay_but_cannot_resume_or_fork() {
         let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir");
-        let choices = || {
-            [SessionRole::Code, SessionRole::Executor]
-                .into_iter()
-                .map(|role| {
-                    (
-                        role,
-                        ["sol", "astra"]
-                            .into_iter()
-                            .map(|name| super::ModelChoice {
-                                name: name.to_owned(),
-                                provider: "scripted".to_owned(),
-                                model: name.to_owned(),
-                                thinking: Thinking::Default,
-                                editing: crate::tool::Editing::Replacement,
-                            })
-                            .collect(),
-                    )
-                })
-                .collect()
-        };
-        let provider = ScriptedProvider::scripted(vec![done_reply("kept")]);
-        let (engine, run) = engine_with_tools(&provider, &dir, Registry::new(512));
-        let engine = engine
-            .with_projects(projects_with(
-                "arc",
-                vec![ToolSource::Builtin, ToolSource::Workspace],
-                vec![Grant::new(&root, Mode::ReadWrite)],
-            ))
-            .with_role_choices(choices());
-        let legacy = engine
-            .create_direct_session(&run, "arc", SessionRole::Executor)
-            .expect("legacy direct session");
+        let provider = ScriptedProvider::scripted(vec![]);
+        let (engine, _run) = engine_with_tools(&provider, &dir, Registry::new(512));
+        let code = "historical-code".to_owned();
         engine
-            .select_model(SessionRole::Code, "astra")
-            .expect("select code");
-        assert_eq!(
-            engine
-                .selected_choice(SessionRole::Executor)
-                .unwrap()
-                .as_deref(),
-            Some("sol")
-        );
-        let code = engine
-            .create_direct_session(&run, "arc", SessionRole::Code)
-            .expect("code");
-        let worker = engine
-            .create_bound_session(&run, "arc", SessionRole::Executor, None)
-            .expect("worker");
-        engine
-            .select_model(SessionRole::Executor, "astra")
-            .expect("select executor");
-        assert_eq!(
-            engine
-                .selected_choice(SessionRole::Code)
-                .unwrap()
-                .as_deref(),
-            Some("astra")
-        );
-        let code_run = Runner {
-            role: SessionRole::Code,
-            model: "astra".to_owned(),
-            ..run.clone()
-        };
-        let (tx, _rx) = channel();
-        let fork_point = engine
-            .send_message(&code_run, Some(&code), "Keep this context", tx)
-            .await
-            .expect("send")
-            .seq;
-        engine
-            .select_model(SessionRole::Code, "sol")
-            .expect("change code");
-        let fork = engine.fork_session(&code, fork_point).expect("fork code");
-        let events = conversation_log(dir.path());
-        for (id, role, model) in [
-            (&legacy, SessionRole::Executor, "sol"),
-            (&code, SessionRole::Code, "astra"),
-            (&worker, SessionRole::Executor, "sol"),
-            (&fork, SessionRole::Code, "sol"),
-        ] {
-            let created = events
-                .iter()
-                .find_map(|event| match event {
-                    session_event::Event::SessionCreated(created) if &created.session_id == id => {
-                        Some(created)
-                    }
-                    _ => None,
-                })
-                .expect("created");
-            assert_eq!(created.role, role as i32);
-            assert_eq!(created.model, model);
-        }
+            .record(
+                Source::User,
+                session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
+                    session_id: code.clone(),
+                    role: crate::provider::LEGACY_DIRECT_ROLE,
+                    provider: "scripted".to_owned(),
+                    model: "test-model".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .expect("record historical session");
         drop(engine);
-        let (reopened, _) = reopened_engine(&provider, &dir, Registry::new(512));
-        let reopened = reopened.with_role_choices(choices());
+        let (reopened, run) = reopened_engine(&provider, &dir, Registry::new(512));
+        let summary = reopened
+            .with_store(|store| store.projection().sessions())
+            .expect("replay");
+        assert_eq!(summary[0].role, crate::provider::LEGACY_DIRECT_ROLE);
+        assert!(matches!(
+            reopened.session_role(&code),
+            Err(super::Error::HistoricalSession { .. })
+        ));
+        let (tx, _rx) = channel();
+        let before = conversation_log(dir.path()).len();
         assert_eq!(
             reopened
-                .selected_choice(SessionRole::Code)
-                .unwrap()
-                .as_deref(),
-            Some("sol")
+                .send_message(&run, Some(&code), "continue", tx)
+                .await
+                .unwrap_err()
+                .to_string(),
+            format!("session {code} uses the retired code role; start a new assistant session")
         );
+        assert!(matches!(
+            reopened.fork_session(&code, 0),
+            Err(super::Error::HistoricalSession { .. })
+        ));
         assert_eq!(
-            reopened
-                .selected_choice(SessionRole::Executor)
-                .unwrap()
-                .as_deref(),
-            Some("astra")
-        );
-        assert_eq!(
-            reopened.session_role(&code).unwrap(),
-            Some(SessionRole::Code)
-        );
-        assert_eq!(
-            reopened.session_role(&legacy).unwrap(),
-            Some(SessionRole::Executor)
+            conversation_log(dir.path()).len(),
+            before,
+            "refused operations append nothing"
         );
     }
 
@@ -5003,7 +4927,7 @@ mod tests {
 
         let session_id = engine
             .create_direct_session(&run, "arc", SessionRole::Executor)
-            .expect(":code opens a direct session");
+            .expect("create a direct session");
 
         let events = conversation_log(dir.path());
         assert_eq!(events.len(), 1, "no dispatch, so nothing else was appended");
@@ -5020,20 +4944,9 @@ mod tests {
         assert!(created.budget.is_none(), "the user is present; no budget");
         assert_eq!(
             created.dispatched_by, "",
-            "a :code session is a root conversation, not a dispatched job"
+            "a direct session is not a dispatched job"
         );
-        assert_eq!(
-            created.grants,
-            [arc_proto::v1::WorkspaceGrant {
-                root: root
-                    .canonicalize()
-                    .expect("canon")
-                    .to_string_lossy()
-                    .into_owned(),
-                read_write: true,
-            }],
-            "implement-style: read-write, no downgrade"
-        );
+        assert!(created.grants.is_empty());
 
         let raw_events = replay_events(dir.path());
         assert_eq!(
@@ -5044,70 +4957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorded_grants_win_over_a_changed_config() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("proj");
-        std::fs::create_dir_all(&root).expect("mkdir proj");
-        std::fs::write(root.join("keep.txt"), "true colors").expect("write");
-        let changed_root = TempDir::new().expect("temp dir 2");
-
-        let mut registry = Registry::new(512);
-        for tool in workspace::tools(Arc::new(Workspace::new())) {
-            registry.register(tool);
-        }
-        let creating_provider = ScriptedProvider::scripted(vec![]);
-        let (creating_engine, run) = engine_with_tools(&creating_provider, &dir, registry);
-        let creating_engine = creating_engine.with_projects(projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(&root, Mode::ReadWrite)],
-        ));
-        let session_id = creating_engine
-            .create_bound_session(&run, "arc", SessionRole::Chat, None)
-            .expect("create a bound session");
-        drop(creating_engine);
-
-        let mut later_registry = Registry::new(512);
-        for tool in workspace::tools(Arc::new(Workspace::new())) {
-            later_registry.register(tool);
-        }
-        let provider = ScriptedProvider::scripted(vec![
-            vec![
-                Ok(call(
-                    "c1",
-                    0,
-                    "read",
-                    &serde_json::json!({"path": root.join("keep.txt")}).to_string(),
-                )),
-                Ok(tool_stop()),
-            ],
-            done_reply("done"),
-        ]);
-        let projects = projects_with(
-            "arc",
-            vec![ToolSource::Builtin, ToolSource::Workspace],
-            vec![Grant::new(changed_root.path(), Mode::ReadWrite)],
-        );
-        let (engine, run) =
-            reopened_engine_with_projects(&provider, &dir, later_registry, projects);
-        let (tx, _rx) = channel();
-
-        engine
-            .send_message(&run, Some(&session_id), "read it", tx)
-            .await
-            .expect("send");
-
-        let events = conversation_log(dir.path());
-        let result = resulted(&events[3]);
-        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
-        assert_eq!(
-            result.content, "true colors",
-            "the session kept the grants recorded at creation, not the reconfigured ones"
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_session_records_the_roles_current_identity_and_copies_grants_and_role() {
+    async fn fork_session_records_the_roles_current_identity_and_project() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -5179,18 +5029,7 @@ mod tests {
             ("codex-new", "gpt-6-new"),
             "the role's current identity, so the fork runs under today's model"
         );
-        assert_eq!(
-            created.grants,
-            [arc_proto::v1::WorkspaceGrant {
-                root: root
-                    .canonicalize()
-                    .expect("canon")
-                    .to_string_lossy()
-                    .into_owned(),
-                read_write: true,
-            }],
-            "the parent's recorded grants, not the reconfigured root"
-        );
+        assert!(created.grants.is_empty());
         assert_eq!(created.dispatched_by, "");
         assert_eq!(created.budget, None);
 
@@ -5382,18 +5221,7 @@ mod tests {
             "budgets are suspended; the dispatched job carries none"
         );
         assert_eq!(child.budget, None);
-        assert_eq!(
-            child.grants,
-            [arc_proto::v1::WorkspaceGrant {
-                root: root
-                    .canonicalize()
-                    .expect("canon")
-                    .to_string_lossy()
-                    .into_owned(),
-                read_write: true,
-            }],
-            "implement records the root grant read-write, as before"
-        );
+        assert!(child.grants.is_empty());
         let child_id = child.session_id.clone();
 
         let result = resulted(&events[4]);
@@ -5413,11 +5241,7 @@ mod tests {
         );
         assert!(!result.content.contains("End this reply"));
         assert!(!result.content.contains("wait"));
-        assert!(
-            result.content.contains("(implement: read-write)"),
-            "{}",
-            result.content
-        );
+        assert!(result.content.contains("(implement)"), "{}", result.content);
 
         // the role-mismatch pin keys on the recorded role, not the runner
         // that created the session, so a same-identity executor runner
@@ -5448,7 +5272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_analyze_dispatch_records_the_root_grant_read_only_but_still_allows_read() {
+    async fn an_analyze_dispatch_is_not_a_permission_mode() {
         let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("temp dir outside /tmp");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -5488,41 +5312,10 @@ mod tests {
         let session_event::Event::SessionCreated(child) = &events[3] else {
             panic!("expected the child SessionCreated, got {:?}", events[3]);
         };
-        assert_eq!(
-            child.grants,
-            [arc_proto::v1::WorkspaceGrant {
-                root: root
-                    .canonicalize()
-                    .expect("canon")
-                    .to_string_lossy()
-                    .into_owned(),
-                read_write: false,
-            }],
-            "analyze records the project root read-only, not the configured read-write"
-        );
+        assert!(child.grants.is_empty());
 
         let result = resulted(&events[4]);
-        assert!(
-            result
-                .content
-                .contains("(analyze: project read-only, /tmp writable)"),
-            "{}",
-            result.content
-        );
-
-        let grants = workspace::Grants::from_recorded(vec![(
-            root.canonicalize().expect("canon"),
-            Mode::ReadOnly,
-        )]);
-        let target = root.join("f.txt");
-        let target = target.to_str().expect("utf8");
-        grants
-            .resolve(target, workspace::Access::Read)
-            .expect("read is still allowed under an analyze grant");
-        let err = grants
-            .resolve(target, workspace::Access::Write)
-            .expect_err("write is refused under an analyze grant");
-        assert!(err.contains("read-only"), "{err}");
+        assert!(result.content.contains("(analyze)"), "{}", result.content);
     }
 
     #[tokio::test]
@@ -5719,7 +5512,7 @@ mod tests {
         let events = conversation_log(dir.path());
         let result = tool_result(&events);
         assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains("chat"), "{}", result.content);
+        assert!(result.content.contains("assistant"), "{}", result.content);
         assert!(result.content.contains("not a job"), "{}", result.content);
     }
 
@@ -5743,6 +5536,7 @@ mod tests {
             dispatched_by: String::new(),
             choice: String::new(),
             editing: String::new(),
+            working_directory: String::new(),
         })
     }
 
@@ -6594,7 +6388,7 @@ mod tests {
         let engine = engine.with_projects(projects.clone());
         run.editing = crate::tool::Editing::Patch;
         let session = engine
-            .create_bound_session(&run, "arc", SessionRole::Code, None)
+            .create_bound_session(&run, "arc", SessionRole::Chat, None)
             .unwrap();
         let patch_sources = engine.tool_setup(&session, false, &run).unwrap().0;
         let names = engine
@@ -6664,7 +6458,7 @@ mod tests {
         assert!(!resumed.contains(&ToolSource::Replacement));
 
         let legacy = reopened
-            .create_bound_session(&changed_default, "arc", SessionRole::Code, None)
+            .create_bound_session(&changed_default, "arc", SessionRole::Chat, None)
             .unwrap();
         let replacement = reopened
             .tool_setup(&legacy, false, &changed_default)
@@ -6717,17 +6511,17 @@ mod tests {
             .record(
                 Source::User,
                 session_event::Event::SessionCreated(arc_proto::v1::SessionCreated {
-                    session_id: "legacy-codex".to_owned(),
+                    session_id: "unpinned-editing".to_owned(),
                     provider: "codex".to_owned(),
                     model: "older".to_owned(),
-                    role: SessionRole::Code as i32,
+                    role: SessionRole::Chat as i32,
                     project: "arc".to_owned(),
                     ..Default::default()
                 }),
             )
             .unwrap();
         let old_sources = reopened
-            .tool_setup("legacy-codex", false, &changed_default)
+            .tool_setup("unpinned-editing", false, &changed_default)
             .unwrap()
             .0;
         assert!(old_sources.contains(&ToolSource::Patch));

@@ -226,7 +226,6 @@ async fn connect(url: &str, events: &mpsc::UnboundedSender<NetEvent>) -> Option<
         let pending = u32::try_from(items.len()).unwrap_or(u32::MAX);
         let _ = events.send(NetEvent::ReviewChanged(pending));
     }
-    // seeds a launch-directory door guess; C still fetches its own fresh list
     if let Ok(projects) = client.projects().await {
         let _ = events.send(NetEvent::ProjectsSeeded(projects));
     }
@@ -297,10 +296,6 @@ async fn handle(
             .jobs()
             .await
             .map(|jobs| Some(NetEvent::JobItems(jobs))),
-        Command::ListProjects => client
-            .projects()
-            .await
-            .map(|projects| Some(NetEvent::ProjectItems(projects))),
         Command::ListModels => client
             .models()
             .await
@@ -315,8 +310,9 @@ async fn handle(
             role,
             project,
             choice,
+            working_directory,
         } => client
-            .create_session_with_choice(role, &project, &choice)
+            .create_session_in_directory(role, &project, &choice, &working_directory)
             .await
             .map(|session_id| Some(NetEvent::SessionCreated { session_id })),
         Command::ForkSession {
@@ -945,7 +941,7 @@ mod tests {
         assert_eq!(
             next_event(&mut events).await,
             NetEvent::ProjectsSeeded(vec![]),
-            "connecting also seeds the project list, for a launch-directory door guess"
+            "connecting also seeds the project list for local matching"
         );
         assert_eq!(next_event(&mut events).await, NetEvent::Sessions(vec![]));
         assert!(

@@ -777,6 +777,7 @@ mod tests {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
                     command_prefix: Vec::new(),
+                    description: String::new(),
                 },
             )])),
         );

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Access, Grants, Workspace, ensure_fresh};
+use super::{Workspace, ensure_fresh, resolve_path};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -36,8 +36,9 @@ impl Tool for ApplyPatch {
                           ends with `*** End Patch`; each hunk is `*** Add File: path` followed \
                           by `+` lines, `*** Delete File: path`, or `*** Update File: path` \
                           (optionally `*** Move to: path`) followed by `@@ context` headers and \
-                          ` `, `-`, `+` lines. Paths are relative to the project root or \
-                          absolute. Updating or deleting a file requires having read it using \
+                          ` `, `-`, `+` lines. Paths are absolute or relative to the project \
+                          root (the daemon's current directory if none). Updating or deleting \
+                          a file requires having read it using \
                           the `read` tool in this session, with no changes since. Reading through \
                           Bash does not count. Hunks are checked before writes; filesystem \
                           errors during sequential writes may leave earlier changes applied. \
@@ -72,11 +73,6 @@ impl Tool for ApplyPatch {
                     ));
                 }
             };
-            let Some(grants) = &ctx.grants else {
-                return ToolReply::error(
-                    "ERROR: no workspace is granted in this session.".to_owned(),
-                );
-            };
             let hunks = match parse(&args.input) {
                 Ok(hunks) => hunks,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
@@ -84,7 +80,7 @@ impl Tool for ApplyPatch {
 
             let mut planned = Vec::with_capacity(hunks.len());
             for hunk in hunks {
-                match self.plan(hunk, grants, &ctx.session_id) {
+                match self.plan(hunk, &ctx) {
                     Ok(change) => planned.push(change),
                     Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
                 }
@@ -141,21 +137,24 @@ impl Change {
 }
 
 impl ApplyPatch {
-    fn plan(&self, hunk: Hunk, grants: &Grants, session_id: &str) -> Result<Change, String> {
-        let resolve = |path: &str, access: Access| {
+    fn plan(&self, hunk: Hunk, ctx: &TurnContext) -> Result<Change, String> {
+        let resolve = |path: &str| {
             let absolute = if Path::new(path).is_absolute() {
                 PathBuf::from(path)
             } else {
-                let root = grants.project_root().ok_or_else(|| {
-                    "no project root to resolve a relative path against.".to_owned()
-                })?;
+                let root = ctx
+                    .grants
+                    .as_ref()
+                    .and_then(|grants| grants.project_root().map(Path::to_path_buf))
+                    .map_or_else(std::env::current_dir, Ok)
+                    .map_err(|error| format!("could not determine working directory ({error})."))?;
                 root.join(path)
             };
-            resolve_creating(grants, &absolute, access)
+            resolve_path(&absolute.to_string_lossy())
         };
         match hunk {
             Hunk::Add { path, content } => {
-                let resolved = resolve(&path, Access::Write)?;
+                let resolved = resolve(&path)?;
                 if resolved.exists() {
                     return Err(format!(
                         "{} already exists; use an Update hunk.",
@@ -168,9 +167,9 @@ impl ApplyPatch {
                 })
             }
             Hunk::Delete { path } => {
-                let resolved = resolve(&path, Access::Write)?;
+                let resolved = resolve(&path)?;
                 let bytes = existing(&resolved)?;
-                ensure_fresh(&self.workspace, session_id, &resolved, &bytes)?;
+                ensure_fresh(&self.workspace, &ctx.session_id, &resolved, &bytes)?;
                 Ok(Change::Delete { path: resolved })
             }
             Hunk::Update {
@@ -178,17 +177,17 @@ impl ApplyPatch {
                 move_to,
                 chunks,
             } => {
-                let resolved = resolve(&path, Access::Write)?;
+                let resolved = resolve(&path)?;
                 let bytes = existing(&resolved)?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| {
                     format!("{} is not text (not valid UTF-8).", resolved.display())
                 })?;
-                ensure_fresh(&self.workspace, session_id, &resolved, &bytes)?;
+                ensure_fresh(&self.workspace, &ctx.session_id, &resolved, &bytes)?;
                 let updated = apply_chunks(text, &chunks, &path)?;
                 let moved_to = move_to
                     .as_deref()
                     .map(|dest| {
-                        let dest = resolve(dest, Access::Write)?;
+                        let dest = resolve(dest)?;
                         if dest.exists() {
                             return Err(format!(
                                 "cannot move to {}: it already exists.",
@@ -254,25 +253,6 @@ impl ApplyPatch {
             }
         }
     }
-}
-
-fn resolve_creating(grants: &Grants, path: &Path, access: Access) -> Result<PathBuf, String> {
-    let mut existing = path;
-    let mut remainder = Vec::new();
-    while !existing.exists() {
-        let name = existing
-            .file_name()
-            .ok_or_else(|| format!("{} does not name a file.", path.display()))?;
-        remainder.push(name.to_owned());
-        existing = existing
-            .parent()
-            .ok_or_else(|| format!("{} has no existing ancestor.", path.display()))?;
-    }
-    let mut resolved = grants.resolve(&existing.to_string_lossy(), access)?;
-    for name in remainder.iter().rev() {
-        resolved.push(name);
-    }
-    Ok(resolved)
 }
 
 fn existing(path: &Path) -> Result<Vec<u8>, String> {
@@ -705,58 +685,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_only_root_an_escape_and_an_existing_add_target_are_refused() {
-        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
+    async fn absolute_paths_work_without_grants_and_existing_adds_fail() {
+        let dir = TempDir::new().unwrap();
         let root = dir.path();
-        fs::write(root.join("a.txt"), "a\n").expect("write");
+        let file = root.join("a.txt");
+        fs::write(&file, "a\n").unwrap();
         let ws = Arc::new(Workspace::new());
-        read(&ws, root, &root.join("a.txt")).await;
-        let tool = ApplyPatch::new(Arc::clone(&ws));
-
-        let reply = tool
+        Read::new(Arc::clone(&ws))
             .execute(
-                args("*** Begin Patch\n*** Update File: a.txt\n-a\n+A\n*** End Patch"),
-                ctx(root, Mode::ReadOnly),
+                serde_json::json!({"path": file}).to_string(),
+                TurnContext::default(),
             )
             .await;
-        assert!(
-            !reply.ok && reply.content.contains("read-only"),
-            "{}",
-            reply.content
+        let tool = ApplyPatch::new(ws);
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n-a\n+A\n*** End Patch",
+            file.display()
         );
+        let reply = tool.execute(args(&patch), TurnContext::default()).await;
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "A\n");
 
-        let reply = tool
-            .execute(
-                args("*** Begin Patch\n*** Add File: ../escape.txt\n+x\n*** End Patch"),
-                ctx(root, Mode::ReadWrite),
-            )
-            .await;
-        assert!(
-            !reply.ok && reply.content.contains("outside"),
-            "{}",
-            reply.content
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+x\n*** End Patch",
+            file.display()
         );
-
-        let reply = tool
-            .execute(
-                args("*** Begin Patch\n*** Add File: missing/../escape.txt\n+x\n*** End Patch"),
-                ctx(root, Mode::ReadWrite),
-            )
-            .await;
-        assert!(!reply.ok, "{}", reply.content);
-        assert!(!root.join("escape.txt").exists());
-
-        let reply = tool
-            .execute(
-                args("*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"),
-                ctx(root, Mode::ReadWrite),
-            )
-            .await;
+        let reply = tool.execute(args(&patch), TurnContext::default()).await;
         assert!(
             !reply.ok && reply.content.contains("already exists"),
             "{}",
             reply.content
         );
-        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
     }
 }

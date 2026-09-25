@@ -27,7 +27,7 @@ use crate::log;
 // 16: sessions split dispatched_by out of parent_session and gained disposition
 // 17: compactions records SessionCompacted, applied by the transcript builder
 // 18: role_selections records RoleModelSelected, one row per role
-pub(crate) const SCHEMA_VERSION: u32 = 23;
+pub(crate) const SCHEMA_VERSION: u32 = 24;
 
 const LAST_SEQ_KEY: &str = "last_seq";
 
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     fork_point     INTEGER,
     dispatched_by  TEXT,
     project        TEXT,
+    working_directory TEXT,
     title          TEXT,
     started_at     INTEGER,
     consolidated_through INTEGER,
@@ -569,18 +570,6 @@ impl Projection {
         Ok(source)
     }
 
-    pub(crate) fn session_started_at(&self, session_id: &str) -> Result<Option<i64>, Error> {
-        let started: Option<Option<i64>> = self
-            .conn
-            .query_row(
-                "SELECT started_at FROM sessions WHERE id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(started.flatten())
-    }
-
     pub(crate) fn role_selection(&self, role: SessionRole) -> Result<Option<String>, Error> {
         role_selection(&self.conn, role)
     }
@@ -595,6 +584,21 @@ impl Projection {
             )
             .optional()?;
         Ok(project.flatten())
+    }
+
+    pub(crate) fn session_working_directory(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let directory: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT working_directory FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(directory.flatten())
     }
 
     /// The provider and model a session was recorded on. `None` for an
@@ -1750,15 +1754,16 @@ fn insert_session(
 ) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO sessions
-             (id, parent_session, fork_point, dispatched_by, project, title, started_at,
+             (id, parent_session, fork_point, dispatched_by, project, working_directory, title, started_at,
               role, provider, model, choice, editing, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         (
             &created.session_id,
             (!created.parent_session.is_empty()).then_some(&created.parent_session),
             (created.fork_point > 0).then_some(seq_param(created.fork_point)?),
             (!created.dispatched_by.is_empty()).then_some(&created.dispatched_by),
             (!created.project.is_empty()).then_some(&created.project),
+            (!created.working_directory.is_empty()).then_some(&created.working_directory),
             &created.title,
             epoch_micros(event.ts.as_ref()),
             created.role,
@@ -2474,6 +2479,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    working_directory: String::new(),
                 })),
             })),
         }
@@ -2707,6 +2713,29 @@ mod tests {
             created.grants = grants;
         }
         event
+    }
+
+    #[test]
+    fn replay_restores_an_unmatched_sessions_directory() {
+        let dir = TempDir::new().expect("directory");
+        let mut event = session_created(0);
+        if let Some(event::Payload::Session(SessionEvent {
+            event: Some(session_event::Event::SessionCreated(created)),
+        })) = event.payload.as_mut()
+        {
+            created.working_directory = "/home/bogdan/notes".to_owned();
+        }
+        let mut log = Log::open(dir.path()).expect("log");
+        log.append(event).expect("append");
+        let mut projection = Projection::in_memory().expect("projection");
+        replay(log.reader().expect("reader"), &mut projection).expect("replay");
+        assert_eq!(
+            projection
+                .session_working_directory("s-01")
+                .unwrap()
+                .as_deref(),
+            Some("/home/bogdan/notes")
+        );
     }
 
     #[test]
@@ -3167,6 +3196,7 @@ mod tests {
                     dispatched_by: String::new(),
                     choice: String::new(),
                     editing: String::new(),
+                    working_directory: String::new(),
                 })),
             })),
         }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Access, Workspace, ensure_fresh};
+use super::{Workspace, ensure_fresh, resolve_path};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -64,12 +64,7 @@ impl Tool for Write {
                 }
             };
 
-            let Some(grants) = &ctx.grants else {
-                return ToolReply::error(
-                    "ERROR: no workspace is granted in this session.".to_owned(),
-                );
-            };
-            let resolved = match grants.resolve(&args.path, Access::Write) {
+            let resolved = match resolve_path(&args.path) {
                 Ok(path) => path,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
             };
@@ -239,22 +234,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writing_into_a_read_only_grant_is_the_gates_refusal() {
-        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("outside /tmp");
-        fs::write(dir.path().join("f.txt"), "x").expect("write");
+    async fn writing_without_grants_is_allowed() {
+        let dir = TempDir::new().unwrap();
         let ws = workspace();
         let tool = Write::new(ws);
 
         let path = dir.path().join("f.txt");
         let reply = tool
-            .execute(
-                write_args(&path, "y"),
-                ctx("s-1", dir.path(), Mode::ReadOnly),
-            )
+            .execute(write_args(&path, "y"), TurnContext::default())
             .await;
 
-        assert!(!reply.ok);
-        assert!(reply.content.contains("read-only"), "{}", reply.content);
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(path).unwrap(), "y");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_root_does_not_limit_writes_elsewhere() {
+        let root = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let path = elsewhere.path().join("new.txt");
+        let reply = Write::new(workspace())
+            .execute(
+                write_args(&path, "outside"),
+                ctx("s-1", root.path(), Mode::ReadOnly),
+            )
+            .await;
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(path).unwrap(), "outside");
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ message SessionInfo {
   string project = 7;
   // the session that dispatched it; empty for a root conversation
   string dispatched_by = 8;
-  // who created the session: USER is a conversation (TUI or :code), MODEL
+  // who created the session: USER is a direct conversation, MODEL
   // a dispatched job — the picker's split, correct for all history where
   // dispatched_by is only recorded from 6.34 on
   Source source = 9;
@@ -136,16 +136,16 @@ message CancelTurn {
   string session_id = 1;
 }
 
-// Creates a direct session. Chat is unbound; code is bound to a project.
-// Empty choice takes the role default.
+// Creates a direct session, optionally with project context.
+// Empty choice takes the assistant default.
 message CreateSession {
   SessionRole role = 1;
   string project = 2;
   string choice = 3;
+  string working_directory = 4;
 }
 
-// Asks for the configured projects `:code` (and `dispatch`) may bind to,
-// for the TUI's project picker. Static config, served fresh per request.
+// Lists configured projects for local directory detection.
 message ListProjects {}
 
 message ProjectInfo {

@@ -13,8 +13,7 @@ const DEFAULT_CREDENTIAL: &str = "codex";
 
 pub fn credential_name(config: &Config) -> &str {
     [
-        config.roles.chat.as_ref(),
-        config.roles.code.as_ref(),
+        config.roles.assistant.as_ref(),
         config.roles.executor.as_ref(),
         config.roles.archivist.as_ref(),
     ]
@@ -79,7 +78,7 @@ mod tests {
         assert_eq!(credential_name(&config), "chatgpt-pro");
 
         let config: Config = toml::from_str(
-            "[roles.code]\nprovider = \"codex\"\nmodel = \"gpt-6-astra\"\nkey = \"code-plan\"\n",
+            "[roles.assistant]\nprovider = \"codex\"\nmodel = \"gpt-6-astra\"\nkey = \"code-plan\"\n",
         )
         .expect("parses");
         assert_eq!(credential_name(&config), "code-plan");

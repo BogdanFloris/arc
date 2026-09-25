@@ -37,7 +37,8 @@ impl Tool for Bash {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_owned(),
-            description: "Run a shell command with bash in the project's root. The \
+            description: "Run a shell command with bash in the project's root when available, \
+                          otherwise the daemon's current directory. The \
                           environment is scrubbed to a small allowlist; no secrets pass \
                           through. Output is capped at 16 KiB per stream, keeping the tail \
                           (errors usually land at the end). Commands default to a 120s \
@@ -77,17 +78,6 @@ impl Tool for Bash {
                 }
             };
 
-            let Some(grants) = &ctx.grants else {
-                return ToolReply::error(
-                    "ERROR: no workspace is granted in this session.".to_owned(),
-                );
-            };
-            let Some(root) = grants.project_root() else {
-                return ToolReply::error(
-                    "ERROR: this session has no project root to run in.".to_owned(),
-                );
-            };
-
             if args.command.trim().is_empty() {
                 return ToolReply::error(
                     "ERROR: command is empty. Pass a non-empty shell command to run.".to_owned(),
@@ -99,7 +89,20 @@ impl Tool for Bash {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
 
-            run(&args.command, root, timeout_secs, &ctx.command_prefix).await
+            let cwd = ctx
+                .grants
+                .as_ref()
+                .and_then(|grants| grants.project_root().map(Path::to_path_buf))
+                .map_or_else(std::env::current_dir, Ok);
+            let cwd = match cwd {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    return ToolReply::error(format!(
+                        "ERROR: could not determine working directory ({error})."
+                    ));
+                }
+            };
+            run(&args.command, &cwd, timeout_secs, &ctx.command_prefix).await
         })
     }
 }
@@ -457,13 +460,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unbound_session_is_a_named_error() {
+    async fn an_unbound_session_runs_in_the_daemons_current_directory() {
         let tool = Bash::new();
 
-        let reply = tool.execute(args("echo hi"), TurnContext::default()).await;
+        let reply = tool.execute(args("pwd"), TurnContext::default()).await;
 
-        assert!(!reply.ok);
-        assert!(reply.content.contains("granted"), "{}", reply.content);
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            reply.content.trim_end(),
+            std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -29,11 +29,8 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RolesConfig {
-    #[serde(alias = "concierge", skip_serializing_if = "Option::is_none")]
-    pub chat: Option<RoleConfig>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<RoleConfig>,
+    pub assistant: Option<RoleConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<RoleConfig>,
@@ -87,37 +84,12 @@ pub struct ProjectConfig {
 
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub read_only: Vec<PathBuf>,
-
-    pub sources: Vec<ToolSource>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub command_prefix: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSource {
-    Builtin,
-    Workspace,
-}
-
-impl ToolSource {
-    pub fn resolve(self) -> arc_core::tool::ToolSource {
-        match self {
-            ToolSource::Builtin => arc_core::tool::ToolSource::Builtin,
-            ToolSource::Workspace => arc_core::tool::ToolSource::Workspace,
-        }
-    }
 }
 
 impl RolesConfig {
     fn configured(&self) -> impl Iterator<Item = (&'static str, &RoleConfig)> {
         [
-            ("chat", self.chat.as_ref()),
-            ("code", self.code.as_ref()),
+            ("assistant", self.assistant.as_ref()),
             ("executor", self.executor.as_ref()),
             ("archivist", self.archivist.as_ref()),
         ]
@@ -213,20 +185,6 @@ impl ProjectConfig {
             "project `{name}`: root {} must be an absolute path, and `~` is not expanded",
             self.root.display()
         );
-        for grant in &self.read_only {
-            ensure!(
-                grant.is_absolute(),
-                "project `{name}`: read-only grant {} must be an absolute path, and `~` is not expanded",
-                grant.display()
-            );
-            if grant.starts_with(&self.root) || self.root.starts_with(grant) {
-                bail!(
-                    "project `{name}`: read-only grant {} overlaps the read-write root {}; grants are separate roots, not holes",
-                    grant.display(),
-                    self.root.display()
-                );
-            }
-        }
         Ok(())
     }
 }
@@ -317,8 +275,7 @@ impl Default for LlamaConfig {
 impl Config {
     pub fn needs_sidecar(&self) -> bool {
         [
-            self.roles.chat.as_ref(),
-            self.roles.code.as_ref().or(self.roles.executor.as_ref()),
+            self.roles.assistant.as_ref(),
             self.roles.executor.as_ref(),
             self.roles.archivist.as_ref(),
         ]
@@ -381,7 +338,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, RoleProvider, ToolSource};
+    use super::{Config, RoleProvider};
     use arc_core::provider::Thinking;
     use std::path::PathBuf;
 
@@ -395,7 +352,7 @@ model = "test"
 key = "test"
 [models.local]
 provider = "local"
-[roles.chat]
+[roles.assistant]
 choices = ["hosted"]
 [roles.executor]
 choices = ["hosted"]
@@ -406,9 +363,9 @@ choices = ["hosted"]
         .expect("config");
         config.validate().expect("valid");
         assert!(!config.needs_sidecar());
-        config.roles.code = Some(config.models["local"].clone());
+        config.roles.assistant = Some(config.models["local"].clone());
         assert!(config.needs_sidecar());
-        config.roles.code = None;
+        config.roles.assistant = Some(config.models["hosted"].clone());
         assert!(!config.needs_sidecar());
         config
             .roles
@@ -547,57 +504,31 @@ provider = "local"
     }
 
     #[test]
-    fn a_project_resolves_to_a_root_grants_and_sources() {
+    fn a_project_contains_only_context() {
         let config = parse(
             r#"
 [projects.arc]
 root      = "/home/bogdan/arc"
-read_only = ["/home/bogdan/notes"]
-sources   = ["builtin", "workspace"]
+description = "ARC implementation"
 
 [projects.scratch]
 root = "/tmp"
-sources = []
 description = "Scratch workspace"
-command_prefix = ["nix", "develop", "-c"]
 "#,
         );
 
         let serialized = toml::to_string(&config).expect("serializes");
         assert_eq!(parse(&serialized), config);
         let project = &config.projects["arc"];
-        assert!(project.description.is_empty());
-        assert!(project.command_prefix.is_empty());
+        assert_eq!(project.description, "ARC implementation");
         assert_eq!(config.projects["scratch"].description, "Scratch workspace");
-        assert_eq!(
-            config.projects["scratch"].command_prefix,
-            ["nix", "develop", "-c"]
-        );
         assert_eq!(project.root, PathBuf::from("/home/bogdan/arc"));
-        assert_eq!(project.read_only, [PathBuf::from("/home/bogdan/notes")]);
-        assert_eq!(
-            project.sources,
-            [ToolSource::Builtin, ToolSource::Workspace]
-        );
     }
 
     #[test]
     fn a_project_path_that_is_not_absolute_is_rejected() {
-        let err = rejected("[projects.arc]\nroot = \"~/arc\"\nsources = []\n");
+        let err = rejected("[projects.arc]\nroot = \"~/arc\"\n");
         assert!(err.contains("absolute"), "{err}");
-
-        let err = rejected(
-            "[projects.arc]\nroot = \"/home/bogdan/arc\"\nread_only = [\"notes\"]\nsources = []\n",
-        );
-        assert!(err.contains("absolute"), "{err}");
-    }
-
-    #[test]
-    fn a_read_only_grant_inside_the_read_write_root_is_rejected() {
-        let err = rejected(
-            "[projects.arc]\nroot = \"/home/bogdan/arc\"\nread_only = [\"/home/bogdan/arc/data\"]\nsources = []\n",
-        );
-        assert!(err.contains("overlaps"), "{err}");
     }
 
     #[test]

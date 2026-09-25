@@ -7,9 +7,9 @@ This is the architectural authority. Amend it before changing a contract.
 
 ARC is a personal assistant: an always-on Rust daemon, thin clients, durable memory, and replaceable LLM providers.
 
-- Inside a configured project, the user develops directly with a bound coding session.
-- Elsewhere, an unbound conversation handles talk, recall, and dispatch.
-- Either session can delegate independent or away-from-keyboard work to jobs.
+- One kind of interactive session handles talk, development, recall, and dispatch.
+- A matched project supplies context and a working directory, never permissions.
+- A session can delegate independent or away-from-keyboard work to jobs.
 
 Priorities: durability, observability, speed, provider independence. v1 excludes multi-user hosting, plugin sandboxing, and robotics code. Voice and devices are later phases.
 
@@ -102,38 +102,34 @@ The parent receives a summary, not the transcript, and can inspect the child's a
 
 **Footprints.** Successful `write`, `edit`, and `apply_patch` operations record canonical `changed_paths` independently of capped result text, including completed operations before a later patch failure. Handbacks read only the completed turn's projected paths. These prove operations, not exclusive authorship: Bash, external writers, and interrupted operations without durable results remain unattributed. Repository diffs and commits are separate, workspace-wide observations.
 
-**Coding prompts.** Direct sessions do the work themselves and dispatch only independent or away work. Stop on whole-task handoff; continue independent work on partial handoff. Give self-contained briefs and verify handbacks. Assign disjoint files; format only after writers stop. Build a small end-to-end slice, run focused tests, wait for ready handbacks before checks spanning child files, then run the full suite after integration. These are versioned harness preambles, not identity or injected memory. Planning/review/retry workflows remain prompts or configuration until use proves they need machinery.
-
-Children report formatting needed unless explicitly assigned integration with exclusive workspace access. Reread formatted files before editing; never bypass freshness checks.
+Direct sessions and jobs have no role-specific coding preamble. The human-owned identity, memory index, and an available `AGENTS.md` supply context; a configured project also contributes its name and description. Job intent is a request, not a filesystem permission.
 
 ### 4.2 Workspaces
 
-A bound session records its configured project and grants durably. The project root is read-write; additional roots are read-only grants. `/tmp` is always read-write scratch for bound sessions, including analyze jobs; this is tool policy, not a stored grant.
-
-Only a human edits project configuration. Models select configured projects, never author roots or modes. Grants list reachable roots, not forbidden paths. Unbound conversation and voice sessions have no workspace tools.
+Projects are context, not permissions. Each configured project has a name, root, and description. The longest canonical root prefix selects the project for a local launch. All interactive sessions, including those without a configured project, have the same tools. Dispatched jobs can select configured projects; `analyze` is an instruction, not enforced read-only access. Historical grants remain in the event schema for replay but do not gate tools.
 
 ### 4.3 Tools, sources, and containment
 
-Session-scoped sources determine both advertised and executable tools:
+Tool sources determine both advertised and executable tools:
 
 - **Builtin:** memory and archive (§5.5).
 - **Jobs:** dispatch, continue, cancel; only in user-opened sessions.
 - **Web:** provider-hosted search/grounding where supported, otherwise empty.
-- **Workspace:** `read`, `bash`, and a pinned editing interface for bound sessions.
+- **Workspace:** `read`, `bash`, and a pinned editing interface for every session.
 
 MCP/device sources wait for the phase that needs them.
 
 Codex defaults to `apply_patch`; other providers to `edit` and `write`. Presets or inline roles may override with `editing = "patch"` or `"replacement"`. Record the choice at session creation. Legacy sessions use their pinned provider, or the serving provider if unpinned.
 
-**File tools** canonicalize paths through the shared resolver and require a grant or `/tmp`; symlinks cannot escape that gate. Writes additionally require a writable grant. Existing-file edits require a fresh read in the same session.
+**File tools** accept absolute paths anywhere the daemon's user can access. Existing-file edits require a fresh read in the same session.
 
 `edit` accepts unique, non-overlapping replacements against the original file; the single-replacement legacy shape remains valid. `apply_patch` preflights all hunks before writing. Filesystem failures during sequential writes can leave a partial patch; results name completed paths.
 
-**Bash is not sandboxed.** It starts at the project root with a scrubbed environment but runs as the user and can reach beyond grants. Grants are advisory in shell-bearing sessions. A whole-home grant waits for a sandboxed worker. Nothing prompts for permission mid-turn; out-of-grant file operations return tool errors.
+**Bash is not sandboxed.** It starts at the project's root, or the local launch directory without a project, with a scrubbed environment. Like the file tools, it runs as the user without a filesystem permission boundary. Keep credentials out of tool environments and logged results.
 
 Prefer workspace CLIs over new builtins. Search uses Bash; preserve output caps and a usable scrubbed `PATH`. `read` supplies pagination and the freshness anchor.
 
-Web is provider-native so unbound sessions need no shell or search credentials. Switching providers can lose that capability. Clients must satisfy provider attribution requirements; an audio-only client must resolve that before using grounded answers.
+Web is provider-native. Switching providers can lose that capability. Clients must satisfy provider attribution requirements; an audio-only client must resolve that before using grounded answers.
 
 ### 4.4 Compaction
 
@@ -167,7 +163,7 @@ Provider support is explicit. Codex sends `input_image` data URLs alongside `inp
 
 `data/identity.md` is small, human-owned, exempt from event-sourcing, and backed up beside the log. ARC may propose edits in output but never writes it; `IdentityEvent` remains reserved.
 
-Load identity wherever the user is present: chat, direct code sessions, user follow-ups inside finished jobs. Dispatched jobs get no personality preamble. Presence, not role, is the boundary.
+Load identity wherever the user is present: interactive sessions and user follow-ups inside finished jobs. Dispatched jobs get no personality preamble. Presence, not role, is the boundary.
 
 The voice is direct: answer first, no enthusiasm scaffolding, plain disagreement, warmth through attention rather than adjectives. Tool-coupled operational rules belong in harness preambles, not identity.
 
@@ -191,7 +187,7 @@ Explicit requests use memory tools immediately. After a session goes idle, an as
 
 **Eligibility and dedup**
 
-- Mine user-opened sessions at either door; dispatched jobs are titled and marked consolidated, not mined for user facts. Recorded creation source governs; legacy unspecified sources retain the old role gate.
+- Mine user-opened sessions; dispatched jobs are titled and marked consolidated, not mined for user facts. Recorded creation source governs; legacy unspecified sources retain the old role gate.
 - Mainline sessions and branches marked *real* consolidate. Branches contribute only their own rows, not inherited history. Presence and branch gates both apply.
 - Show identity as already-known context; elide recalled memory/archive tool results so injected facts are not learned again.
 - Show a bounded selection of existing records relevant to the user's messages. One extraction call chooses write, supersede, or nothing; exact-normalized duplicates and unchanged supersedes are dropped in code. Ambiguous near matches go to review, not another model call.
@@ -218,8 +214,7 @@ Reasoning providers implement `Provider` in `arc-core`. Normalize tool-calling a
 
 | Role | Purpose |
 | --- | --- |
-| `chat` | Conversation, recall, dispatch; latency, voice, vision, judgment. |
-| `code` | Interactive development; judgment and collaboration. |
+| `assistant` | All direct user sessions: conversation and development. Persisted as the historical `chat` value. |
 | `executor` | Delegated work; cost per completed task. |
 | `archivist` | Extraction, classification, titling, compaction; quality and bulk cost. |
 
@@ -230,7 +225,7 @@ Routing is static configuration, not a difficulty classifier. Requests and spans
 - `[models]` presets and role `choices` define allowed models. First choice is default until `RoleModelSelected` records another; removed defaults fall back to the first configured choice.
 - Defaults affect new sessions and forks, never open sessions. Sessions record role, preset, provider, and model. Missing presets/credentials or pin mismatches fail explicitly, without provider fallback.
 - Forks keep role but take an explicitly requested preset or the current default, paying one cache miss.
-- New direct development uses `code`; dispatch uses `executor`. Omitted `roles.code` inherits the executor menu, not its durable selection. Legacy interactive executor sessions keep their role.
+- New direct sessions use `assistant`; dispatch uses `executor`. Historical `code` events still decode, but those sessions cannot be opened or forked; the TUI shows an error in the conversation view. Their role number is reserved, not reused. Historical interactive executor sessions remain readable and resumable under their recorded pins.
 - Legacy sessions without presets resolve by provider/model only when unambiguous. Sessions predating roles remain unpinned.
 
 Cache reads dominate long sessions; model swaps would repay the prefix. Change models through a new session or fork. Add fallback policy only when outage/spend evidence requires it.
@@ -251,13 +246,13 @@ The log records the model that actually ran.
 
 `wire.proto` defines protobuf over localhost WebSocket. Remote access uses Tailscale; v1 adds no tunnel, TLS termination, or auth beyond a local token. Clients hold no durable state.
 
-Send with empty session ID to create a session. Clients stream text/tool events and query history, metadata, jobs, and status. A local launch under a configured root opens a pending code session using the canonical longest root prefix; other directories and remote launches open chat. Each door remains reachable from the other.
+Send with empty session ID to create a session. Clients stream text/tool events and query history, metadata, jobs, and status. A local launch under a configured root starts a session in that project; elsewhere it starts an unscoped session. A local unmatched directory is recorded on session creation as its working directory and supplies `AGENTS.md` when present.
 
 **TUI**
 
-- Empty conversations have a masthead; work has a compact door/title/recorded-model header. Herdr sends the title as pane metadata and omits only that title from ARC's header.
+- Empty conversations have a masthead; work has a compact project/title/recorded-model header. Herdr sends the title as pane metadata and omits only that title from ARC's header.
 - The session model menu selects presets for creation or forks under them. Role-default selection is separate and never relabels an open session.
-- Normal-mode Tab switches remembered chat/code sessions with separate drafts. `:chat` opens chat; bare `:code` opens projects. Finish or stop streaming before switching.
+- The session picker scopes to the current project when one is known; `a` shows all sessions. There is no chat/code switch or Tab door.
 - Ctrl-o toggles all thoughts/tools, including new blocks, in Insert/Normal/Visual modes. Job handbacks stay collapsed. No individual folding, inspector, or footer flag.
 - At bottom, toggling follows bottom. Scrolled up, preserve the top visible block/offset; collapsing details anchors to their summary. Remember details per session until restart.
 - Expanded tools separate readable inputs, retained output, and completion status. No second display truncation.
@@ -314,7 +309,7 @@ Each phase must become a daily driver before the next starts.
 | 3 — Development | Jobs, workspaces, roles, installation. Exit: a week of development and rebuild matching live state. |
 | 3.5 — Tree | Fork, rewind, navigation. Exit: branching used naturally. |
 | 3.6 — Quiet week | Done 2026-09-03. Relay failures motivated the direct door. |
-| **3.7 — Direct door** | **Current.** One runner, mid-turn messages, visible tools, event compaction, directory-selected door, presence-gated memory. Exit: a week in `:code`, chat for talk/away dispatch, real compaction without visible context loss. |
+| **3.7 — Direct sessions** | **Current.** One runner, mid-turn messages, visible tools, event compaction, directory-selected project context, presence-gated memory. Exit: a week in unified sessions, real compaction without visible context loss. |
 | 4 — Voice + remote | §7.1 prototype/local fallback, phone access, automated backup. Exit: voice correction/reconnect, restore drill, provider-pinned offline degradation. |
 | 5 — Devices | First MCP actuator and safety policy, then arm. Room satellites are clients, not device tools. Embeddings only when FTS falls short. |
 

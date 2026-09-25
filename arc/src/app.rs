@@ -37,7 +37,6 @@ pub enum Command {
         record_id: String,
     },
     ListJobs,
-    ListProjects,
     ListModels,
     SelectModel {
         role: SessionRole,
@@ -56,6 +55,7 @@ pub enum Command {
         role: SessionRole,
         project: String,
         choice: String,
+        working_directory: String,
     },
     ForkSession {
         session_id: String,
@@ -119,7 +119,6 @@ pub enum NetEvent {
     ReviewItems(Vec<ReviewEntry>),
     ReviewChanged(u32),
     JobItems(Vec<JobInfo>),
-    ProjectItems(Vec<ProjectInfo>),
     ProjectsSeeded(Vec<ProjectInfo>),
     ModelItems(Vec<ModelChoice>),
     SessionAppended {
@@ -167,13 +166,6 @@ pub struct Picker {
     pub show_all: bool,
     pub show_abandoned: bool,
     pub tree: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Projects {
-    pub items: Vec<ProjectInfo>,
-    pub selected: usize,
-    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +264,6 @@ pub enum Overlay {
     Picker(Picker),
     Review(Review),
     Jobs(Jobs),
-    Projects(Projects),
     Models(Models),
     SessionStatus,
 }
@@ -308,10 +299,7 @@ pub struct App {
     pub restore_anchor: bool,
     pub details_held_focus: Option<usize>,
     pub visible_blocks: Vec<usize>,
-    chat_return: Option<String>,
-    code_return: Option<(Option<String>, String)>,
-    chat_draft: String,
-    code_draft: String,
+    pending_project: Option<String>,
     pub search: Option<Search>,
     pub searching: bool,
     pub status: Status,
@@ -345,15 +333,10 @@ pub struct App {
     visual_rewind: bool,
     pending_rewind_text: Option<String>,
     session_meta: HashMap<String, (SessionRole, String, Source)>,
-    pending_code: Option<String>,
     pending_first: Option<(String, Vec<ImageAttachment>)>,
     pending_model: Option<PendingModel>,
     pub review_pending: u32,
     launch_dir: Option<PathBuf>,
-    seeded_projects: Vec<ProjectInfo>,
-    /// True until the first key reaches `on_key`: gates the launch-directory
-    /// door guess, so a key the user already pressed always wins.
-    untouched: bool,
 }
 
 impl App {
@@ -406,12 +389,6 @@ impl App {
             _ => None,
         }
     }
-    pub fn projects_mut(&mut self) -> Option<&mut Projects> {
-        match &mut self.overlay {
-            Overlay::Projects(value) => Some(value),
-            _ => None,
-        }
-    }
     pub fn models_mut(&mut self) -> Option<&mut Models> {
         match &mut self.overlay {
             Overlay::Models(value) => Some(value),
@@ -442,10 +419,7 @@ impl App {
             restore_anchor: false,
             details_held_focus: None,
             visible_blocks: Vec::new(),
-            chat_return: None,
-            code_return: None,
-            chat_draft: String::new(),
-            code_draft: String::new(),
+            pending_project: None,
             search: None,
             searching: false,
             status: Status::Idle,
@@ -473,13 +447,10 @@ impl App {
             visual_rewind: false,
             pending_rewind_text: None,
             session_meta: HashMap::new(),
-            pending_code: None,
             pending_first: None,
             pending_model: None,
             review_pending: 0,
             launch_dir: None,
-            seeded_projects: Vec::new(),
-            untouched: true,
         }
     }
 
@@ -520,7 +491,6 @@ impl App {
                 jobs.confirmation = None;
                 move_row(&mut jobs.selected, jobs.items.len());
             }
-            Overlay::Projects(projects) => move_row(&mut projects.selected, projects.items.len()),
             Overlay::Models(models) => move_row(&mut models.selected, models.items.len()),
             Overlay::SessionStatus => {}
             Overlay::Picker(_) => self.move_picker_selection(up),
@@ -536,7 +506,6 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
         self.details_held_focus = None;
-        self.untouched = false;
         self.yank_note = None;
         match key.code {
             KeyCode::PageUp if self.picker().is_some() => {
@@ -588,7 +557,6 @@ impl App {
         match self.overlay {
             Overlay::Review(_) => return self.on_review_key(key.code),
             Overlay::Jobs(_) => return self.on_jobs_key(key.code),
-            Overlay::Projects(_) => return self.on_projects_key(key.code),
             Overlay::Models(_) => return self.on_models_key(key.code),
             Overlay::Picker(_) => return self.on_picker_key(key.code),
             Overlay::SessionStatus => return None,
@@ -606,7 +574,6 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) -> Option<Command> {
-        self.untouched = false;
         self.yank_note = None;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.overlay != Overlay::None {
@@ -759,8 +726,6 @@ impl App {
             KeyCode::Char('J') => return Some(self.open_jobs()),
             KeyCode::Char('Q') => return Some(self.open_review()),
             KeyCode::Char('M') => return self.open_models(false),
-            KeyCode::Char('C') => return self.code_picker(),
-            KeyCode::Tab => return self.switch_door(),
             KeyCode::Char('y') if self.status != Status::Streaming => {
                 return self.yank_last_reply();
             }
@@ -1110,49 +1075,22 @@ impl App {
                     "jobs" => return Some(self.open_jobs()),
                     "model" => return self.open_models(false),
                     "model-default" => return self.open_models(true),
-                    "chat" => return self.switch_chat(),
-                    "code" => return self.code_picker(),
-                    "mode" => return self.switch_door(),
                     "help" => self.overlay = Overlay::Help { scroll: 0 },
                     "status" => self.overlay = Overlay::SessionStatus,
                     "fork" => return self.fork_selected(),
                     "compact" => return self.compact_session(),
                     "attach clear" => self.clear_attachments(),
-                    cmd => match cmd.strip_prefix("code ") {
-                        Some(project) => return self.open_code(project.trim()),
-                        None => match cmd.strip_prefix("attach ") {
-                            Some(path) => self.attach(path.trim()),
-                            None => {
-                                self.last_error =
-                                    Some(format!("Unknown command :{cmd}; use :help"));
-                            }
-                        },
+                    cmd => match cmd.strip_prefix("attach ") {
+                        Some(path) => self.attach(path.trim()),
+                        None => {
+                            self.last_error = Some(format!("Unknown command :{cmd}; use :help"));
+                        }
                     },
                 }
             }
             _ => {}
         }
         None
-    }
-
-    fn open_code(&mut self, project: &str) -> Option<Command> {
-        if !self.can_switch_door() {
-            return None;
-        }
-        if project.is_empty() {
-            return self.code_picker();
-        }
-        if self.open_project().is_none() {
-            self.chat_return = self.session_id.clone();
-            self.chat_draft = std::mem::take(&mut self.input);
-        }
-        let command = self.start_session(None);
-        self.pending_code = Some(project.to_owned());
-        self.code_return = Some((None, project.to_owned()));
-        self.input = std::mem::take(&mut self.code_draft);
-        self.cursor = self.input.len();
-        self.mode = Mode::Insert;
-        command
     }
 
     fn fork_selected(&mut self) -> Option<Command> {
@@ -1313,52 +1251,13 @@ impl App {
         Some(entry.id)
     }
 
-    fn can_switch_door(&mut self) -> bool {
+    fn can_switch_session(&mut self) -> bool {
         if self.status == Status::Streaming {
             self.last_error = Some("Finish or stop the turn before switching sessions".to_owned());
             self.yank_note = self.last_error.clone();
             return false;
         }
         true
-    }
-
-    fn code_picker(&mut self) -> Option<Command> {
-        self.can_switch_door().then(|| self.open_projects())
-    }
-
-    fn switch_chat(&mut self) -> Option<Command> {
-        if !self.can_switch_door() {
-            return None;
-        }
-        self.open_project()?;
-        self.code_draft = std::mem::take(&mut self.input);
-        let command = self.start_session(self.chat_return.clone());
-        self.input = std::mem::take(&mut self.chat_draft);
-        self.cursor = self.input.len();
-        self.mode = Mode::Insert;
-        command
-    }
-
-    fn switch_door(&mut self) -> Option<Command> {
-        if self.open_project().is_some() {
-            return self.switch_chat();
-        }
-        if !self.can_switch_door() {
-            return None;
-        }
-        let Some((session, project)) = self.code_return.clone() else {
-            return Some(self.open_projects());
-        };
-        self.chat_return = self.session_id.clone();
-        self.chat_draft = std::mem::take(&mut self.input);
-        let command = self.start_session(session);
-        if self.session_id.is_none() {
-            self.pending_code = Some(project);
-        }
-        self.input = std::mem::take(&mut self.code_draft);
-        self.cursor = self.input.len();
-        self.mode = Mode::Insert;
-        command
     }
 
     fn current_foldable(&self) -> Option<usize> {
@@ -1389,17 +1288,8 @@ impl App {
         })
     }
 
-    fn open_projects(&mut self) -> Command {
-        self.overlay = Overlay::Projects(Projects {
-            items: Vec::new(),
-            selected: 0,
-            loaded: false,
-        });
-        Command::ListProjects
-    }
-
     fn open_models(&mut self, default: bool) -> Option<Command> {
-        if !default && !self.can_switch_door() {
+        if !default && !self.can_switch_session() {
             return None;
         }
         if !default && self.pending_model.is_some() {
@@ -1415,17 +1305,20 @@ impl App {
             self.last_error = Some("Session metadata unavailable; retry after refresh".to_owned());
             return None;
         }
-        let role = self
-            .pending_code
-            .as_ref()
-            .map(|_| SessionRole::Code)
-            .or_else(|| {
-                self.session_id
-                    .as_deref()
-                    .and_then(|id| self.session_meta.get(id))
-                    .map(|(role, _, _)| *role)
-            })
-            .unwrap_or(SessionRole::Chat);
+        let role = if default {
+            SessionRole::Chat
+        } else {
+            self.session_id
+                .as_deref()
+                .and_then(|id| self.session_meta.get(id))
+                .map_or(SessionRole::Chat, |(role, _, source)| {
+                    if *source == Source::User {
+                        SessionRole::Chat
+                    } else {
+                        *role
+                    }
+                })
+        };
         if !default && role == SessionRole::Unspecified {
             self.last_error = Some("Session role unknown; cannot choose a model".to_owned());
             return None;
@@ -1491,30 +1384,30 @@ impl App {
                     Some("No durable message to fork; retry after history loads".to_owned());
                 return None;
             }
-            (role, project)
+            (
+                if source == Source::User {
+                    SessionRole::Chat
+                } else {
+                    role
+                },
+                project,
+            )
         } else {
-            self.pending_code
-                .clone()
-                .map_or((SessionRole::Chat, String::new()), |project| {
-                    (SessionRole::Code, project)
-                })
+            (
+                SessionRole::Chat,
+                self.pending_project.clone().unwrap_or_default(),
+            )
         };
         self.pending_model = Some(PendingModel::Create(role, project.clone()));
         Some(Command::CreateSession {
             role,
             project,
             choice: name,
+            working_directory: self
+                .launch_dir
+                .as_ref()
+                .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned()),
         })
-    }
-
-    fn on_projects_key(&mut self, code: KeyCode) -> Option<Command> {
-        if code != KeyCode::Enter {
-            return None;
-        }
-        let projects = self.projects_mut()?;
-        let name = projects.items.get(projects.selected)?.name.clone();
-        self.overlay = Overlay::None;
-        self.open_code(&name)
     }
 
     fn open_jobs(&mut self) -> Command {
@@ -1812,7 +1705,7 @@ impl App {
     fn picker_candidates(&self) -> Vec<&SessionInfo> {
         let show_all = self.picker().is_some_and(|picker| picker.show_all);
         let show_abandoned = self.picker().is_some_and(|picker| picker.show_abandoned);
-        let open_project = self.open_project();
+        let open_project = self.current_project();
         let order: Vec<&SessionInfo> = self
             .by_recency()
             .into_iter()
@@ -1890,37 +1783,14 @@ impl App {
             .insert(session_id.to_owned(), (role, project.to_owned(), source));
     }
 
-    pub fn open_door_label(&self) -> Option<String> {
-        if self.session_id.is_none() {
-            if let Some(project) = &self.pending_code {
-                return Some(format!("code/{project}"));
-            }
+    pub fn current_project(&self) -> Option<&str> {
+        match self.session_id.as_deref() {
+            Some(id) => self
+                .session_meta
+                .get(id)
+                .and_then(|(_, project, _)| (!project.is_empty()).then_some(project.as_str())),
+            None => self.pending_project.as_deref(),
         }
-        let (role, project, source) = self
-            .session_id
-            .as_deref()
-            .and_then(|id| self.session_meta.get(id))?;
-        match (*source, *role) {
-            (Source::Model, _) => Some(format!("job/{project}")),
-            (Source::User, SessionRole::Code | SessionRole::Executor) => {
-                Some(format!("code/{project}"))
-            }
-            _ => None,
-        }
-    }
-
-    /// The project a code door — pending or already open — is bound to.
-    /// `None` for the chat, where the picker stays unscoped.
-    pub fn open_project(&self) -> Option<&str> {
-        if self.session_id.is_none() {
-            return self.pending_code.as_deref();
-        }
-        let (role, project, source) = self
-            .session_id
-            .as_deref()
-            .and_then(|id| self.session_meta.get(id))?;
-        (*source == Source::User && matches!(role, SessionRole::Code | SessionRole::Executor))
-            .then_some(project.as_str())
     }
 
     fn back_session(&mut self) -> Option<Command> {
@@ -1929,12 +1799,24 @@ impl App {
     }
 
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
-        if let Some(project) = self.open_project().map(str::to_owned) {
-            self.code_return = Some((self.session_id.clone(), project));
-        } else if self.session_id.is_some() {
-            self.chat_return = self.session_id.clone();
+        if session_id.as_deref().is_some_and(|id| {
+            self.sessions.iter().any(|session| {
+                session.id == id && session.role == arc_core::provider::LEGACY_DIRECT_ROLE
+            })
+        }) {
+            self.start_session(None);
+            self.last_error = Some("historical_session".to_owned());
+            self.push_block(Block::Fault {
+                code: "historical_session".to_owned(),
+                msg: "This session used the retired code role. Start a new assistant session."
+                    .to_owned(),
+            });
+            return None;
         }
-        self.pending_code = None;
+        self.pending_project = match session_id.as_deref() {
+            Some(_) => None,
+            None => self.current_project().map(str::to_owned),
+        };
         self.pending_first = None;
         self.pending_attachments.clear();
         if self.session_id != session_id {
@@ -1996,16 +1878,20 @@ impl App {
             self.pending_live = Some((content, attachments));
             return None;
         }
-        if self.session_id.is_none() {
-            if let Some(project) = self.pending_code.clone() {
-                self.status = Status::Streaming;
-                self.pending_first = Some((content, attachments));
-                return Some(Command::CreateSession {
-                    role: SessionRole::Code,
-                    project,
-                    choice: String::new(),
-                });
-            }
+        if self.session_id.is_none()
+            && (self.pending_project.is_some() || self.launch_dir.is_some())
+        {
+            self.status = Status::Streaming;
+            self.pending_first = Some((content, attachments));
+            return Some(Command::CreateSession {
+                role: SessionRole::Chat,
+                project: self.pending_project.clone().unwrap_or_default(),
+                choice: String::new(),
+                working_directory: self
+                    .launch_dir
+                    .as_ref()
+                    .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned()),
+            });
         }
         Some(self.send_with_attachments(content, attachments))
     }
@@ -2297,14 +2183,6 @@ impl App {
                 self.review_pending = pending;
                 None
             }
-            NetEvent::ProjectItems(items) => {
-                if let Some(projects) = self.projects_mut() {
-                    projects.selected = 0;
-                    projects.items = items;
-                    projects.loaded = true;
-                }
-                None
-            }
             NetEvent::ModelItems(items) => {
                 if let Some(models) = self.models_mut() {
                     let items: Vec<_> = items
@@ -2314,7 +2192,7 @@ impl App {
                     models.selected = if models.default {
                         items
                             .iter()
-                            .position(|c| c.selected && c.role == SessionRole::Code as i32)
+                            .position(|c| c.selected && c.role == SessionRole::Chat as i32)
                             .or_else(|| {
                                 items.iter().position(|c| {
                                     c.selected && c.role == SessionRole::Executor as i32
@@ -2331,18 +2209,17 @@ impl App {
                 None
             }
             NetEvent::ProjectsSeeded(items) => {
-                if self.untouched && self.session_id.is_none() && self.pending_code.is_none() {
+                if self.session_id.is_none()
+                    && self.pending_project.is_none()
+                    && self.status == Status::Idle
+                {
                     let roots = canonical_roots(&items);
-                    let matched = self
+                    self.pending_project = self
                         .launch_dir
                         .as_deref()
                         .and_then(|dir| longest_matching_root(dir, &roots))
                         .map(str::to_owned);
-                    if let Some(project) = matched {
-                        self.open_code(&project);
-                    }
                 }
-                self.seeded_projects = items;
                 None
             }
             NetEvent::JobItems(items) => {
@@ -2403,10 +2280,10 @@ impl App {
                     self.pending_attachments = attachments;
                     return command;
                 }
-                if let Some(project) = self.pending_code.take() {
+                if let Some(project) = self.pending_project.take() {
                     self.session_meta.insert(
                         session_id.clone(),
-                        (SessionRole::Code, project, Source::User),
+                        (SessionRole::Chat, project, Source::User),
                     );
                 }
                 self.session_id = Some(session_id);
@@ -2587,11 +2464,6 @@ fn is_running(job: &JobInfo) -> bool {
     job.state == job_info::State::Running as i32
 }
 
-/// A dispatched child, kept behind the picker's show-all toggle; a root
-/// conversation — including a `:code` session — always lists. Keyed on the
-/// recorded creation source (row 9.5), correct for all history unlike
-/// `dispatched_by` alone; UNSPECIFIED only exists in a stale index and
-/// fails toward hiding it as noise.
 pub fn is_job_session(session: &SessionInfo) -> bool {
     session.source != Source::User as i32
 }
@@ -2919,101 +2791,6 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn switching_doors_restores_each_session_and_its_draft() {
-        let mut app = App::new();
-        app.on_net(NetEvent::Sessions(vec![
-            session("chat"),
-            code_session("code", "", "arc"),
-        ]));
-        app.start_session(Some("chat".to_owned()));
-        app.input = "a personal question".to_owned();
-        app.open_code("arc");
-        app.on_net(NetEvent::SessionCreated {
-            session_id: "code".to_owned(),
-        });
-        app.input = "keep the public API".to_owned();
-
-        assert_eq!(
-            app.switch_chat(),
-            Some(Command::History {
-                session_id: "chat".to_owned()
-            })
-        );
-        assert_eq!(app.input, "a personal question");
-        assert_eq!(
-            app.switch_door(),
-            Some(Command::History {
-                session_id: "code".to_owned()
-            })
-        );
-        assert_eq!(app.input, "keep the public API");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-    }
-
-    #[test]
-    fn code_and_legacy_executor_doors_reopen_without_changing_role_or_pin() {
-        for role in [SessionRole::Code, SessionRole::Executor] {
-            let mut app = App::new();
-            let mut info = code_session("code", "development", "arc");
-            info.role = role as i32;
-            info.provider = "codex".to_owned();
-            info.model = "pinned-model".to_owned();
-            app.on_net(NetEvent::Sessions(vec![session("chat"), info.clone()]));
-            app.start_session(Some("chat".to_owned()));
-            app.start_session(Some("code".to_owned()));
-            assert_eq!(app.open_project(), Some("arc"));
-            assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-            assert_eq!(
-                app.switch_chat(),
-                Some(Command::History {
-                    session_id: "chat".to_owned()
-                })
-            );
-            assert_eq!(
-                app.switch_door(),
-                Some(Command::History {
-                    session_id: "code".to_owned()
-                })
-            );
-            assert!(app.pending_code.is_none());
-            assert_eq!(app.session_meta["code"].0, role);
-            assert_eq!(app.sessions.iter().find(|s| s.id == "code"), Some(&info));
-            assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-        }
-    }
-
-    #[test]
-    fn switching_an_unsent_code_draft_keeps_the_pending_project() {
-        let mut app = App::new();
-        app.open_code("arc");
-        app.input = "unfinished code request".to_owned();
-        assert_eq!(app.switch_chat(), None);
-        assert_eq!(app.session_id, None);
-        app.input = "unfinished chat request".to_owned();
-        assert_eq!(app.switch_door(), None);
-        assert_eq!(app.input, "unfinished code request");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-    }
-
-    #[test]
-    fn a_live_turn_cannot_change_doors_or_lose_its_draft() {
-        let mut app = App::new();
-        app.open_code("arc");
-        app.status = Status::Streaming;
-        app.input = "steering".to_owned();
-        assert_eq!(app.switch_chat(), None);
-        assert_eq!(app.code_picker(), None);
-        assert_eq!(app.input, "steering");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-        assert!(
-            app.last_error
-                .as_deref()
-                .expect("reason")
-                .contains("stop the turn")
-        );
     }
 
     fn typed(app: &mut App, text: &str) {
@@ -4317,6 +4094,7 @@ mod tests {
                 role: SessionRole::Chat,
                 project: String::new(),
                 choice: "glm-flash".to_owned(),
+                working_directory: String::new(),
             })
         );
         assert_eq!(app.models_mut(), None, "enter closes the picker");
@@ -4327,67 +4105,24 @@ mod tests {
     }
 
     #[test]
-    fn model_default_picker_selects_code_independently_from_executor() {
+    fn model_default_picker_selects_chat_independently_from_executor() {
         let mut app = normal_app();
         app.on_key(key(KeyCode::Char(':')));
         typed(&mut app, "model-default");
         app.on_key(key(KeyCode::Enter));
         app.on_net(NetEvent::ModelItems(vec![
             choice(SessionRole::Executor, "sol", true),
-            choice(SessionRole::Code, "sol", true),
-            choice(SessionRole::Code, "astra", false),
+            choice(SessionRole::Chat, "sol", true),
+            choice(SessionRole::Chat, "astra", false),
         ]));
         assert_eq!(app.models_mut().unwrap().selected, 1);
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
             Some(Command::SelectModel {
-                role: SessionRole::Code,
+                role: SessionRole::Chat,
                 choice: "astra".to_owned(),
             })
-        );
-    }
-
-    #[test]
-    fn choosing_for_a_pending_code_door_keeps_the_draft_and_attachments() {
-        let mut app = normal_app();
-        app.pending_code = Some("arc".to_owned());
-        app.input = "unfinished".to_owned();
-        app.cursor = app.input.len();
-        app.pending_attachments.push(ImageAttachment {
-            name: "plot.png".to_owned(),
-            ..Default::default()
-        });
-        assert_eq!(
-            app.on_key(key(KeyCode::Char('M'))),
-            Some(Command::ListModels)
-        );
-        app.on_net(NetEvent::ModelItems(vec![
-            choice(SessionRole::Chat, "chat", true),
-            choice(SessionRole::Code, "fast", false),
-        ]));
-        assert_eq!(app.models_mut().unwrap().items.len(), 1);
-        assert_eq!(
-            app.on_key(key(KeyCode::Enter)),
-            Some(Command::CreateSession {
-                role: SessionRole::Code,
-                project: "arc".to_owned(),
-                choice: "fast".to_owned(),
-            })
-        );
-        assert_eq!(
-            app.on_net(NetEvent::SessionCreated {
-                session_id: "new".to_owned()
-            }),
-            Some(Command::History {
-                session_id: "new".to_owned()
-            })
-        );
-        assert_eq!(app.input, "unfinished");
-        assert_eq!(app.pending_attachments().len(), 1);
-        assert_eq!(
-            app.session_meta["new"],
-            (SessionRole::Code, "arc".to_owned(), Source::User)
         );
     }
 
@@ -4468,25 +4203,26 @@ mod tests {
     }
 
     #[test]
-    fn choosing_for_an_empty_code_session_creates_a_new_bound_session() {
+    fn choosing_for_an_empty_session_creates_a_bound_session() {
         let mut app = normal_app();
         app.session_id = Some("empty".to_owned());
         app.session_meta.insert(
             "empty".to_owned(),
-            (SessionRole::Code, "arc".to_owned(), Source::User),
+            (SessionRole::Chat, "arc".to_owned(), Source::User),
         );
         app.on_key(key(KeyCode::Char('M')));
         app.on_net(NetEvent::ModelItems(vec![choice(
-            SessionRole::Code,
+            SessionRole::Chat,
             "deep",
             false,
         )]));
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
             Some(Command::CreateSession {
-                role: SessionRole::Code,
+                role: SessionRole::Chat,
                 project: "arc".to_owned(),
                 choice: "deep".to_owned(),
+                working_directory: String::new(),
             })
         );
         assert_eq!(app.session_id.as_deref(), Some("empty"));
@@ -4523,81 +4259,6 @@ mod tests {
     }
 
     #[test]
-    fn capital_c_picks_a_project_and_enter_walks_the_code_door() {
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Esc));
-        let command = app.on_key(key(KeyCode::Char('C')));
-        assert_eq!(command, Some(Command::ListProjects));
-        assert!(!app.projects_mut().expect("picker is open").loaded);
-
-        app.on_net(NetEvent::ProjectItems(vec![
-            ProjectInfo {
-                name: "arc".to_owned(),
-                description: "ARC's own repo".to_owned(),
-                root: String::new(),
-            },
-            ProjectInfo {
-                name: "scratch".to_owned(),
-                description: String::new(),
-                root: String::new(),
-            },
-        ]));
-        app.on_key(key(KeyCode::Char('j')));
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, None, "nothing durable for an unsent pick");
-        assert_eq!(app.projects_mut(), None, "enter closes the picker");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/scratch"));
-
-        app.on_key(key(KeyCode::Char('i')));
-        typed(&mut app, "hello");
-        let command = app.on_key(key(KeyCode::Enter));
-        assert_eq!(
-            command,
-            Some(Command::CreateSession {
-                role: SessionRole::Code,
-                project: "scratch".to_owned(),
-                choice: String::new(),
-            }),
-            "from the pick on, this is exactly the :code flow"
-        );
-    }
-
-    #[test]
-    fn colon_code_is_frontend_only_until_the_first_message() {
-        let mut app = App::new();
-        normal(&mut app, ":code arc");
-        let command = app.on_key(key(KeyCode::Enter));
-
-        assert_eq!(command, None, "nothing durable for an unsent :code");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-        assert_eq!(app.last_error, None, ":code is a command, not E492");
-
-        app.on_key(key(KeyCode::Char('i')));
-        typed(&mut app, "hello");
-        let command = app.on_key(key(KeyCode::Enter));
-        assert_eq!(
-            command,
-            Some(Command::CreateSession {
-                role: SessionRole::Code,
-                project: "arc".to_owned(),
-                choice: String::new(),
-            }),
-            "the first message is what opens the session"
-        );
-        app.on_net(NetEvent::SessionCreated {
-            session_id: "s-new".to_owned(),
-        });
-        assert_eq!(
-            app.open_door_label().as_deref(),
-            Some("code/arc"),
-            "labelled from the create flow, before any Sessions push lands"
-        );
-    }
-
-    // start_session(None) is the same path a pending door abandons through
-    // (see above); this proves it holds for an already-created code session too
-    #[test]
     fn nested_roots_prefer_the_longer_and_reject_a_sibling() {
         let roots = vec![
             ("outer", PathBuf::from("/a")),
@@ -4616,153 +4277,170 @@ mod tests {
     }
 
     #[test]
-    fn a_seeded_root_matching_the_launch_dir_opens_the_pending_code_door() {
+    fn launch_project_and_picker_new_session_share_scope() {
         let root = tempfile::tempdir().expect("tempdir");
-        let launch_dir = root.path().join("docs");
-        std::fs::create_dir(&launch_dir).expect("mkdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
-        let canonical_launch = std::fs::canonicalize(&launch_dir).expect("canonicalize");
-
-        let mut app = App::new();
-        app.set_launch_dir(Some(canonical_launch));
-        let command = app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
-            name: "arc".to_owned(),
-            description: String::new(),
-            root: canonical_root.display().to_string(),
-        }]));
-
-        assert_eq!(command, None, "nothing durable until the first message");
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-    }
-
-    // a remote client's launch_dir is None (main.rs never sets one), which
-    // takes the same no-door path as a directory outside every root
-    #[test]
-    fn a_seed_arriving_after_the_user_acts_first_opens_no_door() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
+        let dir = std::fs::canonicalize(root.path()).expect("canonicalize");
         let seed = vec![ProjectInfo {
             name: "arc".to_owned(),
-            description: String::new(),
-            root: canonical_root.display().to_string(),
+            root: dir.display().to_string(),
+            ..Default::default()
         }];
-
-        let mut typed_first = App::new();
-        typed_first.set_launch_dir(Some(canonical_root.clone()));
-        typed(&mut typed_first, "hello");
-        typed_first.on_net(NetEvent::ProjectsSeeded(seed.clone()));
-        assert_eq!(
-            typed_first.open_door_label(),
-            None,
-            "typing before the seed arrives claims the door"
-        );
-
-        let mut picker_first = App::new();
-        picker_first.set_launch_dir(Some(canonical_root));
-        picker_first.on_key(ctrl('p'));
-        assert!(picker_first.picker().is_some());
-        picker_first.on_net(NetEvent::ProjectsSeeded(seed));
-        assert_eq!(
-            picker_first.open_door_label(),
-            None,
-            "opening the picker before the seed arrives claims the door"
-        );
-    }
-
-    #[test]
-    fn the_picker_scopes_to_the_open_project_until_show_all() {
         let mut app = App::new();
+        app.set_launch_dir(Some(dir.clone()));
+        app.on_net(NetEvent::ProjectsSeeded(seed.clone()));
+        assert_eq!(app.current_project(), Some("arc"));
         app.on_net(NetEvent::Sessions(vec![
-            code_session("s-arc-1", "in arc", "arc"),
-            code_session("s-scratch-1", "in scratch", "scratch"),
-            session("s-chat"),
-            job_session("s-job", "job in arc", SessionRole::Executor, "arc"),
+            code_session("arc-old", "in arc", "arc"),
+            code_session("other", "elsewhere", "other"),
+            session_with("unbound", "question", "hi"),
         ]));
-        normal(&mut app, ":code arc");
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-
         app.on_key(ctrl('p'));
-        let scoped: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(
-            scoped,
-            vec!["s-arc-1"],
-            "the default candidate set is scoped to the open project"
-        );
-
-        app.on_key(key(KeyCode::Char(' ')));
-        let all: Vec<&str> = app.picker_rows().iter().map(|s| s.id.as_str()).collect();
-        assert!(
-            all.contains(&"s-scratch-1"),
-            "show-all lifts the project scope"
-        );
-        assert!(
-            all.contains(&"s-chat"),
-            "show-all includes chat conversations"
-        );
-        assert!(!all.contains(&"s-job"), "show-all still excludes jobs");
-
-        app.on_key(key(KeyCode::Char('a')));
         assert_eq!(
             app.picker_rows()
                 .iter()
                 .map(|s| s.id.as_str())
                 .collect::<Vec<_>>(),
-            ["s-arc-1"],
-            "a returns to the scoped list"
+            ["arc-old"]
         );
-    }
-
-    #[test]
-    fn submitting_after_an_auto_opened_door_creates_a_session_like_code_does() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize");
-
-        let mut app = App::new();
-        app.set_launch_dir(Some(canonical_root.clone()));
-        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
-            name: "arc".to_owned(),
-            description: String::new(),
-            root: canonical_root.display().to_string(),
-        }]));
-        assert_eq!(app.open_door_label().as_deref(), Some("code/arc"));
-
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.current_project(), Some("arc"));
         typed(&mut app, "hello");
-        let command = app.on_key(key(KeyCode::Enter));
-
         assert_eq!(
-            command,
+            app.on_key(key(KeyCode::Enter)),
             Some(Command::CreateSession {
-                role: SessionRole::Code,
+                role: SessionRole::Chat,
                 project: "arc".to_owned(),
                 choice: String::new(),
+                working_directory: dir.display().to_string(),
+            })
+        );
+        assert_eq!(
+            app.on_net(NetEvent::SessionCreated {
+                session_id: "new".to_owned()
             }),
-            "the first message after an auto-opened door is exactly the :code flow"
+            Some(Command::Send {
+                session_id: Some("new".to_owned()),
+                content: "hello".to_owned(),
+                attachments: Vec::new(),
+            })
+        );
+        assert_eq!(app.current_project(), Some("arc"));
+
+        let mut remote = App::new();
+        remote.on_net(NetEvent::ProjectsSeeded(seed));
+        assert_eq!(remote.current_project(), None);
+        typed(&mut remote, "hello");
+        assert!(matches!(
+            remote.on_key(key(KeyCode::Enter)),
+            Some(Command::Send {
+                session_id: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn project_seed_after_typing_still_binds_the_unsent_session() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = std::fs::canonicalize(root.path()).expect("canonicalize");
+        let mut app = App::new();
+        app.set_launch_dir(Some(dir.clone()));
+        typed(&mut app, "already typing");
+        app.on_net(NetEvent::ProjectsSeeded(vec![ProjectInfo {
+            name: "arc".to_owned(),
+            root: dir.display().to_string(),
+            ..Default::default()
+        }]));
+        assert_eq!(app.current_project(), Some("arc"));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::CreateSession {
+                role: SessionRole::Chat,
+                project: "arc".to_owned(),
+                choice: String::new(),
+                working_directory: dir.display().to_string(),
+            })
         );
     }
 
     #[test]
-    fn a_created_session_receives_the_stashed_first_message() {
+    fn picker_switches_scope_to_selected_project_and_new_inherits_it() {
         let mut app = App::new();
-        normal(&mut app, ":code scratch");
-        app.on_key(key(KeyCode::Enter));
-        typed(&mut app, "run the tests");
-        app.on_key(key(KeyCode::Enter));
-
-        let command = app.on_net(NetEvent::SessionCreated {
-            session_id: "s-code".to_owned(),
-        });
-
-        assert_eq!(app.session_id.as_deref(), Some("s-code"));
+        app.on_net(NetEvent::Sessions(vec![
+            code_session("old", "legacy", "arc"),
+            SessionInfo {
+                role: SessionRole::Chat as i32,
+                ..code_session("other", "other project", "scratch")
+            },
+            session_with("free", "unbound", "hello"),
+        ]));
+        app.start_session(Some("old".to_owned()));
+        app.on_key(ctrl('p'));
+        assert_eq!(app.picker_rows().len(), 1);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.picker_rows().len(), 3);
+        let row = app
+            .picker_rows()
+            .iter()
+            .position(|s| s.id == "other")
+            .unwrap()
+            + 1;
+        app.picker_mut().unwrap().selected = row;
         assert_eq!(
-            command,
-            Some(Command::Send {
-                session_id: Some("s-code".to_owned()),
-                content: "run the tests".to_owned(),
-                attachments: Vec::new(),
-            }),
-            "the message that opened the door is the session's first turn"
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::History {
+                session_id: "other".to_owned()
+            })
         );
+        assert_eq!(app.current_project(), Some("scratch"));
+        app.on_key(ctrl('p'));
+        assert_eq!(
+            app.picker_rows()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["other"]
+        );
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.session_id, None);
+        assert_eq!(app.current_project(), Some("scratch"));
+    }
+
+    #[test]
+    fn opening_a_historical_code_session_shows_a_chat_error() {
+        let mut app = normal_app();
+        let mut old = code_session("legacy", "ongoing", "arc");
+        old.role = arc_core::provider::LEGACY_DIRECT_ROLE;
+        app.on_net(NetEvent::Sessions(vec![old]));
+        normal(&mut app, "s");
+        let row = app
+            .picker_rows()
+            .iter()
+            .position(|s| s.id == "legacy")
+            .unwrap()
+            + 1;
+        app.picker_mut().unwrap().selected = row;
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.session_id, None);
+        assert!(matches!(
+            app.transcript.last().map(|entry| &entry.block),
+            Some(Block::Fault { code, msg })
+                if code == "historical_session" && msg.contains("Start a new assistant session")
+        ));
+    }
+
+    #[test]
+    fn tab_never_switches_sessions_or_drafts() {
+        let mut app = App::new();
+        app.on_net(NetEvent::Sessions(vec![code_session(
+            "old", "legacy", "arc",
+        )]));
+        app.start_session(Some("old".to_owned()));
+        app.input = "draft".to_owned();
+        app.mode = Mode::Normal;
+        assert_eq!(app.on_key(key(KeyCode::Tab)), None);
+        assert_eq!(app.session_id.as_deref(), Some("old"));
+        assert_eq!(app.input, "draft");
     }
 
     #[test]

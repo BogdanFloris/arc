@@ -89,6 +89,7 @@ pub(crate) mod testkit {
                         sources: Vec::new(),
                         grants: vec![Grant::new(root, Mode::ReadWrite)],
                         command_prefix: Vec::new(),
+                        description: String::new(),
                     },
                 )]),
             ),
@@ -110,6 +111,7 @@ pub(crate) mod testkit {
                         sources: Vec::new(),
                         grants: vec![Grant::new(root, Mode::ReadWrite)],
                         command_prefix: Vec::new(),
+                        description: String::new(),
                     },
                 )]))
                 .with_notifier(notifier),

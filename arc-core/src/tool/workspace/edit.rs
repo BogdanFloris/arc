@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Access, Workspace, ensure_fresh};
+use super::{Workspace, ensure_fresh, resolve_path};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -95,12 +95,7 @@ impl Tool for Edit {
                     ),
                 };
 
-            let Some(grants) = &ctx.grants else {
-                return ToolReply::error(
-                    "ERROR: no workspace is granted in this session.".to_owned(),
-                );
-            };
-            let resolved = match grants.resolve(&args.path, Access::Write) {
+            let resolved = match resolve_path(&args.path) {
                 Ok(path) => path,
                 Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
             };
@@ -297,8 +292,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_keeps_freshness_and_grant_checks() {
-        let dir = TempDir::new_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    async fn batch_keeps_freshness_checks_without_grants() {
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("f.txt");
         fs::write(&path, "alpha beta").unwrap();
         let ws = workspace();
@@ -316,11 +311,26 @@ mod tests {
             .execute(request.clone(), ctx("s", dir.path(), Mode::ReadWrite))
             .await;
         assert!(stale.content.contains("changed since"));
-        let denied = tool
-            .execute(request, ctx("s", dir.path(), Mode::ReadOnly))
+        Read::new(Arc::clone(&tool.workspace))
+            .execute(
+                read_args(&path),
+                TurnContext {
+                    session_id: "s".to_owned(),
+                    ..TurnContext::default()
+                },
+            )
             .await;
-        assert!(denied.content.contains("read-only"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha beta!");
+        let edited = tool
+            .execute(
+                request,
+                TurnContext {
+                    session_id: "s".to_owned(),
+                    ..TurnContext::default()
+                },
+            )
+            .await;
+        assert!(edited.ok, "{}", edited.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A B!");
     }
 
     #[tokio::test]

@@ -59,12 +59,13 @@ impl Thinking {
 pub fn role_label(role: SessionRole) -> &'static str {
     match role {
         SessionRole::Unspecified => "unspecified",
-        SessionRole::Chat => "chat",
-        SessionRole::Code => "code",
+        SessionRole::Chat => "assistant",
         SessionRole::Executor => "executor",
         SessionRole::Archivist => "archivist",
     }
 }
+
+pub const LEGACY_DIRECT_ROLE: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {

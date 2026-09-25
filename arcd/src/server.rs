@@ -281,7 +281,7 @@ async fn request(
             supervisor.drop_steers(&drop.session_id),
         )),
         Some(client_frame::Msg::CreateSession(create)) => {
-            Ok(create_session(engine, supervisor, create))
+            Ok(create_session(engine, supervisor, &create))
         }
         Some(client_frame::Msg::ForkSession(fork)) => engine
             .fork_session_with_choice(&fork.session_id, fork.fork_point, &fork.choice)
@@ -528,24 +528,17 @@ async fn compact_session(
 fn create_session(
     engine: &Engine,
     supervisor: &Supervisor,
-    create: CreateSession,
+    create: &CreateSession,
 ) -> server_frame::Msg {
     let role = SessionRole::try_from(create.role).unwrap_or(SessionRole::Unspecified);
-    if !matches!(
-        role,
-        SessionRole::Chat | SessionRole::Code | SessionRole::Executor
-    ) {
+    if role != SessionRole::Chat {
         error_frame(
             "unsupported_role",
             format!("cannot directly open a {} session", role_label(role)),
         )
     } else if let Some(runner) = supervisor.role_runner(role) {
-        let result = if role == SessionRole::Chat && create.project.is_empty() {
-            engine.create_session_with_choice(&runner, &create.choice)
-        } else if role == SessionRole::Chat {
-            Err(SessionError::UnknownProject {
-                project: create.project,
-            })
+        let result = if create.project.is_empty() {
+            engine.create_session_with_directory(&runner, &create.choice, &create.working_directory)
         } else {
             engine.create_direct_session_with_choice(&runner, &create.project, role, &create.choice)
         };
@@ -665,6 +658,7 @@ fn error_code(error: &SessionError) -> &'static str {
         SessionError::UnknownProject { .. } => "unknown_project",
         SessionError::UnknownChoice { .. } => "unknown_choice",
         SessionError::UnknownSession { .. } => "unknown_session",
+        SessionError::HistoricalSession { .. } => "historical_session",
         SessionError::InvalidForkPoint { .. } => "invalid_fork_point",
         SessionError::NotABranch { .. } => "not_a_branch",
         SessionError::Store(StoreError::UnknownRecord { .. }) => "unknown_record",
@@ -925,16 +919,7 @@ mod tests {
                 script,
                 registry,
                 Vec::new(),
-                BTreeMap::from([
-                    (
-                        SessionRole::Code,
-                        Runner {
-                            role: SessionRole::Code,
-                            ..executor_runner.clone()
-                        },
-                    ),
-                    (SessionRole::Executor, executor_runner),
-                ]),
+                BTreeMap::from([(SessionRole::Executor, executor_runner)]),
                 projects,
             )
             .await
@@ -961,7 +946,7 @@ mod tests {
             let (notifier, _receiver) = broadcast::channel(256);
             // mirrors daemon.rs: a dispatched job records the role's own
             // runner, not the dispatching chat's
-            let role_identities = job_runners
+            let mut role_identities: BTreeMap<_, _> = job_runners
                 .iter()
                 .map(|(role, runner)| {
                     (
@@ -970,6 +955,10 @@ mod tests {
                     )
                 })
                 .collect();
+            role_identities.insert(
+                SessionRole::Chat,
+                (provider.name().to_owned(), "test-model".to_owned()),
+            );
             // mirrors daemon.rs: the same read-write root a project's spec
             // grants is what a job's (or a direct turn's) system prompt reads
             // AGENTS.md from
@@ -1260,6 +1249,7 @@ mod tests {
                 role: role as i32,
                 project: project.to_owned(),
                 choice: String::new(),
+                working_directory: String::new(),
             }),
         )
         .await;
@@ -1933,6 +1923,7 @@ mod tests {
                     arc_core::tool::workspace::Mode::ReadWrite,
                 )],
                 command_prefix: Vec::new(),
+                description: String::new(),
             },
         )]);
         (registry, project_dir, projects)
@@ -2288,7 +2279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_opens_a_code_session_with_the_direct_prompt_and_a_job_keeps_its_own() {
+    async fn create_session_opens_a_project_session_with_agents_md_and_identity() {
         let (registry, project_dir, projects) = dispatch_registry_and_projects();
         std::fs::write(
             project_dir.path().join("AGENTS.md"),
@@ -2296,10 +2287,13 @@ mod tests {
         )
         .expect("write AGENTS.md");
 
-        let executor_provider =
-            ScriptedProvider::scripted(vec![done_reply("on it"), done_reply("hi there")]);
+        let executor_provider = ScriptedProvider::scripted(vec![done_reply("on it")]);
+        let mut chat = dispatching_chat("fix the failing test");
+        if let Script::Canned(steps) = &mut chat {
+            steps.push_back(done_reply("hi there"));
+        }
         let mut harness = Harness::with_executor_provider(
-            dispatching_chat("fix the failing test"),
+            chat,
             registry,
             Arc::clone(&executor_provider) as Arc<dyn Provider>,
             projects,
@@ -2311,51 +2305,44 @@ mod tests {
         run_turn_to_end(&mut ws, 1).await;
         harness.drain_jobs().await;
 
-        let msg = create_session(&mut ws, 2, SessionRole::Code, "arc").await;
-        let code_session_id = match msg {
+        let msg = create_session(&mut ws, 2, SessionRole::Chat, "arc").await;
+        let session_id = match msg {
             server_frame::Msg::MessageAccepted(accepted) => accepted.session_id,
             other => panic!("expected MessageAccepted, got {other:?}"),
         };
-        assert!(!code_session_id.is_empty());
+        assert!(!session_id.is_empty());
         assert_ne!(
-            code_session_id,
+            session_id,
             dispatched_child_id(&harness),
-            "a :code session is its own session, not the dispatched job"
+            "a direct session is not a dispatched job"
         );
 
-        send(&mut ws, 3, say(&code_session_id, "hello")).await;
-        let (session_id, text, closing) = turn(&mut ws, 3).await;
-        assert_eq!(session_id, code_session_id);
+        send(&mut ws, 3, say(&session_id, "hello")).await;
+        let (answered, text, closing) = turn(&mut ws, 3).await;
+        assert_eq!(answered, session_id);
         assert_eq!(text, "hi there");
         assert!(!ended(closing).partial);
 
         let requests = executor_provider.requests();
-        assert_eq!(requests.len(), 2, "the job's turn, then the :code turn");
+        assert_eq!(requests.len(), 1, "the job has its own runner");
         assert_eq!(requests[0].role, SessionRole::Executor);
-        assert_eq!(requests[1].role, SessionRole::Code);
         let job_system = requests[0]
             .system
             .clone()
             .expect("the job gets a system prompt");
-        assert!(
-            job_system.contains("non-interactively") && job_system.contains("job's report"),
-            "{job_system}"
-        );
+        assert!(job_system.contains("Project: arc"), "{job_system}");
         assert!(job_system.contains("Keep commits small."), "{job_system}");
         assert!(
             !job_system.contains(TEST_IDENTITY),
             "a dispatched job never carries identity: {job_system}"
         );
 
-        let direct_system = requests[1]
+        let direct_request = harness.provider.requests().pop().expect("direct request");
+        assert_eq!(direct_request.role, SessionRole::Chat);
+        let direct_system = direct_request
             .system
-            .clone()
-            .expect("the :code turn gets a system prompt");
-        assert!(
-            direct_system.contains("interactively with the user"),
-            "{direct_system}"
-        );
-        assert!(!direct_system.contains("job's report"), "{direct_system}");
+            .expect("direct turn gets project context");
+        assert!(direct_system.contains("Project: arc"), "{direct_system}");
         assert!(
             direct_system.contains("Keep commits small."),
             "{direct_system}"
@@ -2366,19 +2353,19 @@ mod tests {
         );
 
         let sessions = list(&mut ws, 4).await;
-        let code_summary = sessions
+        let summary = sessions
             .iter()
-            .find(|s| s.id == code_session_id)
-            .expect("the :code session is listed");
-        assert_eq!(code_summary.role, SessionRole::Code as i32);
+            .find(|s| s.id == session_id)
+            .expect("the project session is listed");
+        assert_eq!(summary.role, SessionRole::Chat as i32);
         assert_eq!(
-            code_summary.dispatched_by, "",
-            "a :code session is a root conversation, not a dispatched child"
+            summary.dispatched_by, "",
+            "a direct session is not a dispatched child"
         );
         assert_eq!(
-            code_summary.source,
+            summary.source,
             Source::User as i32,
-            "a :code session is user-opened, not model-dispatched"
+            "a direct session is user-opened"
         );
 
         harness.stop().await;
@@ -2396,6 +2383,7 @@ mod tests {
                 role: SessionRole::Chat as i32,
                 project: String::new(),
                 choice: "unconfigured".to_owned(),
+                working_directory: String::new(),
             }),
         )
         .await;
@@ -2412,6 +2400,83 @@ mod tests {
         assert_eq!(served, id);
         assert_eq!(reply, "re: hello");
 
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn historical_code_session_cannot_resume() {
+        let id = "historical-code";
+        let event = Event {
+            seq: 0,
+            ts: None,
+            source: Source::User as i32,
+            payload: Some(event::Payload::Session(arc_proto::v1::SessionEvent {
+                event: Some(session_event::Event::SessionCreated(
+                    arc_proto::v1::SessionCreated {
+                        session_id: id.to_owned(),
+                        role: arc_core::provider::LEGACY_DIRECT_ROLE,
+                        provider: "mock".to_owned(),
+                        model: "test-model".to_owned(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+        };
+        let mut harness = Harness::with_seed(
+            Script::Echo,
+            Registry::new(512),
+            vec![event],
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .await;
+        let mut ws = harness.connect().await;
+        let sessions = list(&mut ws, 1).await;
+        assert_eq!(sessions[0].role, arc_core::provider::LEGACY_DIRECT_ROLE);
+        assert_eq!(sessions[0].model, "test-model");
+
+        send(&mut ws, 2, say(id, "continue")).await;
+        let reply = next_frame(&mut ws).await;
+        assert_eq!(failed(reply.msg.expect("error")).code, "historical_session");
+        assert!(harness.provider.requests().is_empty());
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_local_directory_supplies_agents_md_and_bash_cwd() {
+        let mut harness = Harness::start(Script::Echo).await;
+        let root = tempfile::tempdir().expect("directory");
+        std::fs::write(root.path().join("AGENTS.md"), "Use jj.\n").expect("agents");
+        let mut ws = harness.connect().await;
+
+        send(
+            &mut ws,
+            1,
+            client_frame::Msg::CreateSession(CreateSession {
+                role: SessionRole::Chat as i32,
+                project: String::new(),
+                choice: String::new(),
+                working_directory: root.path().display().to_string(),
+            }),
+        )
+        .await;
+        let id = match next_frame(&mut ws).await.msg {
+            Some(server_frame::Msg::MessageAccepted(accepted)) => accepted.session_id,
+            other => panic!("expected session id, got {other:?}"),
+        };
+        send(&mut ws, 2, say(&id, "hello")).await;
+        let (served, reply, _) = turn(&mut ws, 2).await;
+        assert_eq!(served, id);
+        assert_eq!(reply, "re: hello");
+        let system = harness.provider.requests().pop().unwrap().system.unwrap();
+        assert!(system.contains("Working directory: "), "{system}");
+        assert!(system.contains("Use jj."), "{system}");
+        assert!(system.contains(TEST_IDENTITY), "{system}");
+        assert!(harness.logged_events().iter().any(|event| matches!(
+            event,
+            session_event::Event::SessionCreated(created)
+                if created.session_id == id && created.working_directory == root.path().display().to_string()
+        )));
         harness.stop().await;
     }
 
@@ -2526,7 +2591,7 @@ mod tests {
             other => panic!("expected ModelList, got {other:?}"),
         };
         assert_eq!(listed.len(), 2, "{listed:?}");
-        for role in [SessionRole::Code, SessionRole::Executor] {
+        for role in [SessionRole::Chat, SessionRole::Executor] {
             let choice = listed
                 .iter()
                 .find(|c| c.role == role as i32)
@@ -2689,6 +2754,7 @@ mod tests {
                             arc_core::tool::workspace::Mode::ReadWrite,
                         )],
                         command_prefix: Vec::new(),
+                        description: String::new(),
                     },
                 )]))
                 .with_notifier(notifier.clone()),

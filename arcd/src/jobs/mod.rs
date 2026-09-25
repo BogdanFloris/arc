@@ -23,7 +23,6 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use handback::{Autonomy, handback_crashed, job_title, record_handback};
-use prompt::job_system_prompt;
 use status::{JobStatuses, notify_job_changed};
 use turn::{EVENT_BUFFER, Task, run_task};
 
@@ -431,8 +430,17 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
             .then(|| shared.menus.get(&SessionRole::Chat))
             .flatten()
     });
+    let candidates = || menu.into_iter().flat_map(|menu| menu.iter());
     let mut runner = if let Some(choice) = choice {
-        menu.and_then(|menu| menu.iter().find(|(name, _)| name == &choice))
+        candidates()
+            .find(|(name, runner)| {
+                name == &choice
+                    && identity.as_ref().is_none_or(|(provider, model)| {
+                        provider.is_empty()
+                            || (runner.provider.name(), runner.model.as_str())
+                                == (provider.as_str(), model.as_str())
+                    })
+            })
             .map(|(_, runner)| runner.clone())
             .ok_or_else(|| SessionError::MissingChoice {
                 session_id: session_id.to_owned(),
@@ -446,9 +454,7 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
                     role: role_label(role).to_owned(),
                 })?
         } else {
-            let mut matches = menu
-                .into_iter()
-                .flat_map(|menu| menu.iter())
+            let mut matches = candidates()
                 .filter(|(_, runner)| runner.provider.name() == provider && runner.model == model);
             let runner = matches.next().map(|(_, runner)| runner.clone());
             if matches.next().is_some() {
@@ -468,21 +474,23 @@ fn turn_runner(shared: &Shared, session_id: &str) -> Result<Runner, SessionError
             session_id: session_id.to_owned(),
         });
     };
-    if matches!(role, SessionRole::Code | SessionRole::Executor) {
-        if let Some(prompt) = direct_system_prompt_for(shared, session_id) {
-            runner.system = Some(prompt);
+    if let Some(project) = shared.engine.session_project(session_id)? {
+        if let Some(configured) = shared.projects.get(&project) {
+            let description = shared.engine.project_description(&project).unwrap_or("");
+            runner.system = Some(prompt::project_context(
+                &project,
+                description,
+                &configured.root,
+                shared.identity.as_deref(),
+            ));
         }
+    } else if let Some(directory) = shared.engine.session_working_directory(session_id)? {
+        runner.system = Some(prompt::directory_context(
+            std::path::Path::new(&directory),
+            shared.identity.as_deref(),
+        ));
     }
     Ok(runner)
-}
-
-fn direct_system_prompt_for(shared: &Shared, session_id: &str) -> Option<String> {
-    let project = shared.engine.session_project(session_id).ok().flatten()?;
-    let root = &shared.projects.get(&project)?.root;
-    Some(prompt::direct_system_prompt(
-        root,
-        shared.identity.as_deref(),
-    ))
 }
 
 fn spawn_dispatched(shared: &Shared, jobs: Vec<DispatchedJob>) {
@@ -523,7 +531,15 @@ fn spawn_job(shared: &Shared, job: DispatchedJob, initial_spent_tokens: u64) -> 
         }
     };
     if let Some(project) = shared.projects.get(&job.project) {
-        runner.system = Some(job_system_prompt(&project.root));
+        runner.system = Some(prompt::project_context(
+            &job.project,
+            shared
+                .engine
+                .project_description(&job.project)
+                .unwrap_or(""),
+            &project.root,
+            None,
+        ));
     }
     let mut live = shared.live.lock().expect("live");
     if live.contains_key(&job.session_id) {
@@ -887,6 +903,7 @@ mod tests {
             dispatched_by: dispatched_by.to_owned(),
             choice: String::new(),
             editing: String::new(),
+            working_directory: String::new(),
         })
     }
 
@@ -986,6 +1003,7 @@ mod tests {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
                     command_prefix: Vec::new(),
+                    description: String::new(),
                 },
             )])),
         );
@@ -1087,7 +1105,7 @@ mod tests {
         ]);
         let executor_provider = ScriptedProvider::scripted(vec![done_reply("grandchild done")]);
         let code_runner = Runner {
-            role: SessionRole::Code,
+            role: SessionRole::Chat,
             model: "astra".to_owned(),
             ..executor_runner(&code_provider)
         };
@@ -1111,11 +1129,12 @@ mod tests {
                         sources: vec![ToolSource::Builtin],
                         grants: vec![Grant::new(&root, Mode::ReadWrite)],
                         command_prefix: Vec::new(),
+                        description: String::new(),
                     },
                 )]))
                 .with_role_identities(BTreeMap::from([
                     (
-                        SessionRole::Code,
+                        SessionRole::Chat,
                         ("scripted".to_owned(), "astra".to_owned()),
                     ),
                     (
@@ -1126,11 +1145,11 @@ mod tests {
         );
 
         let child = engine
-            .create_direct_session(&code_runner, "arc", SessionRole::Code)
+            .create_direct_session(&code_runner, "arc", SessionRole::Chat)
             .expect("create the direct session durably");
 
         let runners = BTreeMap::from([
-            (SessionRole::Code, code_runner),
+            (SessionRole::Chat, code_runner),
             (SessionRole::Executor, worker_runner),
         ]);
         let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
@@ -1176,7 +1195,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .all(|r| r.role == SessionRole::Code && r.model == "astra")
+                .all(|r| r.role == SessionRole::Chat && r.model == "astra")
         );
         let worker_requests = executor_provider.requests();
         assert_eq!(worker_requests.len(), 1);
@@ -1523,6 +1542,7 @@ mod tests {
                     sources: vec![ToolSource::Builtin],
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
                     command_prefix: Vec::new(),
+                    description: String::new(),
                 },
             )])),
         );

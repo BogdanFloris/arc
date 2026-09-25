@@ -816,6 +816,7 @@ mod tests {
             dispatched_by: String::new(),
             choice: String::new(),
             editing: String::new(),
+            working_directory: String::new(),
         })
     }
 

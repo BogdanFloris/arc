@@ -430,6 +430,7 @@ mod tests {
                     sources: Vec::new(),
                     grants: vec![Grant::new(&root, Mode::ReadWrite)],
                     command_prefix: Vec::new(),
+                    description: String::new(),
                 },
             )]))
             .with_notifier(notifier.clone()),
@@ -500,6 +501,7 @@ mod tests {
                         sources: Vec::new(),
                         grants: vec![Grant::new(&root, Mode::ReadWrite)],
                         command_prefix: Vec::new(),
+                        description: String::new(),
                     },
                 )]))
                 .with_notifier(notifier.clone()),

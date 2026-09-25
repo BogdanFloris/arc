@@ -13,50 +13,14 @@ use arc_proto::v1::SessionRole;
 
 use crate::config::{Config, RoleConfig, RoleProvider};
 
-const RUNNING_JOBS: &str = r"Running jobs:
-- Dispatch, then end your reply. The handback (reply from job) arrives on its own.
-- If a finished job already holds the context (files it read, a repo
-  it analyzed) continue that job, if you believe the follow-up requires the context.
-  A fresh dispatch starts from nothing.
-- Briefs are self-contained. The child sees nothing of this
-  conversation.
-- A handback is the job's claim, not a verified fact. Say what the job
-  reports, not what is proven, unless you checked.
-- A job cancelled by the user stays stopped. Acknowledge it; never
-  dispatch or continue that work again unless the user asks.
-- Describe the codebase, its UI, or its commits only from a handback.
-  Otherwise dispatch analyze, or say you cannot see it.
-- Report a job's commits by the ids and messages the job named.
-- A brief that touches drawing asks for the rendered frame in the report.
-- Hand the user conclusions, not transcripts.";
-
-pub(crate) const MEMORY: &str = r"Memory:
-- Save a fact when it will still hold next month and would otherwise be
-  explained again: where something lives, how a tool behaves here, what
-  the user decided and why.
-- Never save the work. What you read, built, changed, or committed is
-  already in the repo and the archive.
-- A fact the project's own AGENTS.md should carry belongs there, not
-  here. Memory is for projects that have no such file.
-- Search the project's namespace before assuming a convention. The index
-  carries titles and one line; memory_read has the rest.";
-
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
     (f64::from(context_window) * f64::from(fraction)) as u32
 }
 
-fn chat_system(identity: Option<String>) -> String {
-    match identity {
-        Some(identity) => format!("{}\n\n{RUNNING_JOBS}\n\n{MEMORY}", identity.trim_end()),
-        None => format!("{RUNNING_JOBS}\n\n{MEMORY}"),
-    }
-}
-
 #[derive(Debug)]
 pub struct Roles {
     chat: Vec<(String, Runner)>,
-    code: Vec<(String, Runner)>,
     executor: Vec<(String, Runner)>,
     archivist: Vec<(String, Runner)>,
 }
@@ -72,23 +36,13 @@ impl Roles {
         Ok(Self {
             chat: built.role(
                 SessionRole::Chat,
-                config.roles.chat.as_ref(),
+                config.roles.assistant.as_ref(),
                 config,
-                Some(chat_system(identity)),
+                identity,
             )?,
             executor: built.role(
                 SessionRole::Executor,
                 config.roles.executor.as_ref(),
-                config,
-                None,
-            )?,
-            code: built.role(
-                SessionRole::Code,
-                config
-                    .roles
-                    .code
-                    .as_ref()
-                    .or(config.roles.executor.as_ref()),
                 config,
                 None,
             )?,
@@ -113,19 +67,13 @@ impl Roles {
         &self.archivist[0].1
     }
 
-    pub fn all(&self) -> [&Runner; 4] {
-        [
-            self.chat(),
-            &self.code[0].1,
-            self.executor(),
-            self.archivist(),
-        ]
+    pub fn all(&self) -> [&Runner; 3] {
+        [self.chat(), self.executor(), self.archivist()]
     }
 
     pub fn menus(&self) -> BTreeMap<SessionRole, Vec<(String, Runner)>> {
         BTreeMap::from([
             (SessionRole::Chat, self.chat.clone()),
-            (SessionRole::Code, self.code.clone()),
             (SessionRole::Executor, self.executor.clone()),
             (SessionRole::Archivist, self.archivist.clone()),
         ])
@@ -400,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_system_is_identity_then_jobs_then_memory_and_job_roles_get_none() {
+    fn only_the_assistant_has_identity() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config: Config = toml::from_str("").expect("parses");
         let roles = Roles::resolve(
@@ -412,17 +360,13 @@ mod tests {
         .expect("resolves");
 
         let system = roles.chat().system.as_deref().expect("a system");
-        assert!(system.starts_with("You are ARC."), "{system}");
-        let jobs = system.find("conclusions, not transcripts.").expect("jobs");
-        let memory = system.find("Memory:").expect("memory");
-        assert!(jobs < memory, "{system}");
-        assert!(system.ends_with("memory_read has the rest."), "{system}");
+        assert_eq!(system, "You are ARC.\n");
         assert_eq!(roles.executor().system, None);
         assert_eq!(roles.archivist().system, None);
     }
 
     #[test]
-    fn code_has_its_own_menu_and_inherits_executor_only_when_omitted() {
+    fn assistant_and_executor_select_independently() {
         use arc_proto::v1::SessionRole;
 
         let worker = r#"
@@ -432,24 +376,15 @@ model = "sol"
 [models.astra]
 provider = "local"
 model = "astra"
+[roles.assistant]
+choices = ["astra"]
 [roles.executor]
 choices = ["sol", "astra"]
 "#;
-        let inherited = resolved(worker);
-        assert_eq!(
-            inherited.choices()[&SessionRole::Code],
-            inherited.choices()[&SessionRole::Executor]
-        );
-        assert_eq!(
-            inherited.menus()[&SessionRole::Code][0].1.role,
-            SessionRole::Code
-        );
-        let split = resolved(&format!(
-            "{worker}\n[roles.code]\nchoices = [\"astra\", \"sol\"]\n"
-        ));
-        assert_eq!(split.menus()[&SessionRole::Code][0].1.model, "astra");
-        assert_eq!(split.menus()[&SessionRole::Executor][0].1.model, "sol");
-        assert_eq!(split.all().len(), 4);
+        let roles = resolved(worker);
+        assert_eq!(roles.menus()[&SessionRole::Chat][0].1.model, "astra");
+        assert_eq!(roles.menus()[&SessionRole::Executor][0].1.model, "sol");
+        assert_eq!(roles.all().len(), 3);
     }
 
     #[test]
@@ -469,7 +404,7 @@ choices = ["sol", "astra"]
     fn roles_on_one_endpoint_share_one_provider() {
         let roles = resolved(
             r#"
-[roles.chat]
+[roles.assistant]
 provider = "openai_compat"
 model    = "deepseek-v4-flash"
 endpoint = "http://127.0.0.1:4096"
@@ -496,7 +431,7 @@ endpoint = "http://127.0.0.1:4096"
         let dir = tempfile::tempdir().expect("temp dir");
         let roles = with_secrets(
             r#"
-[roles.chat]
+[roles.assistant]
 provider = "openai_compat"
 model    = "grok-4.5"
 endpoint = "https://shared.example/v1"

@@ -66,7 +66,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Overlay::Picker(picker) => draw_picker(frame, frame.area(), app, picker),
         Overlay::Review(review) => draw_review(frame, frame.area(), review),
         Overlay::Jobs(jobs) => draw_jobs(frame, frame.area(), jobs),
-        Overlay::Projects(projects) => draw_projects(frame, frame.area(), projects),
         Overlay::Models(models) => draw_models(frame, frame.area(), models),
         Overlay::Help { .. } => draw_help(frame, app, frame.area()),
         Overlay::SessionStatus => draw_status(frame, frame.area(), app),
@@ -459,19 +458,16 @@ fn draw_session_heading(frame: &mut Frame, area: Rect, app: &App) {
                 _ => None,
             })
         })
-        .unwrap_or("New conversation");
+        .unwrap_or("New session");
     let model = match session {
         Some(session) if session.model.is_empty() => "model not recorded".to_owned(),
         Some(session) => format!("model: {}", session.model),
         None => "loading model…".to_owned(),
     };
     let room = usize::from(area.width);
-    let door = elide(
-        &app.open_door_label().unwrap_or_else(|| "chat".to_owned()),
-        room / 3,
-    );
-    let title = elide(title, room.saturating_sub(door.chars().count() + 3));
-    let mut heading = vec![Span::styled(door, theme::ACCENT)];
+    let project = elide(app.current_project().unwrap_or("session"), room / 3);
+    let title = elide(title, room.saturating_sub(project.chars().count() + 3));
+    let mut heading = vec![Span::styled(project, theme::ACCENT)];
     if !app.herdr_enabled {
         heading.push(Span::styled(" · ", theme::DIM));
         heading.push(Span::styled(title, theme::STRONG));
@@ -701,7 +697,7 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
     if !mode_word.is_empty() {
         left.push(mode_word.to_owned());
     }
-    left.push(app.open_door_label().unwrap_or_else(|| "chat".to_owned()));
+    left.push(app.current_project().unwrap_or("session").to_owned());
     if app.review_pending > 0 {
         left.push(format!("review {}", app.review_pending));
     }
@@ -731,10 +727,10 @@ fn draw_rule(frame: &mut Frame, area: Rect, app: &App) {
                 words.push(Span::styled(format!(" {code}"), theme::ERROR));
             } else {
                 let hint = match app.mode {
-                    Mode::Normal => " Tab chat/code · ? help",
+                    Mode::Normal => " Ctrl-P sessions · ? help",
                     Mode::Visual => " j/k select · f fork · Esc back",
                     Mode::Insert => " Esc normal · Ctrl-P sessions",
-                    Mode::Cmd => " :chat · :code · :help",
+                    Mode::Cmd => " :help",
                 };
                 words.push(Span::styled(hint, theme::DIM));
             }
@@ -957,9 +953,9 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
     };
     let height = rows.len() + 1;
     let scope = if picker.show_all {
-        "all conversations"
+        "all sessions"
     } else {
-        app.open_project().unwrap_or("conversations")
+        app.current_project().unwrap_or("all sessions")
     };
     let view = if picker.tree { "tree" } else { "recent" };
     let abandoned = if picker.show_abandoned {
@@ -1294,64 +1290,12 @@ fn menu_area(
     body
 }
 
-fn draw_projects(frame: &mut Frame, full: Rect, projects: &crate::app::Projects) {
-    let rows = projects.items.len().max(1);
-    let area = menu_area(
-        frame,
-        full,
-        72,
-        rows,
-        "code",
-        "j/k select · Enter open code session · q close",
-    );
-
-    let mut lines = Vec::new();
-    if projects.items.is_empty() {
-        let word = if projects.loaded {
-            "no projects configured"
-        } else {
-            "loading"
-        };
-        lines.push(Line::styled(format!("   {word}"), theme::DIM));
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
-    }
-
-    let name_width = projects
-        .items
-        .iter()
-        .map(|p| p.name.chars().count())
-        .max()
-        .unwrap_or(0);
-    let visible = area.height as usize;
-    let start = projects.selected.saturating_sub(visible.saturating_sub(1));
-    let room = (area.width as usize).saturating_sub(name_width + 5);
-    let end = projects.items.len().min(start + visible);
-    for (row, project) in projects.items.iter().enumerate().take(end).skip(start) {
-        let selected = row == projects.selected;
-        let (prefix, style) = if selected {
-            (" > ", theme::ACCENT)
-        } else {
-            ("   ", theme::PLAIN)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{prefix}{:<name_width$}", project.name), style),
-            Span::styled(
-                format!("  {}", elide(&project.description, room)),
-                theme::DIM,
-            ),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
 fn draw_models(frame: &mut Frame, full: Rect, models: &crate::app::Models) {
     let rows = models.items.len().max(1);
-    let role = arc_core::provider::role_label(models.role);
     let title = if models.default {
         "role defaults".to_owned()
     } else {
-        format!("{role} session model")
+        "session model".to_owned()
     };
     let hint = if models.default {
         "Enter changes role default · * default · q close".to_owned()
@@ -1418,15 +1362,13 @@ const HELP: &[(&str, &[&str])] = &[
             "enter             send; typing during work steers the next step",
             "Esc · stop        normal mode; Esc ×2 · stop in insert",
             "                  close overlays/search first; pending d/g adds one Esc",
-            "tab               switch chat/code in normal mode",
-            ":chat :code       chat / project picker",
             "ctrl-p            find a session; / filters, enter opens the match",
             "ctrl-o            toggle session details (off by default)",
             "v then j/k        point at messages, tools, or thoughts",
             ":compact          compact the current idle session",
             ":attach <path>    attach a local image to the next message",
             ":attach clear     discard pending images",
-            "M                 defaults for new sessions; open sessions stay pinned",
+            "M                 pick a model for a new session or fork",
         ],
     ),
     (
@@ -1451,7 +1393,6 @@ const HELP: &[(&str, &[&str])] = &[
             "ctrl-n            new session",
             "ctrl-o            toggle all tools / thoughts",
             "? J Q             help / jobs / review queue popups",
-            "C                 pick a project; enter opens it like :code",
             "M                 pick a model for a new session or fork; * marks the role default",
             "ctrl-c            quit",
             ":                 command mode",
@@ -1487,8 +1428,6 @@ const HELP: &[(&str, &[&str])] = &[
             ":status           context measurement and Codex allowance",
             ":attach <path>    attach PNG, JPEG, or WebP to the next message",
             ":attach clear     discard pending images",
-            ":code <project>   open a bound code session, no dispatch",
-            "                  without a project, open the project picker",
             ":fork             branch at the visual selection",
             ":help             this popup (j k scroll it)",
         ],
@@ -1499,7 +1438,7 @@ const HELP: &[(&str, &[&str])] = &[
             "j k               move selection",
             "tab               toggle flat recency / tree view",
             "/                 filter by title/preview",
-            "space a           toggle showing dispatched jobs",
+            "space a           toggle all projects / current project",
             "x                 toggle showing abandoned branches",
             "m                 mark the selected branch real",
             "X                 mark the selected branch abandoned",
@@ -1739,7 +1678,6 @@ mod tests {
                 choice(SessionRole::Chat, "astra", "gpt-6-astra", true),
                 choice(SessionRole::Executor, "sol", "gpt-5.6-sol", true),
                 choice(SessionRole::Executor, "glm-flash", "glm-5.3-flash", false),
-                choice(SessionRole::Code, "sol", "gpt-5.6-sol", true),
             ],
             selected: 2,
             loaded: true,
@@ -1756,7 +1694,7 @@ mod tests {
             "the popup is titled role defaults:\n{text}"
         );
         assert!(
-            text.contains("   chat      *astra      codex gpt-6-astra medium"),
+            text.contains("   assistant *astra      codex gpt-6-astra medium"),
             "{text}"
         );
         assert!(
@@ -1767,10 +1705,6 @@ mod tests {
             text.contains(" > executor   glm-flash  codex glm-5.3-flash medium"),
             "the pointed row carries the cursor, not the mark:\n{text}"
         );
-        assert!(
-            text.contains("   code      *sol        codex gpt-5.6-sol medium"),
-            "{text}"
-        );
     }
 
     #[test]
@@ -1779,7 +1713,7 @@ mod tests {
         app.overlay = Overlay::Models(Models {
             items: vec![
                 ModelChoice {
-                    role: SessionRole::Code as i32,
+                    role: SessionRole::Chat as i32,
                     name: "fast".to_owned(),
                     provider: "codex".to_owned(),
                     model: "model-fast".to_owned(),
@@ -1787,7 +1721,7 @@ mod tests {
                     selected: true,
                 },
                 ModelChoice {
-                    role: SessionRole::Code as i32,
+                    role: SessionRole::Chat as i32,
                     name: "deep".to_owned(),
                     provider: "codex".to_owned(),
                     model: "model-deep".to_owned(),
@@ -1798,12 +1732,12 @@ mod tests {
             selected: 1,
             loaded: true,
             default: false,
-            role: SessionRole::Code,
+            role: SessionRole::Chat,
             recorded_model: Some("model-deep".to_owned()),
         });
         let text = plain_text(&rendered(&mut app));
         println!("SESSION MODEL PICKER\n{text}");
-        assert!(text.contains("code session model"), "{text}");
+        assert!(text.contains("session model"), "{text}");
         assert!(text.contains("Current: model-deep"), "{text}");
         assert!(text.contains("*fast"), "{text}");
         assert!(text.contains(" deep"), "{text}");
@@ -1822,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn working_header_uses_the_door_and_recorded_model_at_both_widths() {
+    fn working_header_uses_the_project_and_recorded_model_at_both_widths() {
         use crate::app::NetEvent;
 
         let mut app = conversation();
@@ -1840,7 +1774,7 @@ mod tests {
         for width in [120, 40] {
             let buffer = rendered_at(&mut app, width, 12);
             let text = plain_text(&buffer);
-            assert!(text.contains("code/arc · Repair"), "{text}");
+            assert!(text.contains("arc · Repair"), "{text}");
             assert!(text.contains("model: pinned-model"), "{text}");
             assert!(buffer[(13, 0)].modifier.contains(Modifier::BOLD));
             assert_eq!(buffer[(2, 0)].fg, theme::ACCENT.fg.unwrap());
@@ -1854,7 +1788,7 @@ mod tests {
             println!("HEADER {width}\n{text}");
             app.herdr_enabled = true;
             let text = plain_text(&rendered_at(&mut app, width, 12));
-            assert_eq!(text.lines().next().unwrap().trim(), "code/arc");
+            assert_eq!(text.lines().next().unwrap().trim(), "arc");
             assert!(text.contains("model: pinned-model"), "{text}");
             assert!(!text.contains("Repair"), "{text}");
             println!("HERDR HEADER {width}\n{text}");
@@ -1985,10 +1919,7 @@ mod tests {
             let buffer = rendered_at(&mut app, width, 16);
             let text = plain_text(&buffer);
             if width == 140 {
-                assert!(
-                    text.contains("sessions · all conversations · recent"),
-                    "{text}"
-                );
+                assert!(text.contains("sessions · all sessions · recent"), "{text}");
             }
             let rows: Vec<_> = text
                 .lines()
@@ -2544,6 +2475,32 @@ mod tests {
             parent_session: String::new(),
             disposition: 0,
         }
+    }
+
+    #[test]
+    fn picker_frame_names_the_project_scope_and_all_toggle() {
+        use crate::app::NetEvent;
+
+        let mut app = App::new();
+        let mut bound = session("bound", "fix parser", "hello");
+        bound.project = "arc".to_owned();
+        bound.role = SessionRole::Chat as i32;
+        bound.source = arc_proto::v1::Source::User as i32;
+        let mut other = session("unbound", "question", "hello");
+        other.source = arc_proto::v1::Source::User as i32;
+        app.on_net(NetEvent::Sessions(vec![bound, other]));
+        app.session_id = Some("bound".to_owned());
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+        let scoped = plain_text(&rendered_at(&mut app, 100, 16));
+        println!("SCOPED PICKER\n{scoped}");
+        assert!(scoped.contains("sessions · arc · recent"), "{scoped}");
+        assert!(scoped.contains("fix parser"), "{scoped}");
+        assert!(!scoped.contains("question"), "{scoped}");
+        app.on_key(key(KeyCode::Char('a')));
+        let all = plain_text(&rendered_at(&mut app, 100, 16));
+        assert!(all.contains("sessions · all sessions · recent"), "{all}");
+        assert!(all.contains("question"), "{all}");
     }
 
     #[test]

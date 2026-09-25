@@ -8,7 +8,7 @@ Write and speak in plain English. Say only what the reader needs. Lead with the 
 
 ## Current phase
 
-Phase 3.7 is the direct door. `docs/DESIGN.md` defines the phase; `docs/TASKS.md` is the live work list. The executor becomes the session the user develops in: one turn runner for every session, messages landing mid-turn, tool results on screen, compaction as a log event, memory gated on presence. History is never rewritten: a fork is a new branch, a rewind is a fork at an earlier point, and compaction is an event the transcript builder honours, never a rewrite (invariant 1). Do not build later-phase features. If work points toward voice, devices, or a sandboxed worker, add only the interface needed now.
+See docs/TASKS.md
 
 ## Workspace
 
@@ -34,9 +34,9 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 3. **Additive schemas.** Never renumber, remove, or repurpose a proto field. Old events must always decode. Reserve numbers when deprecating.
 4. **No vendor SDKs.** Providers are plain HTTP + SSE via reqwest behind the `Provider` trait. Auth is a swappable layer: API keys, plus the one OAuth exception `docs/providers.md` principle 2 records (Codex). No other OAuth without amending that principle first.
 5. **Secrets never touch the log**, backups, traces, or test fixtures.
-6. **Memory is tools, not injection.** Nothing enters model context automatically except the identity file and the distilled-record index.
+6. **Memory is tools, not injection.** Identity and the distilled-record index enter automatically; project name/description and an available `AGENTS.md` are local context, not memory.
 7. **Identity file is human-owned.** Code may propose edits in session output; it never writes `data/identity.md`.
-8. **Tools are contained, not gated.** Workspace tools resolve paths to their canonical form and accept them only under one of the session's granted roots; `write` and `edit` also refuse a read-only grant. `bash` is the exception: it starts in the project root but nothing stands between it and the filesystem, so it is bounded by the tool set and this being a personal machine, not by the grants (DESIGN 4.3). Grants list what is reachable, never what is forbidden. Tools run with a scrubbed environment: arcd keeps credentials and child tools never inherit them. Nothing prompts the user mid-turn — what a project allows is configuration, and a call outside it returns an error the model can act on.
+8. **Tools run as the user.** Project roots supply context and a Bash working directory, not access restrictions. File tools accept absolute paths anywhere the daemon user can reach. Tools run with a scrubbed environment: arcd keeps credentials and child tools never inherit them.
 9. **Sessions are pinned to one provider.** Role is chosen at session or job creation and does not change for its lifetime. A mid-session model swap discards the prompt cache, which is ~96% of the workload.
 
 ## Conventions
@@ -54,7 +54,7 @@ New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
 - Tests live with the code; projection logic must have replay tests (log in → state out, deterministic).
 - In event tests, find events by kind, session, and call id rather than fixed positions. Assert exact sequence numbers only when their values or ordering are the contract under test.
 - To see a TUI screen, render an `App` in a test with `rendered` and read it with `plain_text` (the helpers in `arc/src/ui.rs` tests); never splice a throwaway test in with a script. A change that touches drawing shows the frame in its report.
-- Runtime state under the configured data directory — `data/` in a checkout, `~/.local/state/arc/` once installed. Never write outside it at runtime.
+- ARC's own runtime state lives under the configured data directory — `data/` in a checkout, `~/.local/state/arc/` once installed. User-requested tools can operate elsewhere.
 
 ## Version control
 

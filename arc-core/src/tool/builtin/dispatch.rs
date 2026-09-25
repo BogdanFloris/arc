@@ -44,12 +44,10 @@ impl Dispatch {
         parts.join(" ")
     }
 
-    // an early-return-on-error reads best here; ToolReply is not on a hot path
     #[allow(clippy::result_large_err)]
     fn resolve_project(&self, project: &str, ctx: &TurnContext) -> Result<String, ToolReply> {
         if project == "none" {
             if ctx.grants.is_some() {
-                // bound: the engine resolves "none" to this session's own project
                 return Ok(project.to_owned());
             }
             return self.scratch.clone().ok_or_else(|| {
@@ -89,9 +87,9 @@ impl Tool for Dispatch {
         project_enum.push("none".to_owned());
         ToolDefinition {
             name: "dispatch".to_owned(),
-            description: "Start a job: a child session bound to a configured project, with \
-                          its own role and budget. This call only starts the job and names \
-                          the child session — it does not wait for the job to finish. \
+            description: "Start a job with its own role and budget. \
+                          This call only starts the job and names the child session, \
+                          it does not wait for the job to finish. \
                           Before dispatching, check whether a finished job already holds \
                           the needed context; continue_job continues it with that context \
                           intact."
@@ -120,9 +118,8 @@ impl Tool for Dispatch {
                     "intent": {
                         "type": "string",
                         "enum": ["analyze", "implement"],
-                        "description": "analyze: the job reads and reports; the workspace \
-                            stays untouched — its write tools are refused. implement: the \
-                            job changes the workspace."
+                        "description": "analyze: ask the job to read and report. implement: \
+                            ask it to change files. These are instructions, not permissions."
                     },
                     "fresh": {
                         "type": "boolean",
