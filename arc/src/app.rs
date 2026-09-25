@@ -50,6 +50,13 @@ pub enum Command {
     CancelTurn {
         session_id: String,
     },
+    FetchThinkingStatus {
+        session_id: String,
+    },
+    SetThinking {
+        session_id: String,
+        thinking: String,
+    },
     DropSteers {
         session_id: String,
     },
@@ -82,6 +89,7 @@ pub enum NetEvent {
         event: TurnEvent,
     },
     SessionStatus(arc_proto::v1::SessionStatus),
+    ThinkingSet(arc_proto::v1::SessionStatus),
     StatusUnavailable(String),
     Sessions(Vec<SessionInfo>),
     History {
@@ -199,9 +207,24 @@ pub struct Jobs {
     pub confirmation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingPicker {
+    pub session_id: String,
+    pub preset: Option<String>,
+    pub levels: Vec<String>,
+    pub selected: usize,
+    pub current: String,
+    pub loaded: bool,
+}
+
 enum PendingModel {
     Create(SessionRole, String),
     Fork(SessionRole, String),
+}
+
+enum PendingThinking {
+    Creating(String),
+    Setting { session_id: String, level: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +302,7 @@ pub enum Overlay {
     Jobs(Jobs),
     Models(Models),
     SessionStatus,
+    Thinking(ThinkingPicker),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -358,6 +382,7 @@ pub struct App {
     session_meta: HashMap<String, (SessionRole, String, Source)>,
     pending_first: Option<(String, Vec<ImageAttachment>)>,
     pending_model: Option<PendingModel>,
+    pending_thinking: Option<PendingThinking>,
     pub review_pending: u32,
     launch_dir: Option<PathBuf>,
 }
@@ -385,6 +410,13 @@ impl App {
     pub fn picker_mut(&mut self) -> Option<&mut Picker> {
         match &mut self.overlay {
             Overlay::Picker(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub fn thinking_picker(&self) -> Option<&ThinkingPicker> {
+        match &self.overlay {
+            Overlay::Thinking(value) => Some(value),
             _ => None,
         }
     }
@@ -473,6 +505,7 @@ impl App {
             session_meta: HashMap::new(),
             pending_first: None,
             pending_model: None,
+            pending_thinking: None,
             review_pending: 0,
             launch_dir: None,
         }
@@ -517,6 +550,7 @@ impl App {
             }
             Overlay::Models(models) => move_row(&mut models.selected, models.items.len()),
             Overlay::SessionStatus => {}
+            Overlay::Thinking(picker) => move_row(&mut picker.selected, picker.levels.len()),
             Overlay::Picker(_) => self.move_picker_selection(up),
             Overlay::None => {
                 self.scroll_back = if up {
@@ -584,6 +618,7 @@ impl App {
             Overlay::Models(_) => return self.on_models_key(key.code),
             Overlay::Picker(_) => return self.on_picker_key(key.code),
             Overlay::SessionStatus => return None,
+            Overlay::Thinking(_) => return self.on_thinking_key(key.code),
             Overlay::None | Overlay::Help { .. } => {}
         }
         if self.searching {
@@ -658,6 +693,7 @@ impl App {
 
     fn on_insert(&mut self, code: KeyCode) -> Option<Command> {
         match code {
+            KeyCode::Tab => return self.open_thinking_picker(),
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.cursor_left();
@@ -665,6 +701,93 @@ impl App {
             }
             KeyCode::Enter => return self.submit(),
             _ => self.edit_input(code),
+        }
+        None
+    }
+
+    fn open_thinking_picker(&mut self) -> Option<Command> {
+        if self.status == Status::Streaming {
+            self.last_error = Some("cannot change thinking during an active turn".into());
+            return None;
+        }
+        if self.pending_thinking.is_some() {
+            self.last_error = Some("Wait for the thinking change to finish".into());
+            return None;
+        }
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let cached = self.session_status.get(&session_id);
+        self.overlay = Overlay::Thinking(ThinkingPicker {
+            session_id: session_id.clone(),
+            preset: None,
+            levels: cached.map_or_else(Vec::new, |s| s.supported_thinking.clone()),
+            selected: cached
+                .and_then(|s| {
+                    s.supported_thinking
+                        .iter()
+                        .position(|level| level == &s.effective_thinking)
+                })
+                .unwrap_or(0),
+            current: cached.map_or_else(String::new, |s| s.effective_thinking.clone()),
+            loaded: cached.is_some(),
+        });
+        if session_id.is_empty() {
+            return Some(Command::ListModels);
+        }
+        if cached.is_none() {
+            Some(Command::FetchThinkingStatus { session_id })
+        } else {
+            None
+        }
+    }
+
+    fn on_thinking_key(&mut self, code: KeyCode) -> Option<Command> {
+        let Overlay::Thinking(picker) = &self.overlay else {
+            return None;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Overlay::Thinking(p) = &mut self.overlay {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Overlay::Thinking(p) = &mut self.overlay {
+                    p.selected = (p.selected + 1).min(p.levels.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter if !picker.loaded => {}
+            KeyCode::Enter => {
+                let level = picker.levels.get(picker.selected).cloned()?;
+                let id = picker.session_id.clone();
+                let current = picker.current.clone();
+                let preset = picker.preset.clone();
+                self.overlay = Overlay::None;
+                if level == current {
+                    return None;
+                }
+                if id.is_empty() {
+                    let choice = preset?;
+                    self.pending_thinking = Some(PendingThinking::Creating(level));
+                    return Some(Command::CreateSession {
+                        role: SessionRole::Chat,
+                        project: self.pending_project.clone().unwrap_or_default(),
+                        choice,
+                        working_directory: self
+                            .launch_dir
+                            .as_ref()
+                            .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned()),
+                    });
+                }
+                self.pending_thinking = Some(PendingThinking::Setting {
+                    session_id: id.clone(),
+                    level: level.clone(),
+                });
+                return Some(Command::SetThinking {
+                    session_id: id,
+                    thinking: level,
+                });
+            }
+            _ => {}
         }
         None
     }
@@ -707,6 +830,7 @@ impl App {
             return None;
         }
         match code {
+            KeyCode::Tab => return self.open_thinking_picker(),
             KeyCode::Esc if self.status == Status::Streaming => return self.cancel_turn(),
             KeyCode::Esc if self.search.is_some() => self.search = None,
             KeyCode::Enter => return self.submit(),
@@ -891,6 +1015,7 @@ impl App {
             return None;
         }
         match code {
+            KeyCode::Tab => return self.open_thinking_picker(),
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('j') => {
                 if self.visual_point {
@@ -1293,6 +1418,10 @@ impl App {
     }
 
     fn can_switch_session(&mut self) -> bool {
+        if self.pending_thinking.is_some() {
+            self.last_error = Some("Wait for the thinking change to finish".to_owned());
+            return false;
+        }
         if self.status == Status::Streaming {
             self.last_error = Some("Finish or stop the turn before switching sessions".to_owned());
             self.yank_note = self.last_error.clone();
@@ -1514,7 +1643,7 @@ impl App {
         }
         let selected = self.picker().expect("picker is open").selected;
         match code {
-            KeyCode::Tab => self.toggle_picker_tree(),
+            KeyCode::Char('t') => self.toggle_picker_tree(),
             KeyCode::Char('/') => self.start_picker_filter(),
             KeyCode::Char('a' | ' ') => self.toggle_picker_show_all(),
             KeyCode::Char('x') => self.toggle_picker_show_abandoned(),
@@ -1554,7 +1683,7 @@ impl App {
         match code {
             KeyCode::Esc => self.cancel_picker_filter(),
             KeyCode::Enter => return self.open_filtered_session(),
-            KeyCode::Tab => self.toggle_picker_tree(),
+            KeyCode::Char('t') => self.toggle_picker_tree(),
             KeyCode::Up => self.move_picker_selection(true),
             KeyCode::Down => self.move_picker_selection(false),
             _ => {
@@ -1840,6 +1969,10 @@ impl App {
     }
 
     fn start_session(&mut self, session_id: Option<String>) -> Option<Command> {
+        if self.pending_thinking.is_some() {
+            self.last_error = Some("Wait for the thinking change to finish".to_owned());
+            return None;
+        }
         if session_id.as_deref().is_some_and(|id| {
             self.sessions.iter().any(|session| {
                 session.id == id && session.role == arc_core::provider::LEGACY_DIRECT_ROLE
@@ -1932,6 +2065,10 @@ impl App {
         }
         if self.pending_model.is_some() {
             self.last_error = Some("Wait for the model switch to finish".to_owned());
+            return None;
+        }
+        if self.pending_thinking.is_some() {
+            self.last_error = Some("Wait for the thinking change to finish".to_owned());
             return None;
         }
         let content = self.input.trim().to_owned();
@@ -2051,6 +2188,7 @@ impl App {
                 event,
                 NetEvent::Disconnected { .. }
                     | NetEvent::SessionStatus(_)
+                    | NetEvent::ThinkingSet(_)
                     | NetEvent::StatusUnavailable(_)
             )
         {
@@ -2058,7 +2196,33 @@ impl App {
         }
         match event {
             NetEvent::Turn { .. } => unreachable!(),
+            NetEvent::ThinkingSet(status) => {
+                if let Some(PendingThinking::Setting { session_id, level }) = &self.pending_thinking
+                {
+                    if *session_id == status.session_id {
+                        if *level != status.effective_thinking {
+                            self.last_error = Some("Thinking change was not applied".to_owned());
+                        }
+                        self.pending_thinking = None;
+                    }
+                }
+                self.session_status
+                    .insert(status.session_id.clone(), status);
+                None
+            }
             NetEvent::SessionStatus(status) => {
+                if let Overlay::Thinking(picker) = &mut self.overlay {
+                    if picker.session_id == status.session_id {
+                        picker.levels.clone_from(&status.supported_thinking);
+                        picker.current.clone_from(&status.effective_thinking);
+                        picker.selected = picker
+                            .levels
+                            .iter()
+                            .position(|x| x == &picker.current)
+                            .unwrap_or(0);
+                        picker.loaded = true;
+                    }
+                }
                 self.session_status
                     .insert(status.session_id.clone(), status);
                 None
@@ -2282,6 +2446,7 @@ impl App {
                 None
             }
             NetEvent::RequestFailed { code, msg } => {
+                self.pending_thinking = None;
                 self.refetch_in_flight = false;
                 self.last_error = Some(code.clone());
                 self.push_block(Block::Fault { code, msg });
@@ -2315,6 +2480,37 @@ impl App {
                 None
             }
             NetEvent::ModelItems(items) => {
+                if let Overlay::Thinking(picker) = &mut self.overlay {
+                    if picker.session_id.is_empty() {
+                        let choice = items
+                            .iter()
+                            .filter(|choice| choice.role == SessionRole::Chat as i32)
+                            .find(|choice| choice.selected)
+                            .or_else(|| {
+                                items
+                                    .iter()
+                                    .find(|choice| choice.role == SessionRole::Chat as i32)
+                            });
+                        if let Some(choice) = choice {
+                            picker.preset = Some(choice.name.clone());
+                            picker.current.clone_from(&choice.thinking);
+                            picker.levels = arc_core::provider::supported_thinking(
+                                &choice.provider,
+                                &choice.model,
+                            )
+                            .iter()
+                            .map(|level| level.label().to_owned())
+                            .collect();
+                            picker.selected = picker
+                                .levels
+                                .iter()
+                                .position(|level| level == &picker.current)
+                                .unwrap_or(0);
+                        }
+                        picker.loaded = true;
+                        return None;
+                    }
+                }
                 if let Some(models) = self.models_mut() {
                     let items: Vec<_> = items
                         .into_iter()
@@ -2416,6 +2612,23 @@ impl App {
                 None
             }
             NetEvent::SessionCreated { session_id } => {
+                if let Some(PendingThinking::Creating(level)) = self.pending_thinking.take() {
+                    if let Some(project) = self.pending_project.take() {
+                        self.session_meta.insert(
+                            session_id.clone(),
+                            (SessionRole::Chat, project, Source::User),
+                        );
+                    }
+                    self.session_id = Some(session_id.clone());
+                    self.pending_thinking = Some(PendingThinking::Setting {
+                        session_id: session_id.clone(),
+                        level: level.clone(),
+                    });
+                    return Some(Command::SetThinking {
+                        session_id,
+                        thinking: level,
+                    });
+                }
                 if let Some(PendingModel::Create(role, project)) = self
                     .pending_model
                     .take_if(|model| matches!(model, PendingModel::Create(..)))
@@ -2461,6 +2674,7 @@ impl App {
             }
             NetEvent::Disconnected { reason } => {
                 self.pending_model = None;
+                self.pending_thinking = None;
                 for mut attachments in self.sending_attachments.drain(..) {
                     self.pending_attachments.append(&mut attachments);
                 }
@@ -3807,7 +4021,7 @@ mod tests {
             session_with("b-root", "root b", "hi"),
         ]));
         normal(&mut app, "s");
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
 
         let rows = app.picker_tree_rows();
         let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
@@ -3855,7 +4069,7 @@ mod tests {
             session_with("s-root", "root", "hi"),
         ]));
         normal(&mut app, "s");
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
 
         let rows = app.picker_tree_rows();
         let ids: Vec<&str> = rows.iter().map(|(s, _)| s.id.as_str()).collect();
@@ -4631,7 +4845,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_never_switches_sessions_or_drafts() {
+    fn tab_opens_thinking_without_changing_session_or_draft() {
         let mut app = App::new();
         app.on_net(NetEvent::Sessions(vec![code_session(
             "old", "legacy", "arc",
@@ -4639,9 +4853,167 @@ mod tests {
         app.start_session(Some("old".to_owned()));
         app.input = "draft".to_owned();
         app.mode = Mode::Normal;
-        assert_eq!(app.on_key(key(KeyCode::Tab)), None);
+        assert_eq!(
+            app.on_key(key(KeyCode::Tab)),
+            Some(Command::FetchThinkingStatus {
+                session_id: "old".into()
+            })
+        );
         assert_eq!(app.session_id.as_deref(), Some("old"));
         assert_eq!(app.input, "draft");
+        assert!(matches!(app.overlay, Overlay::Thinking(_)));
+    }
+
+    #[test]
+    fn thinking_tab_preserves_mode_and_draft_in_conversation_modes() {
+        for mode in [Mode::Insert, Mode::Normal, Mode::Visual] {
+            let mut app = App::new();
+            app.session_id = Some("s1".into());
+            app.input = "keep me".into();
+            app.cursor = 3;
+            app.mode = mode;
+            app.session_status.insert(
+                "s1".into(),
+                arc_proto::v1::SessionStatus {
+                    supported_thinking: vec!["low".into(), "high".into()],
+                    effective_thinking: "low".into(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(app.on_key(key(KeyCode::Tab)), None);
+            assert_eq!(app.input, "keep me");
+            assert_eq!(app.cursor, 3);
+            assert_eq!(app.mode, mode);
+            assert!(app.thinking_picker().is_some());
+        }
+    }
+
+    #[test]
+    fn thinking_picker_loads_status_and_sets_a_different_level() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        assert_eq!(
+            app.on_key(key(KeyCode::Tab)),
+            Some(Command::FetchThinkingStatus {
+                session_id: "s1".into()
+            })
+        );
+        assert!(!app.thinking_picker().unwrap().loaded);
+        app.on_net(NetEvent::SessionStatus(arc_proto::v1::SessionStatus {
+            session_id: "s1".into(),
+            supported_thinking: vec!["low".into(), "high".into()],
+            effective_thinking: "low".into(),
+            ..Default::default()
+        }));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::SetThinking {
+                session_id: "s1".into(),
+                thinking: "high".into()
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_picker_same_level_is_noop_escape_cancels_and_streaming_rejects() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.session_status.insert(
+            "s1".into(),
+            arc_proto::v1::SessionStatus {
+                supported_thinking: vec!["low".into(), "high".into()],
+                effective_thinking: "low".into(),
+                ..Default::default()
+            },
+        );
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.thinking_picker(), None);
+        app.status = Status::Streaming;
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.thinking_picker(), None);
+        assert!(app.last_error.as_deref().unwrap().contains("active turn"));
+    }
+
+    #[test]
+    fn thinking_before_first_message_creates_session_without_losing_draft() {
+        let mut app = App::new();
+        app.pending_project = Some("arc".to_owned());
+        app.input = "draft".to_owned();
+        app.cursor = app.input.len();
+        app.pending_attachments.push(ImageAttachment {
+            name: "sketch.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            data: vec![1, 2, 3],
+        });
+        assert_eq!(app.on_key(key(KeyCode::Tab)), Some(Command::ListModels));
+        let mut preset = choice(SessionRole::Chat, "astra", true);
+        preset.model = "gpt-6-astra".to_owned();
+        preset.thinking = "high".to_owned();
+        app.on_net(NetEvent::ModelItems(vec![preset]));
+        assert_eq!(app.thinking_picker().unwrap().current, "high");
+        assert_eq!(app.thinking_picker().unwrap().levels[0], "low");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::CreateSession {
+                role: SessionRole::Chat,
+                project: "arc".to_owned(),
+                choice: "astra".to_owned(),
+                working_directory: String::new(),
+            })
+        );
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.pending_attachments().len(), 1);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None, "wait for creation");
+        assert_eq!(
+            app.on_net(NetEvent::SessionCreated {
+                session_id: "new".to_owned(),
+            }),
+            Some(Command::SetThinking {
+                session_id: "new".to_owned(),
+                thinking: "low".to_owned(),
+            })
+        );
+        assert_eq!(app.session_id.as_deref(), Some("new"));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None, "wait for override");
+        app.on_net(NetEvent::ThinkingSet(arc_proto::v1::SessionStatus {
+            session_id: "new".to_owned(),
+            effective_thinking: "low".to_owned(),
+            ..Default::default()
+        }));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Command::Send {
+                session_id: Some(id),
+                content,
+                attachments,
+            }) if id == "new" && content == "draft" && attachments.len() == 1
+        ));
+    }
+
+    #[test]
+    fn failed_thinking_selection_preserves_the_draft() {
+        let mut app = App::new();
+        app.input = "draft".to_owned();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Tab));
+        let mut preset = choice(SessionRole::Chat, "astra", true);
+        preset.model = "gpt-6-astra".to_owned();
+        app.on_net(NetEvent::ModelItems(vec![preset]));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Enter));
+        app.on_net(NetEvent::RequestFailed {
+            code: "unavailable".to_owned(),
+            msg: "could not create session".to_owned(),
+        });
+        assert_eq!(app.session_id, None);
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.on_key(key(KeyCode::Tab)), Some(Command::ListModels));
     }
 
     #[test]

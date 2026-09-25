@@ -199,7 +199,9 @@ pub async fn run_control(
     let mut client: Option<Client> = None;
     while let Some(command) = commands.recv().await {
         let scope = match &command {
-            Command::SendLive { session_id, .. } => Some(session_id.clone()),
+            Command::SendLive { session_id, .. }
+            | Command::FetchThinkingStatus { session_id }
+            | Command::SetThinking { session_id, .. } => Some(session_id.clone()),
             _ => None,
         };
         let mut connected = match client.take() {
@@ -227,6 +229,22 @@ pub async fn run_control(
             Command::CancelTurn { session_id } => {
                 connected.cancel_turn(&session_id).await.map(|()| true)
             }
+            Command::FetchThinkingStatus { session_id } => {
+                connected.fetch_status(&session_id).await.map(|status| {
+                    let _ = events.send(NetEvent::SessionStatus(status));
+                    true
+                })
+            }
+            Command::SetThinking {
+                session_id,
+                thinking,
+            } => connected
+                .set_session_thinking(&session_id, &thinking)
+                .await
+                .map(|status| {
+                    let _ = events.send(NetEvent::ThinkingSet(status));
+                    true
+                }),
             Command::SendLive {
                 session_id,
                 content,
@@ -399,6 +417,17 @@ async fn handle(
             .compact_session(&session_id)
             .await
             .map(|()| Some(NetEvent::Compacted { session_id })),
+        Command::FetchThinkingStatus { session_id } => client
+            .fetch_status(&session_id)
+            .await
+            .map(|status| Some(NetEvent::SessionStatus(status))),
+        Command::SetThinking {
+            session_id,
+            thinking,
+        } => client
+            .set_session_thinking(&session_id, &thinking)
+            .await
+            .map(|status| Some(NetEvent::ThinkingSet(status))),
         // main.rs writes the OSC 52 sequence itself; this never reaches the
         // socket, and CancelTurn/SendLive go to run_control's own connection
         Command::Send { .. }

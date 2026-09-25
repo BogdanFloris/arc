@@ -67,6 +67,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Overlay::Review(review) => draw_review(frame, frame.area(), review),
         Overlay::Jobs(jobs) => draw_jobs(frame, frame.area(), jobs),
         Overlay::Models(models) => draw_models(frame, frame.area(), models),
+        Overlay::Thinking(thinking) => draw_thinking(frame, frame.area(), thinking),
         Overlay::Help { .. } => draw_help(frame, app, frame.area()),
         Overlay::SessionStatus => draw_status(frame, frame.area(), app),
         Overlay::None => {}
@@ -527,6 +528,12 @@ fn status_line(app: &App, room: usize) -> Line<'static> {
         text,
         if near_limit { theme::ERROR } else { theme::DIM },
     )];
+    if let Some(thinking) = status
+        .map(|s| s.effective_thinking.as_str())
+        .filter(|thinking| !thinking.is_empty())
+    {
+        spans.push(Span::styled(format!(" · thinking {thinking}"), theme::DIM));
+    }
     let codex = status.is_some_and(|s| s.codex)
         || app.session_id.as_ref().is_some_and(|id| {
             app.sessions
@@ -989,7 +996,7 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
                 theme::PLAIN,
             ),
             Line::styled(
-                "/ filter · Tab view · a all · x abandoned · Enter open",
+                "/ filter · t tree · a all · x abandoned · Enter open",
                 theme::DIM,
             ),
         ]),
@@ -1080,6 +1087,53 @@ fn draw_picker(frame: &mut Frame, full: Rect, app: &App, picker: &crate::app::Pi
         );
         frame.render_widget(Paragraph::new(Line::from(spans)).style(style), row_area);
     }
+}
+
+fn draw_thinking(frame: &mut Frame, full: Rect, thinking: &crate::app::ThinkingPicker) {
+    let mut lines = Vec::new();
+    if !thinking.current.is_empty() {
+        lines.push(Line::styled(
+            format!("Current: {}", thinking.current),
+            theme::DIM,
+        ));
+    }
+    if !thinking.loaded {
+        lines.push(Line::styled("Loading thinking levels…", theme::DIM));
+    } else if thinking.levels.is_empty() {
+        lines.push(Line::styled(
+            "No supported thinking levels for this session",
+            theme::DIM,
+        ));
+    } else {
+        for (index, level) in thinking.levels.iter().enumerate() {
+            let selected = index == thinking.selected;
+            let current = level == &thinking.current;
+            lines.push(Line::styled(
+                format!(
+                    " {}{} {level}",
+                    if current { "*" } else { " " },
+                    if selected { ">" } else { " " }
+                ),
+                if selected {
+                    theme::ACCENT
+                } else {
+                    theme::PLAIN
+                },
+            ));
+        }
+    }
+    lines.push(Line::styled(
+        "Enter change · Esc close · applies next user turn",
+        theme::DIM,
+    ));
+    let area = popup(
+        frame,
+        full,
+        64,
+        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        "thinking",
+    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn tree_prefix(flags: &[bool]) -> String {
@@ -1443,7 +1497,7 @@ const HELP: &[(&str, &[&str])] = &[
         "picker keys",
         &[
             "j k               move selection",
-            "tab               toggle flat recency / tree view",
+            "t                 toggle flat recency / tree view",
             "/                 filter by title/preview",
             "space a           toggle all projects / current project",
             "x                 toggle showing abandoned branches",
@@ -1720,6 +1774,31 @@ mod tests {
         assert!(
             text.contains(" > executor   glm-flash  codex glm-5.3-flash medium"),
             "the pointed row carries the cursor, not the mark:\n{text}"
+        );
+    }
+
+    #[test]
+    fn thinking_picker_renders_supported_levels_and_turn_hint() {
+        use crate::app::{Overlay, ThinkingPicker};
+
+        let mut app = App::new();
+        app.overlay = Overlay::Thinking(ThinkingPicker {
+            session_id: "session-1".to_owned(),
+            preset: None,
+            levels: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+            selected: 1,
+            current: "low".to_owned(),
+            loaded: true,
+        });
+        let text = plain_text(&rendered(&mut app));
+        println!("{text}");
+        assert!(text.contains("+ thinking "), "{text}");
+        assert!(text.contains("Current: low"), "{text}");
+        assert!(text.contains("  > medium"), "{text}");
+        assert!(text.contains(" *  low"), "{text}");
+        assert!(
+            text.contains("Enter change · Esc close · applies next user turn"),
+            "{text}"
         );
     }
 
@@ -2604,7 +2683,7 @@ mod tests {
         app.on_net(NetEvent::Sessions(vec![root, fork]));
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('s')));
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
 
         let text = plain_text(&rendered(&mut app));
         let branch_line = text
@@ -2651,7 +2730,7 @@ mod tests {
         app.session_id = Some("s-first".to_owned());
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('s')));
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
 
         let text = plain_text(&rendered(&mut app));
         let column = |line: &str, needle: char| {
