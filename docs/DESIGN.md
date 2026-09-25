@@ -90,13 +90,13 @@ A cut reply is logged with `partial = true`. Client errors are not archived as m
 A job is a child session with its own role, tools, and budget, not a separate transcript store or runner. It gets ordinary archive, replay, fork, and rewind semantics.
 
 - Every session runs as a supervised task in arcd, with one live turn per session. Connections subscribe and may disconnect without stopping the turn.
-- Dispatch durably creates the child and returns its ID immediately. The supervisor starts it after the tool result is durable, without waiting for the parent's turn to end. Continue/cancel take effect at the same boundary.
+- Dispatch always creates a new child, even when a finished job exists in the same project, and returns its ID immediately. Continue queues a follow-up in a running job or resumes a finished job with its existing context; neither call polls for results. The supervisor starts a dispatched job after the tool result is durable, without waiting for the parent's turn to end. Continue/cancel take effect at the same boundary.
 - User messages, parent steers, and child handbacks reach live turns at the next step boundary. Into an idle session, they start a turn.
 - Jobs cannot dispatch, continue, or cancel other jobs. The tree below a user-opened session is one level deep.
 - Jobs stay pinned to role and provider (§6.1).
 - Budget enforcement remains dormant during daily-use calibration; dispatch does not ask the model for budgets. Restore enforcement only when spend data supports useful limits.
 
-**Handbacks.** Completion appends a SYSTEM message to the parent with the child's summary and session ID, separate from dispatch's immediate result. The parent reads it in its current or a new turn. Pending handbacks may share a turn; fifty consecutive system-started turns without user input bound pathological loops. Crash recovery still never restarts turns (§3.1).
+**Handbacks.** Completion automatically appends a SYSTEM message to the parent with the child's summary and session ID, separate from dispatch's immediate result. The parent reads it in its current or a new turn; no polling or sleep is needed. Pending handbacks may share a turn; fifty consecutive system-started turns without user input bound pathological loops. Crash recovery still never restarts turns (§3.1).
 
 The parent receives a summary, not the transcript, and can inspect the child's archive. Physical actions may use a plan-only job followed by a user-requested action job; which actions need that split belongs in prompts/configuration, not mid-turn permission machinery.
 

@@ -76,8 +76,6 @@ struct DispatchArgs {
     project: String,
     brief: String,
     intent: String,
-    #[serde(default)]
-    fresh: bool,
 }
 
 impl Tool for Dispatch {
@@ -87,12 +85,9 @@ impl Tool for Dispatch {
         project_enum.push("none".to_owned());
         ToolDefinition {
             name: "dispatch".to_owned(),
-            description: "Start a job with its own role and budget. \
-                          This call only starts the job and names the child session, \
-                          it does not wait for the job to finish. \
-                          Before dispatching, check whether a finished job already holds \
-                          the needed context; continue_job continues it with that context \
-                          intact."
+            description: "Start a new job and return its session ID. The result arrives \
+                          automatically as a handback when it finishes. Use continue_job \
+                          for follow-ups in an existing job."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -100,9 +95,8 @@ impl Tool for Dispatch {
                     "role": {
                         "type": "string",
                         "enum": ["executor", "archivist"],
-                        "description": "Who runs the job. executor: coding and workspace \
-                            tasks. archivist: extraction and organization of memory. Recall \
-                            questions are answered directly here, never dispatched."
+                        "description": "executor: coding and workspace tasks; archivist: \
+                            memory organization."
                     },
                     "project": {
                         "type": "string",
@@ -120,13 +114,6 @@ impl Tool for Dispatch {
                         "enum": ["analyze", "implement"],
                         "description": "analyze: ask the job to read and report. implement: \
                             ask it to change files. These are instructions, not permissions."
-                    },
-                    "fresh": {
-                        "type": "boolean",
-                        "description": "Start from nothing even though a finished job in \
-                            this project keeps its context. A dispatch refused for that \
-                            reason names the job to continue; set fresh only when its \
-                            context is irrelevant to this task."
                     },
                 },
                 "required": ["role", "project", "brief", "intent"]
@@ -190,7 +177,6 @@ impl Tool for Dispatch {
                     brief: args.brief,
                     budget: None,
                     intent,
-                    fresh: args.fresh,
                 }),
                 ..ToolReply::ok(content)
             }
@@ -255,12 +241,16 @@ mod tests {
         assert_eq!(job.brief, "fix the bug");
         assert_eq!(job.budget, None);
         assert_eq!(job.intent, crate::tool::Intent::Implement);
-        assert!(!job.fresh, "fresh defaults to false when absent");
     }
 
     #[tokio::test]
-    async fn a_dispatch_with_fresh_true_carries_it_on_the_job_request() {
+    async fn a_legacy_fresh_argument_does_not_change_dispatch() {
         let tool = dispatch(&[("arc", "")], None);
+        assert!(
+            tool.definition().parameters["properties"]
+                .get("fresh")
+                .is_none()
+        );
 
         let reply = tool
             .execute(
@@ -277,7 +267,10 @@ mod tests {
             .await;
 
         assert!(reply.ok, "{}", reply.content);
-        assert!(reply.job_request.expect("a job request").fresh);
+        assert_eq!(
+            reply.job_request.expect("a job request").brief,
+            "unrelated work"
+        );
     }
 
     #[tokio::test]

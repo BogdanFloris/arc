@@ -17,11 +17,9 @@ impl Tool for CancelJob {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "cancel_job".to_owned(),
-            description: "Cancels a dispatched job the caller started. The job stops at its \
-                          next await point and its handback confirms. Cancelling a job that \
-                          already finished is a no-op; the jobs list will tell the truth about \
-                          it."
-            .to_owned(),
+            description: "Cancel a dispatched job. A running job stops at its next await \
+                          point and sends a handback; an already finished job is unchanged."
+                .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -59,11 +57,7 @@ impl Tool for CancelJob {
             }
             ToolReply {
                 changed_paths: Vec::new(),
-                content: format!(
-                    "Cancellation requested for {}; if it was running, its handback will \
-                     confirm.",
-                    args.session_id
-                ),
+                content: format!("Cancellation requested for {}.", args.session_id),
                 ok: true,
                 memory_events: Vec::new(),
                 job_request: None,

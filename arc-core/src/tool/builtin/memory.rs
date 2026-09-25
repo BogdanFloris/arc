@@ -220,9 +220,8 @@ fn record_properties(namespaces: &[String]) -> serde_json::Value {
         "namespace": {
             "type": "string",
             "enum": namespaces,
-            "description": "Where the fact files: the project it was stated \
-                about — preferences for how ARC behaves within a project belong \
-                to that project — and global only for facts that hold everywhere."
+            "description": "The project the fact concerns; global only when it \
+                applies across projects. Do not generalize a project-specific preference."
         },
         "links": {
             "type": "array",
@@ -254,27 +253,13 @@ impl Tool for MemoryWrite {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_owned(),
-            description: "Save a durable memory record when the user states a \
-                          preference, correction, or stable fact about themselves, or when \
-                          you establish a fact about their world that will still hold next \
-                          month: where a toolchain lives, how a tool behaves in this \
-                          project, a convention the project follows. Save it only if it \
-                          would change future replies in similar \
-                          situations — the best memory stops the user repeating themselves. \
-                          SKIP: short-lived, random, redundant, or overly personal details; \
-                          what you read, built, changed, or committed, which the repo and \
-                          the archive already hold; anything the project's own AGENTS.md \
-                          carries; if it will \
-                          be stale in a week it does not belong. If the index already holds \
-                          the fact, use memory_supersede or nothing. Phrase records as \
-                          self-contained, present-tense declarative facts with names, not \
-                          pronouns (\"User prefers X\", \"PlatformIO headers live outside \
-                          the project root\"), never as instructions. Save the \
-                          fact at the scope it was stated: a preference voiced about one \
-                          project is about that project, not a wider habit — widen only \
-                          when the user says it holds everywhere. Dates absolute, proper \
-                          nouns unrounded, one clause of summary that does not repeat the \
-                          body."
+            description: "Save a user preference or established fact that will remain useful \
+                          in future sessions. Skip temporary details, task history, unnecessary \
+                          personal information, and facts already in memory or AGENTS.md. \
+                          If an existing fact changed, use memory_supersede instead. \
+                          Write self-contained facts, not instructions, using names and \
+                          absolute dates. Keep the summary short and put detail in the body. \
+                          Preserve the user's stated scope; generalize only when confirmed."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -330,11 +315,9 @@ impl Tool for MemorySupersede {
         }
         ToolDefinition {
             name: "memory_supersede".to_owned(),
-            description: "Replace a memory record that is wrong or outdated. Pass the old id \
-                          and the full corrected record; the old one is retired, not deleted. \
-                          Prefer this over memory_write whenever an existing record covers \
-                          the same fact — a changed fact is a supersede, never a sibling — \
-                          and supersede only when something actually changed."
+            description: "Correct an existing memory by passing its id and the full replacement \
+                          record. The old record remains in history. Use instead of memory_write \
+                          for a changed fact; leave unchanged records alone."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

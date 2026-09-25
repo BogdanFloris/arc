@@ -26,7 +26,6 @@ pub struct JobRequest {
     pub brief: String,
     pub budget: Option<Budget>,
     pub intent: Intent,
-    pub fresh: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

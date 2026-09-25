@@ -32,11 +32,9 @@ impl Tool for Read {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_owned(),
-            description: "Read a file's contents. path must be absolute. Large files page: \
-                          offset is the 1-based first line to return, limit caps how many \
-                          lines come back (default 2000, capped at 48KiB regardless of limit). \
-                          A page that does not reach the end of the file ends with a marker \
-                          naming the offset to continue from."
+            description: "Read a file by absolute path, recording the version for later edits. \
+                          Returns up to limit lines and 48 KiB. Truncated pages include \
+                          the next offset."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

@@ -803,19 +803,6 @@ impl Engine {
         } else {
             job_request.project
         };
-        if !job_request.fresh {
-            if let Some(warm) = self.warm_finished_job(parent_session, &project, role, intent) {
-                return (
-                    ToolOutcome::Error,
-                    format!(
-                        "ERROR: job {warm} already finished in {project} and keeps its \
-                         context. Continue it with continue_job, or re-send this dispatch \
-                         with fresh: true if that context is irrelevant to this task."
-                    ),
-                    None,
-                );
-            }
-        }
         match self.create_bound_session_with_intent(
             runner,
             &project,
@@ -829,10 +816,8 @@ impl Engine {
             Ok(child_id) => (
                 ToolOutcome::Ok,
                 format!(
-                    "Dispatched {} into {project} as session {child_id} ({}). The job is \
-                     running; its summary will arrive here as a handback when it \
-                     finishes. Do not call continue_job to ask for status or results — \
-                     each message costs the job a full turn.",
+                    "Dispatched {} into {project} as session {child_id} ({}). \
+                     Its result will arrive automatically as a handback.",
                     provider::role_label(role),
                     match intent {
                         Intent::Analyze => "analyze",
@@ -850,24 +835,6 @@ impl Engine {
             ),
             Err(error) => (ToolOutcome::Error, format!("ERROR: {error}"), None),
         }
-    }
-
-    fn warm_finished_job(
-        &self,
-        parent_session: &str,
-        project: &str,
-        role: SessionRole,
-        _intent: Intent,
-    ) -> Option<String> {
-        let candidate = self
-            .with_store(|store| {
-                store
-                    .projection()
-                    .latest_finished_job(parent_session, project, role as i32)
-            })
-            .ok()
-            .flatten()?;
-        Some(candidate)
     }
 
     fn continue_job(
@@ -941,8 +908,7 @@ impl Engine {
         (
             ToolOutcome::Ok,
             format!(
-                "Continuing job {}. Its reply arrives later as a handback; do not call \
-                 continue_job again to fetch it.",
+                "Continuing job {}. Its reply will arrive as a handback.",
                 request.session_id
             ),
             Some(ContinuedJob {
@@ -967,13 +933,7 @@ impl Engine {
             .map(|text| format!("\n{text}"))
             .unwrap_or_default();
         let content = match reason {
-            None => {
-                let tail = format!(
-                    "For follow-ups about anything this job read or did, continue_job \
-                     {child_session} keeps its context; a new dispatch starts from nothing."
-                );
-                format!("Job {child_session} finished.\n{summary}{footprint}\n{tail}")
-            }
+            None => format!("Job {child_session} finished.\n{summary}{footprint}"),
             Some(reason) => format!("Job {child_session} stopped: {reason}.\n{summary}{footprint}"),
         };
         Ok(content)
@@ -2554,7 +2514,7 @@ fn truncate_summary(summary: &str, child_session: &str) -> String {
         cut -= 1;
     }
     format!(
-        "{} [truncated; the rest is in the job's own transcript — continue_job {child_session} reads it]",
+        "{} [truncated; use session_read for session {child_session} to read the rest]",
         &summary[..cut]
     )
 }
@@ -5232,12 +5192,7 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("summary will arrive here as a handback")
-        );
-        assert!(
-            result
-                .content
-                .contains("Do not call continue_job to ask for status")
+                .contains("arrive automatically as a handback")
         );
         assert!(!result.content.contains("End this reply"));
         assert!(!result.content.contains("wait"));
@@ -5319,7 +5274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dispatch_into_a_project_with_a_finished_job_is_bounced_toward_continue_job() {
+    async fn a_dispatch_into_a_project_with_a_finished_job_creates_a_new_child() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).expect("mkdir proj");
@@ -5376,20 +5331,24 @@ mod tests {
         let second = engine
             .send_message(&run, Some(&reply.session_id), "more work", tx)
             .await
-            .expect("a bounced dispatch fails the call, not the turn");
+            .expect("a second dispatch creates a new child");
 
-        assert!(second.jobs.is_empty(), "no second child was spawned");
+        assert_eq!(second.jobs.len(), 1);
+        assert_ne!(second.jobs[0].session_id, child_id);
+        assert_eq!(second.jobs[0].parent_session, reply.session_id);
+        assert_eq!(second.jobs[0].brief, "now check the docs");
         let events = conversation_log(dir.path());
-        assert_eq!(events.len(), 11, "no SessionCreated in the second turn");
-        let result = resulted(&events[9]);
-        assert_eq!(result.outcome, ToolOutcome::Error as i32);
-        assert!(result.content.contains(&child_id), "{}", result.content);
-        assert!(
-            result.content.contains("continue_job"),
-            "{}",
-            result.content
-        );
-        assert!(result.content.contains("fresh: true"), "{}", result.content);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                session_event::Event::ToolResultRecorded(result) if result.call_id == "c2" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("second dispatch result");
+        assert_eq!(result.outcome, ToolOutcome::Ok as i32);
+        assert!(result.content.contains(&second.jobs[0].session_id));
     }
 
     fn continue_job_args(session_id: &str, message: &str) -> String {
@@ -5722,12 +5681,8 @@ mod tests {
             other => panic!("expected a message entry, got {other:?}"),
         };
         assert!(
-            content.contains(" [truncated; the rest is in the job's own transcript — continue_job child-1 reads it]\n"),
+            content.contains(" [truncated; use session_read for session child-1 to read the rest]"),
             "{content}"
-        );
-        assert!(
-            content.ends_with("a new dispatch starts from nothing."),
-            "the continue_job affordance stays the closing line: {content}"
         );
         assert!(content.len() < long_summary.len());
     }

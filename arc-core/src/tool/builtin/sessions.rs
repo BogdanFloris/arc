@@ -29,12 +29,9 @@ impl Tool for SessionsSearch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "sessions_search".to_owned(),
-            description: "Search the archive of all past conversations. Use whenever the user \
-                          asks about themselves, their preferences, or anything discussed in \
-                          an earlier session — search before saying you do not know. Returns \
-                          sessions with snippets and an anchor_seq for session_read. \
-                          Use the previews first; read a narrow range around the anchor \
-                          only if needed. Stop once the question is answered."
+            description: "Search past conversations for missing context before saying you do \
+                          not know. Returns snippets and an anchor_seq for session_read. \
+                          Read around the anchor only if the snippets are insufficient."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -113,13 +110,11 @@ impl Tool for SessionRead {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "session_read".to_owned(),
-            description: "Read a small page of past context by seq range (at most \
-                          8 KiB of JSON and 20 messages), or clipped opening/closing \
-                          previews with ends. Prefer a narrow range around the \
-                          sessions_search anchor. A next cursor gives start_seq and \
-                          start_offset for continuation; keep the same end_seq. \
-                          Long messages split across pages without losing text. \
-                          Continue only if the answer needs more context."
+            description: "Read a narrow range of past messages, or opening/closing previews \
+                          with ends. Pages contain at most 8 KiB of JSON and 20 messages; \
+                          long messages span pages. To continue, use the next cursor's \
+                          start_seq and start_offset with the same end_seq. \
+                          Fetch another page only if needed."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

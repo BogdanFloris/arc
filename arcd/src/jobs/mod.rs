@@ -1295,14 +1295,14 @@ mod tests {
                 (
                     Role::User,
                     format!(
-                        "Job {child_id} finished.\non it\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
+                        "Job {child_id} finished.\non it\n{footprint}",
                         footprint = arc_core::footprint::report(Some(&[]), None)
                     )
                 ),
                 (
                     Role::User,
                     format!(
-                        "Job {child_id} finished.\nlinted too\n{footprint}\nFor follow-ups about anything this job read or did, continue_job {child_id} keeps its context; a new dispatch starts from nothing.",
+                        "Job {child_id} finished.\nlinted too\n{footprint}",
                         footprint = arc_core::footprint::report(Some(&[]), None)
                     )
                 ),

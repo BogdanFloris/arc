@@ -37,13 +37,10 @@ impl Tool for Bash {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_owned(),
-            description: "Run a shell command with bash in the project's root when available, \
-                          otherwise the daemon's current directory. The \
-                          environment is scrubbed to a small allowlist; no secrets pass \
-                          through. Output is capped at 16 KiB per stream, keeping the tail \
-                          (errors usually land at the end). Commands default to a 120s \
-                          timeout (max 600); raise timeout_secs for one that legitimately \
-                          runs long."
+            description: "Run Bash in the session's working directory, falling back to the \
+                          daemon's directory. The environment is scrubbed; daemon credentials \
+                          are not inherited. Output keeps the last 16 KiB of each stream. \
+                          Prefer narrow queries and plain output."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",

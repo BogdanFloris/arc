@@ -18,14 +18,9 @@ impl Tool for ContinueJob {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "continue_job".to_owned(),
-            description: "Continues a dispatched job: queued if it is still running, resumed \
-                          with its full context if it finished. Use it to change course or \
-                          add work — and when a finished job already holds the needed \
-                          context (files it read, a repo it analyzed), continue it even for \
-                          a new question; a fresh dispatch starts from nothing. Never call \
-                          it to fetch a result: the reply arrives on its own as a handback \
-                          when the job finishes, this call returns only an acknowledgment, \
-                          and each message costs a full job turn."
+            description: "Send a follow-up to an existing job. It queues if running or \
+                          resumes with its context if finished. Results arrive automatically \
+                          as handbacks; this does not fetch a result."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -76,8 +71,7 @@ impl Tool for ContinueJob {
             ToolReply {
                 changed_paths: Vec::new(),
                 content: format!(
-                    "Continuing job {}. Its reply arrives later as a handback; do not call \
-                     continue_job again to fetch it.",
+                    "Continuing job {}. Its reply will arrive as a handback.",
                     args.session_id
                 ),
                 ok: true,
