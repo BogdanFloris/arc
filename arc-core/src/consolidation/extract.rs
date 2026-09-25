@@ -7,195 +7,29 @@ use futures::StreamExt as _;
 use serde::Deserialize;
 
 use super::{ExtractError, Extractor, SessionSnapshot};
-use crate::memory::{index_line, kind_name};
+use crate::memory::index_line;
 use crate::projection::{MemoryIndexEntry, MessageRow};
 use crate::provider::{CompletionDelta, CompletionRequest, Message, Provider, Stop, Thinking};
 use crate::tool::builtin::memory::{mint_record, parse_kind};
 
-pub const PROMPT_VERSION_V1: &str = "v1";
+pub const PROMPT_VERSION: &str = "v5";
 
-pub const PROMPT_V1: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Two questions decide what to extract: what did the user reveal about
-themselves, and what did they express about how ARC should operate?
-If nothing is worth saving, return an empty operations list and stop.
-
-Do not capture:
-- environment-dependent failures: the user can fix those, and the record
-  outlives the fix
-- negative claims about tools: "X is broken" hardens into refusals that
-  outlive the problem
-- transient errors that resolved: if retrying worked, the lesson is the
-  retry pattern, not the failure
-- unresolved dead ends dressed up as workflow
-
-Phrase every record as a declarative fact, never as an imperative.
-"User prefers concise replies" is right; "Always reply concisely" is wrong:
-an imperative gets re-read as a directive in later sessions and can
-override what the user is actually asking for.
-
-The archive already remembers this conversation verbatim, searchably.
-Extract only what must sit in the small always-loaded index; if it will be
-stale in a week, it does not belong.
-
-Before writing a new record, check the existing records listed after the
-transcript. If one covers the same class of fact, extend or replace it
-with a supersede operation instead of creating a narrow sibling.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-
-pub const PROMPT_VERSION_V2: &str = "v2";
-
-pub const PROMPT_V2: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Most conversations contain nothing durable. Return {"operations": []}
-unless a fact clearly earns a place in the small always-loaded index; an
-empty list is the expected outcome, and a needless record is a failure,
-not thoroughness.
-
-Save a fact only if it would change ARC's replies in similar future
-situations. Look, in order: corrections and mistakes the user pointed
-out; stated preferences; stable facts about the user or their world.
-Contrast: "User prefers short chapters" is worth saving; "User edited
-chapter 3 today" is not — the archive already holds this conversation
-verbatim and searchably.
-
-Never capture: task progress or completed work; the conversation itself
-("user asked about X"); anything the already-known section or the
-existing records already cover; environment-dependent or transient
-failures; negative claims about tools.
-
-A record is a self-contained, present-tense declarative fact: names, not
-pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
-console"). "User prefers concise replies" is right; "Always reply
-concisely" is wrong — an imperative gets re-read as a directive later.
-
-If an existing record covers the same fact and something changed, emit a
-supersede of that record. If nothing changed, emit nothing for it.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-
-pub const PROMPT_VERSION_V3: &str = "v3";
-
-pub const PROMPT_V3: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Most conversations contain nothing durable. Return {"operations": []}
-unless a fact clearly earns a place in the small always-loaded index; an
-empty list is the expected outcome, and a needless record is a failure,
-not thoroughness.
-
-Save a fact only if it would change ARC's replies in similar future
-situations. Look, in order: corrections and mistakes the user pointed
-out; stated preferences; stable facts about the user or their world.
-Contrast: "User prefers short chapters" is worth saving; "User edited
-chapter 3 today" is not — the archive already holds this conversation
-verbatim and searchably.
-
-Never capture: task progress or completed work; the conversation itself
-("user asked about X"); anything the already-known section or the
-existing records already cover; environment-dependent or transient
-failures; negative claims about tools.
-
-A record is a self-contained, present-tense declarative fact: names, not
-pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
-console"). "User prefers concise replies" is right; "Always reply
-concisely" is wrong — an imperative gets re-read as a directive later.
-
-If an existing record covers the same fact and something changed, emit a
-supersede of that record. If nothing changed, emit nothing for it.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "namespace"
-files the fact: choose from the namespaces listed in the input — a
-project's name when the fact is about that project, "global" otherwise;
-a supersede keeps its record's namespace. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-
-pub const PROMPT_VERSION_V4: &str = "v4";
-
-pub const PROMPT_V4: &str = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Most conversations contain nothing durable. Return {"operations": []}
-unless a fact clearly earns a place in the small always-loaded index; an
-empty list is the expected outcome, and a needless record is a failure,
-not thoroughness.
-
-Save a fact only if it would change ARC's replies in similar future
-situations. Look, in order: corrections and mistakes the user pointed
-out; stated preferences; stable facts about the user or their world.
-Contrast: "User prefers short chapters" is worth saving; "User edited
-chapter 3 today" is not — the archive already holds this conversation
-verbatim and searchably.
-
-Never capture: task progress or completed work; the conversation itself
-("user asked about X"); anything the already-known section or the
-existing records already cover; environment-dependent or transient
-failures; negative claims about tools.
-
-A record is a self-contained, present-tense declarative fact: names, not
-pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
-console"). "User prefers concise replies" is right; "Always reply
-concisely" is wrong — an imperative gets re-read as a directive later.
-
-If an existing record covers the same fact and something changed, emit a
-supersede of that record. If nothing changed, emit nothing for it.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "namespace"
-files the fact: choose from the namespaces listed in the input — a
-project's name when the fact is about that project, "global" otherwise;
-a supersede keeps its record's namespace. "summary" is
-one declarative line; it appears in every future session. "links" names
-ids from the existing-records list that this fact leans on — link a
-record when this fact would need re-checking if that record changed;
-otherwise leave links empty. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-
-pub const KNOWN_VERSIONS: &[(&str, &str)] = &[
-    (PROMPT_VERSION_V1, PROMPT_V1),
-    (PROMPT_VERSION_V2, PROMPT_V2),
-    (PROMPT_VERSION_V3, PROMPT_V3),
-    (PROMPT_VERSION_V4, PROMPT_V4),
-];
-
-pub const DEDUP_PROMPT_V1: &str = r#"You judge one candidate memory record against numbered existing records.
-Think briefly, then answer with strict JSON, nothing else:
-{"reasoning": "...", "duplicate_of": [], "supersedes": []}
-duplicate_of: numbers of existing records stating the same fact — same
-meaning counts even if the wording differs. supersedes: numbers of
-existing records the candidate updates or contradicts — the same fact
-with a changed value supersedes; it is not a duplicate. Records that
-differ in numbers, dates, or qualifiers are never duplicates. Both lists
-empty means the candidate is genuinely new.
+pub const PROMPT: &str = r#"Read the conversation and save only durable facts that would change ARC's future replies.
+Most conversations need no memory: return {"operations":[]}.
+Never save task progress, recalled facts, transient failures, or facts already known.
+Use the shown existing records: omit unchanged facts, supersede changed facts by id,
+and write only new facts. If unsure whether a fact is durable, omit it.
+Records must be self-contained, present-tense facts, not instructions.
+Use a listed namespace for new records; a supersede keeps its old namespace.
+Reply with strict JSON only:
+{"operations":[{"op":"write","kind":"fact","namespace":"global","title":"...","summary":"...","body":"...","links":[]}]}
+An operation can instead use "op":"supersede" and "id":"mr-...".
+Kinds: person, project, preference, fact, decision. Use [] for unused links.
 "#;
 
 const TRANSCRIPT_BUDGET: usize = 24_000;
+const INDEX_BUDGET: usize = 6_000;
+const INDEX_LIMIT: usize = 20;
 
 const TOOL_SNIPPET: usize = 200;
 
@@ -229,8 +63,6 @@ pub struct ModelExtractor {
     model: String,
     thinking: Thinking,
     timeout: Duration,
-    prompt: String,
-    seed: Option<u64>,
     identity: Option<String>,
     namespaces: Vec<String>,
 }
@@ -249,37 +81,13 @@ impl ModelExtractor {
             model: model.to_owned(),
             thinking,
             timeout,
-            prompt: PROMPT_V4.to_owned(),
-            seed: None,
-            identity,
-            namespaces,
-        }
-    }
-
-    pub(crate) fn pinned(
-        provider: Arc<dyn Provider>,
-        model: &str,
-        timeout: Duration,
-        prompt: &str,
-        seed: u64,
-        identity: Option<String>,
-        namespaces: Vec<String>,
-    ) -> Self {
-        Self {
-            provider,
-            model: model.to_owned(),
-            thinking: Thinking::Minimal,
-            timeout,
-            prompt: prompt.to_owned(),
-            seed: Some(seed),
             identity,
             namespaces,
         }
     }
 }
 
-// FNV-1a — a session must seed the same way on every replay
-pub(crate) fn session_seed(session_id: &str) -> u64 {
+fn session_seed(session_id: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in session_id.bytes() {
         hash ^= u64::from(byte);
@@ -301,7 +109,7 @@ impl ModelExtractor {
                 reasoning: None,
             }],
             tools: Vec::new(),
-            seed: Some(self.seed.unwrap_or_else(|| session_seed(session_id))),
+            seed: Some(session_seed(session_id)),
             web: false,
             cache_key: Some(session_id.to_owned()),
         }
@@ -355,101 +163,6 @@ impl ModelExtractor {
         }
         Ok(text)
     }
-
-    async fn dedup(
-        &self,
-        operations: Vec<RawOperation>,
-        index: &[MemoryIndexEntry],
-        session_id: &str,
-    ) -> (Vec<RawOperation>, DedupStats) {
-        let mut stats = DedupStats::default();
-        let mut result = Vec::with_capacity(operations.len());
-        let mut seen_writes: HashSet<_> = index
-            .iter()
-            .map(|entry| (normalize(&entry.title), normalize(&entry.summary)))
-            .collect();
-        for mut op in operations {
-            match op.op.as_str() {
-                "write" => {
-                    if !seen_writes.insert((normalize(&op.title), normalize(&op.summary))) {
-                        stats.dropped += 1;
-                        continue;
-                    }
-                    let candidates = dedup_candidates(&op.title, &op.summary, index);
-                    if !candidates.is_empty() {
-                        stats.calls += 1;
-                        match self.forced_choice(&op, &candidates, session_id).await {
-                            Some(DedupChoice::Duplicate) => {
-                                stats.dropped += 1;
-                                continue;
-                            }
-                            Some(DedupChoice::Supersede(target_id)) => {
-                                stats.converted += 1;
-                                "supersede".clone_into(&mut op.op);
-                                op.id = Some(target_id);
-                                op.namespace = None;
-                            }
-                            None => {}
-                        }
-                    }
-                }
-                "supersede" => {
-                    let target = op
-                        .id
-                        .as_ref()
-                        .and_then(|id| index.iter().find(|entry| entry.id == *id));
-                    let touch = target.is_some_and(|target| {
-                        normalize(&op.title) == normalize(&target.title)
-                            && normalize(&op.summary) == normalize(&target.summary)
-                            && normalize(&op.body) == normalize(&target.body)
-                    });
-                    if touch {
-                        stats.dropped += 1;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-            result.push(op);
-        }
-        (result, stats)
-    }
-
-    /// A dedup call that fails to parse, errors, or times out keeps the
-    /// write: the human review queue catches a duplicate, but a dropped
-    /// fact is unrecoverable.
-    async fn forced_choice(
-        &self,
-        op: &RawOperation,
-        candidates: &[&MemoryIndexEntry],
-        session_id: &str,
-    ) -> Option<DedupChoice> {
-        let request = self.request(
-            session_id,
-            DEDUP_PROMPT_V1.to_owned(),
-            render_dedup_input(op, candidates),
-        );
-        let text = match tokio::time::timeout(self.timeout, self.completion_text(request)).await {
-            Ok(Ok(text)) => text,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "dedup call failed; keeping the write");
-                return None;
-            }
-            Err(_) => {
-                tracing::warn!("dedup call timed out; keeping the write");
-                return None;
-            }
-        };
-        let reply: DedupReply = match serde_json::from_str(strip_residue(&text)) {
-            Ok(reply) => reply,
-            Err(error) => {
-                tracing::warn!(%error, "unparseable dedup reply; keeping the write");
-                return None;
-            }
-        };
-        tracing::debug!(reasoning = %reply.reasoning, "dedup reasoning");
-        apply_dedup_reply(&reply, candidates)
-    }
 }
 
 impl Extractor for ModelExtractor {
@@ -460,8 +173,6 @@ impl Extractor for ModelExtractor {
             task = "consolidation",
             session_id = %session.session_id,
             counter.dedup_dropped = tracing::field::Empty,
-            counter.dedup_converted = tracing::field::Empty,
-            dedup_calls = tracing::field::Empty,
         )
     )]
     async fn extract(
@@ -470,7 +181,7 @@ impl Extractor for ModelExtractor {
     ) -> Result<Vec<memory_event::Event>, ExtractError> {
         let request = self.request(
             &session.session_id,
-            self.prompt.clone(),
+            PROMPT.to_owned(),
             render_input(session, self.identity.as_deref(), &self.namespaces),
         );
         let text = tokio::time::timeout(self.timeout, self.completion_text(request))
@@ -483,19 +194,9 @@ impl Extractor for ModelExtractor {
             })??;
         let operations = parse_operations(&text)?;
         tracing::debug!(operations = operations.len(), "extraction parsed");
-        let (operations, stats) = self
-            .dedup(operations, &session.memory_index, &session.session_id)
-            .await;
-        let span = tracing::Span::current();
-        if stats.dropped > 0 {
-            span.record("counter.dedup_dropped", stats.dropped);
-        }
-        if stats.converted > 0 {
-            span.record("counter.dedup_converted", stats.converted);
-        }
-        if stats.calls > 0 {
-            span.record("dedup_calls", stats.calls);
-        }
+        let before = operations.len();
+        let operations = drop_unchanged(operations, &session.memory_index);
+        tracing::Span::current().record("counter.dedup_dropped", before - operations.len());
         operations
             .into_iter()
             .map(|op| to_event(op, session, &self.namespaces))
@@ -618,22 +319,55 @@ fn render_input(
         lines.push(render_row(row, &calls));
     }
     let known = identity.unwrap_or("(none)");
-    let index = if session.memory_index.is_empty() {
-        "(none yet)".to_owned()
-    } else {
-        session
-            .memory_index
-            .iter()
-            .map(index_line)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let index = relevant_index(session);
     format!(
         "[Session transcript]\n{}\n\n[Already known — never extract]\n{known}\n\n\
          [Namespaces]\n{}\n\n[Existing memory records]\n{index}",
         windowed(&lines),
         namespaces.join(", ")
     )
+}
+
+fn relevant_index(session: &SessionSnapshot) -> String {
+    let user_text: String = session
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            MessageRow::Message { role, content, .. } if *role == Role::User as i32 => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let user_words = tokenize(&user_text);
+    let mut matches: Vec<_> = session
+        .memory_index
+        .iter()
+        .enumerate()
+        .filter_map(|(position, entry)| {
+            let words = tokenize(&format!("{} {}", entry.title, entry.summary));
+            let score = words.intersection(&user_words).count();
+            (score > 0).then_some((score, position, entry))
+        })
+        .collect();
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    let mut lines = Vec::new();
+    let mut length = 0;
+    for (_, _, entry) in matches.into_iter().take(INDEX_LIMIT) {
+        let line = index_line(entry);
+        if length + line.chars().count() + usize::from(!lines.is_empty()) > INDEX_BUDGET {
+            continue;
+        }
+        length += line.chars().count() + usize::from(!lines.is_empty());
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        "(none relevant)".to_owned()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn render_row(row: &MessageRow, calls: &HashMap<&str, &str>) -> String {
@@ -694,25 +428,13 @@ fn snippet(text: &str) -> String {
 }
 
 fn windowed(lines: &[String]) -> String {
-    let total: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
-    if total.saturating_sub(1) <= TRANSCRIPT_BUDGET {
-        return lines.join("\n");
+    let text = lines.join("\n");
+    let length = text.chars().count();
+    if length <= TRANSCRIPT_BUDGET {
+        return text;
     }
-    let mut kept = 0;
-    let mut start = lines.len();
-    while start > 0 {
-        let cost = lines[start - 1].chars().count() + 1;
-        if kept + cost > TRANSCRIPT_BUDGET {
-            break;
-        }
-        kept += cost;
-        start -= 1;
-    }
-    let start = start.min(lines.len() - 1);
-    format!(
-        "[transcript truncated: {start} earlier lines elided, the most recent follow]\n{}",
-        lines[start..].join("\n")
-    )
+    let tail: String = text.chars().skip(length - TRANSCRIPT_BUDGET).collect();
+    format!("[transcript truncated; latest text follows]\n{tail}")
 }
 
 #[derive(Deserialize)]
@@ -773,130 +495,32 @@ const STOPWORDS: &[&str] = &[
     "user", "arc",
 ];
 
-fn tokenize(normalized: &str) -> HashSet<&str> {
-    normalized
-        .split_whitespace()
-        .filter(|word| !STOPWORDS.contains(word))
+fn tokenize(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() > 2 && !STOPWORDS.contains(word))
+        .map(str::to_owned)
         .collect()
 }
 
-fn dedup_candidates<'a>(
-    title: &str,
-    summary: &str,
-    index: &'a [MemoryIndexEntry],
-) -> Vec<&'a MemoryIndexEntry> {
-    let op_norm = normalize(&format!("{title} {summary}"));
-    let op_words = tokenize(&op_norm);
-    let mut scored: Vec<(usize, usize, &MemoryIndexEntry)> = index
+fn drop_unchanged(operations: Vec<RawOperation>, index: &[MemoryIndexEntry]) -> Vec<RawOperation> {
+    let mut seen: HashSet<_> = index
         .iter()
-        .enumerate()
-        .filter_map(|(position, entry)| {
-            let entry_norm = normalize(&format!("{} {}", entry.title, entry.summary));
-            let score = tokenize(&entry_norm).intersection(&op_words).count();
-            (score >= 2).then_some((score, position, entry))
-        })
+        .map(|entry| (normalize(&entry.title), normalize(&entry.summary)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored
+    operations
         .into_iter()
-        .take(3)
-        .map(|(_, _, entry)| entry)
+        .filter(|op| match op.op.as_str() {
+            "write" => seen.insert((normalize(&op.title), normalize(&op.summary))),
+            "supersede" => !index.iter().any(|entry| {
+                op.id.as_deref() == Some(entry.id.as_str())
+                    && normalize(&op.title) == normalize(&entry.title)
+                    && normalize(&op.summary) == normalize(&entry.summary)
+                    && normalize(&op.body) == normalize(&entry.body)
+            }),
+            _ => true,
+        })
         .collect()
-}
-
-#[derive(Default)]
-struct DedupStats {
-    dropped: usize,
-    converted: usize,
-    calls: usize,
-}
-
-enum DedupChoice {
-    Duplicate,
-    Supersede(String),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DedupReply {
-    reasoning: String,
-    #[serde(default)]
-    duplicate_of: Vec<i64>,
-    #[serde(default)]
-    supersedes: Vec<i64>,
-}
-
-fn apply_dedup_reply(reply: &DedupReply, candidates: &[&MemoryIndexEntry]) -> Option<DedupChoice> {
-    let len = candidates.len();
-    let in_range = |number: i64| {
-        usize::try_from(number)
-            .ok()
-            .filter(|n| *n >= 1 && *n <= len)
-    };
-
-    for &number in &reply.duplicate_of {
-        if in_range(number).is_none() {
-            tracing::warn!(
-                number,
-                "dedup duplicate_of names a nonexistent candidate; ignored"
-            );
-        }
-    }
-    if reply
-        .duplicate_of
-        .iter()
-        .any(|&number| in_range(number).is_some())
-    {
-        return Some(DedupChoice::Duplicate);
-    }
-
-    for &number in &reply.supersedes {
-        if in_range(number).is_none() {
-            tracing::warn!(
-                number,
-                "dedup supersedes names a nonexistent candidate; ignored"
-            );
-        }
-    }
-    let mut hits: Vec<usize> = reply
-        .supersedes
-        .iter()
-        .filter_map(|&number| in_range(number))
-        .collect();
-    if hits.is_empty() {
-        return None;
-    }
-    hits.sort_unstable();
-    if hits.len() > 1 {
-        tracing::warn!(
-            count = hits.len(),
-            "dedup supersedes named more than one candidate; using the lowest"
-        );
-    }
-    Some(DedupChoice::Supersede(candidates[hits[0] - 1].id.clone()))
-}
-
-fn render_dedup_input(op: &RawOperation, candidates: &[&MemoryIndexEntry]) -> String {
-    use std::fmt::Write as _;
-
-    let candidate = format!(
-        "[Candidate]\nkind: {}\ntitle: {}\nsummary: {}\nbody: {}",
-        op.kind, op.title, op.summary, op.body
-    );
-    let mut listed = String::from("[Existing records]");
-    for (position, entry) in candidates.iter().enumerate() {
-        let _ = write!(
-            listed,
-            "\n{}. kind: {}\n   namespace: {}\n   title: {}\n   summary: {}\n   body: {}",
-            position + 1,
-            kind_name(entry.kind),
-            entry.namespace,
-            entry.title,
-            entry.summary,
-            entry.body,
-        );
-    }
-    format!("{candidate}\n\n{listed}")
 }
 
 fn to_event(
@@ -1005,9 +629,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ModelExtractor, PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4, PROMPT_VERSION_V1,
-        PROMPT_VERSION_V2, PROMPT_VERSION_V3, PROMPT_VERSION_V4, TITLE_PROMPT, TRANSCRIPT_BUDGET,
-        render_input, windowed,
+        INDEX_BUDGET, INDEX_LIMIT, ModelExtractor, PROMPT, PROMPT_VERSION, TITLE_PROMPT,
+        TRANSCRIPT_BUDGET, render_input, windowed,
     };
     use crate::consolidation::{Extractor as _, Outcome, SessionSnapshot, run_pass};
     use crate::projection::{MemoryIndexEntry, MessageRow};
@@ -1027,19 +650,6 @@ mod tests {
         vec![
             Ok(CompletionDelta::Reasoning("weighing durability".to_owned())),
             Ok(CompletionDelta::Reasoning(" of the exchange".to_owned())),
-            Ok(CompletionDelta::Text(json.to_owned())),
-            Ok(CompletionDelta::Done {
-                usage: usage(),
-                stop: Stop::EndTurn,
-            }),
-        ]
-    }
-
-    fn dedup_reply(json: &str) -> Vec<Result<CompletionDelta, ProviderError>> {
-        vec![
-            Ok(CompletionDelta::Reasoning(
-                "comparing against neighbors".to_owned(),
-            )),
             Ok(CompletionDelta::Text(json.to_owned())),
             Ok(CompletionDelta::Done {
                 usage: usage(),
@@ -1102,8 +712,6 @@ mod tests {
         extract_scripted(vec![script], index).await
     }
 
-    /// `ScriptedProvider` panics on script exhaustion, which proves a test
-    /// that supplies only the extraction reply made no dedup call.
     async fn extract_scripted(
         scripts: Vec<Vec<Result<CompletionDelta, ProviderError>>>,
         index: Vec<MemoryIndexEntry>,
@@ -1128,8 +736,6 @@ mod tests {
         "title":"Terse replies","summary":"User prefers short answers",
         "body":"User prefers short answers in chat.","links":[]}]}"#;
 
-    /// Shares "coffee", "drinks", "every" with `overlap_neighbor`, three
-    /// content words above the >= 2 candidate threshold.
     const OVERLAP_WRITE_OP: &str = r#"{"operations":[{"op":"write","kind":"fact",
         "title":"Coffee habit","summary":"drinks coffee every day",
         "body":"The user drinks coffee every day.","links":[]}]}"#;
@@ -1176,7 +782,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V4,
+            PROMPT_VERSION,
             &HashSet::new(),
         )
         .await
@@ -1220,7 +826,7 @@ mod tests {
             request.cache_key.as_deref(),
             Some(reply.session_id.as_str())
         );
-        assert_eq!(request.system.as_deref(), Some(PROMPT_V4));
+        assert_eq!(request.system.as_deref(), Some(PROMPT));
         assert!(request.tools.is_empty());
         let [Message::Text { role, content, .. }] = request.messages.as_slice() else {
             panic!("expected one user message, got {:?}", request.messages);
@@ -1236,7 +842,7 @@ mod tests {
              [Namespaces]\n\
              global, arc\n\n\
              [Existing memory records]\n\
-             (none yet)"
+             (none relevant)"
         );
 
         let events = replay_events(dir.path());
@@ -1275,7 +881,7 @@ mod tests {
         let Some(session_event::Event::SessionConsolidated(marker)) = &session.event else {
             panic!("expected SessionConsolidated, got {session:?}");
         };
-        assert_eq!(marker.prompt_version, "v4");
+        assert_eq!(marker.prompt_version, "v5");
         assert_eq!(marker.through_seq, 3);
 
         let (tx, _rx) = channel();
@@ -1321,7 +927,7 @@ mod tests {
         let (engine, run) = reopened_engine(&provider, &dir, Registry::new(512));
         let (tx, _rx) = channel();
         let reply = engine
-            .send_message(&run, None, "I moved to Y", tx)
+            .send_message(&run, None, "I moved my address to Y", tx)
             .await
             .expect("send");
 
@@ -1341,7 +947,7 @@ mod tests {
             &engine,
             &extractor,
             ALL_IDLE,
-            PROMPT_VERSION_V4,
+            PROMPT_VERSION,
             &HashSet::new(),
         )
         .await
@@ -1536,149 +1142,22 @@ mod tests {
             .map(|n| format!("user: message number {n} padded {}", "p".repeat(30)))
             .collect();
         let windowed = windowed(&lines);
-        assert!(
-            windowed.starts_with("[transcript truncated: "),
-            "{}",
-            &windowed[..80]
-        );
+        assert!(windowed.starts_with("[transcript truncated;"));
         assert!(windowed.ends_with(lines.last().expect("last").as_str()));
         assert!(!windowed.contains("message number 0 "), "the head dropped");
-        let body: usize = windowed
-            .lines()
-            .skip(1)
-            .map(|line| line.chars().count() + 1)
-            .sum();
-        assert!(body <= TRANSCRIPT_BUDGET + 1, "{body}");
+        let body = windowed.split_once('\n').expect("marker").1;
+        assert_eq!(body.chars().count(), TRANSCRIPT_BUDGET);
     }
 
     #[test]
-    fn prompt_v1_is_pinned() {
-        assert_eq!(PROMPT_VERSION_V1, "v1");
-        let pinned = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Two questions decide what to extract: what did the user reveal about
-themselves, and what did they express about how ARC should operate?
-If nothing is worth saving, return an empty operations list and stop.
-
-Do not capture:
-- environment-dependent failures: the user can fix those, and the record
-  outlives the fix
-- negative claims about tools: "X is broken" hardens into refusals that
-  outlive the problem
-- transient errors that resolved: if retrying worked, the lesson is the
-  retry pattern, not the failure
-- unresolved dead ends dressed up as workflow
-
-Phrase every record as a declarative fact, never as an imperative.
-"User prefers concise replies" is right; "Always reply concisely" is wrong:
-an imperative gets re-read as a directive in later sessions and can
-override what the user is actually asking for.
-
-The archive already remembers this conversation verbatim, searchably.
-Extract only what must sit in the small always-loaded index; if it will be
-stale in a week, it does not belong.
-
-Before writing a new record, check the existing records listed after the
-transcript. If one covers the same class of fact, extend or replace it
-with a supersede operation instead of creating a narrow sibling.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-        assert_eq!(PROMPT_V1, pinned);
-    }
-
-    #[test]
-    fn prompt_v2_is_pinned() {
-        assert_eq!(PROMPT_VERSION_V2, "v2");
-        let pinned = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Most conversations contain nothing durable. Return {"operations": []}
-unless a fact clearly earns a place in the small always-loaded index; an
-empty list is the expected outcome, and a needless record is a failure,
-not thoroughness.
-
-Save a fact only if it would change ARC's replies in similar future
-situations. Look, in order: corrections and mistakes the user pointed
-out; stated preferences; stable facts about the user or their world.
-Contrast: "User prefers short chapters" is worth saving; "User edited
-chapter 3 today" is not — the archive already holds this conversation
-verbatim and searchably.
-
-Never capture: task progress or completed work; the conversation itself
-("user asked about X"); anything the already-known section or the
-existing records already cover; environment-dependent or transient
-failures; negative claims about tools.
-
-A record is a self-contained, present-tense declarative fact: names, not
-pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
-console"). "User prefers concise replies" is right; "Always reply
-concisely" is wrong — an imperative gets re-read as a directive later.
-
-If an existing record covers the same fact and something changed, emit a
-supersede of that record. If nothing changed, emit nothing for it.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-        assert_eq!(PROMPT_V2, pinned);
-    }
-
-    #[test]
-    fn prompt_v3_is_pinned() {
-        assert_eq!(PROMPT_VERSION_V3, "v3");
-        let pinned = r#"You are ARC's memory consolidation pass, reading one finished conversation.
-Most conversations contain nothing durable. Return {"operations": []}
-unless a fact clearly earns a place in the small always-loaded index; an
-empty list is the expected outcome, and a needless record is a failure,
-not thoroughness.
-
-Save a fact only if it would change ARC's replies in similar future
-situations. Look, in order: corrections and mistakes the user pointed
-out; stated preferences; stable facts about the user or their world.
-Contrast: "User prefers short chapters" is worth saving; "User edited
-chapter 3 today" is not — the archive already holds this conversation
-verbatim and searchably.
-
-Never capture: task progress or completed work; the conversation itself
-("user asked about X"); anything the already-known section or the
-existing records already cover; environment-dependent or transient
-failures; negative claims about tools.
-
-A record is a self-contained, present-tense declarative fact: names, not
-pronouns; dates absolute; specifics kept specific ("Gamecube", never "a
-console"). "User prefers concise replies" is right; "Always reply
-concisely" is wrong — an imperative gets re-read as a directive later.
-
-If an existing record covers the same fact and something changed, emit a
-supersede of that record. If nothing changed, emit nothing for it.
-
-Answer with strict JSON, nothing else after your thinking:
-{"operations": []}
-where each operation is one of
-{"op": "write", "kind": "...", "namespace": "...", "title": "...", "summary": "...", "body": "...", "links": ["mr-..."]}
-{"op": "supersede", "id": "mr-...", "kind": "...", "title": "...", "summary": "...", "body": "...", "links": []}
-"kind" is one of person, project, preference, fact, decision. "namespace"
-files the fact: choose from the namespaces listed in the input — a
-project's name when the fact is about that project, "global" otherwise;
-a supersede keeps its record's namespace. "summary" is
-one declarative line; it appears in every future session. "links" is
-optional related record ids. A supersede's "id" names the existing record
-it replaces. An empty operations list means nothing was worth saving.
-"#;
-        assert_eq!(PROMPT_V3, pinned);
+    fn one_long_message_is_bounded_too() {
+        let input = format!("user: {}", "x".repeat(TRANSCRIPT_BUDGET * 2));
+        let body = windowed(&[input])
+            .split_once('\n')
+            .expect("marker")
+            .1
+            .to_owned();
+        assert_eq!(body.chars().count(), TRANSCRIPT_BUDGET);
     }
 
     #[test]
@@ -1701,7 +1180,7 @@ it replaces. An empty operations list means nothing was worth saving.
     }
 
     #[tokio::test]
-    async fn a_v3_write_files_its_namespace_and_an_unknown_one_goes_global() {
+    async fn a_write_files_its_namespace_and_an_unknown_one_goes_global() {
         let filed = extract_from(
             extraction_reply(
                 r#"{"operations":[{"op":"write","kind":"fact","namespace":"arc",
@@ -1775,59 +1254,60 @@ it replaces. An empty operations list means nothing was worth saving.
     }
 
     #[tokio::test]
-    async fn a_forced_choice_duplicate_of_drops_the_write() {
+    async fn a_near_match_needs_no_second_model_call() {
         let events = extract_scripted(
-            vec![
-                extraction_reply(OVERLAP_WRITE_OP),
-                dedup_reply(r#"{"reasoning":"same fact","duplicate_of":[1],"supersedes":[]}"#),
-            ],
-            vec![overlap_neighbor("mr-1", "global")],
+            vec![extraction_reply(OVERLAP_WRITE_OP)],
+            vec![overlap_neighbor("mr-1", "coffee-notes")],
         )
         .await
         .expect("extract");
-        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+    }
+
+    #[test]
+    fn the_existing_index_is_relevant_and_bounded() {
+        let mut session = snapshot(
+            (0..100)
+                .map(|i| entry(&format!("mr-{i}"), "Coffee habit", &"coffee ".repeat(100)))
+                .chain([entry("mr-unrelated", "Ski gear", "ski boots")])
+                .collect(),
+        );
+        let MessageRow::Message { content, .. } = &mut session.rows[0] else {
+            panic!("expected user message");
+        };
+        *content = "I drink coffee".to_owned();
+        let input = render_input(&session, None, &["global".to_owned()]);
+        let index = input
+            .split("[Existing memory records]\n")
+            .nth(1)
+            .expect("index");
+        assert!(index.chars().count() <= INDEX_BUDGET);
+        assert!(index.lines().count() <= INDEX_LIMIT);
+        assert!(index.contains("mr-0"));
+        assert!(!index.contains("mr-unrelated"));
     }
 
     #[tokio::test]
-    async fn a_forced_choice_supersedes_converts_the_write_through_to_event() {
+    async fn a_model_supersede_needs_no_second_model_call() {
         let events = extract_scripted(
-            vec![
-                extraction_reply(OVERLAP_WRITE_OP),
-                dedup_reply(r#"{"reasoning":"value changed","duplicate_of":[],"supersedes":[1]}"#),
-            ],
+            vec![extraction_reply(
+                r#"{"operations":[{"op":"supersede","id":"mr-1","kind":"fact",
+                "title":"Coffee habit","summary":"drinks coffee every day",
+                "body":"The user drinks coffee every day.","links":[]}]}"#,
+            )],
             vec![overlap_neighbor("mr-1", "coffee-notes")],
         )
         .await
         .expect("extract");
         assert_eq!(events.len(), 1);
         let memory_event::Event::RecordSuperseded(superseded) = &events[0] else {
-            panic!("expected RecordSuperseded, got {:?}", events[0]);
+            panic!("expected supersede");
         };
         assert_eq!(superseded.superseded_id, "mr-1");
-        let record = superseded.record.as_ref().expect("record");
-        assert_ne!(record.id, "mr-1");
-        assert_eq!(record.namespace, "coffee-notes", "namespace inherited");
-        assert_eq!(record.title, "Coffee habit");
-    }
-
-    #[tokio::test]
-    async fn an_unparseable_dedup_reply_keeps_the_write_and_extraction_still_succeeds() {
-        let events = extract_scripted(
-            vec![
-                extraction_reply(OVERLAP_WRITE_OP),
-                vec![
-                    Ok(CompletionDelta::Text("not json at all".to_owned())),
-                    Ok(CompletionDelta::Done {
-                        usage: usage(),
-                        stop: Stop::EndTurn,
-                    }),
-                ],
-            ],
-            vec![overlap_neighbor("mr-1", "global")],
-        )
-        .await
-        .expect("extract");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], memory_event::Event::RecordCreated(_)));
+        assert_eq!(
+            superseded.record.as_ref().expect("record").namespace,
+            "coffee-notes"
+        );
     }
 }

@@ -57,7 +57,7 @@ Backup needs the segments and identity file, not SQLite.
 - Persist and fsync the entire call batch before executing any call. Results append in completion order; provider transcripts order them by call index.
 - Reasoning is streamed, never durable. Tools-only steps append no empty assistant message.
 
-**Crash recovery.** A durable call without a durable result has UNKNOWN outcome: it may have run. Never silently retry or drop it. At startup, before dispatching work, arcd closes each orphan with one SYSTEM `ToolResultRecorded{UNKNOWN}` explaining that the daemon restarted and the call may have run. Readers, rebuild, and memory replay append nothing. A live in-flight call is not an orphan.
+**Crash recovery.** A durable call without a durable result has UNKNOWN outcome: it may have run. Never silently retry or drop it. At startup, before dispatching work, arcd closes each orphan with one SYSTEM `ToolResultRecorded{UNKNOWN}` explaining that the daemon restarted and the call may have run. Readers and rebuild append nothing. A live in-flight call is not an orphan.
 
 Recovery does not restart model turns. The next user message resumes the conversation. Automatic retry of idempotent UNKNOWN calls remains open; tools have no idempotence declaration.
 
@@ -194,13 +194,13 @@ Explicit requests use memory tools immediately. After a session goes idle, an as
 - Mine user-opened sessions at either door; dispatched jobs are titled and marked consolidated, not mined for user facts. Recorded creation source governs; legacy unspecified sources retain the old role gate.
 - Mainline sessions and branches marked *real* consolidate. Branches contribute only their own rows, not inherited history. Presence and branch gates both apply.
 - Show identity as already-known context; elide recalled memory/archive tool results so injected facts are not learned again.
-- Drop exact-normalized duplicates in code. Near matches get one validated model choice: duplicate-of, supersedes, or neither, using integer indices into shown neighbors.
+- Show a bounded selection of existing records relevant to the user's messages. One extraction call chooses write, supersede, or nothing; exact-normalized duplicates and unchanged supersedes are dropped in code. Ambiguous near matches go to review, not another model call.
 
 **Commit.** `SessionConsolidated{session_id, through_seq, prompt_version}` records coverage even when nothing was extracted. Eligibility is a query over idle time and rows after the latest marker, not daemon memory.
 
 Snapshot under the engine lock, run the model unlocked, then recheck idleness and unchanged input before appending records and marker together. New activity discards the pass. Extractor writes have source SYSTEM.
 
-**Tuning and review.** Version prompts and evaluate against real history with `arcd memory-replay`. Weekly TUI review checks created/superseded records; corrections supply few-shot examples and labels for precision/recall. Trace created-per-session, supersede rate, and retrieval use to detect hoarding or missed memory.
+**Review.** Weekly TUI review checks created/superseded records; corrections supply examples for precision and recall. Trace created-per-session, supersede rate, and retrieval use to detect hoarding or missed memory.
 
 Review verdicts have source USER: accept appends `MemoryRecordReviewed`, fix supersedes, delete appends deletion. `changed_at`/`reviewed_at` selects records changed in the window and not reviewed since. Fixing prefills a conversational instruction; the UI never mutates memory directly. See [Hermes notes](prior-art-hermes.md) for curation lessons.
 
@@ -310,7 +310,7 @@ Each phase must become a daily driver before the next starts.
 | --- | --- |
 | 0 — Scaffold | Done: crates, schemas, build/test/fmt/lint. |
 | 1 — Walking skeleton | Done 2026-08-13: local chat, log/projection, streaming TUI, identity, traces; daily simple questions. |
-| 2 — Memory | Done 2026-08-22: records, archive search, consolidation/replay, review; both recall paths work on real history. |
+| 2 — Memory | Done 2026-08-22: records, archive search, consolidation, review; both recall paths work on real history. |
 | 3 — Development | Jobs, workspaces, roles, installation. Exit: a week of development and rebuild matching live state. |
 | 3.5 — Tree | Fork, rewind, navigation. Exit: branching used naturally. |
 | 3.6 — Quiet week | Done 2026-09-03. Relay failures motivated the direct door. |

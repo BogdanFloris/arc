@@ -24,7 +24,6 @@ Not new implementation tasks until evidence arrives:
 - Edit-tool friction, grant-widening use, executor latency, unnecessary code comments.
 - `a_cut_stream_appends_a_partial_reply` flakiness.
 - Archive search ranking when the current session dominates results.
-- Whether live consolidation should use the same deterministic seed as `memory-replay`.
 
 ## Deferred
 

@@ -17,7 +17,6 @@ mod jobs;
 mod llama;
 mod login;
 mod rebuild;
-mod replay;
 mod roles;
 mod server;
 mod telemetry;
@@ -66,10 +65,5 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Run => daemon::run(config, dirs).await,
         Command::Rebuild => rebuild::run(&dirs),
         Command::Login => login::codex(&config, &dirs).await,
-        Command::MemoryReplay {
-            prompt,
-            against,
-            sessions,
-        } => replay::run(config, dirs, &prompt, against.as_deref(), &sessions).await,
     }
 }

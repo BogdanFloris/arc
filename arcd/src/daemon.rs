@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use arc_core::archive::Archive;
-use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION_V4};
+use arc_core::consolidation::extract::{ModelExtractor, PROMPT_VERSION};
 use arc_core::consolidation::{self, Extractor};
 use arc_core::log::Log;
 use arc_core::orphan;
@@ -339,7 +339,7 @@ fn consolidation_task(
     info!(
         idle_seconds = config.idle_seconds,
         timeout_seconds = config.timeout_seconds,
-        prompt_version = PROMPT_VERSION_V4,
+        prompt_version = PROMPT_VERSION,
         "consolidation enabled"
     );
     Some(tokio::spawn(async move {
@@ -365,8 +365,7 @@ async fn tick_once<E: Extractor>(
     strikes: &mut Strikes,
     notifier: &broadcast::Sender<Notification>,
 ) {
-    let pass =
-        consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION_V4, strikes.skip());
+    let pass = consolidation::run_pass(engine, extractor, cutoff, PROMPT_VERSION, strikes.skip());
     match pass.await {
         Ok(consolidation::Outcome::Consolidated {
             session_id,
