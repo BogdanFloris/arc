@@ -199,6 +199,9 @@ fn scrub_env(cmd: &mut Command) {
             cmd.env(key, value);
         }
     }
+    cmd.env("NO_COLOR", "1");
+    cmd.env("CLICOLOR", "0");
+    cmd.env("TERM", "dumb");
 }
 
 #[derive(Default)]
@@ -380,6 +383,13 @@ mod tests {
             reply.content
         );
         assert!(reply.content.contains("HOME="), "{}", reply.content);
+        for setting in ["NO_COLOR=1", "CLICOLOR=0", "TERM=dumb"] {
+            assert!(
+                reply.content.lines().any(|line| line == setting),
+                "missing {setting}: {}",
+                reply.content
+            );
+        }
     }
 
     #[tokio::test]
