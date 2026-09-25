@@ -215,7 +215,7 @@ pub struct CompactionConfig {
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        Self { fraction: 0.8 }
+        Self { fraction: 0.9 }
     }
 }
 

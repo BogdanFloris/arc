@@ -15,7 +15,7 @@ use crate::config::{Config, RoleConfig, RoleProvider};
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compact_at_for(context_window: u32, fraction: f32) -> u32 {
-    (f64::from(context_window) * f64::from(fraction)) as u32
+    (f64::from(context_window) * f64::from(fraction)).round() as u32
 }
 
 #[derive(Debug)]
@@ -521,7 +521,8 @@ key      = "codex"
         assert_eq!(executor.provider.name(), "openai-compat");
         assert_eq!(executor.model, "deepseek-v4-flash");
         assert_eq!(executor.thinking, arc_core::provider::Thinking::Low);
-        assert_eq!(executor.compact_at, Some(80_000));
+        assert_eq!(executor.compact_at, Some(90_000));
+        assert_eq!(super::compact_at_for(272_000, 0.9), 244_800);
         let menu = roles.menus();
         assert_eq!(
             menu[&arc_proto::v1::SessionRole::Executor]
