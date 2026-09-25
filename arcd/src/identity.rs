@@ -16,9 +16,9 @@ pub fn load(path: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::load;
     use std::fs;
     use tempfile::TempDir;
-    use super::load;
 
     #[cfg(unix)]
     #[test]

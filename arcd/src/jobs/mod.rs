@@ -63,7 +63,9 @@ pub enum SendOutcome {
         session_id: String,
         events: Option<mpsc::Receiver<TurnEvent>>,
     },
-    Queued { session_id: String },
+    Queued {
+        session_id: String,
+    },
 }
 
 #[derive(Clone)]
