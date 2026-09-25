@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use arc_core::client::TurnEvent;
 use arc_core::projection::REVIEW_WINDOW_MICROS;
 use arc_proto::v1::{
     HistoryEntry, HistoryMessage, ImageAttachment, JobInfo, ModelChoice, ProjectInfo, Role,
@@ -75,6 +76,11 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEvent {
+    Turn {
+        session_id: Option<String>,
+        acknowledged: bool,
+        event: TurnEvent,
+    },
     SessionStatus(arc_proto::v1::SessionStatus),
     StatusUnavailable(String),
     Sessions(Vec<SessionInfo>),
@@ -111,6 +117,10 @@ pub enum NetEvent {
         queued: bool,
     },
     Failed {
+        code: String,
+        msg: String,
+    },
+    RequestFailed {
         code: String,
         msg: String,
     },
@@ -283,6 +293,15 @@ impl From<Block> for Entry {
     }
 }
 
+struct SuspendedTurn {
+    transcript: Vec<Entry>,
+    live_streams: u32,
+    thinking_since: Option<Instant>,
+    turn_started: Option<Instant>,
+    streamed_chars: usize,
+    events: Vec<NetEvent>,
+}
+
 pub struct App {
     pub herdr_enabled: bool,
     pub transcript: Vec<Entry>,
@@ -312,6 +331,7 @@ pub struct App {
     /// `Accepted` increments, `StreamEnd`/error decrements, `Disconnected`
     /// resets — two sockets can each hold one at once.
     live_streams: u32,
+    suspended_turns: HashMap<String, SuspendedTurn>,
     /// A message typed while streaming but before the session id is known
     /// (the first message of a brand-new session): sent as `Send` once an
     /// `Accepted` names the session, the way `pending_first` already works.
@@ -429,6 +449,7 @@ impl App {
             last_error: None,
             yank_note: None,
             live_streams: 0,
+            suspended_turns: HashMap::new(),
             pending_live: None,
             pending_attachments: Vec::new(),
             sending_attachments: VecDeque::new(),
@@ -1845,6 +1866,19 @@ impl App {
         if let Some(current) = &self.session_id {
             self.session_details
                 .insert(current.clone(), self.show_details);
+            if self.status == Status::Streaming {
+                self.suspended_turns.insert(
+                    current.clone(),
+                    SuspendedTurn {
+                        transcript: std::mem::take(&mut self.transcript),
+                        live_streams: self.live_streams,
+                        thinking_since: self.thinking_since.take(),
+                        turn_started: self.turn_started.take(),
+                        streamed_chars: self.streamed_chars,
+                        events: Vec::new(),
+                    },
+                );
+            }
         }
         self.show_details = session_id
             .as_ref()
@@ -1852,6 +1886,11 @@ impl App {
             .copied()
             .unwrap_or(false);
         self.session_id.clone_from(&session_id);
+        self.live_streams = 0;
+        self.thinking_since = None;
+        self.turn_started = None;
+        self.streamed_chars = 0;
+        self.status = Status::Idle;
         self.transcript.clear();
         self.viewport_anchor = None;
         self.restore_anchor = false;
@@ -1863,11 +1902,34 @@ impl App {
         self.last_error = None;
         self.refetch_in_flight = false;
         let session_id = session_id?;
-        self.push_block(Block::Note("loading".to_owned()));
+        if let Some(turn) = self.suspended_turns.remove(&session_id) {
+            self.transcript = turn.transcript;
+            self.live_streams = turn.live_streams;
+            self.thinking_since = turn.thinking_since;
+            self.turn_started = turn.turn_started;
+            self.streamed_chars = turn.streamed_chars;
+            self.status = Status::Streaming;
+            for event in turn.events {
+                self.on_net(event);
+            }
+            for entry in &mut self.transcript {
+                set_details(&mut entry.block, self.show_details);
+            }
+            if self.status == Status::Streaming {
+                return None;
+            }
+        } else {
+            self.push_block(Block::Note("loading".to_owned()));
+        }
+        self.refetch_in_flight = true;
         Some(Command::History { session_id })
     }
 
     fn submit(&mut self) -> Option<Command> {
+        if self.refetch_in_flight {
+            self.yank_note = Some("Wait for history to load".to_owned());
+            return None;
+        }
         if self.pending_model.is_some() {
             self.last_error = Some("Wait for the model switch to finish".to_owned());
             return None;
@@ -1957,6 +2019,32 @@ impl App {
     }
 
     pub fn on_net(&mut self, event: NetEvent) -> Option<Command> {
+        let event = if let NetEvent::Turn {
+            session_id,
+            acknowledged,
+            event,
+        } = event
+        {
+            let event = match event {
+                TurnEvent::Failed { code, msg } if !acknowledged => {
+                    NetEvent::RequestFailed { code, msg }
+                }
+                event => crate::net::map_turn_event(event),
+            };
+            if let Some(turn) = session_id
+                .as_ref()
+                .and_then(|id| self.suspended_turns.get_mut(id))
+            {
+                turn.events.push(event);
+                return None;
+            }
+            if session_id != self.session_id && self.session_id.is_some() {
+                return None;
+            }
+            event
+        } else {
+            event
+        };
         // any live event proves the socket is back; only another disconnect says otherwise
         if self.status == Status::Disconnected
             && !matches!(
@@ -1969,6 +2057,7 @@ impl App {
             self.status = Status::Idle;
         }
         match event {
+            NetEvent::Turn { .. } => unreachable!(),
             NetEvent::SessionStatus(status) => {
                 self.session_status
                     .insert(status.session_id.clone(), status);
@@ -2002,7 +2091,9 @@ impl App {
                 fork_point,
                 branches,
             } => {
-                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                if self.session_id.as_deref() == Some(session_id.as_str())
+                    && self.status != Status::Streaming
+                {
                     let mut rebuilt =
                         history_blocks(entries, &parent_session, fork_point, &branches);
                     for entry in &mut rebuilt {
@@ -2190,6 +2281,13 @@ impl App {
                 self.turn_over();
                 None
             }
+            NetEvent::RequestFailed { code, msg } => {
+                self.refetch_in_flight = false;
+                self.last_error = Some(code.clone());
+                self.push_block(Block::Fault { code, msg });
+                self.turn_over();
+                None
+            }
             NetEvent::ReviewItems(items) => {
                 if let Some(review) = self.review_mut() {
                     if !review.all {
@@ -2255,7 +2353,7 @@ impl App {
                 }
                 None
             }
-            NetEvent::JobItems(items) => {
+            NetEvent::JobItems(mut items) => {
                 for job in &items {
                     self.record_session_meta(
                         &job.session_id,
@@ -2265,8 +2363,19 @@ impl App {
                     );
                 }
                 if let Some(jobs) = self.jobs_mut() {
+                    let selected = jobs
+                        .items
+                        .get(jobs.selected)
+                        .map(|job| job.session_id.clone());
+                    for job in &jobs.items {
+                        if !items.iter().any(|item| item.session_id == job.session_id) {
+                            items.push(job.clone());
+                        }
+                    }
                     jobs.items = items;
-                    jobs.selected = 0;
+                    jobs.selected = selected
+                        .and_then(|id| jobs.items.iter().position(|job| job.session_id == id))
+                        .unwrap_or(0);
                     jobs.loaded = true;
                 }
                 None
@@ -2297,6 +2406,11 @@ impl App {
                         .find(|item| item.session_id == job.session_id)
                     {
                         *row = job;
+                    } else {
+                        jobs.items.insert(0, job);
+                        if jobs.items.len() > 1 {
+                            jobs.selected += 1;
+                        }
                     }
                 }
                 None
@@ -2351,13 +2465,17 @@ impl App {
                     self.pending_attachments.append(&mut attachments);
                 }
                 self.turn_started = None;
-                self.live_streams = 0;
+                self.refetch_in_flight = false;
                 self.last_error = Some("disconnected".to_owned());
                 self.push_block(Block::Fault {
                     code: "disconnected".to_owned(),
                     msg: reason,
                 });
-                self.status = Status::Disconnected;
+                self.status = if self.live_streams > 0 {
+                    Status::Streaming
+                } else {
+                    Status::Disconnected
+                };
                 None
             }
         }
@@ -4671,6 +4789,103 @@ mod tests {
             "the second push replaces, not appends"
         );
         assert_eq!(app.strip_job().map(|j| j.spent_tokens), Some(99));
+    }
+
+    #[test]
+    fn a_live_parent_can_open_a_new_job_and_return_without_mixing_streams() {
+        use arc_proto::v1::job_info::State;
+
+        let turn = |event| NetEvent::Turn {
+            session_id: Some("parent".into()),
+            acknowledged: true,
+            event,
+        };
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.on_net(turn(TurnEvent::Accepted {
+            session_id: "parent".into(),
+        }));
+        assert_eq!(app.status, Status::Streaming);
+        assert_eq!(app.open_jobs(), Command::ListJobs);
+        let new_job = job_of("child", "parent", State::Running);
+        app.on_net(NetEvent::JobChanged(new_job.clone()));
+        app.on_net(NetEvent::JobItems(vec![]));
+        assert_eq!(
+            app.jobs().expect("pane").items.as_slice(),
+            std::slice::from_ref(&new_job)
+        );
+
+        assert_eq!(
+            app.on_jobs_key(KeyCode::Enter),
+            Some(Command::History {
+                session_id: "child".into()
+            })
+        );
+        assert_eq!(app.status, Status::Idle);
+        app.on_net(NetEvent::RequestFailed {
+            code: "history_failed".into(),
+            msg: "try again".into(),
+        });
+        assert_eq!(
+            app.on_net(NetEvent::SessionAppended {
+                session_id: "child".into()
+            }),
+            Some(Command::History {
+                session_id: "child".into()
+            })
+        );
+        app.on_net(NetEvent::History {
+            session_id: "child".into(),
+            entries: vec![],
+            parent_session: "parent".into(),
+            fork_point: 0,
+            branches: vec![],
+        });
+        app.on_net(turn(TurnEvent::Delta("parent only".into())));
+        assert!(
+            !app.block_contents().iter().any(
+                |block| matches!(block, Block::Arc { text, .. } if text.contains("parent only"))
+            )
+        );
+        assert_eq!(app.back_session(), None);
+        assert_eq!(app.session_id.as_deref(), Some("parent"));
+        assert_eq!(app.status, Status::Streaming);
+        app.on_net(turn(TurnEvent::Delta(", still running".into())));
+        app.on_net(NetEvent::History {
+            session_id: "parent".into(),
+            entries: vec![prose_entry_at(
+                1,
+                Role::Assistant as i32,
+                "parent only",
+                false,
+            )],
+            parent_session: String::new(),
+            fork_point: 0,
+            branches: vec![],
+        });
+        assert_eq!(
+            app.block_contents(),
+            vec![Block::Arc {
+                text: "parent only, still running".into(),
+                partial: false
+            }]
+        );
+        app.back_session();
+        app.on_net(turn(TurnEvent::End {
+            input_tokens: 0,
+            output_tokens: 0,
+            partial: false,
+            step_capped: false,
+            grounding_json: String::new(),
+            queued: false,
+        }));
+        assert_eq!(
+            app.back_session(),
+            Some(Command::History {
+                session_id: "parent".into()
+            })
+        );
+        assert_eq!(app.status, Status::Idle);
     }
 
     #[test]

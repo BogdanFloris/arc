@@ -68,7 +68,7 @@ pub async fn run(
                 return;
             };
             client = match connect(&url, &events).await {
-                Some(fresh) => handle(fresh, command, &events).await,
+                Some(fresh) => handle_or_send(fresh, command, &url, &events).await,
                 None => None,
             };
             continue;
@@ -76,7 +76,7 @@ pub async fn run(
 
         client = tokio::select! {
             command = commands.recv() => match command {
-                Some(command) => handle(connected, command, &events).await,
+                Some(command) => handle_or_send(connected, command, &url, &events).await,
                 None => return,
             },
             result = connected.next_notification() => match result {
@@ -92,6 +92,48 @@ pub async fn run(
                 }
             },
         };
+    }
+}
+
+async fn handle_or_send(
+    client: Client,
+    command: Command,
+    url: &str,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Option<Client> {
+    if let Command::Send {
+        session_id,
+        content,
+        attachments,
+    } = command
+    {
+        let url = url.to_owned();
+        let events = events.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut client = Client::connect(&url).await?;
+                send(
+                    &mut client,
+                    session_id.as_deref(),
+                    &content,
+                    attachments,
+                    &events,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = result {
+                let event = turn_failure(error);
+                let _ = events.send(NetEvent::Turn {
+                    session_id,
+                    acknowledged: false,
+                    event,
+                });
+            }
+        });
+        Some(client)
+    } else {
+        handle(client, command, events).await
     }
 }
 
@@ -156,20 +198,35 @@ pub async fn run_control(
 ) {
     let mut client: Option<Client> = None;
     while let Some(command) = commands.recv().await {
+        let scope = match &command {
+            Command::SendLive { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        };
         let mut connected = match client.take() {
             Some(connected) => connected,
             None => match Client::connect(&url).await {
                 Ok(connected) => connected,
                 Err(error) => {
-                    let _ = events.send(NetEvent::Disconnected {
+                    let event = NetEvent::Disconnected {
                         reason: error.to_string(),
+                    };
+                    let _ = events.send(if let Some(session_id) = scope {
+                        NetEvent::Turn {
+                            session_id: Some(session_id),
+                            acknowledged: false,
+                            event: turn_failure(error),
+                        }
+                    } else {
+                        event
                     });
                     continue;
                 }
             },
         };
         let result = match command {
-            Command::CancelTurn { session_id } => connected.cancel_turn(&session_id).await,
+            Command::CancelTurn { session_id } => {
+                connected.cancel_turn(&session_id).await.map(|()| true)
+            }
             Command::SendLive {
                 session_id,
                 content,
@@ -190,14 +247,32 @@ pub async fn run_control(
             }
         };
         match result {
-            Ok(()) => client = Some(connected),
+            Ok(true) => client = Some(connected),
+            Ok(false) => client = None,
             Err(Error::Server { code, msg }) => {
-                let _ = events.send(NetEvent::Failed { code, msg });
+                let _ = events.send(if let Some(session_id) = scope {
+                    NetEvent::Turn {
+                        session_id: Some(session_id),
+                        acknowledged: false,
+                        event: TurnEvent::Failed { code, msg },
+                    }
+                } else {
+                    NetEvent::RequestFailed { code, msg }
+                });
                 client = Some(connected);
             }
             Err(error) => {
-                let _ = events.send(NetEvent::Disconnected {
+                let event = NetEvent::Disconnected {
                     reason: error.to_string(),
+                };
+                let _ = events.send(if let Some(session_id) = scope {
+                    NetEvent::Turn {
+                        session_id: Some(session_id),
+                        acknowledged: false,
+                        event: turn_failure(error),
+                    }
+                } else {
+                    event
                 });
             }
         }
@@ -263,26 +338,12 @@ async fn handle(
     command: Command,
     events: &mpsc::UnboundedSender<NetEvent>,
 ) -> Option<Client> {
-    let sending = matches!(command, Command::Send { .. });
     let result = match command {
         Command::List => client
             .list_sessions()
             .await
             .map(|sessions| Some(NetEvent::Sessions(sessions))),
         Command::History { session_id } => history(&mut client, &session_id).await.map(Some),
-        Command::Send {
-            session_id,
-            content,
-            attachments,
-        } => send(
-            &mut client,
-            session_id.as_deref(),
-            &content,
-            attachments,
-            events,
-        )
-        .await
-        .map(|()| None),
         Command::ReviewList { since_micros } => {
             review_list(&mut client, since_micros).await.map(Some)
         }
@@ -340,7 +401,10 @@ async fn handle(
             .map(|()| Some(NetEvent::Compacted { session_id })),
         // main.rs writes the OSC 52 sequence itself; this never reaches the
         // socket, and CancelTurn/SendLive go to run_control's own connection
-        Command::CancelTurn { .. } | Command::SendLive { .. } | Command::Yank(_) => Ok(None),
+        Command::Send { .. }
+        | Command::CancelTurn { .. }
+        | Command::SendLive { .. }
+        | Command::Yank(_) => Ok(None),
     };
     match result {
         Ok(event) => {
@@ -349,8 +413,8 @@ async fn handle(
             }
             Some(client)
         }
-        Err(Error::Server { code, msg }) if !sending => {
-            let _ = events.send(NetEvent::Failed { code, msg });
+        Err(Error::Server { code, msg }) => {
+            let _ = events.send(NetEvent::RequestFailed { code, msg });
             Some(client)
         }
         Err(error) => {
@@ -426,7 +490,7 @@ async fn send(
     content: &str,
     attachments: Vec<arc_proto::v1::ImageAttachment>,
     events: &mpsc::UnboundedSender<NetEvent>,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let tracked = attachments.clone();
     let turn = if attachments.is_empty() {
         client.send_message(session_id, content).await?
@@ -435,21 +499,32 @@ async fn send(
             .send_message_with_attachments(session_id, content, attachments)
             .await?
     };
-    drive_turn(turn, events, tracked).await
+    drive_turn(turn, events, tracked, session_id.map(str::to_owned)).await
 }
 
-/// Drives a turn to completion, mapping each event to the app. Shared by the
-/// main socket's `send()` and the control socket's `SendLive`, so a message
-/// landing in an already-live turn is handled the same way either arrives.
 async fn drive_turn(
     mut turn: Turn<'_>,
     events: &mpsc::UnboundedSender<NetEvent>,
     attachments: Vec<arc_proto::v1::ImageAttachment>,
-) -> Result<(), Error> {
+    mut session_id: Option<String>,
+) -> Result<bool, Error> {
     let mut accepted = false;
-    while let Some(event) = turn.next().await? {
+    loop {
+        let event = match turn.next().await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = events.send(NetEvent::Turn {
+                    session_id,
+                    acknowledged: accepted,
+                    event: turn_failure(error),
+                });
+                return Ok(false);
+            }
+        };
         match &event {
-            TurnEvent::Accepted { .. } => {
+            TurnEvent::Accepted { session_id: id } => {
+                session_id = Some(id.clone());
                 accepted = true;
                 if !attachments.is_empty() {
                     let _ = events.send(NetEvent::AttachmentsAccepted(attachments.clone()));
@@ -460,12 +535,26 @@ async fn drive_turn(
             }
             _ => {}
         }
-        let _ = events.send(map_turn_event(event));
+        let _ = events.send(NetEvent::Turn {
+            session_id: session_id.clone(),
+            acknowledged: accepted,
+            event,
+        });
     }
-    Ok(())
+    Ok(true)
 }
 
-fn map_turn_event(event: TurnEvent) -> NetEvent {
+fn turn_failure(error: Error) -> TurnEvent {
+    match error {
+        Error::Server { code, msg } => TurnEvent::Failed { code, msg },
+        error => TurnEvent::Failed {
+            code: "disconnected".to_owned(),
+            msg: error.to_string(),
+        },
+    }
+}
+
+pub(crate) fn map_turn_event(event: TurnEvent) -> NetEvent {
     match event {
         TurnEvent::Accepted { session_id } => NetEvent::Accepted { session_id },
         TurnEvent::Delta(text) => NetEvent::Delta(text),
@@ -556,10 +645,14 @@ mod tests {
     }
 
     async fn next_event(events: &mut mpsc::UnboundedReceiver<NetEvent>) -> NetEvent {
-        tokio::time::timeout(PATIENCE, events.recv())
+        let event = tokio::time::timeout(PATIENCE, events.recv())
             .await
             .expect("an event arrives within PATIENCE")
-            .expect("the event channel stays open")
+            .expect("the event channel stays open");
+        match event {
+            NetEvent::Turn { event, .. } => map_turn_event(event),
+            event => event,
+        }
     }
 
     #[tokio::test]
@@ -694,36 +787,40 @@ mod tests {
         let url = format!("ws://{}", listener.local_addr().expect("address"));
         let (release, wait) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("turn connection");
-            let mut turn = tokio_tungstenite::accept_async(stream)
+            let (stream, _) = listener.accept().await.expect("browsing connection");
+            let mut browsing = tokio_tungstenite::accept_async(stream)
                 .await
                 .expect("handshake");
             assert!(matches!(
-                expect_frame(&mut turn).await.msg,
+                expect_frame(&mut browsing).await.msg,
                 Some(client_frame::Msg::Subscribe(_))
             ));
-            let review = expect_frame(&mut turn).await;
+            let review = expect_frame(&mut browsing).await;
             assert!(matches!(
                 review.msg,
                 Some(client_frame::Msg::MemoryReviewList(_))
             ));
             reply(
-                &mut turn,
+                &mut browsing,
                 review.request_id,
                 server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
             )
             .await;
-            let projects = expect_frame(&mut turn).await;
+            let projects = expect_frame(&mut browsing).await;
             assert!(matches!(
                 projects.msg,
                 Some(client_frame::Msg::ListProjects(_))
             ));
             reply(
-                &mut turn,
+                &mut browsing,
                 projects.request_id,
                 server_frame::Msg::ProjectList(ProjectList { projects: vec![] }),
             )
             .await;
+            let (stream, _) = listener.accept().await.expect("turn connection");
+            let mut turn = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
             let request = expect_frame(&mut turn).await;
             assert!(matches!(
                 request.msg,
@@ -845,6 +942,174 @@ mod tests {
         drop(metadata_commands);
         turn_task.await.expect("turn task");
         metadata_task.await.expect("metadata task");
+    }
+
+    #[tokio::test]
+    async fn jobs_and_history_remain_available_before_the_parent_stream_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}", listener.local_addr().expect("address"));
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let job = JobInfo {
+            session_id: "job".into(),
+            parent_session: "parent".into(),
+            ..Default::default()
+        };
+        let expected = job.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("browse");
+            let mut browse = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("handshake");
+            let subscription = expect_frame(&mut browse).await;
+            assert!(matches!(
+                subscription.msg,
+                Some(client_frame::Msg::Subscribe(_))
+            ));
+            let review = expect_frame(&mut browse).await;
+            reply(
+                &mut browse,
+                review.request_id,
+                server_frame::Msg::MemoryReviewItems(MemoryReviewItems { items: vec![] }),
+            )
+            .await;
+            let projects = expect_frame(&mut browse).await;
+            reply(
+                &mut browse,
+                projects.request_id,
+                server_frame::Msg::ProjectList(ProjectList { projects: vec![] }),
+            )
+            .await;
+
+            let (socket, _) = listener.accept().await.expect("turn");
+            let mut turn = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("handshake");
+            let send = expect_frame(&mut turn).await;
+            assert!(matches!(send.msg, Some(client_frame::Msg::SendMessage(_))));
+            reply(
+                &mut turn,
+                send.request_id,
+                server_frame::Msg::MessageAccepted(MessageAccepted {
+                    session_id: "parent".into(),
+                }),
+            )
+            .await;
+            reply(
+                &mut browse,
+                subscription.request_id,
+                server_frame::Msg::Notification(Notification {
+                    event: Some(notification::Event::JobChanged(job.clone())),
+                }),
+            )
+            .await;
+
+            let list = expect_frame(&mut browse).await;
+            assert!(matches!(list.msg, Some(client_frame::Msg::ListJobs(_))));
+            reply(
+                &mut browse,
+                list.request_id,
+                server_frame::Msg::JobList(JobList { jobs: vec![job] }),
+            )
+            .await;
+            let history = expect_frame(&mut browse).await;
+            assert!(
+                matches!(&history.msg, Some(client_frame::Msg::FetchHistory(request)) if request.session_id == "job")
+            );
+            reply(
+                &mut browse,
+                history.request_id,
+                server_frame::Msg::SessionHistory(arc_proto::v1::SessionHistory {
+                    session_id: "job".into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+            wait.await.expect("parent held open through history");
+            reply(
+                &mut turn,
+                send.request_id,
+                server_frame::Msg::Delta(Delta {
+                    session_id: "parent".into(),
+                    text: "parent continues".into(),
+                }),
+            )
+            .await;
+            reply(
+                &mut turn,
+                send.request_id,
+                server_frame::Msg::StreamEnd(StreamEnd {
+                    session_id: "parent".into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        });
+
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run(url, rx, tx));
+        commands
+            .send(Command::Send {
+                session_id: Some("parent".into()),
+                content: "dispatch".into(),
+                attachments: vec![],
+            })
+            .expect("send");
+        assert_eq!(next_event(&mut events).await, NetEvent::ReviewChanged(0));
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::ProjectsSeeded(vec![])
+        );
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, events.recv())
+                .await
+                .expect("accepted before timeout")
+                .expect("accepted"),
+            NetEvent::Turn {
+                session_id: Some("parent".into()),
+                acknowledged: true,
+                event: TurnEvent::Accepted {
+                    session_id: "parent".into()
+                },
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::JobChanged(expected.clone())
+        );
+        commands.send(Command::ListJobs).expect("jobs");
+        assert_eq!(
+            next_event(&mut events).await,
+            NetEvent::JobItems(vec![expected])
+        );
+        commands
+            .send(Command::History {
+                session_id: "job".into(),
+            })
+            .expect("history");
+        assert!(
+            matches!(next_event(&mut events).await, NetEvent::History { session_id, .. } if session_id == "job")
+        );
+        release.send(()).expect("release");
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, events.recv())
+                .await
+                .expect("delta before timeout")
+                .expect("delta"),
+            NetEvent::Turn {
+                session_id: Some("parent".into()),
+                acknowledged: true,
+                event: TurnEvent::Delta("parent continues".into()),
+            }
+        );
+        assert!(matches!(
+            next_event(&mut events).await,
+            NetEvent::End { .. }
+        ));
+        drop(commands);
+        task.await.expect("net task");
+        server.await.expect("server");
     }
 
     // a daemon restart looks like: the same address answers, but a fresh
@@ -1032,7 +1297,7 @@ mod tests {
             .expect("control task alive");
         assert_eq!(
             next_event(&mut events).await,
-            NetEvent::Failed {
+            NetEvent::RequestFailed {
                 code: "no_turn".to_owned(),
                 msg: "no turn is running on session s-idle".to_owned(),
             }

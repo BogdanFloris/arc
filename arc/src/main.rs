@@ -148,6 +148,7 @@ async fn run(
             event = events.recv() => match event {
                 Some(event) => {
                     if matches!(&event, NetEvent::End { .. } | NetEvent::Compacted { .. })
+                        || matches!(&event, NetEvent::Turn { session_id, event: arc_core::client::TurnEvent::End { .. }, .. } if session_id == &app.session_id)
                         || matches!(&event, NetEvent::SessionAppended { session_id } if app.session_id.as_ref() == Some(session_id))
                     {
                         let _ = status_session.send(app.session_id.clone());
@@ -205,7 +206,11 @@ fn needs_session_metadata(app: &App, event: &NetEvent) -> bool {
     if matches!(event, NetEvent::SessionAppended { .. }) {
         return true;
     }
-    let (NetEvent::Accepted { session_id }
+    let (NetEvent::Turn {
+        event: arc_core::client::TurnEvent::Accepted { session_id },
+        ..
+    }
+    | NetEvent::Accepted { session_id }
     | NetEvent::SessionCreated { session_id }
     | NetEvent::SessionForked { session_id }) = event
     else {
