@@ -147,6 +147,8 @@ Compaction changes the provider transcript, never history.
 
 Each compaction inherently pays one prompt-cache miss.
 
+Thinking-effort changes are session events and part of the provider transcript policy. Replay applies updates at their original positions in the active transcript. After ARC's summary replacement, replay the active prefix and add a fresh update after the summary to establish the effective effort; do not claim this is provider-side compaction. OpenAI documents that `configuration_update` cannot be combined with automatic compaction/truncation or standalone `/responses/compact`; its `compaction_trigger` flow requires a fresh update afterward. ARC does not use those mechanisms. Preserve this distinction and verify that update replay works across ARC compaction before implementation. Compaction still pays one prompt-cache miss.
+
 ### 4.5 Picture attachments
 
 Pictures are durable message content, not file references. `MessageAppended` stores media type, display name, and bytes. Projection, forks, and provider transcripts carry them until compaction covers the message; summaries carry no stale attachment reference.
@@ -227,10 +229,14 @@ Routing is static configuration, not a difficulty classifier. Requests and spans
 - `[models]` presets and role `choices` define allowed models. First choice is default until `RoleModelSelected` records another; removed defaults fall back to the first configured choice.
 - Defaults affect new sessions and forks, never open sessions. Sessions record role, preset, provider, and model. Missing presets/credentials or pin mismatches fail explicitly, without provider fallback.
 - Forks keep role but take an explicitly requested preset or the current default, paying one cache miss.
+- A session snapshots its configured preset's initial thinking effort at creation. Its effective effort is the latest session thinking override, if any, otherwise that snapshot. Legacy sessions without recorded effort use the provider's established legacy behavior; do not guess a compatibility mapping.
+- The per-session thinking picker offers only levels supported by the pinned model. Unsupported levels are disabled or hidden; never silently map a selected level to another level or to off. Changing effort appends a session event and affects the next user turn only; it cannot alter an active turn. It never changes the model. An explicit model-menu choice resets effort to that preset, even when the model is unchanged. A same-model fork without an explicit choice inherits the effective effort at its fork point; a fork under a different model uses its selected preset.
 - New direct sessions use `assistant`; dispatch uses `executor`. Historical `code` events still decode, but those sessions cannot be opened or forked; the TUI shows an error in the conversation view. Their role number is reserved, not reused. Historical interactive executor sessions remain readable and resumable under their recorded pins.
 - Legacy sessions without presets resolve by provider/model only when unambiguous. Sessions predating roles remain unpinned.
 
 Cache reads dominate long sessions; model swaps would repay the prefix. Change models through a new session or fork. Add fallback policy only when outage/spend evidence requires it.
+
+Thinking-level cache behavior is provider-specific and not guaranteed by this design. OpenAI documents `configuration_update` for the GPT-6 family in standard single-agent requests: preserve the original request-level effort and replay updates in their original positions, without adjacent updates. `response.reasoning.effort` reports the request-level value, not an updated value. ARC's Codex endpoint experiment accepted updates in two calls, but both reported `cached_tokens=0`; cache reuse remains unproven. Other providers may use top-level effort changes with explicit cache costs and limitations. Do not claim cache preservation without provider evidence. References: [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning), [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
 ### 6.2 Transport and credentials
 
@@ -252,12 +258,16 @@ Send with empty session ID to create a session. Clients stream text/tool events 
 
 **TUI**
 
+- The TUI keeps browsing and pushed notifications responsive during a live turn. Turn streams use their own connection and carry session identity. Switching views retains an active stream's transcript in memory and keeps updating it; returning restores that view without merging live deltas with history. Sessions without a local stream load durable history.
 - Empty conversations have a masthead; work has a compact project/title/recorded-model header. Herdr sends the title as pane metadata and omits only that title from ARC's header.
-- The session model menu selects presets for creation or forks under them. Role-default selection is separate and never relabels an open session.
-- The session picker scopes to the current project when one is known; `a` shows all sessions. There is no chat/code switch or Tab door.
+- The session model menu selects presets for creation or forks under them. Role-default selection is separate and never relabels an open session. Selecting a new model resets that session's thinking effort to the selected preset.
+- Pressing Tab in a conversation opens its per-session thinking picker. It lists only levels supported by the pinned model, shows the current effective level, and explains that a change applies on the next user turn. Before the first message, it uses the selected assistant preset; choosing a level creates the session and records the override before any send, without losing the draft. The picker is unavailable during a live turn. It does not change models.
+- The session picker scopes to the current project when one is known; `a` shows all sessions. There is no chat/code switch; Tab is not a chat/code door.
 - Ctrl-o toggles all thoughts/tools, including new blocks, in Insert/Normal/Visual modes. Job handbacks stay collapsed. No individual folding, inspector, or footer flag.
 - At bottom, toggling follows bottom. Scrolled up, preserve the top visible block/offset; collapsing details anchors to their summary. Remember details per session until restart.
 - Expanded tools separate readable inputs, retained output, and completion status. No second display truncation.
+
+Acceptance: verify append-and-replay of effort overrides, legacy fallback, initial preset snapshot, and same-model fork inheritance at the fork point. Verify a different-model fork and model-menu change use the selected preset; unsupported levels never map silently; idle changes leave the current model and turn unchanged and affect only the next turn. Verify transcript replay preserves update order across compaction and forks. Check provider cache behavior as an observation, not a guaranteed outcome.
 
 **Titles.** Background titling follows completed exchanges independently of memory's idle gate. Use bounded opening/recent conversation, excluding system handbacks, to name the concrete task. Retain saved titles; retry greetings after conversation advances. Deduplicate unchanged input, reject stale results, and notify clients on `SessionTitled`. Never change pins or memory eligibility.
 
