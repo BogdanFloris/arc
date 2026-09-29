@@ -3,6 +3,7 @@ pub mod continue_job;
 pub mod dispatch;
 pub mod memory;
 pub mod sessions;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use continue_job::ContinueJob;
 use dispatch::Dispatch;
 use memory::{MemoryRead, MemorySearch, MemorySupersede, MemoryWrite};
 use sessions::{SessionRead, SessionsSearch};
+use web::{WebFetch, WebSearch};
 
 use crate::archive::Archive;
 use crate::tool::Tool;
@@ -36,6 +38,8 @@ pub fn tools(
         Box::new(MemoryWrite::new(namespaces)),
         Box::new(SessionRead::new(Arc::clone(&archive))),
         Box::new(SessionsSearch::new(archive)),
+        Box::new(WebFetch),
+        Box::new(WebSearch),
     ]
 }
 
@@ -46,7 +50,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn the_builtin_source_is_the_ten_tools_the_daemon_had() {
+    fn the_builtin_source_contains_memory_archive_and_web_tools() {
         let dir = TempDir::new().expect("temp dir");
         let tools = super::tools(
             archive_at(&dir),
@@ -67,14 +71,17 @@ mod tests {
                 "memory_write",
                 "session_read",
                 "sessions_search",
+                "web_fetch",
+                "web_search",
             ]
         );
         let sources: Vec<ToolSource> = tools.iter().map(|tool| tool.source()).collect();
         assert_eq!(&sources[..3], [ToolSource::Jobs; 3]);
         assert!(
-            sources[3..]
+            sources[3..9]
                 .iter()
                 .all(|source| *source == ToolSource::Builtin)
         );
+        assert_eq!(&sources[9..], [ToolSource::SharedWeb; 2]);
     }
 }

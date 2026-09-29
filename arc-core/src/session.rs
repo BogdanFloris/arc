@@ -1201,9 +1201,11 @@ impl Engine {
         if source != Some(Source::Model as i32) {
             sources.push(ToolSource::Jobs);
         }
-        if role == SessionRole::Chat {
-            sources.push(ToolSource::Web);
-        }
+        sources.extend(web_tool_sources(
+            role,
+            runner.provider.name(),
+            runner.provider.endpoint(),
+        ));
         Ok((sources, command_prefix))
     }
 
@@ -2917,6 +2919,27 @@ struct ReadArgsId {
     id: String,
 }
 
+fn web_tool_sources(role: SessionRole, provider: &str, endpoint: &str) -> Vec<ToolSource> {
+    if role == SessionRole::Archivist {
+        return Vec::new();
+    }
+    if provider == "codex" || provider == "gemini" {
+        return if role == SessionRole::Chat {
+            vec![ToolSource::Web]
+        } else {
+            Vec::new()
+        };
+    }
+    let go_endpoint = reqwest::Url::parse(endpoint).is_ok_and(|url| {
+        url.host_str() == Some("opencode.ai") && url.path().trim_end_matches('/') == "/zen/go"
+    });
+    if go_endpoint {
+        Vec::from([ToolSource::SharedWeb])
+    } else {
+        Vec::new()
+    }
+}
+
 impl MemoryCounters {
     fn observe_call(&mut self, name: &str, arguments_json: &str, result_content: &str) {
         match name {
@@ -3004,7 +3027,7 @@ mod tests {
 
     use super::{
         ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, ProjectSpec, Runner,
-        max_tool_steps,
+        max_tool_steps, web_tool_sources,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -5139,7 +5162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_chat_session_asks_the_provider_for_web_grounding() {
+    async fn a_chat_session_does_not_enable_native_search_on_an_unhosted_provider() {
         let dir = TempDir::new().expect("temp dir");
         let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
         let (engine, run) = engine_with_role(&provider, &dir, SessionRole::Chat);
@@ -5150,7 +5173,7 @@ mod tests {
             .await
             .expect("send");
 
-        assert!(provider.requests()[0].web, "chat is a web capability");
+        assert!(!provider.requests()[0].web);
     }
 
     #[tokio::test]
@@ -5161,6 +5184,9 @@ mod tests {
 
         for role in [SessionRole::Executor, SessionRole::Archivist] {
             let run = runner_with_role(&provider, role);
+            let sources = engine.tool_setup("", true, &run).unwrap().0;
+            assert!(!sources.contains(&ToolSource::SharedWeb));
+            assert!(!sources.contains(&ToolSource::Web));
             let (tx, _rx) = channel();
             engine
                 .send_message(&run, None, "hi", tx)
@@ -5176,6 +5202,49 @@ mod tests {
                 .iter()
                 .map(|r| r.web)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn only_opencode_go_gets_shared_web_tools() {
+        use crate::tool::builtin::web::{WebFetch, WebSearch};
+        let go = "https://opencode.ai/zen/go";
+        let mut registry = Registry::new(1024);
+        registry.register(Box::new(WebSearch));
+        registry.register(Box::new(WebFetch));
+        let names = |sources: Vec<ToolSource>| {
+            registry
+                .definitions(&sources)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            web_tool_sources(SessionRole::Executor, "openai-compat", go),
+            [ToolSource::SharedWeb]
+        );
+        assert_eq!(
+            names(web_tool_sources(SessionRole::Executor, "openai-compat", go)),
+            ["web_fetch", "web_search"]
+        );
+        assert_eq!(
+            web_tool_sources(SessionRole::Chat, "codex", ""),
+            [ToolSource::Web]
+        );
+        assert!(names(web_tool_sources(SessionRole::Chat, "codex", "")).is_empty());
+        assert_eq!(
+            web_tool_sources(SessionRole::Chat, "gemini", ""),
+            [ToolSource::Web]
+        );
+        assert!(names(web_tool_sources(SessionRole::Chat, "gemini", "")).is_empty());
+        for provider in ["codex", "gemini"] {
+            assert!(web_tool_sources(SessionRole::Executor, provider, "").is_empty());
+            assert!(web_tool_sources(SessionRole::Archivist, provider, "").is_empty());
+        }
+        assert!(web_tool_sources(SessionRole::Archivist, "openai-compat", go).is_empty());
+        assert!(
+            web_tool_sources(SessionRole::Chat, "openai-compat", "https://example.com/v1")
+                .is_empty()
         );
     }
 

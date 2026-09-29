@@ -114,7 +114,7 @@ Tool sources determine both advertised and executable tools:
 
 - **Builtin:** memory and archive (§5.5).
 - **Jobs:** dispatch, continue, cancel; only in user-opened sessions.
-- **Web:** provider-hosted search/grounding where supported, otherwise empty.
+- **Web:** shared `web_search` and `web_fetch` tools for non-archivist OpenCode Go sessions. Codex and Gemini retain their provider-hosted search/grounding paths.
 - **Workspace:** `read`, `bash`, and a pinned editing interface for every session.
 
 MCP/device sources wait for the phase that needs them.
@@ -129,7 +129,7 @@ Codex defaults to `apply_patch`; other providers to `edit` and `write`. Presets 
 
 Prefer workspace CLIs over new builtins. Search uses Bash; preserve output caps and a usable scrubbed `PATH`. `read` supplies pagination and the freshness anchor.
 
-Web is provider-native. Switching providers can lose that capability. Clients must satisfy provider attribution requirements; an audio-only client must resolve that before using grounded answers.
+Shared web tools use provider-independent HTTP services and bounded plain-text results. Provider-hosted search/grounding remains available where supported. Fetching constrains redirects, response size, and supported schemes. Clients must satisfy provider attribution requirements; an audio-only client must resolve that before using grounded answers.
 
 ### 4.4 Compaction
 

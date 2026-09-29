@@ -92,6 +92,7 @@ pub enum ToolSource {
     Builtin,
     Jobs,
     Web,
+    SharedWeb,
     Workspace,
     Patch,
     Replacement,
@@ -129,10 +130,11 @@ impl Editing {
 }
 
 impl ToolSource {
-    pub const ALL: [ToolSource; 6] = [
+    pub const ALL: [ToolSource; 7] = [
         ToolSource::Builtin,
         ToolSource::Jobs,
         ToolSource::Web,
+        ToolSource::SharedWeb,
         ToolSource::Workspace,
         ToolSource::Patch,
         ToolSource::Replacement,

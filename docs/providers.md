@@ -67,6 +67,8 @@ context_window = 272000
 
 **OpenAI-compatible / OpenCode Go.** Configure the base endpoint without `/v1`; arcd appends `/v1/chat/completions`. Go uses bare model IDs. From the 2026-09-06 integration, requests carry ARC's session ID as `x-opencode-session` and identify as `arc/<version>`. Turns, compaction, titles, and extraction keep the source session ID stable across calls/restarts; probes supply their own conversation ID. DeepSeek's seed range is `[0, 2^63)`, so serialization masks the unsigned seed's top bit.
 
+**Shared web fallback.** Non-archivist OpenCode Go sessions get `web_search` and `web_fetch`, backed by Exa's MCP endpoint with keyless, rate-limited access. Codex and Gemini keep their existing provider-native search paths without shared tools. Requests send ARC's `User-Agent`, a search `objective` alongside `query`, and `urls` for fetch. See [Exa MCP](https://exa.ai/docs/get-started/exa-mcp).
+
 Go spillover can use prepaid Zen credit; keep auto-reload off to preserve a hard spending ceiling. Recheck caps and retention before returning to it as the default. The earlier configuration excluded Muse Spark for training on traffic and Grok/Luna for 30-day retention; that was a dated plan policy, not a current provider-wide claim.
 
 **Gemini.** Direct API key. The August measurements below informed the old chat choice; do not assume those capabilities or rates apply to another model.
