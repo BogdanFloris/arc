@@ -44,6 +44,7 @@ message AllowanceWindow {
   uint32 remaining_percent = 1;
   optional int64 resets_at = 2;
   optional uint64 window_seconds = 3;
+  string label = 4;
 }
 
 message SessionStatus {
@@ -58,6 +59,7 @@ message SessionStatus {
   string effective_thinking = 8;
   // Supported labels for the session's pinned model.
   repeated string supported_thinking = 9;
+  string allowance_source = 10;
 }
 
 // Appends SessionThinkingSelected. Answered with the updated SessionStatus.
