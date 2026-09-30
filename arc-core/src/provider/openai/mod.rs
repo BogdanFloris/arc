@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::provider::{
     CompletionRequest, CompletionStream, Error, Message, Provider, Thinking, ToolDefinition,
-    failure, stream as delta_stream,
+    failure, opencode_go, stream as delta_stream,
 };
 use arc_proto::v1::Role;
 
@@ -18,6 +18,7 @@ pub struct OpenAiCompat {
     endpoint: String,
     key: Option<String>,
     http: reqwest::Client,
+    allowance_cache: tokio::sync::Mutex<opencode_go::Cache>,
 }
 
 // key should not reache a log
@@ -43,6 +44,7 @@ impl OpenAiCompat {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_owned(),
             key,
+            allowance_cache: tokio::sync::Mutex::new(opencode_go::Cache::default()),
             // no pooling: a stale keep-alive kills the tool loop's second call
             http: reqwest::Client::builder()
                 .user_agent(concat!("arc/", env!("CARGO_PKG_VERSION")))
@@ -64,6 +66,18 @@ impl Provider for OpenAiCompat {
 
     fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    fn allowance(&self) -> BoxFuture<'_, Result<Option<crate::provider::AccountAllowance>, Error>> {
+        Box::pin(async move {
+            opencode_go::fetch(
+                &self.endpoint,
+                self.key.as_deref(),
+                &self.http,
+                &self.allowance_cache,
+            )
+            .await
+        })
     }
 
     #[tracing::instrument(

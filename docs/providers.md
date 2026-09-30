@@ -65,7 +65,7 @@ thinking       = "medium"
 context_window = 272000
 ```
 
-**OpenAI-compatible / OpenCode Go.** Configure the base endpoint without `/v1`; arcd appends `/v1/chat/completions`. Go uses bare model IDs. From the 2026-09-06 integration, requests carry ARC's session ID as `x-opencode-session` and identify as `arc/<version>`. Turns, compaction, titles, and extraction keep the source session ID stable across calls/restarts; probes supply their own conversation ID. DeepSeek's seed range is `[0, 2^63)`, so serialization masks the unsigned seed's top bit.
+**OpenAI-compatible / OpenCode Go.** Configure the base endpoint without `/v1`; arcd appends `/v1/chat/completions`. Go uses bare model IDs. From the 2026-09-06 integration, requests carry ARC's session ID as `x-opencode-session` and identify as `arc/<version>`. Turns, compaction, titles, and extraction keep the source session ID stable across calls/restarts; probes supply their own conversation ID. DeepSeek's seed range is `[0, 2^63)`, so serialization masks the unsigned seed's top bit. The exact `https://opencode.ai/zen/go` endpoint also fetches plan allowance from `/zen/go/v1/usage`; the rolling, weekly, and monthly windows appear in session status. Other OpenAI-compatible endpoints do not fetch account allowance. This is Go plan usage, not Zen prepaid balance.
 
 **Shared web fallback.** Non-archivist OpenCode Go sessions get `web_search` and `web_fetch`, backed by Exa's MCP endpoint with keyless, rate-limited access. Codex and Gemini keep their existing provider-native search paths without shared tools. Requests send ARC's `User-Agent`, a search `objective` alongside `query`, and `urls` for fetch. See [Exa MCP](https://exa.ai/docs/get-started/exa-mcp).
 

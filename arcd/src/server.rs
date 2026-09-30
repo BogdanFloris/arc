@@ -496,26 +496,33 @@ async fn session_status(
         status.context = Some(context);
         status.context_observed_at = observed_at;
     }
-    if status.codex {
-        if let Some(runner) = supervisor.status_runner(
-            SessionRole::try_from(session.role).unwrap_or_default(),
-            &session.provider,
-            &session.model,
-        ) {
-            if let Ok(Some(allowance)) = runner.provider.allowance().await {
-                status.allowance_observed_at = allowance.observed_at;
-                status.allowance_stale = allowance.stale;
-                status.allowance = allowance
-                    .primary
-                    .into_iter()
-                    .chain(allowance.secondary)
-                    .map(|window| arc_proto::v1::AllowanceWindow {
-                        remaining_percent: remaining_percent(window.remaining_percent),
-                        resets_at: window.resets_at_unix_seconds,
-                        window_seconds: window.window_seconds,
-                    })
-                    .collect();
-            }
+    if let Some(runner) = supervisor.status_runner(
+        SessionRole::try_from(session.role).unwrap_or_default(),
+        &session.provider,
+        &session.model,
+    ) {
+        if status.codex {
+            "Codex".clone_into(&mut status.allowance_source);
+        } else if session.provider == "openai_compat"
+            && arc_core::provider::opencode_go::is_endpoint(runner.provider.endpoint())
+        {
+            "OpenCode Go".clone_into(&mut status.allowance_source);
+        }
+        if let Ok(Some(allowance)) = runner.provider.allowance().await {
+            status.allowance_observed_at = allowance.observed_at;
+            status.allowance_stale = allowance.stale;
+            status.allowance = allowance
+                .primary
+                .into_iter()
+                .chain(allowance.secondary)
+                .chain(allowance.tertiary)
+                .map(|window| arc_proto::v1::AllowanceWindow {
+                    remaining_percent: remaining_percent(window.remaining_percent),
+                    resets_at: window.resets_at_unix_seconds,
+                    window_seconds: window.window_seconds,
+                    label: window.label.unwrap_or_default(),
+                })
+                .collect();
         }
     }
     Ok(status)

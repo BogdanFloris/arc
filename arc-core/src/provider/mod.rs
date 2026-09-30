@@ -1,6 +1,7 @@
 pub mod codex;
 pub mod gemini;
 pub mod openai;
+pub mod opencode_go;
 pub mod sidecar;
 pub mod sse;
 pub(crate) mod stream;
@@ -192,6 +193,7 @@ pub struct AccountAllowance {
     pub stale: bool,
     pub primary: Option<AllowanceWindow>,
     pub secondary: Option<AllowanceWindow>,
+    pub tertiary: Option<AllowanceWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +201,7 @@ pub struct AllowanceWindow {
     pub remaining_percent: f64,
     pub window_seconds: Option<u64>,
     pub resets_at_unix_seconds: Option<i64>,
+    pub label: Option<String>,
 }
 
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<CompletionDelta, Error>> + Send>>;

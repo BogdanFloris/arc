@@ -491,6 +491,9 @@ fn current_status(app: &App) -> Option<&arc_proto::v1::SessionStatus> {
 }
 
 fn allowance_label(window: &arc_proto::v1::AllowanceWindow) -> String {
+    if !window.label.is_empty() {
+        return window.label.clone();
+    }
     match window.window_seconds {
         Some(604_800) => "week".to_owned(),
         Some(seconds) if seconds >= 3600 && seconds % 3600 == 0 => format!("{}h", seconds / 3600),
@@ -540,7 +543,11 @@ fn status_line(app: &App, room: usize) -> Line<'static> {
                 .iter()
                 .any(|s| &s.id == id && s.provider == "codex")
         });
-    if codex {
+    let source = status
+        .map(|s| s.allowance_source.as_str())
+        .filter(|source| !source.is_empty())
+        .or_else(|| codex.then_some("Codex"));
+    if source.is_some() || status.is_some_and(|s| !s.allowance.is_empty()) {
         match status.filter(|s| !s.allowance.is_empty()) {
             Some(status) => {
                 let stale = allowance_stale(status);
@@ -562,7 +569,11 @@ fn status_line(app: &App, room: usize) -> Line<'static> {
                     ));
                 }
             }
-            None => spans.push(Span::styled(" · Codex usage unknown", theme::DIM)),
+            None if source.is_some() => spans.push(Span::styled(
+                format!(" · {} usage unknown", source.unwrap_or_default()),
+                theme::DIM,
+            )),
+            None => {}
         }
     }
     let mut remaining = room;
@@ -600,7 +611,7 @@ fn draw_status(frame: &mut Frame, full: Rect, app: &App) {
                 "Context: no measurement since creation or compaction",
             )),
         }
-        if status.codex {
+        if status.codex || !status.allowance_source.is_empty() || !status.allowance.is_empty() {
             lines.push(Line::default());
             if status.allowance_observed_at > 0 {
                 let age = chrono::Utc::now()
@@ -608,10 +619,10 @@ fn draw_status(frame: &mut Frame, full: Rect, app: &App) {
                     .saturating_sub(status.allowance_observed_at)
                     .max(0);
                 lines.push(Line::from(format!(
-                    "Codex account allowance: observed {age}s ago"
+                    "Account allowance: observed {age}s ago"
                 )));
             } else {
-                lines.push(Line::from("Codex account allowance: unavailable"));
+                lines.push(Line::from("Account allowance: unavailable"));
             }
             for window in &status.allowance {
                 let reset = window
@@ -1925,11 +1936,13 @@ mod tests {
                         remaining_percent: 72,
                         resets_at: Some(1_900_000_000),
                         window_seconds: Some(18_000),
+                        label: String::new(),
                     },
                     arc_proto::v1::AllowanceWindow {
                         remaining_percent: 41,
                         resets_at: None,
                         window_seconds: Some(604_800),
+                        label: String::new(),
                     },
                 ],
                 ..Default::default()
@@ -1977,6 +1990,50 @@ mod tests {
             rendered_at(&mut app, 40, 12)[(2, 2)].fg,
             theme::ERROR.fg.unwrap()
         );
+    }
+
+    #[test]
+    fn opencode_go_status_shows_three_named_windows() {
+        let mut app = conversation();
+        let mut info = session("go", "Go allowance", "");
+        info.provider = "openai_compat".to_owned();
+        app.on_net(crate::app::NetEvent::Sessions(vec![info]));
+        app.session_id = Some("go".to_owned());
+        app.session_status.insert(
+            "go".to_owned(),
+            arc_proto::v1::SessionStatus {
+                session_id: "go".to_owned(),
+                allowance_observed_at: chrono::Utc::now().timestamp(),
+                allowance_source: "OpenCode Go".to_owned(),
+                allowance: ["rolling", "weekly", "monthly"]
+                    .into_iter()
+                    .map(|label| arc_proto::v1::AllowanceWindow {
+                        remaining_percent: 42,
+                        resets_at: Some(1_900_000_000),
+                        window_seconds: None,
+                        label: label.to_owned(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let text = plain_text(&rendered_at(&mut app, 100, 16));
+        assert!(
+            text.contains("rolling 42% left · weekly 42% left · monthly 42% left"),
+            "{text}"
+        );
+        println!("GO STATUS\n{text}");
+        app.mode = Mode::Cmd;
+        app.cmd = "status".to_owned();
+        app.on_key(key(KeyCode::Enter));
+        let text = plain_text(&rendered_at(&mut app, 100, 24));
+        assert!(text.contains("Account allowance: observed"), "{text}");
+        assert!(text.contains("monthly: 42% left · resets"), "{text}");
+        println!("GO STATUS DETAILS\n{text}");
+        app.session_status.get_mut("go").unwrap().allowance.clear();
+        let text = plain_text(&rendered_at(&mut app, 100, 24));
+        assert!(text.contains("OpenCode Go usage unknown"), "{text}");
+        assert!(text.contains("Account allowance: observed"), "{text}");
     }
 
     #[test]

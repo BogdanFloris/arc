@@ -84,6 +84,7 @@ impl Codex {
             stale: false,
             primary: limits.primary_window.and_then(Window::normalize),
             secondary: limits.secondary_window.and_then(Window::normalize),
+            tertiary: None,
         })
     }
 
@@ -143,6 +144,7 @@ impl Window {
                 .filter(|seconds| *seconds > 0)
                 .and_then(|seconds| u64::try_from(seconds).ok()),
             resets_at_unix_seconds: self.reset_at.filter(|seconds| *seconds > 0),
+            label: None,
         })
     }
 }
@@ -207,6 +209,7 @@ mod tests {
                 remaining_percent: 75.0,
                 window_seconds: Some(18000),
                 resets_at_unix_seconds: Some(1_900_000_000),
+                label: None,
             })
         );
         assert!(result.secondary.unwrap().remaining_percent.abs() < f64::EPSILON);
