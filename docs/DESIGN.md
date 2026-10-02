@@ -15,15 +15,22 @@ Priorities: durability, observability, speed, provider independence. v1 excludes
 
 ## 2. Repository layout
 
-| Crate | Owns |
+| Component | Owns |
 | --- | --- |
 | `arc-proto` | Serialized formats: `.proto` schemas and generated types in `arc.v1`. The trimmed upstream `perfetto.proto` keeps its package and field numbers and is never logged. |
 | `arc-core` | Logic: log, projections, providers, sessions, tools, memory, tracing. Testable without a daemon. |
 | `arcd` | Composition: log ownership, WebSocket, supervised turns, credentials, sidecar, background work. |
 | `arc` | TUI client. |
 | `arc-voice` | Phase 4 audio client. |
+| `arc-web` | Svelte/TypeScript desktop and mobile PWA. Static assets, browser-local drafts, and a binary protobuf client. |
 
-The mobile client lives in Cairn's repository as its first focused app. It uses ARC's protocol from `arc-proto`, not `arc-core` or the projection database. ARC remains independently operable.
+The web client lives in this repository as `arc-web`. It uses ARC's protocol from `arc-proto`, not `arc-core` or the projection database. The daemon and TUI remain independently operable. The broader app-suite and Writing plans are paused; no suite shell or document engine belongs in this move.
+
+The app is branded ARC (Autonomous Robotic Core). The approved mark is an orange square core between two opposing angular frame/gripper arms. Use the transparent mark alone in the desktop sidebar, without a wordmark; mobile conversations have no brand header. Installation icons put the same mark on white. Keep one canonical transparent SVG and add the installation background during PNG generation. Bogdan approved the deployed appearance; controlled real-phone acceptance remains incomplete.
+
+Keep the conversation UI's existing Gruvbox theme. Preserve the deployment origin, manifest identity, root scope, and `/arc` WebSocket route while renaming package, browser storage, and static release paths. Upgrade legacy browser state without resending input or discarding drafts; remove the old storage key only after the new state is saved.
+
+`arc-web/docs/DEVELOPMENT.md` records frontend commands, deployment, and acceptance limits. It owns no separate assistant state: arcd owns conversations, execution, jobs, and memory. Browser state is host-scoped, switching is explicit, and uncertain sends are never automatically retried. Safe Markdown, approved WebSocket origins, and restricted tailnet access remain required.
 
 ## 3. The event log
 
@@ -273,7 +280,7 @@ Acceptance: verify append-and-replay of effort overrides, legacy fallback, initi
 
 `arc` exercises the protocol first; local UDS remains a desired transport. `arc-voice` owns audio devices and wake/mute controls, not reasoning or durable state. Backend adapters live in arc-core, credentials in arcd. Phase 4 defines audio/control schemas; the text wire is not assumed to support full-duplex audio unchanged.
 
-**Mobile.** Cairn owns the mobile shell and touch-native ARC interface. Start with text conversations and jobs: connect to Erebor, browse/resume sessions, stream replies and tool activity, inspect job results, and recover after disconnection or app suspension. Show connection state; when Erebor is unreachable, ARC is unavailable. No second assistant or offline session store. Voice is not a prerequisite. Cairn's later Writing app owns local documents and editing state independently, with explicit review handoffs through ARC's protocol.
+**Web and mobile.** `arc-web` owns the desktop browser and touch-native PWA interface. Text conversations and jobs are implemented: browse/resume sessions, stream replies and tool activity, inspect job results, and recover after disconnection or app suspension. Show connection state; when the selected daemon is unreachable, ARC is unavailable. One host is active at a time; local interactions do not wait for the network. No second assistant, offline conversation store, replication, or automatic failover. Voice is not a prerequisite. Installed-iPhone keyboard, lifecycle, long-session performance, and app-update acceptance remain incomplete; desktop Chromium checks do not close them.
 
 ### 7.1 Replaceable voice backends
 
@@ -313,7 +320,7 @@ Design confirmation against the real actuator. UNKNOWN outcomes cannot be retrie
 
 ## 11. Phases
 
-Each phase must become a daily driver before the next starts. Cairn's text mobile client is an explicit exception: it can start alongside Phase 3.7 without waiting for voice.
+Each phase must become a daily driver before the next starts. ARC's text web/mobile client is an explicit exception: it can start alongside Phase 3.7 without waiting for voice.
 
 | Phase | Scope and exit |
 | --- | --- |
@@ -324,7 +331,7 @@ Each phase must become a daily driver before the next starts. Cairn's text mobil
 | 3.5 — Tree | Fork, rewind, navigation. Exit: branching used naturally. |
 | 3.6 — Quiet week | Done 2026-09-03. Relay failures motivated the direct door. |
 | **3.7 — Direct sessions** | **Current.** One runner, mid-turn messages, visible tools, event compaction, directory-selected project context, presence-gated memory. Exit: a week in unified sessions, real compaction without visible context loss. |
-| 4 — Voice + remote | §7.1 prototype/local fallback, Cairn phone access (text can start early), automated backup. Exit: phone session/job access and reconnect, voice correction/reconnect, restore drill, provider-pinned offline degradation. |
+| 4 — Voice + remote | §7.1 prototype/local fallback, ARC phone access (text can start early), automated backup. Exit: phone session/job access and reconnect, voice correction/reconnect, restore drill, provider-pinned offline degradation. |
 | 5 — Devices | First MCP actuator and safety policy, then arm. Room satellites are clients, not device tools. Embeddings only when FTS falls short. |
 
 ## 12. Open questions

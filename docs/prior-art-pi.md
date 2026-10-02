@@ -48,7 +48,7 @@ This guarantees duplicate suppression at submission, not exactly-once execution 
 
 **Verify:** Disconnect before and after acceptance, daemon restart, concurrent retries, payload conflicts, new-session retries, and queued messages.
 
-**Priority:** Before Cairn's reconnect path becomes a daily driver.
+**Priority:** Before ARC web's reconnect path becomes a daily driver.
 
 ## 3. Tool progress and interrupted output
 

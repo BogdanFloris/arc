@@ -1,6 +1,6 @@
 # ARC (Autonomous Robotic Core)
 
-A personal assistant built around an always-on Rust daemon, a TUI, branching conversations, durable memory, and replaceable providers. Development happens directly in a project-bound session; independent work runs as jobs.
+A personal assistant built around an always-on Rust daemon, terminal and web clients, branching conversations, durable memory, and replaceable providers. Development happens directly in a project-bound session; independent work runs as jobs.
 
 ![The arc TUI](docs/arc-tui.png)
 
@@ -13,13 +13,13 @@ One person's daily driver, built in the open. **Current phase: 3.7, the direct d
 
 ## Clients
 
-The TUI is the current daily driver. The planned mobile interface lives in Cairn, a separate personal app suite, with ARC as its first focused app. Cairn owns the mobile shell and touch interface; `arcd` continues to own sessions, models, tools, jobs, and memory.
+The TUI and `arc-web` use the same binary protobuf protocol. The Svelte/TypeScript web client runs in desktop browsers and as a phone PWA, with real conversations, streaming, jobs, safe Gruvbox Markdown, and local drafts. `arcd` owns sessions, models, tools, jobs, and memory.
 
-Start mobile with text conversations, job results, and reconnecting to Erebor through ARC's protocol. Voice is not a prerequisite. Cairn's later Writing app owns local documents independently and can explicitly send passages to ARC for review.
+See [web development](arc-web/docs/DEVELOPMENT.md) for setup, tailnet HTTPS deployment, and remaining acceptance checks. Installed-iPhone keyboard/lifecycle and long-session performance still need real-device testing. Voice is not a prerequisite.
 
 ## Build and run
 
-The Nix development shell supplies Rust, `protoc`, and build tools. Local inference additionally needs `llama-server` and a GGUF; hosted-only configuration starts no sidecar.
+The Nix development shell supplies Rust, `protoc`, Node 24, Buf, librsvg, and build tools. Local inference additionally needs `llama-server` and a GGUF; hosted-only configuration starts no sidecar.
 
 ```sh
 nix develop
@@ -34,6 +34,16 @@ Without `--config`, arcd prefers `~/.config/arc/arc.toml`, then `data/arc.toml`.
 Runtime state follows `data_dir`: checkout default `data/`, installed convention `~/.local/state/arc/`. `just install` builds release binaries, installs the user service, and restarts it. `just install-service` only installs the unit.
 
 Checks: `just test`, `just fmt`, `just lint`.
+
+For the web client, in the same shell:
+
+```sh
+cd arc-web
+npm ci
+npm run dev
+```
+
+From the repository root, `just web-build`, `just web-test`, `just web-test-browser`, `just web-proto`, and `just web-deploy` run frontend commands. Web deployment publishes static files only; it does not restart arcd.
 
 ## Traces
 

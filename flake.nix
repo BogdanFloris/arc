@@ -80,10 +80,14 @@
             pkgs.just
             pkgs.python3
             pkgs.ripgrep
+            pkgs.nodejs_24
+            pkgs.librsvg
+            pkgs.buf
           ]
           ++ pkgs.lib.optional (traceProcessorBinaries ? ${system}) traceProcessor;
 
         RUST_BACKTRACE = "1";
+        PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "/run/current-system/sw/bin/google-chrome-stable";
       };
     });
 }

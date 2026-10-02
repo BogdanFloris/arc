@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.direnv/
+test-results/
+playwright-report/

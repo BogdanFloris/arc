@@ -17,8 +17,9 @@ See docs/TASKS.md
 - `arcd` — daemon binary. Thin composition over arc-core. Owns the log, serves the WebSocket.
 - `arc` — TUI client.
 - `arc-voice` — voice client (Phase 4; placeholder until then).
+- `arc-web` — Svelte/TypeScript desktop and mobile PWA. See `arc-web/AGENTS.md` and `arc-web/docs/DEVELOPMENT.md`.
 
-New logic goes in `arc-core` unless it is genuinely binary-specific wiring.
+Assistant logic goes in `arc-core` unless it is genuinely binary-specific wiring. Browser UI, transport, and local drafts belong in `arc-web`.
 
 ## Commands
 

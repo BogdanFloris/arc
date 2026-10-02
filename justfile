@@ -38,6 +38,24 @@ lint:
 check:
     cargo check --workspace
 
+web-dev:
+    cd arc-web && npm run dev
+
+web-build:
+    cd arc-web && npm run build
+
+web-test:
+    cd arc-web && npm test
+
+web-test-browser: web-build
+    cd arc-web && npm run test:browser
+
+web-proto:
+    cd arc-web && npm run proto
+
+web-deploy:
+    cd arc-web && npm run deploy
+
 # Install the systemd user unit. Enabling it is a separate, deliberate step:
 # `systemctl --user enable --now arcd`.
 install-service:

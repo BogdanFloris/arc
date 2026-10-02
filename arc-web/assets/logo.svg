@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="arc-title">
+  <title id="arc-title">ARC</title>
+  <g fill="#fe8019">
+    <path d="M108 60H88l-36 40v56l36 40h20v-24H98l-22-26v-36l22-26h10V60Z"/>
+    <rect x="108" y="108" width="40" height="40"/>
+    <path d="M148 60h20l36 40v56l-36 40h-20v-24h10l22-26v-36l-22-26h-10V60Z"/>
+  </g>
+</svg>
