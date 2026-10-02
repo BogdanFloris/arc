@@ -331,6 +331,8 @@ Each phase must become a daily driver before the next starts. Cairn's text mobil
 
 Decide when evidence or the relevant phase requires it:
 
+The [Pi Durable notes](prior-art-pi.md) rank candidate improvements; they do not change current contracts.
+
 - Consolidation timing: keep configurable idle timeout until traces justify close-triggered or continuous extraction.
 - Role-specific timeouts/concurrency, especially titling vs extraction; dispatch model quality.
 - Compaction threshold and summary quality on real work.
