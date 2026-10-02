@@ -11,6 +11,12 @@ One person's daily driver, built in the open. **Current phase: 3.7, the direct d
 - [Providers](docs/providers.md) — configuration and dated measurements.
 - [Testing](docs/testing.md) — focused runs, logs, rendered frames.
 
+## Clients
+
+The TUI is the current daily driver. The planned mobile interface lives in Cairn, a separate personal app suite, with ARC as its first focused app. Cairn owns the mobile shell and touch interface; `arcd` continues to own sessions, models, tools, jobs, and memory.
+
+Start mobile with text conversations, job results, and reconnecting to Erebor through ARC's protocol. Voice is not a prerequisite. Cairn's later Writing app owns local documents independently and can explicitly send passages to ARC for review.
+
 ## Build and run
 
 The Nix development shell supplies Rust, `protoc`, and build tools. Local inference additionally needs `llama-server` and a GGUF; hosted-only configuration starts no sidecar.

@@ -23,7 +23,7 @@ Priorities: durability, observability, speed, provider independence. v1 excludes
 | `arc` | TUI client. |
 | `arc-voice` | Phase 4 audio client. |
 
-A future mobile client uses the same protocol and depends only on `arc-proto`.
+The mobile client lives in Cairn's repository as its first focused app. It uses ARC's protocol from `arc-proto`, not `arc-core` or the projection database. ARC remains independently operable.
 
 ## 3. The event log
 
@@ -271,7 +271,9 @@ Acceptance: verify append-and-replay of effort overrides, legacy fallback, initi
 
 **Titles.** Background titling follows completed exchanges independently of memory's idle gate. Use bounded opening/recent conversation, excluding system handbacks, to name the concrete task. Retain saved titles; retry greetings after conversation advances. Deduplicate unchanged input, reject stale results, and notify clients on `SessionTitled`. Never change pins or memory eligibility.
 
-`arc` exercises the protocol first; local UDS remains a desired transport. `arc-voice` owns audio devices and wake/mute controls, not reasoning or durable state. Backend adapters live in arc-core, credentials in arcd. Phase 4 defines audio/control schemas; the text wire is not assumed to support full-duplex audio unchanged. Mobile follows two stable clients.
+`arc` exercises the protocol first; local UDS remains a desired transport. `arc-voice` owns audio devices and wake/mute controls, not reasoning or durable state. Backend adapters live in arc-core, credentials in arcd. Phase 4 defines audio/control schemas; the text wire is not assumed to support full-duplex audio unchanged.
+
+**Mobile.** Cairn owns the mobile shell and touch-native ARC interface. Start with text conversations and jobs: connect to Erebor, browse/resume sessions, stream replies and tool activity, inspect job results, and recover after disconnection or app suspension. Show connection state; when Erebor is unreachable, ARC is unavailable. No second assistant or offline session store. Voice is not a prerequisite. Cairn's later Writing app owns local documents and editing state independently, with explicit review handoffs through ARC's protocol.
 
 ### 7.1 Replaceable voice backends
 
@@ -311,7 +313,7 @@ Design confirmation against the real actuator. UNKNOWN outcomes cannot be retrie
 
 ## 11. Phases
 
-Each phase must become a daily driver before the next starts.
+Each phase must become a daily driver before the next starts. Cairn's text mobile client is an explicit exception: it can start alongside Phase 3.7 without waiting for voice.
 
 | Phase | Scope and exit |
 | --- | --- |
@@ -322,7 +324,7 @@ Each phase must become a daily driver before the next starts.
 | 3.5 — Tree | Fork, rewind, navigation. Exit: branching used naturally. |
 | 3.6 — Quiet week | Done 2026-09-03. Relay failures motivated the direct door. |
 | **3.7 — Direct sessions** | **Current.** One runner, mid-turn messages, visible tools, event compaction, directory-selected project context, presence-gated memory. Exit: a week in unified sessions, real compaction without visible context loss. |
-| 4 — Voice + remote | §7.1 prototype/local fallback, phone access, automated backup. Exit: voice correction/reconnect, restore drill, provider-pinned offline degradation. |
+| 4 — Voice + remote | §7.1 prototype/local fallback, Cairn phone access (text can start early), automated backup. Exit: phone session/job access and reconnect, voice correction/reconnect, restore drill, provider-pinned offline degradation. |
 | 5 — Devices | First MCP actuator and safety policy, then arm. Room satellites are clients, not device tools. Embeddings only when FTS falls short. |
 
 ## 12. Open questions
