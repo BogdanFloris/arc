@@ -43,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 textwrap = "0.16"
 libc = "0.2"
 base64 = "0.22"
+url = "2"
 
 arc-core = { path = "arc-core" }
 arc-proto = { path = "arc-proto" }

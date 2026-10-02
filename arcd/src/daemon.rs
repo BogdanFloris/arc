@@ -241,6 +241,7 @@ impl Daemon {
 
         server::serve(
             listener,
+            self.config.allowed_origins,
             self.engine,
             self.reads,
             Arc::clone(&supervisor),

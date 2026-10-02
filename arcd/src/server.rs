@@ -22,7 +22,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::{
+    Message as WsMessage,
+    handshake::server::{Request, Response},
+};
 use tracing::{info, warn};
 
 use crate::jobs::{SendOutcome, Supervisor, TurnEvent};
@@ -33,6 +36,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn serve(
     listener: TcpListener,
+    allowed_origins: Vec<String>,
     engine: Arc<Engine>,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
@@ -52,6 +56,7 @@ pub async fn serve(
                     connections.spawn(connection(
                         stream,
                         peer,
+                        allowed_origins.clone(),
                         Arc::clone(&engine),
                         Arc::clone(&reads),
                         Arc::clone(&supervisor),
@@ -90,16 +95,32 @@ struct Subscription {
 }
 
 #[tracing::instrument(name = "server.connection", skip_all, fields(peer = %peer))]
+#[allow(clippy::result_large_err)]
 async fn connection(
     stream: TcpStream,
     peer: SocketAddr,
+    allowed_origins: Vec<String>,
     engine: Arc<Engine>,
     reads: Arc<Reader>,
     supervisor: Arc<Supervisor>,
     notifier: broadcast::Sender<Notification>,
     mut closing: watch::Receiver<bool>,
 ) {
-    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+    let mut ws = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        move |request: &Request, response: Response| {
+            if origin_allowed(request, &allowed_origins).is_ok() {
+                Ok(response)
+            } else {
+                Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("origin denied".to_owned()))
+                    .expect("valid response"))
+            }
+        },
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(error) => {
             warn!(%error, "websocket handshake failed");
@@ -165,6 +186,21 @@ async fn connection(
     }
 
     info!("client disconnected");
+}
+
+fn origin_allowed(request: &Request, allowed: &[String]) -> Result<(), ()> {
+    let mut values = request.headers().get_all("origin").iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let origin = value.to_str().map_err(|_| ())?;
+    if origin == "null" || !allowed.iter().any(|item| item == origin) {
+        return Err(());
+    }
+    Ok(())
 }
 
 async fn told_to_close(closing: &mut watch::Receiver<bool>) {
@@ -796,6 +832,8 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 
     use super::*;
     use arc_core::provider::{Provider, Thinking};
@@ -1059,6 +1097,7 @@ mod tests {
             let (shutdown, signal) = oneshot::channel();
             let server = tokio::spawn(serve(
                 listener,
+                vec!["https://erebor.taile59ef0.ts.net".to_owned()],
                 engine,
                 reads,
                 Arc::clone(&supervisor),
@@ -1111,6 +1150,7 @@ mod tests {
             let (shutdown, signal) = oneshot::channel();
             let server = tokio::spawn(serve(
                 listener,
+                Vec::new(),
                 engine,
                 reads,
                 Arc::clone(&supervisor),
@@ -1143,6 +1183,23 @@ mod tests {
                 .await
                 .expect("connect");
             ws
+        }
+
+        async fn handshake(
+            &self,
+            origin_headers: &[&str],
+        ) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+            let mut request = format!("ws://{}", self.addr)
+                .into_client_request()
+                .expect("request");
+            for origin in origin_headers {
+                request
+                    .headers_mut()
+                    .append(ORIGIN, origin.parse().expect("origin header"));
+            }
+            tokio_tungstenite::connect_async(request)
+                .await
+                .map(|(ws, _)| ws)
         }
 
         async fn stop(&mut self) {
@@ -1300,6 +1357,34 @@ mod tests {
         let frame = next_frame(ws).await;
         assert_eq!(frame.request_id, request_id);
         frame.msg.expect("a server frame with no message")
+    }
+
+    #[tokio::test]
+    async fn websocket_origin_policy_checks_browser_handshakes() {
+        let mut harness = Harness::start(Script::Echo).await;
+        assert!(
+            harness
+                .handshake(&["https://erebor.taile59ef0.ts.net"])
+                .await
+                .is_ok()
+        );
+        assert!(harness.handshake(&[]).await.is_ok());
+        for origins in [
+            vec!["https://evil.example"],
+            vec!["null"],
+            vec!["not an origin"],
+            vec!["https://erebor.taile59ef0.ts.net", "https://evil.example"],
+        ] {
+            let response = harness
+                .handshake(&origins)
+                .await
+                .expect_err("origin rejected");
+            assert!(
+                matches!(response, tokio_tungstenite::tungstenite::Error::Http(ref response) if response.status() == 403),
+                "{response:?}"
+            );
+        }
+        harness.stop().await;
     }
 
     #[tokio::test]
@@ -2894,6 +2979,7 @@ mod tests {
         let (shutdown, signal) = oneshot::channel();
         let server = tokio::spawn(serve(
             listener,
+            Vec::new(),
             Arc::clone(&engine),
             reads,
             Arc::clone(&supervisor),

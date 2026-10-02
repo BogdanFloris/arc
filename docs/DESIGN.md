@@ -252,7 +252,7 @@ The log records the model that actually ran.
 
 ## 7. Wire protocol and clients
 
-`wire.proto` defines protobuf over localhost WebSocket. Remote access uses Tailscale; v1 adds no tunnel, TLS termination, or auth beyond a local token. Clients hold no durable state.
+`wire.proto` defines protobuf over localhost WebSocket. Remote access uses Tailscale. arcd accepts browser WebSocket handshakes only from explicitly configured exact origins; Origin-bearing requests are denied by default. Requests without Origin remain available to native clients. This is browser-origin protection, not authentication; network access must remain limited to trusted tailnet clients.
 
 Send with empty session ID to create a session. Clients stream text/tool events and query history, metadata, jobs, and status. A local launch under a configured root starts a session in that project; elsewhere it starts an unscoped session. A local unmatched directory is recorded on session creation as its working directory and supplies `AGENTS.md` when present.
 
@@ -309,7 +309,7 @@ Design confirmation against the real actuator. UNKNOWN outcomes cannot be retrie
 - Rustic backs up `log/` and `identity.md` with repository encryption. Exclude rebuildable index/traces and credentials.
 - Credentials use OS keychain or protected secrets storage under the data directory. Never include them in log, traces, fixtures, or backups.
 - Workspace tools inherit a scrubbed environment, not arcd's credentials. This does not sandbox Bash or prevent access to files the user can read (§4.3).
-- WebSocket binds localhost; Tailscale supplies remote access.
+- WebSocket binds localhost; Tailscale supplies remote access. Configure browser origins with `allowed_origins` in `arc.toml`; the default is empty. Origin checks do not authenticate native clients.
 
 ## 11. Phases
 

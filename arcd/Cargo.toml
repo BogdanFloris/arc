@@ -9,6 +9,7 @@ arc-core.workspace = true
 arc-proto.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+url.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 reqwest.workspace = true

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub data_dir: PathBuf,
     pub bind: SocketAddr,
+    pub allowed_origins: Vec<String>,
     pub llama: LlamaConfig,
     pub max_tool_result_bytes: usize,
     pub consolidation: ConsolidationConfig,
@@ -248,6 +249,7 @@ impl Default for Config {
         Self {
             data_dir: PathBuf::from("data"),
             bind: SocketAddr::from(([127, 0, 0, 1], 8787)),
+            allowed_origins: Vec::new(),
             llama: LlamaConfig::default(),
             max_tool_result_bytes: 32 * 1024,
             consolidation: ConsolidationConfig::default(),
@@ -309,6 +311,21 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.compaction.validate()?;
+        for origin in &self.allowed_origins {
+            let parsed = url::Url::parse(origin)
+                .with_context(|| format!("invalid allowed origin `{origin}`"))?;
+            ensure!(
+                matches!(parsed.scheme(), "http" | "https")
+                    && parsed.host().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.path() == "/"
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none()
+                    && parsed.origin().ascii_serialization() == *origin,
+                "allowed origin `{origin}` must be an exact http(s) scheme/host/port origin"
+            );
+        }
         for (name, preset) in &self.models {
             ensure!(
                 preset.choices.is_empty(),
@@ -536,6 +553,17 @@ description = "Scratch workspace"
         let err = toml::from_str::<Config>("modle = \"gemini-3.1-pro\"\n")
             .expect_err("a typo must not be ignored");
         assert!(err.to_string().contains("modle"), "{err}");
+    }
+
+    #[test]
+    fn browser_origins_are_configured_as_exact_origins() {
+        assert!(Config::default().allowed_origins.is_empty());
+        let config = parse("allowed_origins = [\"https://example.com\"]");
+        assert_eq!(config.allowed_origins, ["https://example.com"]);
+        for origin in ["null", "https://example.com/path", "https://example.com/"] {
+            let err = rejected(&format!("allowed_origins = [\"{origin}\"]"));
+            assert!(err.contains("allowed origin"), "{err}");
+        }
     }
 
     #[test]
