@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
-import { ClientFrameSchema, ServerFrameSchema, type ClientFrame, type ServerFrame, type SessionInfo, type SessionHistory, type JobInfo, type Notification, type StreamEnd, type SessionList, type JobList } from './gen/wire_pb';
+import { ClientFrameSchema, ServerFrameSchema, type ClientFrame, type ServerFrame, type SessionInfo, type SessionHistory, type JobInfo, type Notification, type StreamEnd, type SessionList, type JobList, type ProjectInfo, type ProjectList, type ModelChoice, type ModelList, type MessageAccepted, type SessionStatus } from './gen/wire_pb';
+import { SessionRole } from './gen/events_pb';
 
 export class ArcRequestError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = 'ArcRequestError'; }
@@ -99,6 +100,30 @@ export class ArcClient {
     return this.request('listJobs', {}, 'jobList').then((reply) => (reply as JobList).jobs);
   }
 
+  listProjects(): Promise<ProjectInfo[]> {
+    return this.request('listProjects', {}, 'projectList').then((reply) => (reply as ProjectList).projects);
+  }
+
+  listModels(): Promise<ModelChoice[]> {
+    return this.request('listModels', {}, 'modelList').then((reply) => (reply as ModelList).choices);
+  }
+
+  createSession(project: string, choice: string): Promise<MessageAccepted> {
+    return this.request('createSession', { role: SessionRole.CHAT, project, choice }, 'messageAccepted');
+  }
+
+  forkSession(sessionId: string, forkPoint: bigint, choice: string): Promise<MessageAccepted> {
+    return this.request('forkSession', { sessionId, forkPoint, choice }, 'messageAccepted');
+  }
+
+  fetchStatus(sessionId: string): Promise<SessionStatus> {
+    return this.request('fetchStatus', { sessionId }, 'sessionStatus');
+  }
+
+  setSessionThinking(sessionId: string, thinking: string): Promise<SessionStatus> {
+    return this.request('setSessionThinking', { sessionId, thinking }, 'sessionStatus');
+  }
+
   async subscribe(callback: (notification: Notification) => void): Promise<() => void> {
     await this.connect();
     const id = nextId++;
@@ -180,8 +205,12 @@ export class ArcClient {
 
   private request(caseName: 'listSessions', value: object, response: 'sessionList'): Promise<SessionList>;
   private request(caseName: 'listJobs', value: object, response: 'jobList'): Promise<JobList>;
+  private request(caseName: 'listProjects', value: object, response: 'projectList'): Promise<ProjectList>;
   private request(caseName: 'fetchHistory', value: object, response: 'sessionHistory'): Promise<SessionHistory>;
-  private async request(caseName: 'listSessions' | 'listJobs' | 'fetchHistory', value: object, response: 'sessionList' | 'jobList' | 'sessionHistory'): Promise<SessionList | JobList | SessionHistory> {
+  private request(caseName: 'listModels', value: object, response: 'modelList'): Promise<ModelList>;
+  private request(caseName: 'createSession' | 'forkSession', value: object, response: 'messageAccepted'): Promise<MessageAccepted>;
+  private request(caseName: 'fetchStatus' | 'setSessionThinking', value: object, response: 'sessionStatus'): Promise<SessionStatus>;
+  private async request(caseName: 'listSessions' | 'listJobs' | 'listProjects' | 'fetchHistory' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking', value: object, response: 'sessionList' | 'jobList' | 'projectList' | 'sessionHistory' | 'modelList' | 'messageAccepted' | 'sessionStatus'): Promise<SessionList | JobList | ProjectList | SessionHistory | ModelList | MessageAccepted | SessionStatus> {
     await this.connect();
     const id = nextId++;
     return new Promise((resolve, reject) => {
@@ -193,7 +222,7 @@ export class ArcClient {
       }, REQUEST_TIMEOUT);
       this.pending.set(id, { resolve: (frame) => {
         if (frame.msg.case !== response) reject(new ArcConnectionError(`Unexpected response: ${frame.msg.case}`, false));
-        else resolve(frame.msg.value as SessionList | JobList | SessionHistory);
+        else resolve(frame.msg.value as SessionList | JobList | ProjectList | SessionHistory | ModelList | MessageAccepted | SessionStatus);
       }, reject, timer });
       try { this.transmit(create(ClientFrameSchema, { requestId: id, msg: { case: caseName, value } })); }
       catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
@@ -219,11 +248,9 @@ export class ArcClient {
       pending.reject(new ArcRequestError(frame.msg.value.code, frame.msg.value.msg));
       return;
     }
-    if (frame.msg.case === 'sessionList' || frame.msg.case === 'sessionHistory' || frame.msg.case === 'jobList') {
-      clearTimeout(pending.timer);
-      this.pending.delete(frame.requestId);
-      pending.resolve(frame);
-    }
+    clearTimeout(pending.timer);
+    this.pending.delete(frame.requestId);
+    pending.resolve(frame);
   }
 
   private disconnect(error: ArcConnectionError): void {

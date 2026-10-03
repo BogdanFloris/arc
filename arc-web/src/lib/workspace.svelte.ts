@@ -1,6 +1,8 @@
 import { ArcClient, ArcConnectionError } from './arc/client';
 import { conversationSessions, historyMessages, jobSummaries, toolState } from './arc/history';
-import type { JobInfo, Notification, ServerFrame, SessionInfo } from './arc/gen/wire_pb';
+import { SessionRole, Source, Role } from './arc/gen/events_pb';
+import { SessionInfoSchema, type JobInfo, type Notification, type ServerFrame, type SessionInfo, type ModelChoice, type SessionStatus } from './arc/gen/wire_pb';
+import { create } from '@bufbuild/protobuf';
 import type { HostProfile, Job, Message, SessionSummary } from './arc/types';
 
 const STORAGE_KEY = 'arc-web.local.v1';
@@ -11,6 +13,7 @@ type LocalState = {
   selected: Record<string, string>;
   drafts: Record<string, Record<string, string>>;
   inputs: Record<string, PendingInput[]>;
+  choices: Record<string, { project: string; model: string }>;
 };
 export type PendingInput = {
   id: string;
@@ -19,9 +22,9 @@ export type PendingInput = {
   state: 'pending' | 'accepted' | 'uncertain' | 'rejected';
 };
 type Turn = { input: PendingInput; messages: Message[]; key: string };
-type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage'>;
+type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'listProjects' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage'>;
 type ClientFactory = (endpoint: string, onDisconnect: (error: ArcConnectionError) => void) => Client;
-const emptyState = (): LocalState => ({ hosts: [], activeHostId: '', selected: {}, drafts: {}, inputs: {} });
+const emptyState = (): LocalState => ({ hosts: [], activeHostId: '', selected: {}, drafts: {}, inputs: {}, choices: {} });
 const draftKey = (sessionId: string | null) => sessionId ?? '__new__';
 
 export class Workspace {
@@ -38,6 +41,20 @@ export class Workspace {
   loading = $state(false);
   pendingInputs = $state<PendingInput[]>([]);
   selectedProject = $state('');
+  newProject = $state('');
+  newModelChoice = $state('');
+  modelChoices = $state<ModelChoice[]>([]);
+  controlsBusy = $state(false);
+  controlsError = $state('');
+  pendingModelFork = $state<string | null>(null);
+  sessionStatus = $state<SessionStatus | null>(null);
+  statusLoading = $state(false);
+  statusError = $state('');
+  private choices: LocalState['choices'] = {};
+  private navigation = 0;
+  private controlsRequest = 0;
+  private statusRequest = 0;
+  private forkPoints = new Map<string, bigint>();
   private storage: Storage | null;
   private drafts: LocalState['drafts'] = {};
   private selected: LocalState['selected'] = {};
@@ -48,6 +65,7 @@ export class Workspace {
   private inputs: LocalState['inputs'] = {};
   private client: Client | null = null;
   private remoteSessions = $state<SessionInfo[]>([]);
+  private configuredProjects = $state<string[]>([]);
   private liveJobs: JobInfo[] = [];
   private liveTurns = new Map<string, Turn>();
   private historyRequests = new Map<string, number>();
@@ -64,7 +82,25 @@ export class Workspace {
   }
   get activeHost() { return this.hosts.find((host) => host.id === this.activeHostId) ?? null; }
   get canSend() { return this.connectionState === 'connected'; }
-  get projectOptions() { return [...new Set(this.remoteSessions.map((session) => session.project).filter((project): project is string => !!project))].sort(); }
+  get projectOptions() { return this.configuredProjects; }
+  get activeSession() { return this.remoteSessions.find((session) => session.id === this.activeSessionId) ?? null; }
+  get availableModels() {
+    const role = this.activeSessionId ? this.activeSession?.role : SessionRole.CHAT;
+    return this.modelChoices.filter((choice) => choice.role === role);
+  }
+  get recordedModel() { return this.activeSession?.model || 'Unknown model'; }
+  get isEmptyConversation() {
+    return !this.activeSessionId || (!!this.activeSession && this.activeSession.source === Source.USER
+      && this.histories.has(this.activeSessionId) && this.messages.length === 0 && !this.loading && !this.sending);
+  }
+  get canConfigure() {
+    return this.canSend && !this.loading && !this.sending && !this.controlsBusy
+      && !this.jobs.some((job) => job.id === this.activeSessionId && job.state === 'running');
+  }
+  get effectiveThinking() {
+    return this.sessionStatus?.effectiveThinking || (!this.activeSessionId
+      ? this.availableModels.find((choice) => choice.name === this.newModelChoice)?.thinking || '' : '');
+  }
   get visibleSessions() { return conversationSessions(this.remoteSessions, { project: this.selectedProject || null }); }
   get activeTitle() {
     const session = this.remoteSessions.find((session) => session.id === this.activeSessionId);
@@ -99,9 +135,11 @@ export class Workspace {
     this.selected = state.selected ?? {};
     this.drafts = state.drafts ?? {};
     this.inputs = state.inputs ?? {};
+    this.choices = state.choices ?? {};
     delete this.selected.demo;
     delete this.drafts.demo;
     delete this.inputs.demo;
+    delete this.choices.demo;
     for (const [host, inputs] of Object.entries(this.inputs)) {
       this.inputs[host] = inputs.filter((input) => input.state !== 'accepted').map((input) =>
         ({ ...input, state: input.state === 'pending' ? 'uncertain' : input.state }));
@@ -151,17 +189,20 @@ export class Workspace {
   selectSession(id: string) {
     if (!this.remoteSessions.some((session) => session.id === id) && !this.jobs.some((job) => job.id === id)) return;
     this.rememberDraft();
+    this.resetControls();
     this.activeSessionId = id;
     this.selected[this.activeHostId] = id;
     this.draft = this.drafts[this.activeHostId]?.[draftKey(id)] ?? '';
     this.activateContent();
     this.sending = this.liveTurns.has(id);
     void this.loadHistory(id);
+    void this.refreshStatus();
     this.persist();
   }
 
   newConversation() {
     this.rememberDraft();
+    this.resetControls();
     this.activeSessionId = null;
     this.selected[this.activeHostId] = '__new__';
     this.draft = this.drafts[this.activeHostId]?.__new__ ?? '';
@@ -192,6 +233,7 @@ export class Workspace {
     if (this.connectionState === 'connected') {
       void this.refreshRemote();
       if (this.activeSessionId && !this.liveTurns.has(this.activeSessionId)) void this.loadHistory(this.activeSessionId);
+      void this.refreshStatus();
     } else if (this.connectionState !== 'connecting') {
       if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -207,6 +249,136 @@ export class Workspace {
 
   async send() { await this.sendRemote(); }
 
+  selectNewProject(project: string) {
+    if (!this.canConfigure || !this.isEmptyConversation || (project && !this.projectOptions.includes(project))) return;
+    this.stageConversation(project, this.newModelChoice);
+  }
+
+  chooseModel(choice: string) {
+    if (!this.canConfigure || !this.availableModels.some((model) => model.name === choice)) return;
+    if (this.isEmptyConversation) this.stageConversation(this.activeSession?.project ?? this.newProject, choice);
+    else this.pendingModelFork = choice;
+  }
+
+  cancelModelFork() { this.pendingModelFork = null; }
+
+  async confirmModelFork() {
+    const choice = this.pendingModelFork;
+    const id = this.activeSessionId;
+    const point = id ? this.forkPoints.get(id) : undefined;
+    if (!choice || !id || !this.canConfigure) return;
+    if (point === undefined) { this.controlsError = 'No durable message to fork. Refresh the conversation first.'; return; }
+    const original = this.activeSession;
+    const model = this.availableModels.find((item) => item.name === choice);
+    if (!original || !model) { this.controlsError = 'This model preset is no longer available.'; return; }
+    await this.control(async (client, current) => {
+      const ack = await client.forkSession(id, point, choice);
+      if (!current()) return;
+      this.adoptSession(create(SessionInfoSchema, {
+        id: ack.sessionId, role: original.role, source: Source.USER, project: original.project,
+        provider: model.provider, model: model.model, parentSession: id,
+      }), false);
+      await this.loadHistory(ack.sessionId);
+      await this.refreshStatus();
+    });
+  }
+
+  async prepareThinking() {
+    if (!this.canConfigure) return;
+    await this.control(async (client, current) => {
+      if (!this.activeSessionId) await this.createConversation(client, current);
+      if (current()) await this.refreshStatus();
+    });
+  }
+
+  async setThinking(thinking: string) {
+    const id = this.activeSessionId;
+    if (!id || !this.canConfigure || !this.sessionStatus?.supportedThinking.includes(thinking)) return;
+    await this.control(async (client, current) => {
+      const status = await client.setSessionThinking(id, thinking);
+      if (current()) { this.statusRequest++; this.sessionStatus = status; this.statusLoading = false; this.statusError = ''; }
+    });
+  }
+
+  async refreshStatus() {
+    const client = this.client, id = this.activeSessionId, generation = this.generation;
+    if (!client || !id || !this.canSend) return;
+    const request = ++this.statusRequest;
+    this.statusLoading = true;
+    const current = () => generation === this.generation && client === this.client && id === this.activeSessionId && request === this.statusRequest;
+    try {
+      const status = await client.fetchStatus(id);
+      if (current()) { this.sessionStatus = status; this.statusError = ''; }
+    } catch (error) {
+      if (current()) this.statusError = `Could not refresh session status. ${error instanceof Error ? error.message : ''}`;
+    } finally {
+      if (current()) this.statusLoading = false;
+    }
+  }
+
+  private resetControls() {
+    this.navigation++;
+    this.controlsRequest++;
+    this.statusRequest++;
+    this.controlsBusy = false;
+    this.controlsError = '';
+    this.pendingModelFork = null;
+    this.sessionStatus = null;
+    this.statusLoading = false;
+    this.statusError = '';
+  }
+
+  private stageConversation(project: string, model: string) {
+    const draft = this.draft;
+    if (this.activeSessionId) this.newConversation();
+    this.newProject = project;
+    this.newModelChoice = model;
+    this.choices[this.activeHostId] = { project, model };
+    this.setDraft(draft);
+  }
+
+  private async control(action: (client: Client, current: () => boolean) => Promise<void>) {
+    const client = this.client, generation = this.generation, navigation = this.navigation;
+    if (!client || !this.canConfigure) return;
+    const request = ++this.controlsRequest;
+    const current = () => generation === this.generation && client === this.client && navigation === this.navigation && request === this.controlsRequest;
+    this.controlsBusy = true;
+    this.controlsError = '';
+    try { await action(client, current); }
+    catch (error) { if (current()) this.controlsError = error instanceof Error ? error.message : 'Conversation controls failed.'; }
+    finally { if (current()) this.controlsBusy = false; }
+  }
+
+  private async createConversation(client: Client, current: () => boolean) {
+    const project = this.newProject, choice = this.newModelChoice;
+    const model = this.modelChoices.find((item) => item.role === SessionRole.CHAT && item.name === choice);
+    if (!model) throw new Error('Choose an available model preset before sending.');
+    if (project && !this.projectOptions.includes(project)) throw new Error('This project is no longer configured. Choose another project.');
+    const ack = await client.createSession(project, choice);
+    if (!current()) return;
+    this.adoptSession(create(SessionInfoSchema, {
+      id: ack.sessionId, source: Source.USER, role: SessionRole.CHAT,
+      project, provider: model.provider, model: model.model,
+    }), true);
+  }
+
+  private adoptSession(session: SessionInfo, empty: boolean) {
+    this.rememberDraft();
+    const oldId = this.activeSessionId;
+    this.remoteSessions = [...this.remoteSessions.filter((item) => item.id !== session.id), session];
+    this.activeSessionId = session.id;
+    this.selected[this.activeHostId] = session.id;
+    this.drafts[this.activeHostId] ??= {};
+    this.drafts[this.activeHostId][session.id] = this.draft;
+    if (oldId === null) this.drafts[this.activeHostId].__new__ = '';
+    this.pendingModelFork = null;
+    this.sessionStatus = null;
+    this.statusRequest++;
+    if (empty) this.histories.set(session.id, []);
+    this.activateContent();
+    this.persist();
+  }
+
   dispose() {
     this.disposed = true;
     this.disconnect();
@@ -221,11 +393,17 @@ export class Workspace {
     this.selectedProject = '';
     this.connectionState = host ? 'connecting' : 'unavailable';
     this.notice = '';
+    this.resetControls();
+    this.modelChoices = [];
+    this.newProject = this.choices[this.activeHostId]?.project ?? '';
+    this.newModelChoice = this.choices[this.activeHostId]?.model ?? '';
     this.sessions = [];
     this.jobs = [];
     this.remoteSessions = [];
+    this.configuredProjects = [];
     this.liveJobs = [];
     this.histories.clear();
+    this.forkPoints.clear();
     this.historyRequests.clear();
     const remembered = this.selected[this.activeHostId];
     this.activeSessionId = remembered && remembered !== '__new__' ? remembered : null;
@@ -248,7 +426,7 @@ export class Workspace {
   }
   private persist() {
     try {
-      this.storage?.setItem(STORAGE_KEY, JSON.stringify({ hosts: this.hosts, activeHostId: this.activeHostId, selected: this.selected, drafts: this.drafts, inputs: this.inputs }));
+      this.storage?.setItem(STORAGE_KEY, JSON.stringify({ hosts: this.hosts, activeHostId: this.activeHostId, selected: this.selected, drafts: this.drafts, inputs: this.inputs, choices: this.choices }));
       if (this.legacyStoragePresent) {
         this.storage?.removeItem(LEGACY_STORAGE_KEY);
         this.legacyStoragePresent = false;
@@ -263,6 +441,7 @@ export class Workspace {
     this.client?.close();
     this.client = null;
     this.loading = false;
+    this.resetControls();
     this.reconnectDelay = 1000;
     this.retireTurns();
   }
@@ -302,6 +481,7 @@ export class Workspace {
       await this.refreshRemote(true);
       if (generation !== this.generation || this.client !== client) return;
       if (this.activeSessionId && this.activeSessionId === selected && !this.liveTurns.has(this.activeSessionId)) await this.loadHistory(this.activeSessionId);
+      void this.refreshStatus();
     } catch (error) {
       if (generation !== this.generation || this.client !== client || this.disposed) return;
       this.connectionState = 'unavailable';
@@ -324,13 +504,18 @@ export class Workspace {
     if (!client || (this.connectionState !== 'connected' && !initial)) return;
     const request = ++this.listRequest;
     try {
-      const [sessions, jobs] = await Promise.all([client.listSessions(), client.listJobs()]);
+      const [sessions, jobs, projects, models] = await Promise.all([client.listSessions(), client.listJobs(), client.listProjects(), client.listModels()]);
       if (generation !== this.generation || this.client !== client || request !== this.listRequest) return;
       if (initial) {
         this.connectionState = 'connected';
         this.notice = '';
       }
       this.remoteSessions = sessions;
+      this.configuredProjects = projects.map((project) => project.name).sort();
+      this.modelChoices = models;
+      if (!this.newModelChoice) this.newModelChoice = models.find((model) => model.role === SessionRole.CHAT && model.selected)?.name
+        ?? models.find((model) => model.role === SessionRole.CHAT)?.name ?? '';
+      if (this.selectedProject && !this.configuredProjects.includes(this.selectedProject)) this.selectedProject = '';
       this.liveJobs = jobs;
       this.sessions = conversationSessions(sessions, { showAbandoned: true });
       this.jobs = jobSummaries(jobs);
@@ -339,7 +524,7 @@ export class Workspace {
       if (!this.activeSessionId && remembered !== '__new__' && !this.liveTurns.has('__new__') && first) {
         this.selectSession(first.id);
       } else if (this.activeSessionId && !sessions.some((session) => session.id === this.activeSessionId)
-        && !this.liveTurns.has(this.activeSessionId)) {
+        && !jobs.some((job) => job.sessionId === this.activeSessionId) && !this.liveTurns.has(this.activeSessionId) && !this.controlsBusy) {
         const fallback = conversationSessions(sessions, {}).at(0);
         if (fallback) this.selectSession(fallback.id);
         else this.newConversation();
@@ -350,16 +535,22 @@ export class Workspace {
     }
   }
 
-  private async loadHistory(id: string) {
+  private async loadHistory(id: string, completedTurn?: Turn) {
     const client = this.client, generation = this.generation;
-    if (!client || this.connectionState !== 'connected' || this.liveTurns.has(id)) return;
+    if (!client || this.connectionState !== 'connected' || (this.liveTurns.has(id) && this.liveTurns.get(id) !== completedTurn)) return;
     const request = (this.historyRequests.get(id) ?? 0) + 1;
     this.historyRequests.set(id, request);
     if (this.activeSessionId === id) this.loading = true;
     try {
       const history = await client.fetchHistory(id);
-      if (generation !== this.generation || this.client !== client || this.historyRequests.get(id) !== request || this.liveTurns.has(id)) return;
+      if (generation !== this.generation || this.client !== client || this.historyRequests.get(id) !== request
+        || (this.liveTurns.has(id) && this.liveTurns.get(id) !== completedTurn)) return;
       this.histories.set(id, historyMessages(history));
+      if (completedTurn) this.liveTurns.delete(id);
+      const point = history.entries.findLast((entry) => entry.entry.case === 'message'
+        && entry.entry.value.source !== Source.SYSTEM && (entry.entry.value.role === Role.USER || entry.entry.value.role === Role.ASSISTANT));
+      if (point) this.forkPoints.set(id, point.seq);
+      else this.forkPoints.delete(id);
       if (this.activeSessionId === id) this.activateContent();
     } catch (error) {
       if (generation === this.generation && this.client === client && this.activeSessionId === id) {
@@ -372,6 +563,10 @@ export class Workspace {
 
   private onNotification(notification: Notification, generation: number) {
     if (generation !== this.generation) return;
+    if (notification.event.case === 'modelsChanged') {
+      this.modelChoices = notification.event.value.choices;
+      return;
+    }
     if (notification.event.case === 'jobChanged') {
       const job = notification.event.value;
       const index = this.liveJobs.findIndex((item) => item.sessionId === job.sessionId);
@@ -386,6 +581,7 @@ export class Workspace {
       if (generation !== this.generation) return;
       void this.refreshRemote();
       if (this.activeSessionId && !this.liveTurns.has(this.activeSessionId)) void this.loadHistory(this.activeSessionId);
+      void this.refreshStatus();
     }, 120);
   }
 
@@ -444,9 +640,16 @@ export class Workspace {
   }
 
   private async sendRemote() {
+    if (!this.canSend || this.loading || this.sending || this.controlsBusy || !this.draft.trim()) return;
+    if (!this.activeSessionId) {
+      const navigation = this.navigation;
+      const draft = this.draft;
+      await this.control(async (client, current) => { await this.createConversation(client, current); });
+      if (navigation !== this.navigation || !this.activeSessionId || this.controlsError || !this.canSend || this.draft !== draft) return;
+    }
     const client = this.client, generation = this.generation, hostId = this.activeHostId;
     const key = draftKey(this.activeSessionId);
-    if (!client || this.connectionState !== 'connected' || !this.draft.trim() || this.liveTurns.has(key) || this.loading) return;
+    if (!client || this.connectionState !== 'connected' || !this.draft.trim() || this.liveTurns.has(key) || this.loading || this.controlsBusy) return;
     const input: PendingInput = { id: globalThis.crypto.randomUUID(), sessionId: this.activeSessionId, content: this.draft, state: 'pending' };
     const turn: Turn = { input, key, messages: [{ id: input.id, role: 'you', content: input.content, delivery: 'pending' }] };
     this.inputs[hostId] ??= [];
@@ -481,10 +684,20 @@ export class Workspace {
       }
     } finally {
       if (generation === this.generation && this.client === client) {
+        if (input.sessionId && input.state === 'accepted') {
+          for (const message of turn.messages) message.streaming = false;
+          await this.loadHistory(input.sessionId, turn);
+          if (generation !== this.generation || this.client !== client) return;
+          if (this.liveTurns.get(turn.key) === turn) {
+            this.histories.set(turn.key, [...(this.histories.get(turn.key) ?? []), ...turn.messages]);
+            this.forkPoints.delete(turn.key);
+          }
+        }
         this.liveTurns.delete(turn.key);
         this.activateContent();
-        if (input.sessionId) await this.loadHistory(input.sessionId);
+        if (input.sessionId && input.state !== 'accepted') await this.loadHistory(input.sessionId);
         await this.refreshRemote();
+        void this.refreshStatus();
       }
     }
   }

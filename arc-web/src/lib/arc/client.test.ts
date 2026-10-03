@@ -18,6 +18,35 @@ const factory = () => { const socket = new FakeSocket(); sockets.push(socket); r
 afterEach(() => { sockets = []; vi.useRealTimers(); });
 
 describe('ArcClient protobuf transport', () => {
+  it('encodes creation, forks, model menus, and thinking through correlated read requests', async () => {
+    const client = new ArcClient('wss://arc/arc', { socketFactory: factory });
+    const models = client.listModels();
+    await Promise.resolve(); sockets[0].open(); await Promise.resolve();
+    let request = fromBinary(ClientFrameSchema, sockets[0].sent.at(-1)!);
+    expect(request.msg.case).toBe('listModels');
+    sockets[0].receive({ requestId: request.requestId, msg: { case: 'modelList', value: { choices: [{ name: 'preset', role: 1 }] } } });
+    await expect(models).resolves.toMatchObject([{ name: 'preset' }]);
+    const creation = client.createSession('arc', 'preset');
+    await Promise.resolve();
+    request = fromBinary(ClientFrameSchema, sockets[0].sent.at(-1)!);
+    expect(request.msg).toMatchObject({ case: 'createSession', value: { role: 1, project: 'arc', choice: 'preset' } });
+    sockets[0].receive({ requestId: request.requestId, msg: { case: 'messageAccepted', value: { sessionId: 'new' } } });
+    await expect(creation).resolves.toMatchObject({ sessionId: 'new' });
+    const fork = client.forkSession('new', 9007199254740993n, 'other');
+    await Promise.resolve();
+    request = fromBinary(ClientFrameSchema, sockets[0].sent.at(-1)!);
+    expect(request.msg).toMatchObject({ case: 'forkSession', value: { sessionId: 'new', forkPoint: 9007199254740993n, choice: 'other' } });
+    sockets[0].receive({ requestId: request.requestId, msg: { case: 'messageAccepted', value: { sessionId: 'fork' } } });
+    await expect(fork).resolves.toMatchObject({ sessionId: 'fork' });
+    const thinking = client.setSessionThinking('fork', 'high');
+    await Promise.resolve();
+    request = fromBinary(ClientFrameSchema, sockets[0].sent.at(-1)!);
+    expect(request.msg).toMatchObject({ case: 'setSessionThinking', value: { sessionId: 'fork', thinking: 'high' } });
+    sockets[0].receive({ requestId: request.requestId, msg: { case: 'sessionStatus', value: { sessionId: 'fork', effectiveThinking: 'high' } } });
+    await expect(thinking).resolves.toMatchObject({ effectiveThinking: 'high' });
+    client.close();
+  });
+
   it('correlates binary requests and returns decoded results', async () => {
     const client = new ArcClient('wss://arc/arc', { socketFactory: factory });
     const promise = client.listSessions(); await Promise.resolve(); sockets[0].open(); await Promise.resolve();

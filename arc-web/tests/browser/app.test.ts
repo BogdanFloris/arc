@@ -1,5 +1,113 @@
 import { expect, test } from '@playwright/test';
 import { fixtureDaemon } from '../fixtures/daemon';
+import { create } from '@bufbuild/protobuf';
+import { AllowanceWindowSchema } from '../../src/lib/arc/gen/wire_pb';
+
+test('job return restores the origin draft and keeps phone rows aligned', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await page.locator('textarea').fill('unsent origin draft');
+  await page.locator('.job-status').click();
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await expect(page.locator('.job-return button')).toContainText('Back to Plan a focused week');
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.locator('.job-return button').click();
+  await expect(page.locator('textarea')).toHaveValue('unsent origin draft');
+  await page.locator('.job-status').click();
+  const metrics = await page.locator('.job').evaluate((row) => {
+    const copy = row.querySelector('.job-copy')!.getBoundingClientRect();
+    const action = row.querySelector('.job-open')!.getBoundingClientRect();
+    return { copyLeft: copy.left, actionLeft: action.left, actionHeight: action.height, overflow: document.documentElement.scrollWidth > innerWidth };
+  });
+  expect(metrics.actionLeft).toBeGreaterThan(metrics.copyLeft);
+  expect(metrics.actionHeight).toBeGreaterThanOrEqual(44);
+  expect(metrics.overflow).toBe(false);
+});
+
+test('job navigation and status refresh preserve live observation and reader position', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => release = resolve);
+  const attach = fixtureDaemon({ streamGate: () => gate });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  const send = page.getByRole('button', { name: 'Send', exact: true });
+  const transcript = page.locator('.transcript');
+  await composer.fill('Long source conversation for reading-position testing.\n'.repeat(35));
+  await send.click();
+  await expect(composer).toHaveValue('');
+  await composer.fill('Next draft remains with the source');
+  await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBeGreaterThan(200);
+  await transcript.evaluate((element) => element.scrollTop = 80);
+  await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+  await page.screenshot({ path: '/tmp/arc-web-parity-phone-jobs.png' });
+  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
+  await expect(page.locator('.title')).toHaveText('Review draft outline');
+  await expect(composer).toHaveValue('');
+  await page.getByRole('button', { name: 'Back to Plan a focused week' }).click();
+  await expect(composer).toHaveValue('Next draft remains with the source');
+  await expect(send).toBeDisabled();
+  await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBe(80);
+  await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+  await page.getByRole('button', { name: 'ARC status' }).click();
+  const status = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(status.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+  await status.getByRole('button', { name: 'Refresh' }).click();
+  await status.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(send).toBeDisabled();
+  release();
+  await expect(send).toBeEnabled({ timeout: 10000 });
+  await expect(page.locator('.message').last()).toContainText('I’ll help you work through:');
+  await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBe(80);
+  await page.getByRole('button', { name: 'Jump to latest' }).click();
+  await expect(page.getByRole('button', { name: 'Jump to latest' })).not.toBeVisible();
+  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to Plan a focused week' }).click();
+  await expect(page.getByRole('button', { name: 'Jump to latest' })).not.toBeVisible();
+  await expect.poll(() => transcript.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(48);
+});
+
+test('new-draft job return survives without overwriting and unrelated navigation clears the route', async ({ page }) => {
+  const attach = fixtureDaemon({ jobsRunning: false });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  const openJob = async () => {
+    await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+    await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
+    await expect(page.locator('.job-return')).toBeVisible();
+  };
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await composer.fill('Unsent new conversation');
+  await openJob();
+  await page.getByRole('button', { name: 'Back to new conversation' }).click();
+  await expect(composer).toHaveValue('Unsent new conversation');
+  await openJob();
+  await page.getByRole('button', { name: 'Open sessions' }).click();
+  await page.getByRole('dialog', { name: 'Sessions', exact: true }).getByRole('button', { name: /Notes on a first draft/ }).click();
+  await expect(page.locator('.job-return')).toHaveCount(0);
+  await openJob();
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await expect(page.locator('.job-return')).toHaveCount(0);
+  await openJob();
+  await expect(page.getByRole('combobox', { name: 'Model' })).toBeEnabled();
+  await page.getByRole('combobox', { name: 'Model' }).selectOption('deep');
+  await page.getByRole('button', { name: 'Fork', exact: true }).click();
+  await expect(page.locator('.job-return')).toHaveCount(0);
+  await openJob();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings', exact: true });
+  await settings.getByRole('button', { name: 'Add daemon host' }).click();
+  await settings.getByLabel('Name', { exact: true }).fill('Another host');
+  await settings.getByLabel('Endpoint', { exact: true }).fill('ws://127.0.0.1:9999/arc');
+  await settings.getByRole('button', { name: 'Add host', exact: true }).click();
+  await settings.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.locator('.job-return')).toHaveCount(0);
+});
 
 test.beforeEach(async ({ page }) => {
   const attachDaemon = fixtureDaemon();
@@ -117,6 +225,173 @@ for (const width of [390, 1440]) {
     await expect(composer).toHaveValue('Keep the new conversation draft too');
   });
 }
+
+test('new conversation creates with selected project and preset', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Project' }).selectOption('configured-project');
+  await page.getByRole('combobox', { name: 'Model' }).selectOption('deep');
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  await composer.fill('Use the selected setup');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.locator('.message.from-user')).toContainText('Use the selected setup');
+  await expect(page.getByRole('combobox', { name: 'Model' })).toHaveValue('__recorded__');
+  await expect(page.locator('.conversation-controls .control-fixed').first()).toHaveText('configured-project');
+});
+
+test('existing conversation requires explicit model fork and cancel preserves original', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  await composer.fill('Keep this draft across a fork');
+  await page.getByRole('combobox', { name: 'Model' }).selectOption('deep');
+  await expect(page.getByRole('group', { name: 'Confirm model fork' })).toContainText('Fork conversation with deep?');
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(page.getByRole('combobox', { name: 'Model' })).toHaveValue('__recorded__');
+  await expect(page.locator('.title')).toContainText('Plan a focused week');
+  await expect(composer).toHaveValue('Keep this draft across a fork');
+  await page.getByRole('combobox', { name: 'Model' }).selectOption('deep');
+  await page.getByRole('button', { name: 'Fork', exact: true }).click();
+  await expect(page.locator('.title')).toHaveText('New conversation');
+  await expect(composer).toHaveValue('Keep this draft across a fork');
+});
+
+test('composer controls fit phone width and meet touch target size', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.goto('/');
+  const metrics = await page.locator('.conversation-controls').evaluate((row) => ({
+    overflow: document.documentElement.scrollWidth > innerWidth,
+    controls: [...row.querySelectorAll('select, button')].map((element) => {
+      const rect = element.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    }),
+  }));
+  expect(metrics.overflow).toBe(false);
+  expect(metrics.controls.length).toBeGreaterThanOrEqual(2);
+  expect(metrics.controls.every(({ width, height }) => width >= 44 && height >= 44)).toBe(true);
+});
+
+test('status stays plain and context controls share the existing composer toolbar', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const status = page.getByRole('button', { name: 'ARC status' });
+  await expect(status).toContainText('Connected');
+  const style = await status.evaluate((element) => ({
+    glass: element.classList.contains('glass'),
+    border: getComputedStyle(element).borderWidth,
+    background: getComputedStyle(element).backgroundColor,
+    shadow: getComputedStyle(element).boxShadow,
+  }));
+  expect(style).toEqual({ glass: false, border: '0px', background: 'rgba(0, 0, 0, 0)', shadow: 'none' });
+  await expect(page.locator('.compose-toolbar .conversation-controls')).toHaveCount(1);
+  await expect(page.locator('.composer > .conversation-controls')).toHaveCount(0);
+  await expect(page.locator('.compose-toolbar')).not.toContainText('ARC');
+  const controls = await page.locator('.conversation-controls select').evaluateAll((elements) => elements.map((element) => ({
+    appearance: getComputedStyle(element).appearance,
+    border: getComputedStyle(element).borderWidth,
+  })));
+  expect(controls.every((control) => control.appearance === 'none' && control.border === '0px')).toBe(true);
+  await page.screenshot({ path: '/tmp/arc-web-quiet-footer.png' });
+});
+
+test('recorded high remains visible when the daemon exposes no editable thinking levels', async ({ page }) => {
+  const attach = fixtureDaemon();
+  attach.setStatus({ effectiveThinking: 'high', supportedThinking: [] });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.goto('/');
+  await expect(page.locator('.thinking-readonly')).toHaveText('high');
+  await expect(page.locator('.conversation-controls')).not.toContainText('unavailable');
+  await expect(page.getByRole('combobox', { name: 'Thinking' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'ARC status' }).click();
+  const status = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(status).toContainText('Thinking · high');
+  await expect(status).toContainText('no editable levels');
+});
+
+test('thinking picker appears only after deliberate preparation and lists supported levels', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByRole('button', { name: 'Choose thinking' }).click();
+  const thinking = page.getByRole('combobox', { name: 'Thinking' });
+  await expect(thinking).toBeVisible();
+  await expect(thinking.locator('option')).toHaveText(['low', 'medium', 'high']);
+  await thinking.selectOption('high');
+  await expect(thinking).toHaveValue('high');
+});
+
+test('status sheet reports measured and stale data, refreshes, and keeps recovery by composer', async ({ page }) => {
+  const attach = fixtureDaemon();
+  attach.setStatus({
+    contextObservedAt: BigInt(Math.floor(Date.now() / 1000) - 300),
+    allowanceObservedAt: BigInt(Math.floor(Date.now() / 1000) - 300),
+    allowanceStale: true,
+  });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.addInitScript(() => {
+    const state = JSON.parse(localStorage.getItem('arc-web.local.v1')!);
+    state.inputs = { 'test-daemon': [{ id: 'recover', sessionId: 'test-planning', content: 'Keep near composer', state: 'uncertain' }] };
+    localStorage.setItem('arc-web.local.v1', JSON.stringify(state));
+  });
+  await page.goto('/');
+  await expect(page.locator('.uncertain-input')).toContainText('Keep near composer');
+  await expect(page.locator('.main > .notice')).toHaveCount(0);
+  const status = page.getByRole('button', { name: 'ARC status' });
+  const bounds = await status.boundingBox();
+  expect(bounds?.height).toBeGreaterThanOrEqual(44);
+  await status.click();
+  const dialog = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(dialog.getByRole('heading', { name: 'ARC status' })).toBeFocused();
+  await expect(dialog).toContainText('1,200 tokens');
+  await expect(dialog).toContainText('Latest completed-step context, not cumulative spend');
+  await expect(dialog).not.toContainText('Context · stale');
+  await expect(dialog).toContainText('week · 72% remaining');
+  await expect(dialog).toContainText('stale');
+  await page.screenshot({ path: '/tmp/arc-web-parity-desktop-status.png' });
+  await expect.poll(() => status.innerText()).toContain('Connected');
+  const refresh = dialog.getByRole('button', { name: 'Refresh' });
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  await expect.poll(() => status.innerText()).toContain('Connected');
+  await page.keyboard.press('Escape');
+  await expect(dialog).not.toBeVisible();
+  await expect(status).toBeFocused();
+  await expect(page.locator('.uncertain-input')).toContainText('Keep near composer');
+});
+
+test('status attention uses fresh allowances and expires stale low readings', async ({ page }) => {
+  const attach = fixtureDaemon();
+  attach.setStatus({ allowance: [create(AllowanceWindowSchema, { remainingPercent: 5, windowSeconds: 604800n })] });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const button = page.getByRole('button', { name: 'ARC status' });
+  await expect(button).toContainText('Low allowance');
+  await button.click();
+  const panel = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(panel).toContainText('10% or less remaining');
+  await page.screenshot({ path: '/tmp/arc-web-parity-phone-status.png' });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+  attach.setStatus({ allowance: [create(AllowanceWindowSchema, { remainingPercent: 5, windowSeconds: 604800n })],
+    allowanceObservedAt: BigInt(Math.floor(Date.now() / 1000) - 300) });
+  await expect(panel.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+  await panel.getByRole('button', { name: 'Refresh' }).click();
+  await expect(button).toContainText('Connected');
+  await expect(panel).toContainText('stale');
+  await expect(panel).not.toContainText('10% or less remaining');
+});
+
+test('status panel states context is unmeasured when no reading is supplied', async ({ page }) => {
+  const attach = fixtureDaemon();
+  attach.setStatus({ context: undefined, allowance: [] });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.goto('/');
+  await page.getByRole('button', { name: 'ARC status' }).click();
+  const dialog = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(dialog).toContainText('Not measured');
+  await expect(dialog).toContainText('window unknown');
+  await expect(dialog).toContainText('Unavailable');
+});
 
 test('phone header leaves clearance below the top safe area', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -508,7 +783,7 @@ test('unreachable daemon host cannot send and preserves its draft', async ({ pag
   await dialog.getByRole('button', { name: 'Add host', exact: true }).click();
   await dialog.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(page.locator('.status')).toContainText('Erebor');
-  await expect(page.locator('.status')).toContainText('Unavailable');
+  await expect(page.locator('.status')).toContainText('Disconnected');
   await expect(page.locator('.message')).toHaveCount(0);
   const composer = page.getByRole('textbox', { name: 'Message to ARC' });
   await composer.fill('Offline host draft');

@@ -7,7 +7,8 @@ import {
   HistoryMessageSchema, HistoryToolCallSchema, HistoryToolResultSchema,
   SessionHistorySchema, SessionListSchema, MessageAcceptedSchema, DeltaSchema,
   ToolCallStartedSchema, ToolCallEndedSchema, StreamEndSchema, JobListSchema, JobInfoSchema, JobInfo_State,
-  type JobInfo, type SessionInfo,
+  ProjectListSchema, ModelListSchema, ModelChoiceSchema, type JobInfo, type SessionInfo,
+  SessionStatusSchema,
 } from '../../src/lib/arc/gen/wire_pb';
 
 const direct = create(SessionInfoSchema, {
@@ -37,10 +38,12 @@ type Daemon = {
   sent: Request[];
   histories: Map<string, ReturnType<typeof create<typeof SessionHistorySchema>>>;
   setHistory: (history: ReturnType<typeof create<typeof SessionHistorySchema>>) => void;
+  setProjects: (projects: string[]) => void;
   attach: (route: WebSocketRoute, options?: { deny?: boolean; streamGate?: () => Promise<void> }) => void;
 };
 
-function daemon(sessions: SessionInfo[] = [direct, secondDirect, job], jobs: JobInfo[] = []): Daemon {
+function daemon(sessions: SessionInfo[] = [direct, secondDirect, job], jobs: JobInfo[] = [], projects = ['arc', 'arc-web']): Daemon {
+  let configuredProjects = projects;
   const sent: Request[] = [];
   const histories = new Map([
     [durableHistory.sessionId, durableHistory],
@@ -51,6 +54,7 @@ function daemon(sessions: SessionInfo[] = [direct, secondDirect, job], jobs: Job
       }) } })],
     })],
   ]);
+  const thinking = new Map<string, string>([['chat-1', 'low'], ['chat-2', 'low']]);
   const sockets = new Set<WebSocketRoute>();
   const attach = (route: WebSocketRoute, options: { deny?: boolean; streamGate?: () => Promise<void> } = {}) => {
   sockets.add(route);
@@ -68,6 +72,19 @@ function daemon(sessions: SessionInfo[] = [direct, secondDirect, job], jobs: Job
       case 'subscribe': break;
       case 'listSessions': reply({ case: 'sessionList', value: create(SessionListSchema, { sessions }) }); break;
       case 'listJobs': reply({ case: 'jobList', value: create(JobListSchema, { jobs }) }); break;
+      case 'listProjects': reply({ case: 'projectList', value: create(ProjectListSchema, { projects: configuredProjects.map((name) => ({ name })) }) }); break;
+      case 'listModels': reply({ case: 'modelList', value: create(ModelListSchema, { choices: [
+        create(ModelChoiceSchema, { role: SessionRole.CHAT, name: 'default', provider: 'openai', model: 'gpt-test', selected: true }),
+      ] }) }); break;
+      case 'fetchStatus':
+      case 'setSessionThinking': {
+        const sessionId = request.msg.value.sessionId;
+        if (request.msg.case === 'setSessionThinking') thinking.set(sessionId, request.msg.value.thinking);
+        reply({ case: 'sessionStatus', value: create(SessionStatusSchema, {
+          sessionId, effectiveThinking: thinking.get(sessionId) ?? 'low', supportedThinking: ['low', 'medium', 'high'],
+        }) });
+        break;
+      }
       case 'fetchHistory': {
         const history = histories.get(request.msg.value.sessionId);
         if (history) reply({ case: 'sessionHistory', value: history });
@@ -100,6 +117,7 @@ function daemon(sessions: SessionInfo[] = [direct, secondDirect, job], jobs: Job
   return {
     sent, histories,
     setHistory: (history) => histories.set(history.sessionId, history),
+    setProjects: (next) => { configuredProjects = next; },
     attach,
   };
 }
@@ -205,7 +223,10 @@ test('switching daemon hosts closes the previous connection and isolates session
   await page.locator('.sidebar').getByRole('combobox', { name: 'Project' }).selectOption('arc');
   await expect(page.locator('.session-list .session')).toHaveCount(1);
   await addHost(page, 'Second daemon', 'ws://127.0.0.1:9999');
-  await expect(page.locator('.status')).toContainText('Second daemon');
+  await expect(page.locator('.status')).toContainText('Connected');
+  await page.getByRole('button', { name: 'ARC status' }).click();
+  await expect(page.getByRole('dialog', { name: 'ARC status' })).toContainText('Second daemon');
+  await page.keyboard.press('Escape');
   await expect(page.locator('.session-list')).toContainText('Protocol history');
   await expect(page.locator('.sidebar').getByRole('combobox', { name: 'Project' })).toHaveValue('');
   await expect(page.locator('.session-list .session')).toHaveCount(2);
@@ -226,7 +247,7 @@ test('sessions default to all projects, filter explicitly, and keep abandoned se
     create(SessionInfoSchema, { id: 'older', title: 'Earlier work', preview: 'Recent window changes', project: 'arc-web', source: Source.USER, lastAt: { seconds: 50n } }),
     create(SessionInfoSchema, { ...direct, project: 'arc-web', lastAt: create(TimestampSchema, { seconds: 100n }) }),
   ];
-  const server = daemon(sessions);
+  const server = daemon(sessions, [], ['arc', 'arc-web']);
   await page.routeWebSocket('ws://127.0.0.1:8787', (route) => server.attach(route));
   await page.setViewportSize({ width: 1100, height: 840 });
   await page.goto('/');
@@ -268,6 +289,31 @@ test('sessions default to all projects, filter explicitly, and keep abandoned se
   await expect(titles).toHaveText(['Another conversation']);
 });
 
+test('removed project history stays under All projects and a removed filter resets on refresh', async ({ page }) => {
+  const sessions = [
+    create(SessionInfoSchema, { ...direct, project: 'removed-project' }),
+    create(SessionInfoSchema, { ...secondDirect, project: 'current-project' }),
+  ];
+  const server = daemon(sessions, [], ['current-project', 'empty-configured-project']);
+  await page.routeWebSocket('ws://127.0.0.1:8787', (route) => server.attach(route));
+  await page.goto('/');
+  await addHost(page);
+  const project = page.locator('.sidebar').getByRole('combobox', { name: 'Project' });
+  await expect(project.locator('option')).toHaveText(['All projects', 'current-project', 'empty-configured-project']);
+  await project.selectOption('current-project');
+  await expect(page.locator('.session-list')).toContainText('Another conversation');
+  await expect(page.locator('.session-list')).not.toContainText('Protocol history');
+  server.setProjects(['empty-configured-project']);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings', exact: true });
+  await settings.getByRole('button', { name: 'Reconnect / refresh' }).click();
+  await settings.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(project).toHaveValue('');
+  await expect(page.locator('.session-list')).toContainText('Protocol history');
+  await expect(page.locator('.session-list')).toContainText('Another conversation');
+  await expect(project.locator('option')).toHaveText(['All projects', 'empty-configured-project']);
+});
+
 test('jobs show only daemon-reported jobs and never inflate the list with archived sessions', async ({ page }) => {
   const server = daemon([direct, job], [
     create(JobInfoSchema, { sessionId: 'current-job', title: 'Current daemon job', state: JobInfo_State.RUNNING }),
@@ -296,7 +342,7 @@ test('legacy Demo profiles are removed while the saved real host and draft survi
     }));
   });
   await page.goto('/');
-  await expect(page.locator('.status')).toContainText('Saved ARC');
+  await expect(page.locator('.status')).toContainText('Connected');
   await expect(page.getByRole('textbox', { name: 'Message to ARC' })).toHaveValue('Keep my real draft');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(page.locator('.host-select')).toHaveCount(1);

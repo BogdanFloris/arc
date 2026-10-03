@@ -81,7 +81,7 @@ describe('Workspace local state', () => {
     workspace.initialize();
     expect(workspace.hosts).toEqual([host('current')]);
     expect(values.has('cairn.local.v1')).toBe(true);
-    expect(values.get('arc-web.local.v1')).toBe(current);
+    expect(JSON.parse(values.get('arc-web.local.v1')!)).toEqual({ ...JSON.parse(current), choices: {} });
   });
 
   it('retains legacy data when migration persistence fails', () => {

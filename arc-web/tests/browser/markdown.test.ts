@@ -1,10 +1,10 @@
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
-import { Role, Source } from '../../src/lib/arc/gen/events_pb';
+import { Role, SessionRole, Source } from '../../src/lib/arc/gen/events_pb';
 import {
   ClientFrameSchema, ServerFrameSchema, SessionInfoSchema, SessionListSchema,
   JobListSchema, SessionHistorySchema, HistoryEntrySchema, HistoryMessageSchema,
-  MessageAcceptedSchema, DeltaSchema, StreamEndSchema,
+  MessageAcceptedSchema, DeltaSchema, StreamEndSchema, ProjectListSchema, ModelListSchema, ModelChoiceSchema, SessionStatusSchema,
 } from '../../src/lib/arc/gen/wire_pb';
 
 const userText = '**Keep my input literal**\nline two';
@@ -72,6 +72,16 @@ async function setup(page: Page, content: string) {
         ] }) });
         break;
       case 'listJobs': reply({ case: 'jobList', value: create(JobListSchema) }); break;
+      case 'listProjects': reply({ case: 'projectList', value: create(ProjectListSchema) }); break;
+      case 'listModels': reply({ case: 'modelList', value: create(ModelListSchema, { choices: [
+        create(ModelChoiceSchema, { role: SessionRole.CHAT, name: 'default', provider: 'openai', model: 'gpt-test', selected: true }),
+      ] }) }); break;
+      case 'fetchStatus':
+      case 'setSessionThinking':
+        reply({ case: 'sessionStatus', value: create(SessionStatusSchema, {
+          sessionId: request.msg.value.sessionId, effectiveThinking: 'low', supportedThinking: ['low', 'medium', 'high'],
+        }) });
+        break;
       case 'fetchHistory':
         reply({ case: 'sessionHistory', value: create(SessionHistorySchema, { sessionId: 'markdown-chat', entries }) });
         break;

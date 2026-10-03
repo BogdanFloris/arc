@@ -52,12 +52,18 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .header-actions { display: flex; grid-column: 3; grid-row: 1; flex: none; align-items: center; gap: 8px; }
 .icon-button svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
 .context { display: flex; grid-column: 1 / -1; grid-row: 2; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
-.status { display: flex; min-width: 0; gap: 6px; align-items: center; color: var(--muted); font-size: 10px; white-space: nowrap; }
-.status::before { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--green); content: ""; }
+.status-button { display: inline-flex; min-width: 44px; max-width: 100%; min-height: 44px; padding: 0; align-items: center; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.status { display: flex; min-width: 0; gap: 7px; align-items: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.status-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
 .host-name { overflow: hidden; text-overflow: ellipsis; }
 .status > span:last-child { flex: none; }
 .status.unavailable { color: var(--muted); }
-.status.unavailable::before { background: var(--yellow); }
+.status.unavailable .status-dot { background: var(--red); }
+.status.attention:not(.unavailable) .status-dot { background: var(--yellow); }
+.status-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.status-section { margin: 16px 0; padding: 12px; border: 1px solid #ebdbb214; border-radius: 14px; background: #28282826; }
+.status-section h3 { margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+.status-section p { margin: 4px 0; overflow-wrap: anywhere; font-size: 13px; }
 .job-status { display: inline-flex; flex: none; padding: 0; align-items: center; gap: 8px; color: var(--muted); font: 11px ui-monospace, monospace; white-space: nowrap; }
 .job-status span { color: var(--orange); font-size: 18px; }
 .transcript { width: 100%; min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable both-edges; }
@@ -129,13 +135,27 @@ pre { margin: 0; padding: 0 12px 12px; overflow-wrap: anywhere; color: var(--mut
 textarea { display: block; width: 100%; min-height: 52px; max-height: 180px; padding: 14px 16px 8px; resize: none; border: 0; border-radius: 16px 16px 0 0; background: transparent; line-height: 1.45; }
 textarea:focus-visible { outline: none; }
 textarea::placeholder { color: var(--muted); }
-.compose-toolbar { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 8px 8px 16px; }
+.compose-toolbar { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px 8px 16px; }
 .send { display: grid; width: 44px; height: 44px; flex: none; padding: 0; border-radius: 50%; place-items: center; }
 .send svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .send, .send:hover:not(:disabled), .action { background: var(--orange); color: #282828; font-weight: 650; }
 .send:disabled { background: var(--line); color: var(--muted); opacity: 1; }
+.conversation-controls { display: flex; flex: 1; min-width: 0; align-items: center; gap: 6px; }
+.project-choice { flex: 1; min-width: 44px; overflow: hidden; }
+.model-choice { flex: 2; min-width: 44px; }
+.thinking-control { flex: none; width: 52px; }
+.conversation-controls select, .control-fixed, .thinking-button { width: 100%; min-width: 44px; min-height: 44px; padding: 8px 0; overflow: hidden; border: 0; border-radius: 0; background: transparent; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-controls select { -webkit-appearance: none; appearance: none; cursor: pointer; }
+.conversation-controls select option { background: var(--raised); color: var(--text); }
+.conversation-controls select:disabled { cursor: default; opacity: .7; }
+.control-fixed { display: flex; align-items: center; }
+.thinking-button { text-align: left; cursor: pointer; }
+.control-error { margin: 4px 2px 0; color: var(--yellow); font-size: 12px; }
+.fork-confirm { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; padding: 4px 0; color: var(--yellow); font-size: 13px; }
+.fork-confirm span { min-width: 0; flex: 1 1 100%; overflow-wrap: anywhere; }
+.fork-confirm button { min-height: 44px; }
 .hint { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; color: var(--muted); font-size: 12px; }
-.keyboard-hint { display: none; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.keyboard-hint { display: none; margin: 0; padding: 0 16px 10px; color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .notice { width: min(760px, 100%); margin: 12px auto 0; padding: 0 var(--gutter); color: var(--yellow); }
 .empty { margin: 0; color: var(--yellow); }
 .jump { position: absolute; z-index: 1; right: calc(var(--gutter) - 8px); bottom: calc(100% + 4px); display: grid; width: 44px; height: 44px; padding: 0; border-radius: 50%; place-items: center; }
@@ -183,7 +203,12 @@ dialog h2:focus-visible { outline: none; }
 .form-actions button, .quiet-action { padding: 10px 16px; border-radius: 24px; font-size: 14px; }
 .quiet-action { flex: none; background: #ebdbb20a; color: var(--text); }
 .panel-notice { margin: 12px 4px 0; color: var(--yellow); font-size: 13px; overflow-wrap: anywhere; }
-.job { display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.job { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.job-copy { display: grid; min-width: 0; gap: 4px; text-align: left; }
+.job-copy strong { overflow-wrap: anywhere; }
+.job-open { width: 44px; min-height: 44px; padding: 0; text-align: center; }
+.job-return { flex: none; width: min(760px, 100%); margin: 0 auto; padding: 8px var(--gutter) 0; }
+.job-return button { max-width: 100%; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-only { display: inline-grid; grid-column: 1; grid-row: 1; }
 @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .glass { background: linear-gradient(135deg, #ebdbb21a, #ebdbb205 45%, #ebdbb20d), var(--glass-fill); -webkit-backdrop-filter: blur(28px) saturate(1.3); backdrop-filter: blur(28px) saturate(1.3); }

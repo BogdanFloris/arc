@@ -5,6 +5,7 @@
   import Markdown from './lib/Markdown.svelte';
   import type { HostProfile } from './lib/arc/types';
   import { pwa } from './pwa.svelte';
+  import { allowanceIsStale, observedAt, resetAt, windowLabel, statusWarning } from './lib/status';
   import logo from '../assets/logo.svg';
 
   function createWorkspace(): Workspace {
@@ -26,26 +27,40 @@
   let panelTitle: HTMLHeadingElement;
   let composer: HTMLTextAreaElement;
   let transcript: HTMLElement;
-  let panelKind = $state<'sessions' | 'settings' | 'jobs'>('sessions');
+  let panelKind = $state<'sessions' | 'settings' | 'jobs' | 'status'>('sessions');
   let name = $state('');
   let endpoint = $state('');
   let adding = $state(false);
   let follow = $state(true);
   let ready = $state(false);
+  let existingModelMenu = $state('__recorded__');
   let hostError = $state('');
+  let jobReturn = $state<{ hostId: string | null; sessionId: string | null; title: string; jobId: string } | null>(null);
   let opener: HTMLElement | null = null;
   const scrollPositions = new Map<string, { top: number; follow: boolean }>();
   let previousTranscriptKey = '';
   let previousTail = '';
   let previousScrollTop = 0;
+  let statusNow = $state(Date.now());
   let activeId = $derived(workspace.activeSessionId);
   let currentHost = $derived(workspace.activeHost);
+  let composerProject = $derived(workspace.activeSession?.project ?? workspace.newProject);
   let connected = $derived(workspace.canSend);
   let connectionLabel = $derived(workspace.connectionState === 'connected' ? 'Connected'
-    : workspace.connectionState === 'connecting' ? 'Connecting…' : 'Unavailable');
+    : workspace.connectionState === 'connecting' ? 'Connecting' : 'Disconnected');
+  let readingWarning = $derived(statusWarning(workspace.sessionStatus, statusNow));
+  let statusSummary = $derived(workspace.connectionState !== 'connected' ? connectionLabel
+    : workspace.notice || workspace.controlsError || workspace.statusError ? 'Notice'
+    : readingWarning ? readingWarning
+    : workspace.sending ? 'Responding' : workspace.controlsBusy ? 'Updating'
+    : workspace.loading ? 'Loading' : 'Connected');
   let transcriptKey = $derived(`${workspace.activeHostId ?? ''}:${activeId ?? ''}`);
 
   onMount(() => {
+    const statusTimer = setInterval(() => {
+      const now = Date.now();
+      if ((panel?.open && panelKind === 'status') || now - statusNow >= 30_000) statusNow = now;
+    }, 1000);
     workspace.initialize();
     ready = true;
     const resume = () => { if (document.visibilityState === 'visible') workspace.resume(); };
@@ -53,12 +68,19 @@
     window.addEventListener('pageshow', resume);
     document.addEventListener('visibilitychange', resume);
     return () => {
+      clearInterval(statusTimer);
       window.removeEventListener('online', resume);
       window.removeEventListener('pageshow', resume);
       document.removeEventListener('visibilitychange', resume);
     };
   });
   onDestroy(() => workspace.dispose());
+
+  async function openStatus(source: HTMLElement) {
+    statusNow = Date.now();
+    await open('status', source);
+    void workspace.refreshStatus();
+  }
 
   async function open(kind: typeof panelKind, source: HTMLElement) {
     panelKind = kind;
@@ -80,12 +102,14 @@
   }
 
   function selectSession(id: string) {
+    jobReturn = null;
     saveScrollPosition();
     workspace.selectSession(id);
     if (panel.open) panel.close();
   }
 
   function newConversation() {
+    jobReturn = null;
     saveScrollPosition();
     workspace.newConversation();
     if (panel.open) panel.close();
@@ -99,9 +123,38 @@
   }
 
   function selectHost(id: string) {
+    jobReturn = null;
     saveScrollPosition();
     workspace.selectHost(id);
   }
+
+  function openJob(id: string) {
+    const route = jobReturn ?? {
+      hostId: workspace.activeHostId,
+      sessionId: workspace.activeSessionId,
+      title: workspace.activeSession ? workspace.activeTitle : 'new conversation',
+      jobId: id
+    };
+    jobReturn = { ...route, jobId: id };
+    saveScrollPosition();
+    workspace.selectSession(id);
+    if (panel.open) panel.close();
+  }
+
+  function returnFromJob() {
+    const route = jobReturn;
+    if (!route || route.hostId !== workspace.activeHostId) return;
+    jobReturn = null;
+    saveScrollPosition();
+    if (route.sessionId) workspace.selectSession(route.sessionId);
+    else workspace.newConversation();
+    if (panel.open) panel.close();
+  }
+
+  $effect(() => {
+    const route = jobReturn;
+    if (route && (workspace.activeHostId !== route.hostId || activeId !== route.jobId)) jobReturn = null;
+  });
 
   function onScroll() {
     if (!transcript) return;
@@ -150,6 +203,11 @@
   async function submit(event: SubmitEvent) {
     event.preventDefault();
     await workspace.send();
+  }
+
+  function cancelModelFork() {
+    workspace.cancelModelFork();
+    existingModelMenu = '__recorded__';
   }
 
   function onDraftInput(event: Event) {
@@ -224,10 +282,11 @@
         </button>
       </div>
       <div class="context">
-        <span class:unavailable={!connected} class="status">
-          <span class="host-name" title={currentHost?.name}>{currentHost?.name ?? 'No host'}</span>
-          <span>· {connectionLabel}</span>
-        </span>
+        <button class="status-button" aria-label="ARC status" onclick={(event) => openStatus(event.currentTarget)}>
+          <span class:unavailable={!connected} class:attention={!!(workspace.notice || workspace.controlsError || workspace.statusError || readingWarning)} class="status">
+            <span class="status-dot" aria-hidden="true"></span><span class="host-name" title={currentHost?.name}>{currentHost?.name ?? 'No host'}</span><span>· {statusSummary}</span>
+          </span>
+        </button>
         {#if currentHost}
           <button class="job-status" aria-label="Jobs" onclick={(event) => open('jobs', event.currentTarget)}>
             {#if workspace.jobs.some((job) => job.state === 'running')}{workspace.jobs.filter((job) => job.state === 'running').length} job running{:else}Jobs{/if}
@@ -237,7 +296,7 @@
       </div>
     </header>
 
-    {#if workspace.notice}<p class="notice" role="status">{workspace.notice}</p>{/if}
+    {#if jobReturn}<div class="job-return"><button class="quiet-action" onclick={returnFromJob}>Back to {jobReturn.title}</button></div>{/if}
     <section class="transcript" aria-label="Conversation" bind:this={transcript} onscroll={onScroll}>
       <div class="transcript-content">
         {#each workspace.messages as message (message.id)}
@@ -295,15 +354,54 @@
       <div class="compose-row">
         <textarea bind:this={composer} value={workspace.draft} oninput={onDraftInput} onkeydown={onKeydown} aria-label="Message to ARC" placeholder={connected ? 'Message ARC…' : 'Draft a message (not connected)'} rows="1"></textarea>
         <div class="compose-toolbar">
-          <p class="hint">
-            <span>{!connected ? connectionLabel : workspace.sending ? 'Responding…' : workspace.loading ? 'Loading…' : 'ARC'}</span>
-            {#if connected}<span class="keyboard-hint">Enter to send · Shift+Enter for newline</span>{/if}
-          </p>
-          <button class="send" type="submit" aria-label="Send" title="Send message" disabled={!connected || workspace.loading || workspace.sending || !workspace.draft.trim()}>
+          <div class="conversation-controls" aria-label="Conversation settings">
+            <div class="project-choice">
+              {#if workspace.isEmptyConversation}
+                <select aria-label="Project" title="Conversation project" value={composerProject} disabled={!workspace.canConfigure} onchange={(event) => workspace.selectNewProject(event.currentTarget.value)}>
+                  {#if composerProject && !workspace.projectOptions.includes(composerProject)}<option value={composerProject}>{composerProject} (unavailable)</option>{/if}
+                  <option value="">No project</option>
+                  {#each workspace.projectOptions as project}<option value={project}>{project}</option>{/each}
+                </select>
+              {:else}<span class="control-fixed composer-project" title={composerProject || 'No project'}>{composerProject || 'No project'}</span>{/if}
+            </div>
+            <div class="model-choice">
+              {#if !workspace.activeSessionId}
+                <select aria-label="Model" title="Model preset" value={workspace.newModelChoice} disabled={!workspace.canConfigure || !workspace.availableModels.length} onchange={(event) => workspace.chooseModel(event.currentTarget.value)}>
+                  {#if workspace.newModelChoice && !workspace.availableModels.some((choice) => choice.name === workspace.newModelChoice)}<option value={workspace.newModelChoice}>{workspace.newModelChoice} (unavailable)</option>{/if}
+                  {#if !workspace.availableModels.length}<option value="">No models</option>{/if}
+                  {#each workspace.availableModels as choice}<option value={choice.name}>{choice.name}</option>{/each}
+                </select>
+              {:else}
+                <select aria-label="Model" title={workspace.recordedModel} bind:value={existingModelMenu} disabled={!workspace.canConfigure || !workspace.availableModels.length} onchange={() => { if (existingModelMenu !== '__recorded__') { workspace.chooseModel(existingModelMenu); existingModelMenu = '__recorded__'; } }}>
+                  <option value="__recorded__">{workspace.recordedModel}</option>
+                  {#each workspace.availableModels as choice}<option value={choice.name}>{choice.name}</option>{/each}
+                </select>
+              {/if}
+            </div>
+            <div class="thinking-control">
+              {#if !workspace.sessionStatus && workspace.isEmptyConversation}
+                <button class="thinking-button" type="button" aria-label="Choose thinking" title="Choose thinking effort" disabled={!workspace.canConfigure} onclick={() => void workspace.prepareThinking()}>{workspace.statusLoading ? '…' : workspace.effectiveThinking || 'thinking'}</button>
+              {:else if workspace.sessionStatus?.supportedThinking.length}
+                <select aria-label="Thinking" title="Thinking effort" value={workspace.sessionStatus.supportedThinking.includes(workspace.effectiveThinking) ? workspace.effectiveThinking : ''} disabled={!workspace.canConfigure} onchange={(event) => void workspace.setThinking(event.currentTarget.value)}>
+                  {#if !workspace.sessionStatus.supportedThinking.includes(workspace.effectiveThinking)}<option value="">{workspace.effectiveThinking || 'Unknown'} · current</option>{/if}
+                  {#each workspace.sessionStatus.supportedThinking as level}<option value={level}>{level}</option>{/each}
+                </select>
+              {:else}<span class="control-fixed thinking-readonly" aria-label={`Thinking ${workspace.effectiveThinking || 'unknown'}, read-only`} title="Current effort; the daemon does not offer changes for this model.">{workspace.effectiveThinking || '—'}</span>{/if}
+            </div>
+          </div>
+          <button class="send" type="submit" aria-label="Send" title="Send message" disabled={!connected || workspace.loading || workspace.sending || workspace.controlsBusy || !workspace.draft.trim()}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>
           </button>
         </div>
+        {#if connected}<p class="keyboard-hint">Enter to send · Shift+Enter for newline</p>{/if}
       </div>
+      {#if workspace.pendingModelFork}
+        <div class="fork-confirm" role="group" aria-label="Confirm model fork">
+          <span>Fork conversation with {workspace.pendingModelFork}?</span>
+          <button type="button" onclick={() => void workspace.confirmModelFork()}>Fork</button>
+          <button type="button" onclick={cancelModelFork}>Cancel</button>
+        </div>
+      {/if}
     </form>
   </main>
 </div>
@@ -312,7 +410,7 @@
   <button class="panel-dismiss" tabindex="-1" aria-label="Dismiss panel" onclick={dismissBackdrop}></button>
   <div class="panel-surface glass" class:list-panel={panelKind !== 'settings'} bind:this={panelSurface}>
   <div class="panel-header">
-    <h2 id="panel-title" tabindex="-1" bind:this={panelTitle}>{panelKind === 'sessions' ? 'Sessions' : panelKind === 'settings' ? 'Settings' : 'Jobs'}</h2>
+    <h2 id="panel-title" tabindex="-1" bind:this={panelTitle}>{panelKind === 'sessions' ? 'Sessions' : panelKind === 'settings' ? 'Settings' : panelKind === 'jobs' ? 'Jobs' : 'ARC status'}</h2>
     <button class="icon-button" aria-label="Close" title="Close panel" onclick={() => panel.close()}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
     </button>
@@ -381,11 +479,29 @@
       </div>
       {#if pwa.error}<p class="panel-notice" role="alert">{pwa.error}</p>{/if}
     </section>
+  {:else if panelKind === 'status'}
+    <div class="status-content">
+      <section class="status-section"><h3>Connection</h3><p>{currentHost?.name ?? 'No host'} · {connectionLabel}</p><p>{workspace.sending ? 'Observing a reply' : workspace.controlsBusy ? 'Updating conversation' : workspace.loading ? 'Loading conversation' : 'No local reply stream'}</p>{#if workspace.statusLoading}<p>Updating status…</p>{/if}<button class="quiet-action" disabled={workspace.statusLoading} onclick={() => { if (connected) void workspace.refreshStatus(); else workspace.resume(); }}>Refresh</button></section>
+      {#if workspace.activeSessionId || workspace.newProject || workspace.newModelChoice || workspace.effectiveThinking}
+        <section class="status-section"><h3>Session</h3>{#if workspace.activeSessionId}<p>{workspace.activeSession?.project || 'No project'} · {workspace.recordedModel}</p><p>{workspace.activeSession?.provider || 'Provider unknown'}</p>{:else}<p>{workspace.newProject || 'No project'} · {workspace.newModelChoice || 'No model selected'}</p>{/if}<p>Thinking · {workspace.effectiveThinking || 'Unknown'}</p><p class="muted">{workspace.sessionStatus && !workspace.sessionStatus.supportedThinking.length ? 'Current effort is recorded; this daemon offers no editable levels for the model.' : 'Changes apply to the next turn.'}</p></section>
+      {/if}
+      {#if workspace.sessionStatus}
+        {@const context = workspace.sessionStatus.context}
+        <section class="status-section"><h3>Context</h3><p>{context ? `${context.inputTokens.toLocaleString()} tokens${context.contextWindow ? ` of ${context.contextWindow.toLocaleString()}` : ' · window unknown'}` : 'Not measured · window unknown'}{#if !connected || workspace.statusError} · last known{/if}</p>{#if context?.compactAt}<p>Compaction at {context.compactAt.toLocaleString()} tokens</p>{/if}<p>Latest completed-step context, not cumulative spend.</p><p>{observedAt(workspace.sessionStatus.contextObservedAt, statusNow)}</p></section>
+        {@const allowanceStale = allowanceIsStale(workspace.sessionStatus, statusNow)}
+        <section class="status-section"><h3>Account allowance</h3><p>Shared account allowance{#if allowanceStale && workspace.sessionStatus.allowance.length} · stale{/if}</p>{#if workspace.sessionStatus.allowance.length}{#each workspace.sessionStatus.allowance as window}<p>{windowLabel(window.windowSeconds, window.label)} · {window.remainingPercent}% remaining · resets {resetAt(window.resetsAt)}</p>{/each}{:else}<p>{workspace.sessionStatus.codex || workspace.sessionStatus.allowanceSource ? 'Unavailable' : 'Not reported by this provider'}</p>{/if}<p>{workspace.sessionStatus.allowanceSource || 'Source unavailable'} · {observedAt(workspace.sessionStatus.allowanceObservedAt, statusNow)}</p></section>
+      {:else}
+        <section class="status-section"><h3>Context</h3><p>{workspace.activeSessionId ? 'Reading unavailable' : 'Not measured · send a message to measure context'}</p></section>
+      {/if}
+      {#if workspace.notice || workspace.controlsError || workspace.statusError || readingWarning}
+        <section class="status-section"><h3>Notices</h3>{#if readingWarning}<p>{readingWarning === 'Low allowance' ? 'A fresh account allowance window reports 10% or less remaining.' : 'The latest context reading is at least 90% of its window.'}</p>{/if}{#if workspace.notice}<p>{workspace.notice}</p>{/if}{#if workspace.controlsError}<p>{workspace.controlsError}</p>{/if}{#if workspace.statusError}<p>{workspace.statusError}</p>{/if}</section>
+      {/if}
+    </div>
   {:else}
     <p class="muted">{connected ? 'Current daemon jobs, not archived conversations.' : 'Last known daemon jobs; reconnect to refresh.'}</p>
     <div class="dialog-list">
       {#each workspace.jobs as job (job.id)}
-        <article class="job"><strong>{job.title}</strong><span class="meta">{job.state}</span><button class="quiet-action" onclick={() => selectSession(job.id)}>Open job conversation</button></article>
+        <article class="job"><div class="job-copy"><strong>{job.title}</strong><span class="meta">{job.state}</span></div><button class="quiet-action job-open" onclick={() => openJob(job.id)}>Open</button></article>
       {:else}<p class="muted">No jobs on this host.</p>{/each}
     </div>
   {/if}
