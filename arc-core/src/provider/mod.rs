@@ -103,7 +103,7 @@ pub fn supported_thinking(provider: &str, model: &str) -> &'static [Thinking] {
     ];
     const GEMINI37: &[Thinking] = &[Thinking::Low, Thinking::Medium, Thinking::High];
     match (provider, model) {
-        ("codex", "gpt-6-astra") => ASTRA,
+        ("codex", "gpt-6-astra" | "gpt-6.1-sol") => ASTRA,
         ("codex", "gpt-6-sol" | "gpt-6-luna") => SOL,
         ("gemini", "gemini-3.6-flash") => GEMINI36,
         ("gemini", "gemini-3.7-flash") => GEMINI37,
@@ -324,8 +324,25 @@ mod tests {
 
     use super::{
         CompletionDelta, CompletionRequest, CompletionStream, Error, MAX_BODY_SNIPPET, Message,
-        Provider, Role, SessionRole, Stop, Thinking, ToolCall, Usage,
+        Provider, Role, SessionRole, Stop, Thinking, ToolCall, Usage, supported_thinking,
     };
+
+    #[test]
+    fn gpt_6_1_sol_supported_thinking() {
+        assert_eq!(
+            supported_thinking("codex", "gpt-6.1-sol"),
+            [
+                Thinking::Low,
+                Thinking::Medium,
+                Thinking::High,
+                Thinking::Xhigh,
+                Thinking::Max,
+            ]
+        );
+        assert!(supported_thinking("codex", "gpt-6-sol").contains(&Thinking::None));
+        assert!(supported_thinking("codex", "unknown").is_empty());
+        assert!(supported_thinking("unknown", "gpt-6.1-sol").is_empty());
+    }
 
     #[derive(Debug)]
     struct MockProvider {
