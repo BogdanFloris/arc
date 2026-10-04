@@ -53,8 +53,17 @@ test('job navigation and status refresh preserve live observation and reader pos
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
   await page.getByRole('button', { name: 'ARC status' }).click();
   const status = page.getByRole('dialog', { name: 'ARC status' });
+  await expect(page.locator('.status')).toHaveText('Test daemon· Connected');
+  const connection = status.locator('.status-section').filter({ has: page.getByRole('heading', { name: 'Connection', exact: true }) });
+  await expect(connection.locator('p')).toHaveText(['Test daemon · Connected']);
+  const connectionHeight = (await connection.boundingBox())!.height;
   await expect(status.getByRole('button', { name: 'Refresh' })).toBeEnabled();
   await status.getByRole('button', { name: 'Refresh' }).click();
+  await expect(status.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+  await expect(connection.locator('p')).toHaveText(['Test daemon · Connected']);
+  expect((await connection.boundingBox())!.height).toBe(connectionHeight);
+  await expect(status).not.toContainText('Changes apply');
+  await expect(status).not.toContainText('Latest completed-step');
   await status.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(send).toBeDisabled();
   release();
@@ -295,6 +304,113 @@ test('status stays plain and context controls share the existing composer toolba
   await page.screenshot({ path: '/tmp/arc-web-quiet-footer.png' });
 });
 
+test('orange focus outlines hug the control without a tinted fill', async ({ page }) => {
+  const attach = fixtureDaemon();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', () => {});
+  await page.goto('/');
+  const status = page.getByRole('button', { name: 'ARC status' });
+  await expect(status).toContainText('Connecting');
+  await expect(page.getByRole('textbox', { name: 'Message to ARC' })).toHaveAttribute('placeholder', 'Message ARC…');
+  const dotColor = await status.locator('.status-dot').evaluate((dot) => getComputedStyle(dot).backgroundColor);
+  expect(dotColor).toBe('rgb(189, 174, 147)');
+  await status.focus();
+  const focus = await status.evaluate((button) => {
+    const style = getComputedStyle(button);
+    return { color: style.outlineColor, background: style.backgroundColor, outline: style.outlineStyle,
+      width: style.outlineWidth, offset: style.outlineOffset, radius: style.borderRadius, padding: style.paddingLeft };
+  });
+  expect(focus).toEqual({ color: 'rgba(254, 128, 25, 0.7)', background: 'rgba(0, 0, 0, 0)', outline: 'solid',
+    width: '1px', offset: '0px', radius: '12px', padding: '8px' });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.reload();
+  await expect(status).toContainText('Connected');
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  await expect(composer).toHaveAttribute('placeholder', 'Message ARC…');
+  await composer.fill('Orange send control');
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+  const controls = await page.evaluate(() => {
+    const send = getComputedStyle(document.querySelector('.send')!);
+    const textarea = getComputedStyle(document.querySelector('textarea')!);
+    const row = getComputedStyle(document.querySelector('.compose-row')!);
+    return { sendColor: send.color, sendBackground: send.backgroundColor,
+      textareaOutline: textarea.outlineStyle, composerOutline: row.outlineStyle,
+      composerBorder: row.borderColor, composerBackground: row.backgroundColor };
+  });
+  expect(controls).toEqual({ sendColor: 'rgb(40, 40, 40)', sendBackground: 'rgb(254, 128, 25)',
+    textareaOutline: 'none', composerOutline: 'none', composerBorder: 'rgb(80, 73, 69)',
+    composerBackground: 'rgb(66, 61, 57)' });
+  await page.screenshot({ path: '/tmp/arc-web-close-outline-phone.png' });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const settings = page.getByRole('button', { name: 'Settings', exact: true });
+  await settings.focus();
+  await page.screenshot({ path: '/tmp/arc-web-close-outline-desktop.png' });
+});
+
+test('composer focus rings stay separated and text has room inside them at 320px', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByRole('button', { name: 'Choose thinking' }).click();
+  const thinking = page.getByRole('combobox', { name: 'Thinking' });
+  await thinking.selectOption('medium');
+  const choices = page.locator('.conversation-controls select');
+  for (const choice of await choices.all()) {
+    await choice.focus();
+    const metrics = await choice.evaluate((element) => {
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      const toolbar = element.closest('.compose-toolbar')!.getBoundingClientRect();
+      const next = element.parentElement!.nextElementSibling?.getBoundingClientRect()
+        ?? element.closest('.compose-toolbar')!.querySelector('.send')!.getBoundingClientRect();
+      return { paddingLeft: style.paddingLeft, paddingRight: style.paddingRight,
+        outline: style.outlineStyle, offset: style.outlineOffset,
+        outlineLeft: bounds.left - 1, toolbarLeft: toolbar.left, outlineRight: bounds.right + 1, nextLeft: next.left,
+        parentOverflow: getComputedStyle(element.parentElement!).overflow };
+    });
+    expect(metrics.paddingLeft).toBe('6px');
+    expect(metrics.paddingRight).toBe('6px');
+    expect(metrics.outline).toBe('solid');
+    expect(metrics.offset).toBe('0px');
+    expect(metrics.outlineLeft).toBeGreaterThan(metrics.toolbarLeft);
+    expect(metrics.outlineRight).toBeLessThan(metrics.nextLeft);
+    expect(metrics.parentOverflow).toBe('visible');
+  }
+  const fits = await thinking.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d')!;
+    context.font = style.font;
+    return context.measureText('medium').width <= element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  });
+  expect(fits).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+  await page.screenshot({ path: '/tmp/arc-web-close-outline-320.png' });
+});
+
+test('startup and history loading do not flash transcript placeholders', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const attach = fixtureDaemon({ historyGate: () => gate });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', () => {});
+  await page.goto('/');
+  await expect(page.locator('.status')).toContainText('Connecting');
+  await expect(page.locator('.transcript')).toBeEmpty();
+  await expect(page.locator('.empty')).toHaveCount(0);
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.reload();
+  await expect(page.locator('.status')).toContainText('Connected');
+  await expect(page.locator('.transcript')).toHaveAttribute('aria-busy', 'true');
+  await expect(page.locator('.empty')).toHaveCount(0);
+  release();
+  await expect(page.locator('.message').first()).toBeVisible();
+  await expect(page.locator('.transcript')).toHaveAttribute('aria-busy', 'false');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await expect(page.locator('.empty')).toHaveText('Start a conversation or choose one from Sessions.');
+  expect(await page.locator('.empty').evaluate((element) => getComputedStyle(element).color)).toBe('rgb(189, 174, 147)');
+});
+
 test('recorded high remains visible when the daemon exposes no editable thinking levels', async ({ page }) => {
   const attach = fixtureDaemon();
   attach.setStatus({ effectiveThinking: 'high', supportedThinking: [] });
@@ -306,7 +422,7 @@ test('recorded high remains visible when the daemon exposes no editable thinking
   await page.getByRole('button', { name: 'ARC status' }).click();
   const status = page.getByRole('dialog', { name: 'ARC status' });
   await expect(status).toContainText('Thinking · high');
-  await expect(status).toContainText('no editable levels');
+  await expect(status).not.toContainText('no editable levels');
 });
 
 test('thinking picker appears only after deliberate preparation and lists supported levels', async ({ page }) => {
@@ -343,7 +459,9 @@ test('status sheet reports measured and stale data, refreshes, and keeps recover
   const dialog = page.getByRole('dialog', { name: 'ARC status' });
   await expect(dialog.getByRole('heading', { name: 'ARC status' })).toBeFocused();
   await expect(dialog).toContainText('1,200 tokens');
-  await expect(dialog).toContainText('Latest completed-step context, not cumulative spend');
+  await expect(dialog).not.toContainText('Latest completed-step context');
+  await expect(dialog).not.toContainText('No local reply stream');
+  await expect(dialog).not.toContainText('Changes apply to the next turn');
   await expect(dialog).not.toContainText('Context · stale');
   await expect(dialog).toContainText('week · 72% remaining');
   await expect(dialog).toContainText('stale');
@@ -359,17 +477,18 @@ test('status sheet reports measured and stale data, refreshes, and keeps recover
   await expect(page.locator('.uncertain-input')).toContainText('Keep near composer');
 });
 
-test('status attention uses fresh allowances and expires stale low readings', async ({ page }) => {
+test('allowance warnings stay in the panel and expire when stale', async ({ page }) => {
   const attach = fixtureDaemon();
   attach.setStatus({ allowance: [create(AllowanceWindowSchema, { remainingPercent: 5, windowSeconds: 604800n })] });
   await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
   const button = page.getByRole('button', { name: 'ARC status' });
-  await expect(button).toContainText('Low allowance');
+  await expect(button).toContainText('Connected');
+  expect(await button.locator('.status-dot').evaluate((dot) => getComputedStyle(dot).backgroundColor)).toBe('rgb(184, 187, 38)');
   await button.click();
   const panel = page.getByRole('dialog', { name: 'ARC status' });
-  await expect(panel).toContainText('10% or less remaining');
+  await expect(panel).toContainText('Low allowance');
   await page.screenshot({ path: '/tmp/arc-web-parity-phone-status.png' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   attach.setStatus({ allowance: [create(AllowanceWindowSchema, { remainingPercent: 5, windowSeconds: 604800n })],
@@ -378,7 +497,7 @@ test('status attention uses fresh allowances and expires stale low readings', as
   await panel.getByRole('button', { name: 'Refresh' }).click();
   await expect(button).toContainText('Connected');
   await expect(panel).toContainText('stale');
-  await expect(panel).not.toContainText('10% or less remaining');
+  await expect(panel).not.toContainText('Low allowance');
 });
 
 test('status panel states context is unmeasured when no reading is supplied', async ({ page }) => {
@@ -439,6 +558,7 @@ test.describe('touch-first navigation', () => {
       await page.keyboard.press('Tab');
       await expect(project).toBeFocused();
       expect(await project.evaluate((select) => getComputedStyle(select).outlineStyle)).toBe('solid');
+      expect(await project.evaluate((select) => getComputedStyle(select).outlineOffset)).toBe('0px');
       const bounds = (await dialog.locator('.panel-surface').boundingBox())!;
       expect(Math.abs(bounds.y + bounds.height - height)).toBeLessThan(1);
       expect(bounds.width).toBeLessThanOrEqual(width);
@@ -448,7 +568,7 @@ test.describe('touch-first navigation', () => {
   }
 });
 
-test('dialog keyboard navigation retains visible focus rings', async ({ page }) => {
+test('dialog keyboard navigation retains the close-fitting orange focus ring', async ({ page }) => {
   await page.goto('/');
   const settings = page.getByRole('button', { name: 'Settings', exact: true });
   await settings.focus();
@@ -461,8 +581,21 @@ test('dialog keyboard navigation retains visible focus rings', async ({ page }) 
   const host = dialog.locator('.host-select').first();
   await expect(host).toBeFocused();
   expect(await host.evaluate((row) => getComputedStyle(row).outlineStyle)).toBe('solid');
+  expect(await host.evaluate((row) => getComputedStyle(row).outlineOffset)).toBe('0px');
+  expect(await host.evaluate((row) => getComputedStyle(row).outlineColor)).toBe('rgba(254, 128, 25, 0.7)');
   await page.keyboard.press('Escape');
   await expect(settings).toBeFocused();
+});
+
+test('higher contrast and forced colours retain an explicit keyboard focus indicator', async ({ page }) => {
+  await page.goto('/');
+  const settings = page.getByRole('button', { name: 'Settings', exact: true });
+  for (const media of [{ contrast: 'more' as const }, { contrast: 'no-preference' as const, forcedColors: 'active' as const }]) {
+    await page.emulateMedia(media);
+    await settings.focus();
+    expect(await settings.evaluate((button) => getComputedStyle(button).outlineStyle)).toBe('solid');
+    expect(await settings.evaluate((button) => getComputedStyle(button).outlineWidth)).toBe('2px');
+  }
 });
 
 test('glass has an opaque higher-contrast fallback', async ({ page }) => {
@@ -786,6 +919,7 @@ test('unreachable daemon host cannot send and preserves its draft', async ({ pag
   await expect(page.locator('.status')).toContainText('Disconnected');
   await expect(page.locator('.message')).toHaveCount(0);
   const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  await expect(composer).toHaveAttribute('placeholder', 'Message ARC…');
   await composer.fill('Offline host draft');
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
   await page.reload();

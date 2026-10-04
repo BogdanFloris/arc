@@ -49,11 +49,6 @@
   let connectionLabel = $derived(workspace.connectionState === 'connected' ? 'Connected'
     : workspace.connectionState === 'connecting' ? 'Connecting' : 'Disconnected');
   let readingWarning = $derived(statusWarning(workspace.sessionStatus, statusNow));
-  let statusSummary = $derived(workspace.connectionState !== 'connected' ? connectionLabel
-    : workspace.notice || workspace.controlsError || workspace.statusError ? 'Notice'
-    : readingWarning ? readingWarning
-    : workspace.sending ? 'Responding' : workspace.controlsBusy ? 'Updating'
-    : workspace.loading ? 'Loading' : 'Connected');
   let transcriptKey = $derived(`${workspace.activeHostId ?? ''}:${activeId ?? ''}`);
 
   onMount(() => {
@@ -283,8 +278,8 @@
       </div>
       <div class="context">
         <button class="status-button" aria-label="ARC status" onclick={(event) => openStatus(event.currentTarget)}>
-          <span class:unavailable={!connected} class:attention={!!(workspace.notice || workspace.controlsError || workspace.statusError || readingWarning)} class="status">
-            <span class="status-dot" aria-hidden="true"></span><span class="host-name" title={currentHost?.name}>{currentHost?.name ?? 'No host'}</span><span>· {statusSummary}</span>
+          <span class:unavailable={workspace.connectionState === 'unavailable'} class:connecting={workspace.connectionState === 'connecting'} class="status">
+            <span class="status-dot" aria-hidden="true"></span><span class="host-name" title={currentHost?.name}>{currentHost?.name ?? 'No host'}</span><span>· {connectionLabel}</span>
           </span>
         </button>
         {#if currentHost}
@@ -297,7 +292,7 @@
     </header>
 
     {#if jobReturn}<div class="job-return"><button class="quiet-action" onclick={returnFromJob}>Back to {jobReturn.title}</button></div>{/if}
-    <section class="transcript" aria-label="Conversation" bind:this={transcript} onscroll={onScroll}>
+    <section class="transcript" aria-label="Conversation" aria-busy={workspace.loading || workspace.connectionState === 'connecting'} bind:this={transcript} onscroll={onScroll}>
       <div class="transcript-content">
         {#each workspace.messages as message (message.id)}
           <article class="message" class:from-user={message.role === 'you'} class:activity-row={message.role === 'handoff' || (!message.content && !!message.tools?.length)}>
@@ -332,8 +327,8 @@
             {/each}
           </article>
         {/each}
-        {#if !workspace.messages.length}
-          <p class="empty">{workspace.loading ? 'Loading conversation…' : !currentHost ? 'Add an ARC host in Settings to load conversations.' : !connected ? 'Connect to ARC to load conversations. Your draft stays on this device.' : activeId ? 'No messages yet.' : 'Start a conversation or choose one from Sessions.'}</p>
+        {#if ready && !workspace.messages.length && !workspace.loading && (!currentHost || connected)}
+          <p class="empty">{!currentHost ? 'Add an ARC host in Settings to load conversations.' : activeId ? 'No messages yet.' : 'Start a conversation or choose one from Sessions.'}</p>
         {/if}
       </div>
     </section>
@@ -352,7 +347,7 @@
         </button>
       {/if}
       <div class="compose-row">
-        <textarea bind:this={composer} value={workspace.draft} oninput={onDraftInput} onkeydown={onKeydown} aria-label="Message to ARC" placeholder={connected ? 'Message ARC…' : 'Draft a message (not connected)'} rows="1"></textarea>
+        <textarea bind:this={composer} value={workspace.draft} oninput={onDraftInput} onkeydown={onKeydown} aria-label="Message to ARC" placeholder="Message ARC…" rows="1"></textarea>
         <div class="compose-toolbar">
           <div class="conversation-controls" aria-label="Conversation settings">
             <div class="project-choice">
@@ -481,20 +476,20 @@
     </section>
   {:else if panelKind === 'status'}
     <div class="status-content">
-      <section class="status-section"><h3>Connection</h3><p>{currentHost?.name ?? 'No host'} · {connectionLabel}</p><p>{workspace.sending ? 'Observing a reply' : workspace.controlsBusy ? 'Updating conversation' : workspace.loading ? 'Loading conversation' : 'No local reply stream'}</p>{#if workspace.statusLoading}<p>Updating status…</p>{/if}<button class="quiet-action" disabled={workspace.statusLoading} onclick={() => { if (connected) void workspace.refreshStatus(); else workspace.resume(); }}>Refresh</button></section>
+      <section class="status-section"><h3>Connection</h3><p>{currentHost?.name ?? 'No host'} · {connectionLabel}</p><button class="quiet-action" disabled={workspace.statusLoading} onclick={() => { if (connected) void workspace.refreshStatus(); else workspace.resume(); }}>Refresh</button></section>
       {#if workspace.activeSessionId || workspace.newProject || workspace.newModelChoice || workspace.effectiveThinking}
-        <section class="status-section"><h3>Session</h3>{#if workspace.activeSessionId}<p>{workspace.activeSession?.project || 'No project'} · {workspace.recordedModel}</p><p>{workspace.activeSession?.provider || 'Provider unknown'}</p>{:else}<p>{workspace.newProject || 'No project'} · {workspace.newModelChoice || 'No model selected'}</p>{/if}<p>Thinking · {workspace.effectiveThinking || 'Unknown'}</p><p class="muted">{workspace.sessionStatus && !workspace.sessionStatus.supportedThinking.length ? 'Current effort is recorded; this daemon offers no editable levels for the model.' : 'Changes apply to the next turn.'}</p></section>
+        <section class="status-section"><h3>Session</h3>{#if workspace.activeSessionId}<p>{workspace.activeSession?.project || 'No project'} · {workspace.recordedModel}</p><p>{workspace.activeSession?.provider || 'Provider unknown'}</p>{:else}<p>{workspace.newProject || 'No project'} · {workspace.newModelChoice || 'No model selected'}</p>{/if}<p>Thinking · {workspace.effectiveThinking || 'Unknown'}</p></section>
       {/if}
       {#if workspace.sessionStatus}
         {@const context = workspace.sessionStatus.context}
-        <section class="status-section"><h3>Context</h3><p>{context ? `${context.inputTokens.toLocaleString()} tokens${context.contextWindow ? ` of ${context.contextWindow.toLocaleString()}` : ' · window unknown'}` : 'Not measured · window unknown'}{#if !connected || workspace.statusError} · last known{/if}</p>{#if context?.compactAt}<p>Compaction at {context.compactAt.toLocaleString()} tokens</p>{/if}<p>Latest completed-step context, not cumulative spend.</p><p>{observedAt(workspace.sessionStatus.contextObservedAt, statusNow)}</p></section>
+        <section class="status-section"><h3>Context</h3><p>{context ? `${context.inputTokens.toLocaleString()} tokens${context.contextWindow ? ` of ${context.contextWindow.toLocaleString()}` : ' · window unknown'}` : 'Not measured · window unknown'}{#if !connected || workspace.statusError} · last known{/if}</p>{#if context?.compactAt}<p>Compaction at {context.compactAt.toLocaleString()} tokens</p>{/if}</section>
         {@const allowanceStale = allowanceIsStale(workspace.sessionStatus, statusNow)}
-        <section class="status-section"><h3>Account allowance</h3><p>Shared account allowance{#if allowanceStale && workspace.sessionStatus.allowance.length} · stale{/if}</p>{#if workspace.sessionStatus.allowance.length}{#each workspace.sessionStatus.allowance as window}<p>{windowLabel(window.windowSeconds, window.label)} · {window.remainingPercent}% remaining · resets {resetAt(window.resetsAt)}</p>{/each}{:else}<p>{workspace.sessionStatus.codex || workspace.sessionStatus.allowanceSource ? 'Unavailable' : 'Not reported by this provider'}</p>{/if}<p>{workspace.sessionStatus.allowanceSource || 'Source unavailable'} · {observedAt(workspace.sessionStatus.allowanceObservedAt, statusNow)}</p></section>
+        <section class="status-section"><h3>Account allowance{#if allowanceStale && workspace.sessionStatus.allowance.length} · stale{/if}</h3>{#if workspace.sessionStatus.allowance.length}{#each workspace.sessionStatus.allowance as window}<p>{windowLabel(window.windowSeconds, window.label)} · {window.remainingPercent}% remaining · resets {resetAt(window.resetsAt)}</p>{/each}{:else}<p>{workspace.sessionStatus.codex || workspace.sessionStatus.allowanceSource ? 'Unavailable' : 'Not reported by this provider'}</p>{/if}<p>{workspace.sessionStatus.allowanceSource || 'Source unavailable'} · {observedAt(workspace.sessionStatus.allowanceObservedAt, statusNow)}</p></section>
       {:else}
-        <section class="status-section"><h3>Context</h3><p>{workspace.activeSessionId ? 'Reading unavailable' : 'Not measured · send a message to measure context'}</p></section>
+        <section class="status-section"><h3>Context</h3><p>{workspace.activeSessionId ? 'Reading unavailable' : 'Not measured'}</p></section>
       {/if}
       {#if workspace.notice || workspace.controlsError || workspace.statusError || readingWarning}
-        <section class="status-section"><h3>Notices</h3>{#if readingWarning}<p>{readingWarning === 'Low allowance' ? 'A fresh account allowance window reports 10% or less remaining.' : 'The latest context reading is at least 90% of its window.'}</p>{/if}{#if workspace.notice}<p>{workspace.notice}</p>{/if}{#if workspace.controlsError}<p>{workspace.controlsError}</p>{/if}{#if workspace.statusError}<p>{workspace.statusError}</p>{/if}</section>
+        <section class="status-section"><h3>Notices</h3>{#if readingWarning}<p>{readingWarning}</p>{/if}{#if workspace.notice}<p>{workspace.notice}</p>{/if}{#if workspace.controlsError}<p>{workspace.controlsError}</p>{/if}{#if workspace.statusError}<p>{workspace.statusError}</p>{/if}</section>
       {/if}
     </div>
   {:else}

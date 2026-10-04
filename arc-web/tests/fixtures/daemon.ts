@@ -13,7 +13,7 @@ import {
 import { ContextMeasuredSchema } from '../../src/lib/arc/gen/events_pb';
 import { histories, jobs, sessions } from './sessions';
 
-export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () => Promise<void> } = {}) {
+export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () => Promise<void>; historyGate?: () => Promise<void> } = {}) {
   const sessionMetadata = new Map(sessions.map((session) => [session.id, {
     id: session.id, title: session.title, project: '', role: jobs.some((job) => job.id === session.id) ? SessionRole.EXECUTOR : SessionRole.CHAT,
     source: jobs.some((job) => job.id === session.id) ? Source.MODEL : Source.USER,
@@ -36,7 +36,7 @@ export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () 
   const thinking = new Map(sessions.map((session) => [session.id, 'low']));
   let statusOverride: Partial<{ context: ReturnType<typeof create<typeof ContextMeasuredSchema>> | undefined; contextObservedAt: bigint; allowance: ReturnType<typeof create<typeof AllowanceWindowSchema>>[]; allowanceObservedAt: bigint; allowanceStale: boolean; effectiveThinking: string; supportedThinking: string[] }> = {};
   let statusFetches = 0;
-  const created = (route: WebSocketRoute) => route.onMessage((data) => {
+  const created = (route: WebSocketRoute) => route.onMessage(async (data) => {
     if (typeof data === 'string') throw new Error('Expected binary protobuf frame');
     const request = fromBinary(ClientFrameSchema, new Uint8Array(data as Buffer));
     const id = request.requestId;
@@ -98,6 +98,7 @@ export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () 
       }
       case 'fetchHistory': {
         const history = historyEntries.get(request.msg.value.sessionId);
+        await options.historyGate?.();
         if (history) reply({ case: 'sessionHistory', value: history });
         break;
       }
