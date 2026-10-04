@@ -208,22 +208,25 @@ dialog h2:focus-visible { outline: none; }
 .form-actions button, .quiet-action { padding: 10px 16px; border-radius: 24px; font-size: 14px; }
 .quiet-action { flex: none; background: #ebdbb20a; color: var(--text); }
 .panel-notice { margin: 12px 4px 0; color: var(--yellow); font-size: 13px; overflow-wrap: anywhere; }
-.job { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.jobs-empty { margin: 0; padding: 24px 0; text-align: center; font-size: 14px; }
+.job { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) 20px; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); color: var(--text); }
 .job-copy { display: grid; min-width: 0; gap: 4px; text-align: left; }
-.job-copy strong { overflow-wrap: anywhere; }
-.job-open { width: 44px; min-height: 44px; padding: 0; text-align: center; }
-.job-return { flex: none; width: min(760px, 100%); margin: 0 auto; padding: 8px var(--gutter) 0; }
-.job-return button { max-width: 100%; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.job-copy strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.job-chevron, .job-return svg { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.job-chevron { color: var(--muted); }
+.job-return { flex: none; width: 100%; overflow: hidden; scrollbar-gutter: stable both-edges; }
+.job-return-content { width: min(760px, 100%); margin: 0 auto; padding: 8px var(--gutter) 0; }
+.job-return button { display: inline-flex; align-items: center; gap: 4px; padding: 8px 0; font-size: 14px; }
 .mobile-only { display: inline-grid; grid-column: 1; grid-row: 1; }
 @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .glass { background: linear-gradient(135deg, #ebdbb21a, #ebdbb205 45%, #ebdbb20d), var(--glass-fill); -webkit-backdrop-filter: blur(28px) saturate(1.3); backdrop-filter: blur(28px) saturate(1.3); }
 }
 @media (hover: hover) and (pointer: fine) and (forced-colors: none) {
-  :is(.transcript, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table) {
+  :is(.transcript, .job-return, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table) {
     scrollbar-width: thin;
     scrollbar-color: #928374 transparent;
   }
-  :is(.transcript, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table)::-webkit-scrollbar {
+  :is(.transcript, .job-return, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table)::-webkit-scrollbar {
     width: 6px;
     height: 6px;
   }
@@ -241,7 +244,7 @@ dialog h2:focus-visible { outline: none; }
     display: none;
   }
   @supports selector(::-webkit-scrollbar) {
-    :is(.transcript, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table) {
+    :is(.transcript, .job-return, .session-list, .panel-surface, .dialog-list, textarea, .tool-output, .markdown pre, .markdown-table) {
       scrollbar-width: auto;
       scrollbar-color: auto;
     }

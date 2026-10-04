@@ -37,20 +37,42 @@ test('job return restores the origin draft and keeps phone rows aligned', async 
   await page.goto('/');
   await page.locator('textarea').fill('unsent origin draft');
   await page.locator('.job-status').click();
-  await page.getByRole('button', { name: 'Open', exact: true }).click();
-  await expect(page.locator('.job-return button')).toContainText('Back to Plan a focused week');
+  await page.locator('.job-copy strong').click();
+  await expect(page.locator('.job-return button')).toHaveText('Back');
   await expect(page.getByRole('dialog')).not.toBeVisible();
   await page.locator('.job-return button').click();
   await expect(page.locator('textarea')).toHaveValue('unsent origin draft');
   await page.locator('.job-status').click();
   const metrics = await page.locator('.job').evaluate((row) => {
     const copy = row.querySelector('.job-copy')!.getBoundingClientRect();
-    const action = row.querySelector('.job-open')!.getBoundingClientRect();
-    return { copyLeft: copy.left, actionLeft: action.left, actionHeight: action.height, overflow: document.documentElement.scrollWidth > innerWidth };
+    const chevron = row.querySelector('.job-chevron')!.getBoundingClientRect();
+    return { copyLeft: copy.left, chevronLeft: chevron.left, height: row.getBoundingClientRect().height, overflow: document.documentElement.scrollWidth > innerWidth };
   });
-  expect(metrics.actionLeft).toBeGreaterThan(metrics.copyLeft);
-  expect(metrics.actionHeight).toBeGreaterThanOrEqual(44);
+  expect(metrics.chevronLeft).toBeGreaterThan(metrics.copyLeft);
+  expect(metrics.height).toBeGreaterThanOrEqual(44);
   expect(metrics.overflow).toBe(false);
+  await expect(page.locator('.job')).toHaveRole('button');
+  await expect(page.locator('.job')).not.toContainText('Open');
+  await page.locator('.job').focus();
+  await page.locator('.job').press('Enter');
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.locator('.job-return button')).toHaveText('Back');
+  await expect(page.locator('.message').first()).toBeVisible();
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    const alignment = await page.locator('.job-return button').evaluate((button) => ({
+      left: button.getBoundingClientRect().left,
+      transcriptLeft: document.querySelector('.message .role')!.getBoundingClientRect().left,
+      height: button.getBoundingClientRect().height,
+      background: getComputedStyle(button).backgroundColor,
+      border: getComputedStyle(button).borderWidth,
+    }));
+    expect(Math.abs(alignment.left - alignment.transcriptLeft)).toBeLessThan(1);
+    expect(alignment.height).toBeGreaterThanOrEqual(44);
+    expect(alignment.background).toBe('rgba(0, 0, 0, 0)');
+    expect(alignment.border).toBe('0px');
+    await page.screenshot({ path: `/tmp/arc-web-job-return-${width}.png` });
+  }
 });
 
 test('job navigation and status refresh preserve live observation and reader position', async ({ page }) => {
@@ -74,11 +96,11 @@ test('job navigation and status refresh preserve live observation and reader pos
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
   await page.getByRole('button', { name: 'Jobs', exact: true }).click();
   await page.screenshot({ path: '/tmp/arc-web-parity-phone-jobs.png' });
-  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: /^Open job:/ }).click();
   await expect(page.locator('.title')).toHaveText('Review draft outline');
   await expect(pending).toHaveCount(0);
   await expect(composer).toHaveValue('');
-  await page.getByRole('button', { name: 'Back to Plan a focused week' }).click();
+  await page.getByRole('button', { name: 'Back to conversation', exact: true }).click();
   await expect(composer).toHaveValue('Next draft remains with the source');
   await expect(pending).toBeVisible();
   await expect(send).toBeDisabled();
@@ -107,8 +129,8 @@ test('job navigation and status refresh preserve live observation and reader pos
   await page.getByRole('button', { name: 'Jump to latest' }).click();
   await expect(page.getByRole('button', { name: 'Jump to latest' })).not.toBeVisible();
   await page.getByRole('button', { name: 'Jobs', exact: true }).click();
-  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
-  await page.getByRole('button', { name: 'Back to Plan a focused week' }).click();
+  await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: /^Open job:/ }).click();
+  await page.getByRole('button', { name: 'Back to conversation', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Jump to latest' })).not.toBeVisible();
   await expect.poll(() => transcript.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(48);
 });
@@ -121,13 +143,13 @@ test('new-draft job return survives without overwriting and unrelated navigation
   const composer = page.getByRole('textbox', { name: 'Message to ARC' });
   const openJob = async () => {
     await page.getByRole('button', { name: 'Jobs', exact: true }).click();
-    await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
+    await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: /^Open job:/ }).click();
     await expect(page.locator('.job-return')).toBeVisible();
   };
   await page.getByRole('button', { name: 'New conversation', exact: true }).click();
   await composer.fill('Unsent new conversation');
   await openJob();
-  await page.getByRole('button', { name: 'Back to new conversation' }).click();
+  await page.getByRole('button', { name: 'Back to conversation', exact: true }).click();
   await expect(composer).toHaveValue('Unsent new conversation');
   await openJob();
   await page.getByRole('button', { name: 'Open sessions' }).click();

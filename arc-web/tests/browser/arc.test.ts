@@ -329,6 +329,84 @@ test('jobs show only daemon-reported jobs and never inflate the list with archiv
   await expect(sheet.locator('.job')).not.toContainText('Model job');
 });
 
+test('empty jobs show one short centered label', async ({ page }) => {
+  const server = daemon();
+  let connection: WebSocketRoute;
+  let offline = false;
+  await page.routeWebSocket('ws://127.0.0.1:8787', (route) => {
+    if (offline) { route.close(); return; }
+    connection = route;
+    server.attach(route);
+  });
+  await page.goto('/');
+  await addHost(page);
+  await expect(page.locator('.status')).toContainText('Connected');
+  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Jobs', exact: true });
+  await expect(sheet.locator('.muted')).toHaveText('No jobs');
+  await expect(sheet.locator('.job')).toHaveCount(0);
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    const metrics = await sheet.locator('.jobs-empty').evaluate((label) => {
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const text = range.getBoundingClientRect();
+      const panel = label.closest('.panel-surface')!.getBoundingClientRect();
+      const style = getComputedStyle(label);
+      return {
+        centerOffset: Math.abs((text.left + text.right - panel.left - panel.right) / 2),
+        paddingTop: style.paddingTop, paddingBottom: style.paddingBottom,
+        overflow: document.documentElement.scrollWidth > innerWidth,
+      };
+    });
+    expect(metrics.centerOffset).toBeLessThan(1);
+    expect(metrics.paddingTop).toBe('24px');
+    expect(metrics.paddingBottom).toBe('24px');
+    expect(metrics.overflow).toBe(false);
+    await page.screenshot({ path: `/tmp/arc-web-empty-jobs-${width}.png` });
+  }
+  offline = true;
+  connection!.close();
+  await expect(sheet.locator('.muted')).toHaveText('Offline');
+});
+
+test('jobs keep long titles compact while preserving access to the full brief', async ({ page }) => {
+  const brief = 'Review the ARC web jobs screen and simplify its presentation. '.repeat(12);
+  const server = daemon([direct, job], [
+    create(JobInfoSchema, { sessionId: job.id, title: brief, state: JobInfo_State.RUNNING }),
+  ]);
+  server.setHistory(create(SessionHistorySchema, {
+    sessionId: job.id,
+    entries: [create(HistoryEntrySchema, { seq: 1n, entry: { case: 'message', value: create(HistoryMessageSchema, {
+      role: Role.USER, source: Source.MODEL, content: brief,
+    }) } })],
+  }));
+  await page.routeWebSocket('ws://127.0.0.1:8787', (route) => server.attach(route));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await addHost(page);
+  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Jobs', exact: true });
+  await expect(sheet.locator('.muted')).toHaveCount(0);
+  await expect(sheet.locator('.job .meta')).toHaveText('running');
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    const metrics = await sheet.locator('.job-copy strong').evaluate((title) => ({
+      height: title.getBoundingClientRect().height,
+      lineHeight: parseFloat(getComputedStyle(title).lineHeight),
+      clipped: title.scrollHeight > title.clientHeight,
+      overflow: document.documentElement.scrollWidth > innerWidth,
+    }));
+    expect(metrics.height).toBeLessThanOrEqual(metrics.lineHeight * 2 + 1);
+    expect(metrics.clipped).toBe(true);
+    expect(metrics.overflow).toBe(false);
+    await page.screenshot({ path: `/tmp/arc-web-compact-jobs-${width}.png` });
+  }
+  await sheet.getByRole('button', { name: /^Open job:/ }).click();
+  await expect(sheet).not.toBeVisible();
+  await expect(page.locator('.message')).toContainText(brief.trim());
+});
+
 test('legacy Demo profiles are removed while the saved real host and draft survive', async ({ page }) => {
   const server = daemon();
   await page.routeWebSocket('ws://127.0.0.1:8787', (route) => server.attach(route));

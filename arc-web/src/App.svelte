@@ -35,7 +35,7 @@
   let ready = $state(false);
   let existingModelMenu = $state('__recorded__');
   let hostError = $state('');
-  let jobReturn = $state<{ hostId: string | null; sessionId: string | null; title: string; jobId: string } | null>(null);
+  let jobReturn = $state<{ hostId: string | null; sessionId: string | null; jobId: string } | null>(null);
   let opener: HTMLElement | null = null;
   const scrollPositions = new Map<string, { top: number; follow: boolean }>();
   let previousTranscriptKey = '';
@@ -127,7 +127,6 @@
     const route = jobReturn ?? {
       hostId: workspace.activeHostId,
       sessionId: workspace.activeSessionId,
-      title: workspace.activeSession ? workspace.activeTitle : 'new conversation',
       jobId: id
     };
     jobReturn = { ...route, jobId: id };
@@ -292,7 +291,7 @@
       </div>
     </header>
 
-    {#if jobReturn}<div class="job-return"><button class="quiet-action" onclick={returnFromJob}>Back to {jobReturn.title}</button></div>{/if}
+    {#if jobReturn}<div class="job-return"><div class="job-return-content"><button aria-label="Back to conversation" onclick={returnFromJob}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>Back</button></div></div>{/if}
     <section class="transcript" aria-label="Conversation" aria-busy={workspace.loading || workspace.connectionState === 'connecting' || workspace.waitingForReply} bind:this={transcript} onscroll={onScroll}>
       <div class="transcript-content">
         {#each workspace.messages as message (message.id)}
@@ -499,11 +498,11 @@
       {/if}
     </div>
   {:else}
-    <p class="muted">{connected ? 'Current daemon jobs, not archived conversations.' : 'Last known daemon jobs; reconnect to refresh.'}</p>
+    {#if !connected && workspace.jobs.length}<p class="muted">Offline · last known jobs</p>{/if}
     <div class="dialog-list">
       {#each workspace.jobs as job (job.id)}
-        <article class="job"><div class="job-copy"><strong>{job.title}</strong><span class="meta">{job.state}</span></div><button class="quiet-action job-open" onclick={() => openJob(job.id)}>Open</button></article>
-      {:else}<p class="muted">No jobs on this host.</p>{/each}
+        <button class="job" aria-label={`Open job: ${job.title}`} onclick={() => openJob(job.id)}><span class="job-copy"><strong>{job.title}</strong><span class="meta">{job.state}</span></span><svg class="job-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button>
+      {:else}<p class="muted jobs-empty">{connected ? 'No jobs' : 'Offline'}</p>{/each}
     </div>
   {/if}
   </div>
