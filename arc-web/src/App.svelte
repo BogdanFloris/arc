@@ -173,7 +173,8 @@
   $effect(() => {
     const msgs = workspace.messages;
     const key = transcriptKey;
-    const tail = msgs.length ? `${msgs[msgs.length - 1].id}:${msgs[msgs.length - 1].content.length}` : '';
+    const last = msgs.at(-1);
+    const tail = `${last?.id ?? ''}:${last?.content.length ?? 0}:${workspace.waitingForReply}`;
     if (!ready) return;
     if (key !== previousTranscriptKey) {
       previousTranscriptKey = key;
@@ -292,7 +293,7 @@
     </header>
 
     {#if jobReturn}<div class="job-return"><button class="quiet-action" onclick={returnFromJob}>Back to {jobReturn.title}</button></div>{/if}
-    <section class="transcript" aria-label="Conversation" aria-busy={workspace.loading || workspace.connectionState === 'connecting'} bind:this={transcript} onscroll={onScroll}>
+    <section class="transcript" aria-label="Conversation" aria-busy={workspace.loading || workspace.connectionState === 'connecting' || workspace.waitingForReply} bind:this={transcript} onscroll={onScroll}>
       <div class="transcript-content">
         {#each workspace.messages as message (message.id)}
           <article class="message" class:from-user={message.role === 'you'} class:activity-row={message.role === 'handoff' || (!message.content && !!message.tools?.length)}>
@@ -327,6 +328,11 @@
             {/each}
           </article>
         {/each}
+        {#if workspace.waitingForReply}
+          <div class="reply-pending" role="status" aria-label="Waiting for ARC">
+            <span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span>
+          </div>
+        {/if}
         {#if ready && !workspace.messages.length && !workspace.loading && (!currentHost || connected)}
           <p class="empty">{!currentHost ? 'Add an ARC host in Settings to load conversations.' : activeId ? 'No messages yet.' : 'Start a conversation or choose one from Sessions.'}</p>
         {/if}

@@ -3,6 +3,35 @@ import { fixtureDaemon } from '../fixtures/daemon';
 import { create } from '@bufbuild/protobuf';
 import { AllowanceWindowSchema } from '../../src/lib/arc/gen/wire_pb';
 
+test('a waiting reply shows three quiet dots without changing the header', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const attach = fixtureDaemon({ streamGate: () => gate });
+  await page.routeWebSocket('ws://127.0.0.1:8787/arc', (socket) => attach(socket));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const pending = page.getByRole('status', { name: 'Waiting for ARC' });
+  const composer = page.getByRole('textbox', { name: 'Message to ARC' });
+  await expect(pending).toHaveCount(0);
+  await composer.fill('Wait for the first reply');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(pending).toBeVisible();
+  await expect(pending.locator('span')).toHaveCount(3);
+  await expect(page.locator('.message').last().locator('.role')).toHaveText('YOU');
+  await expect(page.locator('.status')).toHaveText('Test daemon· Connected');
+  await expect(page.locator('.transcript')).toHaveAttribute('aria-busy', 'true');
+  await composer.fill('Next draft stays editable');
+  await expect(composer).toHaveValue('Next draft stays editable');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  expect(await pending.locator('span').first().evaluate((dot) => getComputedStyle(dot).animationName)).toBe('none');
+  await page.screenshot({ path: '/tmp/arc-web-waiting-reply-phone.png' });
+  release();
+  await expect(page.locator('.message').last()).toContainText('I’ll help you work through:');
+  await expect(pending).toHaveCount(0);
+  await expect(composer).toHaveValue('Next draft stays editable');
+  await expect(page.locator('.transcript')).toHaveAttribute('aria-busy', 'false');
+});
+
 test('job return restores the origin draft and keeps phone rows aligned', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
@@ -37,6 +66,8 @@ test('job navigation and status refresh preserve live observation and reader pos
   await composer.fill('Long source conversation for reading-position testing.\n'.repeat(35));
   await send.click();
   await expect(composer).toHaveValue('');
+  const pending = page.getByRole('status', { name: 'Waiting for ARC' });
+  await expect(pending).toBeVisible();
   await composer.fill('Next draft remains with the source');
   await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBeGreaterThan(200);
   await transcript.evaluate((element) => element.scrollTop = 80);
@@ -45,9 +76,11 @@ test('job navigation and status refresh preserve live observation and reader pos
   await page.screenshot({ path: '/tmp/arc-web-parity-phone-jobs.png' });
   await page.getByRole('dialog', { name: 'Jobs', exact: true }).getByRole('button', { name: 'Open', exact: true }).click();
   await expect(page.locator('.title')).toHaveText('Review draft outline');
+  await expect(pending).toHaveCount(0);
   await expect(composer).toHaveValue('');
   await page.getByRole('button', { name: 'Back to Plan a focused week' }).click();
   await expect(composer).toHaveValue('Next draft remains with the source');
+  await expect(pending).toBeVisible();
   await expect(send).toBeDisabled();
   await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBe(80);
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
@@ -68,6 +101,7 @@ test('job navigation and status refresh preserve live observation and reader pos
   await expect(send).toBeDisabled();
   release();
   await expect(send).toBeEnabled({ timeout: 10000 });
+  await expect(pending).toHaveCount(0);
   await expect(page.locator('.message').last()).toContainText('I’ll help you work through:');
   await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBe(80);
   await page.getByRole('button', { name: 'Jump to latest' }).click();

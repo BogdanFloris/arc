@@ -52,6 +52,7 @@ Input is saved locally before transmission. An acknowledgement confirms daemon a
 - Bogdan reported picker scrolling reaching the underlying conversation, then gave positive deployed-use feedback on the scrolling/project selector, Markdown, and cleaned-up header/picker. This is user smoke feedback; Chromium touch-gesture checks and that feedback do not establish full iPhone acceptance.
 - Session switches preserve draft and in-memory scroll state. Drafts and selected sessions also survive reload.
 - The composer remains editable while a reply streams. Enter sends; Shift+Enter adds a newline. Composition Enter does not submit.
+- A local send shows three subdued pulsing dots beneath the user message until the first nonempty text delta or tool starts. Acknowledgement does not hide them. They stop on completion, failure, or loss of observation, follow the active conversation, and stay static with reduced motion. The connection header remains unchanged.
 - Project context replaces the ARC label inside the composer toolbar. Model and thinking are quiet, unboxed text controls beside it, not a separate labelled settings row. Native select appearance is disabled while touch targets stay 44px. New-conversation project and preset choices are host-scoped and survive reload, independently of the session-list filter. Unavailable saved choices stay explicit rather than silently falling back. Choosing thinking before a first message deliberately creates an empty session to query its supported levels; changing that empty conversation's context stages a replacement while preserving its draft.
 - An effective thinking level remains visible when the daemon supplies no editable levels. It is read-only, not labelled unavailable; its tooltip explains that distinction. The browser never invents supported levels or changes the recorded effort.
 - Existing project context stays fixed. Selecting a model preset requires an explicit fork confirmation at the last durable user/assistant message. Cancelling leaves the original pin unchanged; confirming preserves the draft in both conversations. Thinking choices come only from session status, apply to the next turn, and are disabled during live work.
@@ -85,6 +86,7 @@ Coverage includes:
 - Long session-list scrolling, portrait/landscape touch scrolling inside Sessions and Jobs with fixed headers and no background scrolling, outer-edge conversation scrollbars, and the compact jump control.
 - Enter/Shift+Enter behavior and synthetic IME key-event guards.
 - Typing the next draft during streaming and reading older content without forced scrolling.
+- Waiting-reply dots through acknowledgement, replacement by text/tool activity, navigation, failure/completion cleanup, and reduced-motion rendering.
 - Composer height restoration and keyboard disclosure of bounded long tool output.
 - Escaped message content, failed daemon connections, and locally preserved drafts.
 - Markdown structures and TUI colour values, keyboard scrolling of wide tables/code on narrow and desktop layouts, hostile HTML/URLs/attributes, no automatic image loads, unfinished fences during streaming, live-follow, reader-position preservation, and stable completed-message DOM.
@@ -99,6 +101,14 @@ Coverage includes:
 - Production manifest/icons and app-shell reload with the browser offline.
 
 These are Chromium checks, not proof of iPhone keyboard, Safari, installed-app behavior, or responsiveness under real ARC traffic.
+
+### Waiting-reply indicator verified October 4, 2026
+
+The transcript now shows three quiet dots during the gap between a local send and its first text or tool activity. The indicator is transient browser state, not a durable message or daemon-execution claim. It disappears immediately when observation ends, even while history reconciliation is pending. Active-conversation routing and live-follow are preserved.
+
+All 60 unit tests and 65 Chromium browser tests pass, including acknowledgement/empty-delta handling, first text/tool replacement, completion/failure cleanup, conversation/host navigation, editable next drafts, and reduced-motion rendering. Type checks, the production build, root `just fmt`, and root `just lint` pass. The static release is published; live HTTPS index and service worker match it. The phone-sized fixture screenshot is `/tmp/arc-web-waiting-reply-phone.png`. No daemon restart or automated live send was used.
+
+Bogdan sent a test message and approved the deployed indicator on October 4, 2026. This is user smoke feedback; the device was not specified, and controlled installed-iPhone acceptance remains open.
 
 ### Quiet controls and status verified October 4, 2026
 

@@ -21,7 +21,7 @@ export type PendingInput = {
   content: string;
   state: 'pending' | 'accepted' | 'uncertain' | 'rejected';
 };
-type Turn = { input: PendingInput; messages: Message[]; key: string };
+type Turn = { input: PendingInput; messages: Message[]; key: string; waitingForReply: boolean };
 type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'listProjects' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage'>;
 type ClientFactory = (endpoint: string, onDisconnect: (error: ArcConnectionError) => void) => Client;
 const emptyState = (): LocalState => ({ hosts: [], activeHostId: '', selected: {}, drafts: {}, inputs: {}, choices: {} });
@@ -36,6 +36,7 @@ export class Workspace {
   jobs = $state<Job[]>([]);
   draft = $state('');
   sending = $state(false);
+  waitingForReply = $state(false);
   notice = $state('');
   connectionState = $state<'connecting' | 'connected' | 'unavailable'>('unavailable');
   loading = $state(false);
@@ -418,6 +419,7 @@ export class Workspace {
     const turn = this.liveTurns.get(key);
     this.messages = [...(this.activeSessionId ? this.histories.get(this.activeSessionId) ?? [] : []), ...(turn?.messages ?? [])];
     this.sending = !!turn;
+    this.waitingForReply = turn?.waitingForReply ?? false;
   }
   private rememberDraft() {
     if (!this.activeHostId) return;
@@ -453,6 +455,7 @@ export class Workspace {
     this.pendingInputs = [...(this.inputs[this.activeHostId] ?? [])];
     this.liveTurns.clear();
     this.sending = false;
+    this.waitingForReply = false;
     this.persist();
   }
 
@@ -615,6 +618,8 @@ export class Workspace {
       this.pendingInputs = [...(this.inputs[this.activeHostId] ?? [])];
       this.persist();
     } else if (msg.case === 'delta') {
+      if (!msg.value.text) return;
+      turn.waitingForReply = false;
       let tail = turn.messages.at(-1);
       if (!tail || tail.tools || !tail.streaming) {
         tail = { id: `${turn.input.id}-reply-${turn.messages.length}`, role: 'arc', content: '', streaming: true };
@@ -622,6 +627,7 @@ export class Workspace {
       }
       tail.content += msg.value.text;
     } else if (msg.case === 'toolCallStarted') {
+      turn.waitingForReply = false;
       const value = msg.value;
       const tail = turn.messages.at(-1);
       if (tail) tail.streaming = false;
@@ -651,7 +657,7 @@ export class Workspace {
     const key = draftKey(this.activeSessionId);
     if (!client || this.connectionState !== 'connected' || !this.draft.trim() || this.liveTurns.has(key) || this.loading || this.controlsBusy) return;
     const input: PendingInput = { id: globalThis.crypto.randomUUID(), sessionId: this.activeSessionId, content: this.draft, state: 'pending' };
-    const turn: Turn = { input, key, messages: [{ id: input.id, role: 'you', content: input.content, delivery: 'pending' }] };
+    const turn: Turn = { input, key, waitingForReply: true, messages: [{ id: input.id, role: 'you', content: input.content, delivery: 'pending' }] };
     this.inputs[hostId] ??= [];
     this.inputs[hostId].push(input);
     this.pendingInputs = [...this.inputs[hostId]];
@@ -684,6 +690,8 @@ export class Workspace {
       }
     } finally {
       if (generation === this.generation && this.client === client) {
+        turn.waitingForReply = false;
+        this.activateContent();
         if (input.sessionId && input.state === 'accepted') {
           for (const message of turn.messages) message.streaming = false;
           await this.loadHistory(input.sessionId, turn);

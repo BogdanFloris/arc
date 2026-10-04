@@ -71,6 +71,60 @@ class FakeClient {
 afterEach(() => vi.useRealTimers());
 
 describe('remote Workspace', () => {
+  it.each(['text', 'tool'])('waits through acknowledgement until the first %s output', async (output) => {
+    const completion = defer<unknown>();
+    let frame!: (value: never) => void;
+    const client = new FakeClient(undefined, makeHistory('history'), (_id, _text, callback) => {
+      frame = callback;
+      return completion.promise;
+    });
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start a reply');
+    const sending = workspace.send();
+    expect(workspace.waitingForReply).toBe(true);
+    frame({ msg: { case: 'messageAccepted', value: { sessionId: 's1' } } } as never);
+    await tick();
+    expect(workspace.waitingForReply).toBe(true);
+    frame({ msg: { case: 'delta', value: { text: '' } } } as never);
+    await tick();
+    expect(workspace.waitingForReply).toBe(true);
+    expect(workspace.messages.at(-1)?.role).toBe('you');
+    workspace.selectSession('s2'); await tick();
+    expect(workspace.waitingForReply).toBe(false);
+    workspace.selectSession('s1'); await tick();
+    expect(workspace.waitingForReply).toBe(true);
+    frame({ msg: output === 'text'
+      ? { case: 'delta', value: { text: 'First words' } }
+      : { case: 'toolCallStarted', value: { callId: 'first-tool', name: 'read', argumentsJson: '{}' } } } as never);
+    await tick();
+    expect(workspace.waitingForReply).toBe(false);
+    expect(workspace.sending).toBe(true);
+    completion.resolve({}); await sending;
+    workspace.dispose();
+  });
+
+  it.each(['finished', 'failed'])('stops waiting when observation %s before any output', async (outcome) => {
+    const completion = defer<unknown>();
+    const client = new FakeClient(undefined, makeHistory('history'), (_id, _text, frame) => {
+      frame({ msg: { case: 'messageAccepted', value: { sessionId: 's1' } } } as never);
+      return completion.promise;
+    });
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start a reply');
+    const sending = workspace.send(); await tick();
+    expect(workspace.waitingForReply).toBe(true);
+    const history = defer<unknown>();
+    client.historyValue = () => history.promise;
+    if (outcome === 'finished') completion.resolve({});
+    else completion.reject(new ArcConnectionError('observation lost', true));
+    await tick();
+    expect(workspace.waitingForReply).toBe(false);
+    history.resolve(makeHistory('durable history')); await sending;
+    workspace.dispose();
+  });
+
   it('keeps completed replies visible until history arrives and blocks forks from an unreconciled tail', async () => {
     const client = new FakeClient([{ id: 's1', title: 'Session', source: 2, role: 1, model: 'model-a' }]);
     const workspace = new Workspace(null, () => client as never, host);
@@ -308,6 +362,7 @@ describe('remote Workspace', () => {
     const workspace = new Workspace(storage, () => client as never, host);
     workspace.initialize(); await tick();
     workspace.setDraft('possibly delivered'); await workspace.send();
+    expect(workspace.waitingForReply).toBe(false);
     expect(workspace.pendingInputs).toMatchObject([{ content: 'possibly delivered', state: 'uncertain' }]);
     expect(client.sends).toEqual(['possibly delivered']);
     workspace.dispose();
@@ -358,7 +413,9 @@ describe('remote Workspace', () => {
     workspace.initialize(); await tick();
     workspace.setDraft('in flight'); const sending = workspace.send();
     expect(first.sends).toEqual(['in flight']);
+    expect(workspace.waitingForReply).toBe(true);
     workspace.saveHost('Other', 'wss://other.test/ws'); await tick();
+    expect(workspace.waitingForReply).toBe(false);
     send.reject(new ArcConnectionError('observation lost'));
     await sending;
     workspace.selectHost(host.id);

@@ -77,6 +77,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .role { margin-bottom: 6px; color: var(--muted); }
 .message p { margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.from-user > p:last-child { margin-bottom: 0; }
+.reply-pending { display: flex; min-height: 20px; align-items: center; gap: 5px; color: var(--muted); }
+.reply-pending span { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: reply-pulse 1.2s ease-in-out infinite; }
+.reply-pending span:nth-child(2) { animation-delay: .15s; }
+.reply-pending span:nth-child(3) { animation-delay: .3s; }
+@keyframes reply-pulse { 0%, 80%, 100% { opacity: .35; } 40% { opacity: 1; } }
 .markdown { min-width: 0; overflow-wrap: anywhere; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -264,4 +269,7 @@ dialog h2:focus-visible { outline: none; }
 @media (prefers-contrast: more), (forced-colors: active) {
   :is(button, select, input, textarea, summary, a, [tabindex="0"]):focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 }
-@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+@media (prefers-reduced-motion: reduce) {
+  * { scroll-behavior: auto !important; transition: none !important; }
+  .reply-pending span { animation: none; }
+}
