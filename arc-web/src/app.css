@@ -144,6 +144,7 @@ textarea::placeholder { color: var(--muted); }
 .compose-toolbar { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px 8px 10px; }
 .send { display: grid; width: 44px; height: 44px; flex: none; padding: 0; border-radius: 50%; place-items: center; }
 .send svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.send.cancel svg { fill: currentColor; stroke: none; }
 .send, .send:hover:not(:disabled), .action { background: var(--orange); color: var(--bg); font-weight: 650; }
 .send:disabled { background: var(--line); color: var(--muted); opacity: 1; }
 .conversation-controls { display: flex; flex: 1; min-width: 0; align-items: center; gap: 6px; }

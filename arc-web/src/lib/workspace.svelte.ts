@@ -22,7 +22,7 @@ export type PendingInput = {
   state: 'pending' | 'accepted' | 'uncertain' | 'rejected';
 };
 type Turn = { input: PendingInput; messages: Message[]; key: string; waitingForReply: boolean };
-type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'listProjects' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage'>;
+type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'listProjects' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage' | 'cancelTurn' | 'cancelJob'>;
 type ClientFactory = (endpoint: string, onDisconnect: (error: ArcConnectionError) => void) => Client;
 const emptyState = (): LocalState => ({ hosts: [], activeHostId: '', selected: {}, drafts: {}, inputs: {}, choices: {} });
 const draftKey = (sessionId: string | null) => sessionId ?? '__new__';
@@ -69,6 +69,7 @@ export class Workspace {
   private configuredProjects = $state<string[]>([]);
   private liveJobs: JobInfo[] = [];
   private liveTurns = new Map<string, Turn>();
+  private cancellingSessions = $state<string[]>([]);
   private historyRequests = new Map<string, number>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -83,6 +84,12 @@ export class Workspace {
   }
   get activeHost() { return this.hosts.find((host) => host.id === this.activeHostId) ?? null; }
   get canSend() { return this.connectionState === 'connected'; }
+  get working() { return this.sending || this.jobs.some((job) => job.id === this.activeSessionId && job.state === 'running'); }
+  get cancelling() { return !!this.activeSessionId && this.cancellingSessions.includes(this.activeSessionId); }
+  get canCancel() {
+    return this.canSend && this.working && !this.cancelling && !!this.activeSessionId
+      && (!this.sending || this.pendingInputs.some((input) => input.sessionId === this.activeSessionId && input.state === 'accepted'));
+  }
   get projectOptions() { return this.configuredProjects; }
   get activeSession() { return this.remoteSessions.find((session) => session.id === this.activeSessionId) ?? null; }
   get availableModels() {
@@ -95,8 +102,7 @@ export class Workspace {
       && this.histories.has(this.activeSessionId) && this.messages.length === 0 && !this.loading && !this.sending);
   }
   get canConfigure() {
-    return this.canSend && !this.loading && !this.sending && !this.controlsBusy
-      && !this.jobs.some((job) => job.id === this.activeSessionId && job.state === 'running');
+    return this.canSend && !this.loading && !this.working && !this.controlsBusy;
   }
   get effectiveThinking() {
     return this.sessionStatus?.effectiveThinking || (!this.activeSessionId
@@ -249,6 +255,27 @@ export class Workspace {
   }
 
   async send() { await this.sendRemote(); }
+
+  async cancel() {
+    const client = this.client, id = this.activeSessionId, generation = this.generation;
+    if (!client || !id || !this.canCancel) return;
+    this.cancellingSessions = [...this.cancellingSessions, id];
+    try {
+      if (this.jobs.some((job) => job.id === id && job.state === 'running')) await client.cancelJob(id);
+      else await client.cancelTurn(id);
+      if (generation !== this.generation || client !== this.client) return;
+      await this.refreshRemote();
+    } catch (error) {
+      if (generation !== this.generation || client !== this.client) return;
+      this.cancellingSessions = this.cancellingSessions.filter((session) => session !== id);
+      if (id === this.activeSessionId) this.notice = `Could not cancel. ${error instanceof Error ? error.message : ''}`;
+    }
+  }
+
+  private pruneCancellations() {
+    this.cancellingSessions = this.cancellingSessions.filter((id) => this.liveTurns.has(id)
+      || this.jobs.some((job) => job.id === id && job.state === 'running'));
+  }
 
   selectNewProject(project: string) {
     if (!this.canConfigure || !this.isEmptyConversation || (project && !this.projectOptions.includes(project))) return;
@@ -454,6 +481,7 @@ export class Workspace {
     }
     this.pendingInputs = [...(this.inputs[this.activeHostId] ?? [])];
     this.liveTurns.clear();
+    this.cancellingSessions = [];
     this.sending = false;
     this.waitingForReply = false;
     this.persist();
@@ -522,6 +550,7 @@ export class Workspace {
       this.liveJobs = jobs;
       this.sessions = conversationSessions(sessions, { showAbandoned: true });
       this.jobs = jobSummaries(jobs);
+      this.pruneCancellations();
       const remembered = this.selected[this.activeHostId];
       const first = conversationSessions(sessions).at(0);
       if (!this.activeSessionId && remembered !== '__new__' && !this.liveTurns.has('__new__') && first) {
@@ -576,6 +605,7 @@ export class Workspace {
       if (index < 0) this.liveJobs = [job, ...this.liveJobs];
       else this.liveJobs = this.liveJobs.map((item, row) => row === index ? job : item);
       this.jobs = jobSummaries(this.liveJobs);
+      this.pruneCancellations();
     }
     if (notification.event.case !== 'sessionAppended' && notification.event.case !== 'jobChanged') return;
     if (this.refreshTimer) return;
@@ -646,7 +676,7 @@ export class Workspace {
   }
 
   private async sendRemote() {
-    if (!this.canSend || this.loading || this.sending || this.controlsBusy || !this.draft.trim()) return;
+    if (!this.canSend || this.loading || this.working || this.controlsBusy || !this.draft.trim()) return;
     if (!this.activeSessionId) {
       const navigation = this.navigation;
       const draft = this.draft;
@@ -702,6 +732,7 @@ export class Workspace {
           }
         }
         this.liveTurns.delete(turn.key);
+        this.pruneCancellations();
         this.activateContent();
         if (input.sessionId && input.state !== 'accepted') await this.loadHistory(input.sessionId);
         await this.refreshRemote();

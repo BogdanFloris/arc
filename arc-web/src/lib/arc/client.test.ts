@@ -57,6 +57,34 @@ describe('ArcClient protobuf transport', () => {
     client.close();
   });
 
+  it('encodes cancellation requests, propagates daemon errors, and leaves live streams open', async () => {
+    const client = new ArcClient('wss://arc/arc', { socketFactory: factory });
+    const turn = client.sendMessage('turn-session', 'hello', () => {});
+    sockets[0].open();
+    const streamRequest = fromBinary(ClientFrameSchema, sockets[0].sent[0]);
+    sockets[0].receive({ requestId: streamRequest.requestId, msg: { case: 'messageAccepted', value: { sessionId: 'turn-session' } } });
+
+    const cancelTurn = client.cancelTurn('turn-session');
+    await Promise.resolve(); sockets[1].open(); await Promise.resolve();
+    let request = fromBinary(ClientFrameSchema, sockets[1].sent[0]);
+    expect(request.msg).toMatchObject({ case: 'cancelTurn', value: { sessionId: 'turn-session' } });
+    sockets[1].receive({ requestId: request.requestId, msg: { case: 'messageAccepted', value: {} } });
+    await expect(cancelTurn).resolves.toBeUndefined();
+    expect(sockets[0].readyState).toBe(FakeSocket.OPEN);
+    expect(turn).toBeInstanceOf(Promise);
+
+    const cancelJob = client.cancelJob('job-session');
+    await Promise.resolve();
+    request = fromBinary(ClientFrameSchema, sockets[1].sent.at(-1)!);
+    expect(request.msg).toMatchObject({ case: 'cancelJob', value: { sessionId: 'job-session' } });
+    sockets[1].receive({ requestId: request.requestId, msg: { case: 'error', value: { code: 'no_turn', msg: 'No active turn' } } });
+    await expect(cancelJob).rejects.toMatchObject<Partial<ArcRequestError>>({ code: 'no_turn' });
+
+    sockets[0].receive({ requestId: streamRequest.requestId, msg: { case: 'streamEnd', value: { sessionId: 'turn-session' } } });
+    await expect(turn).resolves.toMatchObject({ sessionId: 'turn-session' });
+    client.close();
+  });
+
   it('streams a send on its own socket through acknowledgement to terminal frame', async () => {
     const client = new ArcClient('wss://arc/arc', { socketFactory: factory });
     const onFrame = vi.fn();

@@ -116,6 +116,14 @@ export class ArcClient {
     return this.request('forkSession', { sessionId, forkPoint, choice }, 'messageAccepted');
   }
 
+  async cancelTurn(sessionId: string): Promise<void> {
+    await this.request('cancelTurn', { sessionId }, 'messageAccepted');
+  }
+
+  async cancelJob(sessionId: string): Promise<void> {
+    await this.request('cancelJob', { sessionId }, 'messageAccepted');
+  }
+
   fetchStatus(sessionId: string): Promise<SessionStatus> {
     return this.request('fetchStatus', { sessionId }, 'sessionStatus');
   }
@@ -209,8 +217,9 @@ export class ArcClient {
   private request(caseName: 'fetchHistory', value: object, response: 'sessionHistory'): Promise<SessionHistory>;
   private request(caseName: 'listModels', value: object, response: 'modelList'): Promise<ModelList>;
   private request(caseName: 'createSession' | 'forkSession', value: object, response: 'messageAccepted'): Promise<MessageAccepted>;
+  private request(caseName: 'cancelTurn' | 'cancelJob', value: object, response: 'messageAccepted'): Promise<MessageAccepted>;
   private request(caseName: 'fetchStatus' | 'setSessionThinking', value: object, response: 'sessionStatus'): Promise<SessionStatus>;
-  private async request(caseName: 'listSessions' | 'listJobs' | 'listProjects' | 'fetchHistory' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking', value: object, response: 'sessionList' | 'jobList' | 'projectList' | 'sessionHistory' | 'modelList' | 'messageAccepted' | 'sessionStatus'): Promise<SessionList | JobList | ProjectList | SessionHistory | ModelList | MessageAccepted | SessionStatus> {
+  private async request(caseName: 'listSessions' | 'listJobs' | 'listProjects' | 'fetchHistory' | 'listModels' | 'createSession' | 'forkSession' | 'cancelTurn' | 'cancelJob' | 'fetchStatus' | 'setSessionThinking', value: object, response: 'sessionList' | 'jobList' | 'projectList' | 'sessionHistory' | 'modelList' | 'messageAccepted' | 'sessionStatus'): Promise<SessionList | JobList | ProjectList | SessionHistory | ModelList | MessageAccepted | SessionStatus> {
     await this.connect();
     const id = nextId++;
     return new Promise((resolve, reject) => {

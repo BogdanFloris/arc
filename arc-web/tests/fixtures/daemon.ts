@@ -9,11 +9,24 @@ import {
   MessageAcceptedSchema, DeltaSchema, StreamEndSchema, ModelListSchema, ModelChoiceSchema,
   SessionStatusSchema,
   AllowanceWindowSchema,
+  ErrorSchema,
 } from '../../src/lib/arc/gen/wire_pb';
 import { ContextMeasuredSchema } from '../../src/lib/arc/gen/events_pb';
 import { histories, jobs, sessions } from './sessions';
 
-export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () => Promise<void>; historyGate?: () => Promise<void> } = {}) {
+export function fixtureDaemon(options: {
+  jobsRunning?: boolean;
+  streamGate?: () => Promise<void>;
+  streamEndGate?: () => Promise<void>;
+  toolGate?: () => Promise<void>;
+  historyGate?: () => Promise<void>;
+  cancelGate?: () => Promise<void>;
+  cancelError?: string;
+  onCancel?: (kind: 'turn' | 'job', sessionId: string) => void;
+} = {}) {
+  let jobState = options.jobsRunning === false ? 2 : 1;
+  let cancelError = options.cancelError;
+  const cancelled = new Set<string>();
   const sessionMetadata = new Map(sessions.map((session) => [session.id, {
     id: session.id, title: session.title, project: '', role: jobs.some((job) => job.id === session.id) ? SessionRole.EXECUTOR : SessionRole.CHAT,
     source: jobs.some((job) => job.id === session.id) ? Source.MODEL : Source.USER,
@@ -54,7 +67,7 @@ export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () 
         }) }) });
         break;
       case 'listJobs':
-        reply({ case: 'jobList', value: create(JobListSchema, { jobs: jobs.map((job) => create(JobInfoSchema, { sessionId: job.id, title: job.title, state: options.jobsRunning === false ? 2 : 1 })) }) });
+        reply({ case: 'jobList', value: create(JobListSchema, { jobs: jobs.map((job) => create(JobInfoSchema, { sessionId: job.id, title: job.title, state: jobState })) }) });
         break;
       case 'listProjects':
         reply({ case: 'projectList', value: create(ProjectListSchema, { projects: [{ name: 'configured-project' }] }) });
@@ -105,21 +118,53 @@ export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () 
       case 'sendMessage': {
         const sessionId = request.msg.value.sessionId || sessions[0].id;
         void (async () => {
+          cancelled.delete(sessionId);
           reply({ case: 'messageAccepted', value: create(MessageAcceptedSchema, { sessionId }) });
           await options.streamGate?.();
+          if (options.toolGate) {
+            reply({ case: 'toolCallStarted', value: { sessionId, callId: 'live-tool', name: 'bash', argumentsJson: '{"command":"sleep 20"}' } });
+            await options.toolGate();
+            reply({ case: 'toolCallEnded', value: { sessionId, callId: 'live-tool', outcome: cancelled.has(sessionId) ? ToolOutcome.ERROR : ToolOutcome.OK, content: cancelled.has(sessionId) ? 'Cancelled' : 'Done' } });
+          }
           const text = `I’ll help you work through: ${request.msg.value.content}`;
+          let streamed = '';
           for (let offset = 0; offset < text.length; offset += 12) {
             await new Promise((resolve) => setTimeout(resolve, 18));
-            reply({ case: 'delta', value: create(DeltaSchema, { sessionId, text: text.slice(offset, offset + 12) }) });
+            if (cancelled.has(sessionId)) break;
+            const delta = text.slice(offset, offset + 12);
+            streamed += delta;
+            reply({ case: 'delta', value: create(DeltaSchema, { sessionId, text: delta }) });
+            if (offset === 0) await options.streamEndGate?.();
           }
           const prior = historyEntries.get(sessionId);
           const seq = (prior?.entries.reduce((last, entry) => entry.seq > last ? entry.seq : last, 0n) ?? 0n) + 1n;
           historyEntries.set(sessionId, create(SessionHistorySchema, { sessionId, entries: [
             ...(prior?.entries ?? []),
             create(HistoryEntrySchema, { seq, entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.USER, source: Source.USER, content: request.msg.value.content }) } }),
-            create(HistoryEntrySchema, { seq: seq + 1n, entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.ASSISTANT, source: Source.MODEL, content: text }) } }),
+            ...(options.toolGate ? [
+              create(HistoryEntrySchema, { seq: seq + 1n, entry: { case: 'toolCall', value: { callId: 'live-tool', name: 'bash', argumentsJson: '{"command":"sleep 20"}' } } }),
+              create(HistoryEntrySchema, { seq: seq + 2n, entry: { case: 'toolResult', value: { callId: 'live-tool', outcome: cancelled.has(sessionId) ? ToolOutcome.ERROR : ToolOutcome.OK, content: cancelled.has(sessionId) ? 'Cancelled' : 'Done' } } }),
+            ] : []),
+            create(HistoryEntrySchema, { seq: seq + (options.toolGate ? 3n : 1n), entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.ASSISTANT, source: Source.MODEL, content: streamed, partial: streamed !== text }) } }),
           ] }));
-          reply({ case: 'streamEnd', value: create(StreamEndSchema, { sessionId }) });
+          reply({ case: 'streamEnd', value: create(StreamEndSchema, { sessionId, partial: cancelled.has(sessionId) }) });
+        })();
+        break;
+      }
+      case 'cancelTurn':
+      case 'cancelJob': {
+        const sessionId = request.msg.value.sessionId;
+        const kind = request.msg.case === 'cancelTurn' ? 'turn' : 'job';
+        options.onCancel?.(kind, sessionId);
+        void (async () => {
+          await options.cancelGate?.();
+          if (cancelError) {
+            reply({ case: 'error', value: create(ErrorSchema, { code: 'cancel_failed', msg: cancelError }) });
+            return;
+          }
+          reply({ case: 'messageAccepted', value: create(MessageAcceptedSchema, { sessionId }) });
+          if (kind === 'turn') cancelled.add(sessionId);
+          else jobState = 4;
         })();
         break;
       }
@@ -127,6 +172,7 @@ export function fixtureDaemon(options: { jobsRunning?: boolean; streamGate?: () 
   });
   return Object.assign(created, {
     setStatus: (status: typeof statusOverride) => { statusOverride = status; },
+    setCancelError: (message?: string) => { cancelError = message; },
     get statusFetches() { return statusFetches; },
   });
 }

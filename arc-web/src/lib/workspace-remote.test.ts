@@ -49,6 +49,8 @@ class FakeClient {
   async listProjects() { return this.projects; }
   async listModels() { return this.models; }
   async listJobs() { return this.jobItems; }
+  async cancelTurn(_id: string) {}
+  async cancelJob(_id: string) {}
   async createSession(project: string, choice: string) {
     this.creates.push({ project, choice });
     const sessionId = `created-${this.creates.length}`;
@@ -71,6 +73,102 @@ class FakeClient {
 afterEach(() => vi.useRealTimers());
 
 describe('remote Workspace', () => {
+  it.each(['waiting', 'text', 'tool'])('cancels %s work without discarding the next draft or ending on acknowledgement', async (activity) => {
+    const completion = defer<unknown>(), acknowledgement = defer<void>();
+    let frame!: (value: never) => void;
+    const client = new FakeClient(undefined, makeHistory('history'), (_id, _text, callback) => {
+      frame = callback;
+      return completion.promise;
+    });
+    const cancel = vi.spyOn(client, 'cancelTurn').mockImplementation(() => acknowledgement.promise);
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start work');
+    const sending = workspace.send();
+    expect(workspace.working).toBe(true);
+    expect(workspace.canCancel).toBe(false);
+    await workspace.cancel();
+    expect(cancel).not.toHaveBeenCalled();
+    frame({ msg: { case: 'messageAccepted', value: { sessionId: 's1' } } } as never);
+    if (activity !== 'waiting') frame({ msg: activity === 'text'
+      ? { case: 'delta', value: { text: 'Partial reply' } }
+      : { case: 'toolCallStarted', value: { callId: 'c1', name: 'bash', argumentsJson: '{}' } } } as never);
+    await tick();
+    expect(workspace.canCancel).toBe(true);
+    workspace.setDraft('next draft');
+    const cancelling = workspace.cancel();
+    await workspace.cancel();
+    expect(cancel).toHaveBeenCalledExactlyOnceWith('s1');
+    expect(workspace.cancelling).toBe(true);
+    workspace.selectSession('s2'); await tick();
+    expect(workspace.working).toBe(false);
+    expect(workspace.cancelling).toBe(false);
+    await workspace.cancel();
+    workspace.selectSession('s1'); await tick();
+    expect(workspace.cancelling).toBe(true);
+    expect(workspace.draft).toBe('next draft');
+    acknowledgement.resolve(); await cancelling;
+    expect(workspace.working).toBe(true);
+    expect(workspace.canCancel).toBe(false);
+    await workspace.send();
+    expect(client.sends).toEqual(['start work']);
+    client.historyValue = makeHistory('durable partial');
+    completion.resolve({ partial: true }); await sending;
+    expect(workspace.messages).toContainEqual(expect.objectContaining({ content: 'durable partial' }));
+    expect(workspace.working).toBe(false);
+    expect(workspace.cancelling).toBe(false);
+    expect(workspace.draft).toBe('next draft');
+    workspace.dispose();
+  });
+
+  it('keeps work cancellable after a rejected request and does not retry automatically', async () => {
+    const completion = defer<unknown>();
+    const client = new FakeClient(undefined, undefined, (id, _text, frame) => {
+      frame({ msg: { case: 'messageAccepted', value: { sessionId: id } } } as never);
+      return completion.promise;
+    });
+    const cancel = vi.spyOn(client, 'cancelTurn').mockRejectedValue(new Error('cancel refused'));
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start work');
+    const sending = workspace.send(); await tick();
+    workspace.setDraft('next draft');
+    await workspace.cancel();
+    expect(workspace.notice).toContain('cancel refused');
+    expect(workspace.canCancel).toBe(true);
+    expect(workspace.working).toBe(true);
+    expect(workspace.draft).toBe('next draft');
+    await tick();
+    expect(cancel).toHaveBeenCalledOnce();
+    completion.resolve({}); await sending;
+    workspace.dispose();
+  });
+
+  it('ignores a late cancellation failure after switching hosts', async () => {
+    const completion = defer<unknown>(), acknowledgement = defer<void>();
+    const first = new FakeClient(undefined, undefined, (id, _text, frame) => {
+      frame({ msg: { case: 'messageAccepted', value: { sessionId: id } } } as never);
+      return completion.promise;
+    });
+    vi.spyOn(first, 'cancelTurn').mockImplementation(() => acknowledgement.promise);
+    const second = new FakeClient();
+    const secondCancel = vi.spyOn(second, 'cancelTurn');
+    const workspace = new Workspace(null, (endpoint) => (endpoint === host.endpoint ? first : second) as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start work');
+    const sending = workspace.send(); await tick();
+    const cancelling = workspace.cancel();
+    workspace.saveHost('Other', 'wss://other.test/ws'); await tick();
+    workspace.setDraft('other host draft');
+    acknowledgement.reject(new Error('late cancel failure')); await cancelling;
+    completion.resolve({}); await sending;
+    expect(workspace.cancelling).toBe(false);
+    expect(workspace.notice).not.toContain('late cancel failure');
+    expect(workspace.draft).toBe('other host draft');
+    expect(secondCancel).not.toHaveBeenCalled();
+    workspace.dispose();
+  });
+
   it.each(['text', 'tool'])('waits through acknowledgement until the first %s output', async (output) => {
     const completion = defer<unknown>();
     let frame!: (value: never) => void;
@@ -143,9 +241,11 @@ describe('remote Workspace', () => {
     workspace.dispose();
   });
 
-  it('keeps a daemon-reported job open across refresh and permits steering without changing its controls', async () => {
+  it('cancels only the selected running job and waits for its terminal state', async () => {
     const client = new FakeClient();
     client.jobItems = [create(JobInfoSchema, { sessionId: 'job', title: 'Live job', state: 1 })];
+    const cancelJob = vi.spyOn(client, 'cancelJob');
+    const cancelTurn = vi.spyOn(client, 'cancelTurn');
     const workspace = new Workspace(null, () => client as never, host);
     workspace.initialize(); await tick();
     workspace.selectSession('job'); await tick();
@@ -153,6 +253,18 @@ describe('remote Workspace', () => {
     workspace.resume(); await tick();
     expect(workspace.activeSessionId).toBe('job');
     workspace.setDraft('follow up'); await workspace.send();
+    expect(client.sendIds).toEqual([]);
+    await workspace.cancel();
+    expect(cancelJob).toHaveBeenCalledExactlyOnceWith('job');
+    expect(cancelTurn).not.toHaveBeenCalled();
+    expect(workspace.cancelling).toBe(true);
+    expect(workspace.working).toBe(true);
+    expect(workspace.draft).toBe('follow up');
+    client.jobItems = [create(JobInfoSchema, { sessionId: 'job', title: 'Live job', state: 4 })];
+    workspace.resume(); await tick();
+    expect(workspace.working).toBe(false);
+    expect(workspace.cancelling).toBe(false);
+    await workspace.send();
     expect(client.sendIds).toEqual(['job']);
     expect(workspace.activeSessionId).toBe('job');
     workspace.dispose();

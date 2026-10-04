@@ -17,6 +17,7 @@ test('a waiting reply shows three quiet dots without changing the header', async
   await page.getByRole('button', { name: 'Send', exact: true }).click();
   await expect(pending).toBeVisible();
   await expect(pending.locator('span')).toHaveCount(3);
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeEnabled();
   await expect(page.locator('.message').last().locator('.role')).toHaveText('YOU');
   await expect(page.locator('.status')).toHaveText('Test daemon· Connected');
   await expect(page.locator('.transcript')).toHaveAttribute('aria-busy', 'true');
@@ -103,7 +104,8 @@ test('job navigation and status refresh preserve live observation and reader pos
   await page.getByRole('button', { name: 'Back to conversation', exact: true }).click();
   await expect(composer).toHaveValue('Next draft remains with the source');
   await expect(pending).toBeVisible();
-  await expect(send).toBeDisabled();
+  await expect(send).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeEnabled();
   await expect.poll(() => transcript.evaluate((element) => element.scrollTop)).toBe(80);
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
   await page.getByRole('button', { name: 'ARC status' }).click();
@@ -120,7 +122,8 @@ test('job navigation and status refresh preserve live observation and reader pos
   await expect(status).not.toContainText('Changes apply');
   await expect(status).not.toContainText('Latest completed-step');
   await status.getByRole('button', { name: 'Close', exact: true }).click();
-  await expect(send).toBeDisabled();
+  await expect(send).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeEnabled();
   release();
   await expect(send).toBeEnabled({ timeout: 10000 });
   await expect(pending).toHaveCount(0);
@@ -920,7 +923,7 @@ test('streaming accepts input without blocking the next draft', async ({ page })
   await page.getByRole('button', { name: 'Send', exact: true }).click();
   await expect(composer).toHaveValue('');
   await composer.fill('Next draft while the reply streams');
-  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 5000 });
   await expect(composer).toHaveValue('Next draft while the reply streams');
   await expect(page.locator('.message').last()).toContainText('I’ll help you work through:');
