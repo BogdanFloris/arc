@@ -60,6 +60,8 @@ message SessionStatus {
   // Supported labels for the session's pinned model.
   repeated string supported_thinking = 9;
   string allowance_source = 10;
+  // Absent on older daemons; live state, never durable history.
+  optional bool turn_running = 11;
 }
 
 // Appends SessionThinkingSelected. Answered with the updated SessionStatus.
@@ -224,7 +226,13 @@ message Notification {
     ReasoningDelta job_reasoning = 4;
     // a role's model selection changed; the full menu with the new pick
     ModelList models_changed = 5;
+    SessionActivity session_activity = 6;
   }
+}
+
+message SessionActivity {
+  string session_id = 1;
+  bool running = 2;
 }
 
 message ReviewChanged {
