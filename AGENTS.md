@@ -8,7 +8,7 @@ Write and speak in plain English. Say only what the reader needs. Lead with the 
 
 ## Current phase
 
-See docs/TASKS.md
+Phase 4 — voice + remote. See docs/DESIGN.md §11. The web/mobile client is deployed; voice and backup/restore remain unfinished.
 
 ## Workspace
 
@@ -16,7 +16,7 @@ See docs/TASKS.md
 - `arc-core` — all logic: event log, projections, providers, memory tools, tracing. Testable without a running daemon.
 - `arcd` — daemon binary. Thin composition over arc-core. Owns the log, serves the WebSocket.
 - `arc` — TUI client.
-- `arc-voice` — voice client (Phase 4; placeholder until then).
+- `arc-voice` — planned voice client; currently a placeholder.
 - `arc-web` — Svelte/TypeScript desktop and mobile PWA. See `arc-web/AGENTS.md` and `arc-web/docs/DEVELOPMENT.md`.
 
 Assistant logic goes in `arc-core` unless it is genuinely binary-specific wiring. Browser UI, transport, and local drafts belong in `arc-web`.

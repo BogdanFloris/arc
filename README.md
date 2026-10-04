@@ -4,16 +4,16 @@ A personal assistant built around an always-on Rust daemon, terminal and web cli
 
 ![The arc TUI](docs/arc-tui.png)
 
-One person's daily driver, built in the open. **Current phase: 3.7, the direct door.** No releases, stability promises, or multi-user plan.
+One person's daily driver, built in the open. **Current phase: [4, voice + remote](docs/DESIGN.md#11-phases).** Web/mobile is deployed; voice and backup/restore remain unfinished. No releases, stability promises, or multi-user plan.
 
 - [Design](docs/DESIGN.md) — architectural authority and crate layout.
-- [Tasks](docs/TASKS.md) — live work and acceptance checks.
+- [Web client](arc-web/docs/DEVELOPMENT.md) — implemented interactions, deployment, and acceptance checks.
 - [Providers](docs/providers.md) — configuration and dated measurements.
 - [Testing](docs/testing.md) — focused runs, logs, rendered frames.
 
 ## Clients
 
-The TUI and `arc-web` use the same binary protobuf protocol. The Svelte/TypeScript web client runs in desktop browsers and as a phone PWA, with real conversations, streaming, jobs, safe Gruvbox Markdown, and local drafts. `arcd` owns sessions, models, tools, jobs, and memory.
+The TUI and `arc-web` use the same binary protobuf protocol. The Svelte/TypeScript web client runs in desktop browsers and as a phone PWA. It supports conversations, streaming replies and tools, cancellation and steering across clients, jobs, project/model/thinking controls, and saved drafts. `arcd` owns sessions, models, tools, jobs, and memory.
 
 See [web development](arc-web/docs/DEVELOPMENT.md) for setup, tailnet HTTPS deployment, and remaining acceptance checks. Installed-iPhone keyboard/lifecycle and long-session performance still need real-device testing. Voice is not a prerequisite.
 
@@ -31,7 +31,7 @@ target/debug/arc  # another terminal
 
 Without `--config`, arcd prefers `~/.config/arc/arc.toml`, then `data/arc.toml`. Missing configuration uses local defaults. For local inference, set `llama.model_file` to your GGUF; `just model` downloads the default under `~/.local/state/arc/models/`, not the checkout.
 
-Runtime state follows `data_dir`: checkout default `data/`, installed convention `~/.local/state/arc/`. `just install` builds release binaries, installs the user service, and restarts it. `just install-service` only installs the unit.
+Runtime state follows `data_dir`: checkout default `data/`, installed convention `~/.local/state/arc/`. `just install` builds release binaries, installs the user service, and restarts it; run it after active turns/jobs finish. `just install-service` only installs the unit.
 
 Checks: `just test`, `just fmt`, `just lint`.
 

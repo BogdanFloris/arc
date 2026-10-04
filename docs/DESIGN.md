@@ -282,7 +282,7 @@ Acceptance: verify append-and-replay of effort overrides, legacy fallback, initi
 
 **Web and mobile.** `arc-web` owns the desktop browser and touch-native PWA interface. Text conversations and jobs are implemented: browse/resume sessions, stream replies and tool activity, inspect job results, and recover after disconnection or app suspension. Show connection state; when the selected daemon is unreachable, ARC is unavailable. One host is active at a time; local interactions do not wait for the network. No second assistant, offline conversation store, replication, or automatic failover. Voice is not a prerequisite. Installed-iPhone keyboard, lifecycle, long-session performance, and app-update acceptance remain incomplete; desktop Chromium checks do not close them.
 
-Core text-and-jobs workflow parity requires shared-session cancellation and steering, including work started by another client. Image attachments, steer-queue management, arbitrary fork/rewind, manual compaction, memory browsing/review, and keyboard-driven transcript navigation remain TUI-only. Shared assistant tools do not replace these client controls. The remaining web UI and device acceptance checks live in `arc-web/docs/DEVELOPMENT.md`; this milestone does not complete Phase 3.7 or the later voice/remote phase.
+Remaining web controls and phone checks are recorded in [web development](../arc-web/docs/DEVELOPMENT.md).
 
 **Web conversation controls.** The daemon's configured projects supply the session filter and new-conversation choices. Historical project names do not add options; their conversations remain accessible under All projects. Project context replaces the ARC label inside the composer toolbar, beside quiet model/effort controls without a separate settings row. Existing project context stays fixed. Selecting another model explicitly forks the conversation; it never changes the original pin or role defaults. Thinking lists only supported levels, applies on the next turn, and cannot change during a live turn. A recorded effort stays visible when the daemon offers no editable levels; that is read-only, not proof that the current effort is invalid. Preserve the draft through creation, effort updates, and forks.
 
@@ -328,7 +328,7 @@ Design confirmation against the real actuator. UNKNOWN outcomes cannot be retrie
 
 ## 11. Phases
 
-Each phase must become a daily driver before the next starts. ARC's text web/mobile client is an explicit exception: it can start alongside Phase 3.7 without waiting for voice.
+ARC is in Phase 4. Text web/mobile access is deployed; voice and backup/restore remain unfinished.
 
 | Phase | Scope and exit |
 | --- | --- |
@@ -338,8 +338,8 @@ Each phase must become a daily driver before the next starts. ARC's text web/mob
 | 3 — Development | Jobs, workspaces, roles, installation. Exit: a week of development and rebuild matching live state. |
 | 3.5 — Tree | Fork, rewind, navigation. Exit: branching used naturally. |
 | 3.6 — Quiet week | Done 2026-09-03. Relay failures motivated the direct door. |
-| **3.7 — Direct sessions** | **Current.** One runner, mid-turn messages, visible tools, event compaction, directory-selected project context, presence-gated memory. Exit: a week in unified sessions, real compaction without visible context loss. |
-| 4 — Voice + remote | §7.1 prototype/local fallback, ARC phone access (text can start early), automated backup. Exit: phone session/job access and reconnect, voice correction/reconnect, restore drill, provider-pinned offline degradation. |
+| 3.7 — Direct sessions | Implemented: one runner, mid-turn messages, visible tools, event compaction, directory-selected project context, presence-gated memory. Acceptance: a week in unified sessions, real compaction without visible context loss. |
+| **4 — Voice + remote** | **Current.** Desktop web and phone PWA are built and deployed. Remaining: §7.1 voice prototype/local fallback, automated backup, and installed-phone checks. Exit: phone session/job access and reconnect, voice correction/reconnect, restore drill, provider-pinned offline degradation. |
 | 5 — Devices | First MCP actuator and safety policy, then arm. Room satellites are clients, not device tools. Embeddings only when FTS falls short. |
 
 ## 12. Open questions
