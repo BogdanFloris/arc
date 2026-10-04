@@ -561,6 +561,7 @@ async fn session_status(
                 .collect();
         }
     }
+    status.turn_running = Some(supervisor.turn_running(session_id));
     Ok(status)
 }
 
@@ -1458,6 +1459,16 @@ mod tests {
         wait_for_child_message_count(&harness, &session_id, 1).await;
 
         let mut second_ws = harness.connect().await;
+        let url = format!("ws://{}", harness.addr);
+        let mut status_client = arc_core::client::Client::connect(&url).await.unwrap();
+        assert_eq!(
+            status_client
+                .fetch_status(&session_id)
+                .await
+                .unwrap()
+                .turn_running,
+            Some(true)
+        );
         send(&mut second_ws, 2, say(&session_id, "and another thing")).await;
         match next_frame(&mut second_ws).await.msg {
             Some(server_frame::Msg::MessageAccepted(m)) => assert_eq!(m.session_id, session_id),
@@ -1469,6 +1480,15 @@ mod tests {
             "the sender is told its message joined a turn already running"
         );
         assert_eq!((queued.input_tokens, queued.output_tokens), (0, 0));
+        assert_eq!(
+            status_client
+                .fetch_status(&session_id)
+                .await
+                .unwrap()
+                .turn_running,
+            Some(true),
+            "a queued steer does not make the shared session idle"
+        );
 
         gate.notify_one();
 
@@ -1487,6 +1507,14 @@ mod tests {
             "the answer to the queued message streams in the turn that took it"
         );
         assert!(!ended(closing).queued);
+        assert_eq!(
+            status_client
+                .fetch_status(&session_id)
+                .await
+                .unwrap()
+                .turn_running,
+            Some(false)
+        );
 
         let messages: Vec<_> = harness
             .logged_events()
@@ -2878,6 +2906,9 @@ mod tests {
                         saw_handback_append = true;
                     }
                 }
+                server_frame::Msg::Notification(Notification {
+                    event: Some(notification::Event::SessionActivity(_)),
+                }) => {}
                 other => panic!("expected a Notification, got {other:?}"),
             }
         }

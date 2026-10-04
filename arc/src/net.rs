@@ -347,7 +347,7 @@ fn dispatch(notification: Notification, events: &mpsc::UnboundedSender<NetEvent>
         Some(notification::Event::ModelsChanged(list)) => {
             let _ = events.send(NetEvent::ModelItems(list.choices));
         }
-        None => {}
+        Some(notification::Event::SessionActivity(_)) | None => {}
     }
 }
 

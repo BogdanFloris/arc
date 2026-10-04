@@ -21,7 +21,7 @@ export type PendingInput = {
   content: string;
   state: 'pending' | 'accepted' | 'uncertain' | 'rejected';
 };
-type Turn = { input: PendingInput; messages: Message[]; key: string; waitingForReply: boolean };
+type Turn = { input: PendingInput; messages: Message[]; key: string; waitingForReply: boolean; queued?: boolean; settled?: boolean; afterSeq: bigint };
 type Client = Pick<ArcClient, 'connect' | 'close' | 'listSessions' | 'listProjects' | 'listModels' | 'createSession' | 'forkSession' | 'fetchStatus' | 'setSessionThinking' | 'fetchHistory' | 'listJobs' | 'subscribe' | 'sendMessage' | 'cancelTurn' | 'cancelJob'>;
 type ClientFactory = (endpoint: string, onDisconnect: (error: ArcConnectionError) => void) => Client;
 const emptyState = (): LocalState => ({ hosts: [], activeHostId: '', selected: {}, drafts: {}, inputs: {}, choices: {} });
@@ -69,6 +69,11 @@ export class Workspace {
   private configuredProjects = $state<string[]>([]);
   private liveJobs: JobInfo[] = [];
   private liveTurns = new Map<string, Turn>();
+  private steerTurns = new Set<Turn>();
+  private activity = new Map<string, boolean>();
+  private activityVersions = new Map<string, number>();
+  private historyMarks = new Map<string, bigint>();
+  private sessionRunning = $state(false);
   private cancellingSessions = $state<string[]>([]);
   private historyRequests = new Map<string, number>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -84,7 +89,11 @@ export class Workspace {
   }
   get activeHost() { return this.hosts.find((host) => host.id === this.activeHostId) ?? null; }
   get canSend() { return this.connectionState === 'connected'; }
-  get working() { return this.sending || this.jobs.some((job) => job.id === this.activeSessionId && job.state === 'running'); }
+  get canSubmit() {
+    return this.canSend && !this.loading && !this.controlsBusy && !!this.draft.trim()
+      && !this.cancelling && !this.pendingInputs.some((input) => input.sessionId === this.activeSessionId && input.state === 'pending');
+  }
+  get working() { return this.sending || this.sessionRunning || this.jobs.some((job) => job.id === this.activeSessionId && job.state === 'running'); }
   get cancelling() { return !!this.activeSessionId && this.cancellingSessions.includes(this.activeSessionId); }
   get canCancel() {
     return this.canSend && this.working && !this.cancelling && !!this.activeSessionId
@@ -201,7 +210,6 @@ export class Workspace {
     this.selected[this.activeHostId] = id;
     this.draft = this.drafts[this.activeHostId]?.[draftKey(id)] ?? '';
     this.activateContent();
-    this.sending = this.liveTurns.has(id);
     void this.loadHistory(id);
     void this.refreshStatus();
     this.persist();
@@ -227,6 +235,10 @@ export class Workspace {
   dismissInput(id: string) {
     this.inputs[this.activeHostId] = (this.inputs[this.activeHostId] ?? []).filter((input) => input.id !== id);
     this.pendingInputs = [...this.inputs[this.activeHostId]];
+    for (const turn of this.steerTurns) {
+      if (turn.input.id === id && turn.input.state !== 'accepted') this.steerTurns.delete(turn);
+    }
+    this.activateContent();
     this.persist();
   }
 
@@ -274,6 +286,7 @@ export class Workspace {
 
   private pruneCancellations() {
     this.cancellingSessions = this.cancellingSessions.filter((id) => this.liveTurns.has(id)
+      || this.activity.get(id) === true
       || this.jobs.some((job) => job.id === id && job.state === 'running'));
   }
 
@@ -332,11 +345,20 @@ export class Workspace {
     const client = this.client, id = this.activeSessionId, generation = this.generation;
     if (!client || !id || !this.canSend) return;
     const request = ++this.statusRequest;
+    const activityVersion = this.activityVersions.get(id) ?? 0;
     this.statusLoading = true;
     const current = () => generation === this.generation && client === this.client && id === this.activeSessionId && request === this.statusRequest;
     try {
       const status = await client.fetchStatus(id);
-      if (current()) { this.sessionStatus = status; this.statusError = ''; }
+      if (current()) {
+        this.sessionStatus = status;
+        if (status.turnRunning !== undefined && activityVersion === (this.activityVersions.get(id) ?? 0)) {
+          this.activity.set(id, status.turnRunning);
+        }
+        this.pruneCancellations();
+        this.activateContent();
+        this.statusError = '';
+      }
     } catch (error) {
       if (current()) this.statusError = `Could not refresh session status. ${error instanceof Error ? error.message : ''}`;
     } finally {
@@ -433,6 +455,7 @@ export class Workspace {
     this.histories.clear();
     this.forkPoints.clear();
     this.historyRequests.clear();
+    this.historyMarks.clear();
     const remembered = this.selected[this.activeHostId];
     this.activeSessionId = remembered && remembered !== '__new__' ? remembered : null;
     this.draft = this.drafts[this.activeHostId]?.[draftKey(this.activeSessionId)] ?? '';
@@ -444,9 +467,12 @@ export class Workspace {
   private activateContent() {
     const key = draftKey(this.activeSessionId);
     const turn = this.liveTurns.get(key);
-    this.messages = [...(this.activeSessionId ? this.histories.get(this.activeSessionId) ?? [] : []), ...(turn?.messages ?? [])];
-    this.sending = !!turn;
-    this.waitingForReply = turn?.waitingForReply ?? false;
+    const steers = [...this.steerTurns].filter((item) => item.input.sessionId === this.activeSessionId);
+    const echoes = steers.flatMap((item) => item.messages);
+    this.messages = [...(this.activeSessionId ? this.histories.get(this.activeSessionId) ?? [] : []), ...(turn?.messages ?? []), ...echoes];
+    this.sending = !!turn || steers.some((item) => !item.settled);
+    this.sessionRunning = !!this.activeSessionId && this.activity.get(this.activeSessionId) === true;
+    this.waitingForReply = turn?.waitingForReply || steers.some((item) => !item.settled && item.waitingForReply);
   }
   private rememberDraft() {
     if (!this.activeHostId) return;
@@ -481,6 +507,10 @@ export class Workspace {
     }
     this.pendingInputs = [...(this.inputs[this.activeHostId] ?? [])];
     this.liveTurns.clear();
+    this.steerTurns.clear();
+    this.activity.clear();
+    this.activityVersions.clear();
+    this.sessionRunning = false;
     this.cancellingSessions = [];
     this.sending = false;
     this.waitingForReply = false;
@@ -569,16 +599,35 @@ export class Workspace {
 
   private async loadHistory(id: string, completedTurn?: Turn) {
     const client = this.client, generation = this.generation;
-    if (!client || this.connectionState !== 'connected' || (this.liveTurns.has(id) && this.liveTurns.get(id) !== completedTurn)) return;
+    const observing = () => (this.liveTurns.has(id) && this.liveTurns.get(id) !== completedTurn)
+      || [...this.steerTurns].some((turn) => turn.input.sessionId === id && !turn.settled && turn !== completedTurn);
+    if (!client || this.connectionState !== 'connected' || observing()) return;
     const request = (this.historyRequests.get(id) ?? 0) + 1;
     this.historyRequests.set(id, request);
     if (this.activeSessionId === id) this.loading = true;
     try {
       const history = await client.fetchHistory(id);
       if (generation !== this.generation || this.client !== client || this.historyRequests.get(id) !== request
-        || (this.liveTurns.has(id) && this.liveTurns.get(id) !== completedTurn)) return;
+        || observing()) return;
       this.histories.set(id, historyMessages(history));
-      if (completedTurn) this.liveTurns.delete(id);
+      this.historyMarks.set(id, history.entries.at(-1)?.seq ?? 0n);
+      if (completedTurn && this.liveTurns.get(id) === completedTurn) this.liveTurns.delete(id);
+      const users = history.entries.flatMap((entry) => entry.entry.case === 'message'
+        && entry.entry.value.role === Role.USER && entry.entry.value.source === Source.USER
+        ? [{ seq: entry.seq, content: entry.entry.value.content }] : []);
+      const matched = new Set<bigint>();
+      for (const turn of this.steerTurns) {
+        if (turn.input.sessionId !== id || !turn.settled || turn.input.state !== 'accepted') continue;
+        const match = users.find((user) => user.seq > turn.afterSeq && !matched.has(user.seq) && user.content === turn.input.content);
+        if (match) {
+          matched.add(match.seq);
+          this.steerTurns.delete(turn);
+          for (const remaining of this.steerTurns) {
+            if (remaining.input.sessionId === id && remaining.afterSeq < match.seq) remaining.afterSeq = match.seq;
+          }
+          this.dismissInput(turn.input.id);
+        }
+      }
       const point = history.entries.findLast((entry) => entry.entry.case === 'message'
         && entry.entry.value.source !== Source.SYSTEM && (entry.entry.value.role === Role.USER || entry.entry.value.role === Role.ASSISTANT));
       if (point) this.forkPoints.set(id, point.seq);
@@ -597,6 +646,17 @@ export class Workspace {
     if (generation !== this.generation) return;
     if (notification.event.case === 'modelsChanged') {
       this.modelChoices = notification.event.value.choices;
+      return;
+    }
+    if (notification.event.case === 'sessionActivity') {
+      const { sessionId, running } = notification.event.value;
+      this.activityVersions.set(sessionId, (this.activityVersions.get(sessionId) ?? 0) + 1);
+      this.activity.set(sessionId, running);
+      this.pruneCancellations();
+      if (sessionId === this.activeSessionId) {
+        this.activateContent();
+        if (!running) void this.loadHistory(sessionId);
+      }
       return;
     }
     if (notification.event.case === 'jobChanged') {
@@ -636,9 +696,11 @@ export class Workspace {
       turn.input.state = 'accepted';
       turn.input.sessionId = id;
       turn.messages[0].delivery = undefined;
-      this.liveTurns.delete(turn.key);
-      turn.key = id;
-      this.liveTurns.set(id, turn);
+      if (!this.steerTurns.has(turn)) {
+        this.liveTurns.delete(turn.key);
+        turn.key = id;
+        this.liveTurns.set(id, turn);
+      }
       if (this.activeSessionId === oldId) {
         this.rememberDraft();
         this.activeSessionId = id;
@@ -676,7 +738,7 @@ export class Workspace {
   }
 
   private async sendRemote() {
-    if (!this.canSend || this.loading || this.working || this.controlsBusy || !this.draft.trim()) return;
+    if (!this.canSubmit) return;
     if (!this.activeSessionId) {
       const navigation = this.navigation;
       const draft = this.draft;
@@ -685,13 +747,18 @@ export class Workspace {
     }
     const client = this.client, generation = this.generation, hostId = this.activeHostId;
     const key = draftKey(this.activeSessionId);
-    if (!client || this.connectionState !== 'connected' || !this.draft.trim() || this.liveTurns.has(key) || this.loading || this.controlsBusy) return;
+    if (!client || this.connectionState !== 'connected' || !this.draft.trim() || this.loading || this.controlsBusy
+      || this.pendingInputs.some((item) => item.sessionId === this.activeSessionId && item.state === 'pending')) return;
     const input: PendingInput = { id: globalThis.crypto.randomUUID(), sessionId: this.activeSessionId, content: this.draft, state: 'pending' };
-    const turn: Turn = { input, key, waitingForReply: true, messages: [{ id: input.id, role: 'you', content: input.content, delivery: 'pending' }] };
+    const turn: Turn = { input, key, waitingForReply: true, afterSeq: this.historyMarks.get(key) ?? 0n,
+      messages: [{ id: input.id, role: 'you', content: input.content, delivery: 'pending' }] };
     this.inputs[hostId] ??= [];
     this.inputs[hostId].push(input);
     this.pendingInputs = [...this.inputs[hostId]];
-    this.liveTurns.set(key, turn);
+    const steering = !!input.sessionId && (this.activity.get(input.sessionId) === true || this.liveTurns.has(input.sessionId)
+      || this.jobs.some((job) => job.id === input.sessionId && job.state === 'running'));
+    if (steering) { turn.waitingForReply = false; this.steerTurns.add(turn); }
+    else this.liveTurns.set(key, turn);
     this.draft = '';
     this.rememberDraft();
     this.persist();
@@ -701,10 +768,15 @@ export class Workspace {
         if (generation === this.generation && this.client === client) this.streamFrame(turn, frame);
       });
       if (generation !== this.generation || this.client !== client) return;
-      this.dismissInput(input.id);
-      if (end.queued) this.notice = 'Message accepted into the running turn. Its reply will appear as history updates.';
-      else if (end.partial || end.stepCapped) this.notice = 'ARC returned a partial reply.';
-      else this.notice = '';
+      if (end.queued) {
+        turn.queued = true;
+        this.steerTurns.add(turn);
+        this.notice = 'Message accepted into the running turn.';
+      } else {
+        this.dismissInput(input.id);
+      }
+      if (!end.queued && (end.partial || end.stepCapped)) this.notice = 'ARC returned a partial reply.';
+      else if (!end.queued) this.notice = '';
     } catch (error) {
       if (generation !== this.generation || this.client !== client) return;
       if (input.state === 'accepted') {
@@ -713,6 +785,8 @@ export class Workspace {
       } else {
         const uncertain = error instanceof ArcConnectionError && error.accepted !== false;
         input.state = uncertain ? 'uncertain' : 'rejected';
+        if (uncertain) turn.messages[0].delivery = 'uncertain';
+        else this.steerTurns.delete(turn);
         this.pendingInputs = [...this.inputs[hostId]];
         this.notice = uncertain ? 'Delivery is unknown. Check conversation history before sending this input again.'
           : `Message not accepted. ${error instanceof Error ? error.message : ''}`;
@@ -720,9 +794,10 @@ export class Workspace {
       }
     } finally {
       if (generation === this.generation && this.client === client) {
+        turn.settled = true;
         turn.waitingForReply = false;
         this.activateContent();
-        if (input.sessionId && input.state === 'accepted') {
+        if (input.sessionId && input.state === 'accepted' && !turn.queued) {
           for (const message of turn.messages) message.streaming = false;
           await this.loadHistory(input.sessionId, turn);
           if (generation !== this.generation || this.client !== client) return;
@@ -731,10 +806,11 @@ export class Workspace {
             this.forkPoints.delete(turn.key);
           }
         }
-        this.liveTurns.delete(turn.key);
+        if (this.liveTurns.get(turn.key) === turn) this.liveTurns.delete(turn.key);
         this.pruneCancellations();
         this.activateContent();
         if (input.sessionId && input.state !== 'accepted') await this.loadHistory(input.sessionId);
+        if (input.sessionId && input.state === 'accepted' && (turn.queued || this.steerTurns.has(turn))) void this.loadHistory(input.sessionId);
         await this.refreshRemote();
         void this.refreshStatus();
       }

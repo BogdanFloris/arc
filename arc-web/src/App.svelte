@@ -389,17 +389,17 @@
               {:else}<span class="control-fixed thinking-readonly" aria-label={`Thinking ${workspace.effectiveThinking || 'unknown'}, read-only`} title="Current effort; the daemon does not offer changes for this model.">{workspace.effectiveThinking || '—'}</span>{/if}
             </div>
           </div>
-          {#if workspace.working}
+          {#if workspace.working && !workspace.draft.trim()}
             <button class="send cancel" type="button" aria-label="Cancel" title={workspace.cancelling ? 'Cancelling…' : 'Cancel work'} disabled={!workspace.canCancel} onclick={() => void workspace.cancel()}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
             </button>
           {:else}
-            <button class="send" type="submit" aria-label="Send" title="Send message" disabled={!connected || workspace.loading || workspace.controlsBusy || !workspace.draft.trim()}>
+            <button class="send" type="submit" aria-label="Send" title={workspace.working ? 'Send steer' : 'Send message'} disabled={!workspace.canSubmit}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>
             </button>
           {/if}
         </div>
-        {#if connected}<p class="keyboard-hint">{workspace.working ? 'Shift+Enter for newline' : 'Enter to send · Shift+Enter for newline'}</p>{/if}
+        {#if connected}<p class="keyboard-hint">{workspace.working ? 'Enter to steer · Shift+Enter for newline' : 'Enter to send · Shift+Enter for newline'}</p>{/if}
       </div>
       {#if workspace.pendingModelFork}
         <div class="fork-confirm" role="group" aria-label="Confirm model fork">

@@ -16,7 +16,9 @@ use super::handback::{
     handback_cancelled, handback_clean, handback_failed, handback_over_budget, handback_user_reply,
 };
 use super::status::notify_job_changed;
-use super::{LiveMap, Shared, TurnEvent, route_cancels, route_continues, spawn_dispatched};
+use super::{
+    Shared, TurnEvent, notify_session_activity, route_cancels, route_continues, spawn_dispatched,
+};
 
 pub(super) const EVENT_BUFFER: usize = 64;
 const JOB_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -130,7 +132,7 @@ pub(super) async fn run_task(
         let next = if cancelled || breach.is_some() {
             None
         } else {
-            next_inbound(&shared.live, &mut inbox_rx, &session_id)
+            next_inbound(&shared, &mut inbox_rx, &session_id)
         };
         end_attached(&mut attached, Some(Ok(reply))).await;
 
@@ -183,15 +185,16 @@ pub(super) async fn run_task(
 }
 
 fn next_inbound(
-    live: &LiveMap,
+    shared: &Shared,
     inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>,
     session_id: &str,
 ) -> Option<Inbound> {
-    let mut live = live.lock().expect("live");
+    let mut live = shared.live.lock().expect("live");
     if let Ok(inbound) = inbox_rx.try_recv() {
         Some(inbound)
     } else {
         live.remove(session_id);
+        notify_session_activity(shared, session_id, false);
         None
     }
 }
@@ -490,7 +493,10 @@ fn drain_dropped(
 }
 
 fn finish_now(shared: &Shared, inbox_rx: &mut mpsc::UnboundedReceiver<Inbound>, session_id: &str) {
-    shared.live.lock().expect("live").remove(session_id);
+    let mut live = shared.live.lock().expect("live");
+    live.remove(session_id);
+    notify_session_activity(shared, session_id, false);
+    drop(live);
     let mut dropped = 0_usize;
     while inbox_rx.try_recv().is_ok() {
         dropped += 1;
@@ -548,7 +554,9 @@ mod tests {
 
         let runners =
             BTreeMap::from([(SessionRole::Executor, executor_runner(&executor_provider))]);
-        let supervisor = Supervisor::for_test(Arc::clone(&engine), runners);
+        let (activity_tx, mut activity_rx) = tokio::sync::broadcast::channel(16);
+        let supervisor =
+            Supervisor::for_test(Arc::clone(&engine), runners).with_notifier(activity_tx);
 
         supervisor.spawn(DispatchedJob {
             session_id: child_id.clone(),
@@ -560,6 +568,7 @@ mod tests {
         });
 
         assert!(steer(&supervisor, &child_id, "too late"));
+        assert!(supervisor.turn_running(&child_id));
         notify.notify_one();
         supervisor.shutdown().await;
 
@@ -567,6 +576,17 @@ mod tests {
             !steer(&supervisor, &child_id, "later still"),
             "a failed job removed its live entry; nothing is left to read a steer"
         );
+        let activities: Vec<_> = std::iter::from_fn(|| activity_rx.try_recv().ok())
+            .filter_map(|notification| match notification.event {
+                Some(arc_proto::v1::notification::Event::SessionActivity(activity))
+                    if activity.session_id == child_id =>
+                {
+                    Some(activity.running)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activities, [true, false]);
         assert_eq!(
             child_user_messages(dir.path(), &child_id),
             [(Role::User, "fix the failing test".to_owned())],

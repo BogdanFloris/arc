@@ -10,6 +10,7 @@ import {
   SessionStatusSchema,
   AllowanceWindowSchema,
   ErrorSchema,
+  NotificationSchema,
 } from '../../src/lib/arc/gen/wire_pb';
 import { ContextMeasuredSchema } from '../../src/lib/arc/gen/events_pb';
 import { histories, jobs, sessions } from './sessions';
@@ -20,13 +21,26 @@ export function fixtureDaemon(options: {
   streamEndGate?: () => Promise<void>;
   toolGate?: () => Promise<void>;
   historyGate?: () => Promise<void>;
+  steerGate?: () => Promise<void>;
   cancelGate?: () => Promise<void>;
   cancelError?: string;
   onCancel?: (kind: 'turn' | 'job', sessionId: string) => void;
+  runningSessions?: string[];
 } = {}) {
   let jobState = options.jobsRunning === false ? 2 : 1;
   let cancelError = options.cancelError;
   const cancelled = new Set<string>();
+  const running = new Set(options.runningSessions);
+  const subscriptions = new Map<WebSocketRoute, bigint>();
+  const notify = (event: Parameters<typeof create<typeof NotificationSchema>>[1]['event']) => {
+    for (const [route, id] of subscriptions) route.send(Buffer.from(toBinary(ServerFrameSchema, create(ServerFrameSchema, {
+      requestId: id, msg: { case: 'notification', value: { event } },
+    }))));
+  };
+  const activity = (sessionId: string, active: boolean) => {
+    if (active) running.add(sessionId); else running.delete(sessionId);
+    notify({ case: 'sessionActivity', value: { sessionId, running: active } });
+  };
   const sessionMetadata = new Map(sessions.map((session) => [session.id, {
     id: session.id, title: session.title, project: '', role: jobs.some((job) => job.id === session.id) ? SessionRole.EXECUTOR : SessionRole.CHAT,
     source: jobs.some((job) => job.id === session.id) ? Source.MODEL : Source.USER,
@@ -49,14 +63,16 @@ export function fixtureDaemon(options: {
   const thinking = new Map(sessions.map((session) => [session.id, 'low']));
   let statusOverride: Partial<{ context: ReturnType<typeof create<typeof ContextMeasuredSchema>> | undefined; contextObservedAt: bigint; allowance: ReturnType<typeof create<typeof AllowanceWindowSchema>>[]; allowanceObservedAt: bigint; allowanceStale: boolean; effectiveThinking: string; supportedThinking: string[] }> = {};
   let statusFetches = 0;
-  const created = (route: WebSocketRoute) => route.onMessage(async (data) => {
+  const created = (route: WebSocketRoute) => {
+  route.onClose(() => subscriptions.delete(route));
+  route.onMessage(async (data) => {
     if (typeof data === 'string') throw new Error('Expected binary protobuf frame');
     const request = fromBinary(ClientFrameSchema, new Uint8Array(data as Buffer));
     const id = request.requestId;
     const reply = (msg: Parameters<typeof create<typeof ServerFrameSchema>>[1]['msg']) =>
       route.send(Buffer.from(toBinary(ServerFrameSchema, create(ServerFrameSchema, { requestId: id, msg }))));
     switch (request.msg.case) {
-      case 'subscribe': break;
+      case 'subscribe': subscriptions.set(route, id); break;
       case 'listSessions':
         reply({ case: 'sessionList', value: create(SessionListSchema, { sessions: [...sessionMetadata.values()].map((metadata) => {
           const session = sessions.find((entry) => entry.id === metadata.id);
@@ -106,7 +122,7 @@ export function fixtureDaemon(options: {
           codex: true, allowance: [create(AllowanceWindowSchema, { remainingPercent: 72, windowSeconds: 604800n })],
           allowanceObservedAt: BigInt(Math.floor(Date.now() / 1000)), allowanceSource: 'account',
           effectiveThinking: thinking.get(sessionId) ?? 'low',
-          supportedThinking: ['low', 'medium', 'high'], ...statusOverride }) });
+          supportedThinking: ['low', 'medium', 'high'], turnRunning: running.has(sessionId), ...statusOverride }) });
         break;
       }
       case 'fetchHistory': {
@@ -117,8 +133,28 @@ export function fixtureDaemon(options: {
       }
       case 'sendMessage': {
         const sessionId = request.msg.value.sessionId || sessions[0].id;
+        if (running.has(sessionId)) {
+          reply({ case: 'messageAccepted', value: create(MessageAcceptedSchema, { sessionId }) });
+          reply({ case: 'streamEnd', value: create(StreamEndSchema, { sessionId, queued: true }) });
+          await options.steerGate?.();
+          const prior = historyEntries.get(sessionId)!;
+          const seq = (prior.entries.at(-1)?.seq ?? 0n) + 1n;
+          historyEntries.set(sessionId, create(SessionHistorySchema, { sessionId, entries: [
+            ...prior.entries,
+            create(HistoryEntrySchema, { seq, entry: { case: 'message', value: { role: Role.USER, source: Source.USER, content: request.msg.value.content } } }),
+          ] }));
+          notify({ case: 'sessionAppended', value: { sessionId } });
+          break;
+        }
         void (async () => {
           cancelled.delete(sessionId);
+          activity(sessionId, true);
+          const initial = historyEntries.get(sessionId)!;
+          const userSeq = (initial.entries.at(-1)?.seq ?? 0n) + 1n;
+          historyEntries.set(sessionId, create(SessionHistorySchema, { sessionId, entries: [
+            ...initial.entries,
+            create(HistoryEntrySchema, { seq: userSeq, entry: { case: 'message', value: { role: Role.USER, source: Source.USER, content: request.msg.value.content } } }),
+          ] }));
           reply({ case: 'messageAccepted', value: create(MessageAcceptedSchema, { sessionId }) });
           await options.streamGate?.();
           if (options.toolGate) {
@@ -140,14 +176,14 @@ export function fixtureDaemon(options: {
           const seq = (prior?.entries.reduce((last, entry) => entry.seq > last ? entry.seq : last, 0n) ?? 0n) + 1n;
           historyEntries.set(sessionId, create(SessionHistorySchema, { sessionId, entries: [
             ...(prior?.entries ?? []),
-            create(HistoryEntrySchema, { seq, entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.USER, source: Source.USER, content: request.msg.value.content }) } }),
             ...(options.toolGate ? [
-              create(HistoryEntrySchema, { seq: seq + 1n, entry: { case: 'toolCall', value: { callId: 'live-tool', name: 'bash', argumentsJson: '{"command":"sleep 20"}' } } }),
-              create(HistoryEntrySchema, { seq: seq + 2n, entry: { case: 'toolResult', value: { callId: 'live-tool', outcome: cancelled.has(sessionId) ? ToolOutcome.ERROR : ToolOutcome.OK, content: cancelled.has(sessionId) ? 'Cancelled' : 'Done' } } }),
+              create(HistoryEntrySchema, { seq, entry: { case: 'toolCall', value: { callId: 'live-tool', name: 'bash', argumentsJson: '{"command":"sleep 20"}' } } }),
+              create(HistoryEntrySchema, { seq: seq + 1n, entry: { case: 'toolResult', value: { callId: 'live-tool', outcome: cancelled.has(sessionId) ? ToolOutcome.ERROR : ToolOutcome.OK, content: cancelled.has(sessionId) ? 'Cancelled' : 'Done' } } }),
             ] : []),
-            create(HistoryEntrySchema, { seq: seq + (options.toolGate ? 3n : 1n), entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.ASSISTANT, source: Source.MODEL, content: streamed, partial: streamed !== text }) } }),
+            create(HistoryEntrySchema, { seq: seq + (options.toolGate ? 2n : 0n), entry: { case: 'message', value: create(HistoryMessageSchema, { role: Role.ASSISTANT, source: Source.MODEL, content: streamed, partial: streamed !== text }) } }),
           ] }));
           reply({ case: 'streamEnd', value: create(StreamEndSchema, { sessionId, partial: cancelled.has(sessionId) }) });
+          activity(sessionId, false);
         })();
         break;
       }
@@ -163,16 +199,21 @@ export function fixtureDaemon(options: {
             return;
           }
           reply({ case: 'messageAccepted', value: create(MessageAcceptedSchema, { sessionId }) });
-          if (kind === 'turn') cancelled.add(sessionId);
+          if (kind === 'turn') {
+            cancelled.add(sessionId);
+            if (options.runningSessions?.includes(sessionId)) activity(sessionId, false);
+          }
           else jobState = 4;
         })();
         break;
       }
     }
   });
+  };
   return Object.assign(created, {
     setStatus: (status: typeof statusOverride) => { statusOverride = status; },
     setCancelError: (message?: string) => { cancelError = message; },
-    get statusFetches() { return statusFetches; },
+    setActivity: activity,
+    statusFetches: () => statusFetches,
   });
 }

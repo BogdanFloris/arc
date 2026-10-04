@@ -187,6 +187,14 @@ impl Supervisor {
         cancel_live(&self.shared.live, session_id)
     }
 
+    pub(crate) fn turn_running(&self, session_id: &str) -> bool {
+        self.shared
+            .live
+            .lock()
+            .expect("live")
+            .contains_key(session_id)
+    }
+
     pub fn drop_steers(&self, session_id: &str) -> bool {
         let live = self.shared.live.lock().expect("live");
         let Some(session) = live.get(session_id) else {
@@ -580,6 +588,7 @@ fn spawn_task(
             drop_tx,
         },
     );
+    notify_session_activity(shared, &task.job.session_id, true);
     let handle = spawn_watched(shared.clone(), runner, task, inbox_rx, cancel_rx, drop_rx);
     let mut handles = shared.handles.lock().expect("handles");
     // reap finished wrappers so a long-lived daemon's history stays bounded
@@ -615,11 +624,10 @@ fn spawn_watched(
                 session_id = %recovery.session_id,
                 "session task panicked; forcing it to failed"
             );
-            shared
-                .live
-                .lock()
-                .expect("live")
-                .remove(&recovery.session_id);
+            let mut live = shared.live.lock().expect("live");
+            live.remove(&recovery.session_id);
+            notify_session_activity(&shared, &recovery.session_id, false);
+            drop(live);
             if !dispatched {
                 return;
             }
@@ -633,6 +641,19 @@ fn spawn_watched(
             handback_crashed(&shared, &recovery);
         }
     })
+}
+
+pub(crate) fn notify_session_activity(shared: &Shared, session_id: &str, running: bool) {
+    if let Some(notifier) = &shared.notifier {
+        let _ = notifier.send(Notification {
+            event: Some(arc_proto::v1::notification::Event::SessionActivity(
+                arc_proto::v1::SessionActivity {
+                    session_id: session_id.to_owned(),
+                    running,
+                },
+            )),
+        });
+    }
 }
 
 fn route_continue(shared: &Shared, cont: ContinuedJob) {

@@ -4,6 +4,7 @@ import { Workspace } from './workspace.svelte';
 import type { HostProfile } from './arc/types';
 import { create } from '@bufbuild/protobuf';
 import { ModelChoiceSchema, SessionStatusSchema, MessageAcceptedSchema, JobInfoSchema } from './arc/gen/wire_pb';
+import { Role, Source } from './arc/gen/events_pb';
 
 const host: HostProfile = { id: 'remote', name: 'Remote', endpoint: 'wss://arc.test/ws', kind: 'daemon' };
 const makeHistory = (content: string) => ({ entries: [{ seq: 1n, entry: { case: 'message', value: { source: 2, role: 2, content } } }] });
@@ -33,6 +34,8 @@ class FakeClient {
   thinking: string[] = [];
   jobItems: ReturnType<typeof create<typeof JobInfoSchema>>[] = [];
   onDisconnect?: (error: ArcConnectionError) => void;
+  notification?: (value: never) => void;
+  turnRunning = false;
   constructor(
     public sessions: unknown[] = [{ id: 's1', title: 'Session', source: 2 }, { id: 's2', title: 'Second', source: 2 }],
     public historyValue: unknown = makeHistory('from history'),
@@ -44,7 +47,7 @@ class FakeClient {
   ) {}
   async connect() {}
   close() { this.closed = true; }
-  async subscribe() {}
+  async subscribe(callback: (value: never) => void) { this.notification = callback; }
   async listSessions() { return this.sessions; }
   async listProjects() { return this.projects; }
   async listModels() { return this.models; }
@@ -63,7 +66,7 @@ class FakeClient {
     return create(MessageAcceptedSchema, { sessionId: 'forked' });
   }
   async fetchStatus(id: string) {
-    return create(SessionStatusSchema, { sessionId: id, supportedThinking: ['medium', 'high'], effectiveThinking: this.thinking.at(-1) ?? 'medium' });
+    return create(SessionStatusSchema, { sessionId: id, turnRunning: this.turnRunning, supportedThinking: ['medium', 'high'], effectiveThinking: this.thinking.at(-1) ?? 'medium' });
   }
   async setSessionThinking(id: string, thinking: string) { this.thinking.push(thinking); return this.fetchStatus(id); }
   async fetchHistory(id: string) { this.historyCalls.push(id); return typeof this.historyValue === 'function' ? (this.historyValue as (id: string) => Promise<unknown>)(id) : this.historyValue; }
@@ -73,6 +76,76 @@ class FakeClient {
 afterEach(() => vi.useRealTimers());
 
 describe('remote Workspace', () => {
+  it('preserves the original stream and reconciles repeated steers only against newer user messages', async () => {
+    const completion = defer<unknown>();
+    let original!: (value: never) => void;
+    const entry = (seq: bigint, content: string) => ({
+      seq, entry: { case: 'message', value: { source: Source.USER, role: Role.USER, content } },
+    });
+    const old = entry(10n, 'repeat this');
+    const client = new FakeClient(undefined, { entries: [old] }, (id, text, frame) => {
+      frame({ msg: { case: 'messageAccepted', value: { sessionId: id } } } as never);
+      if (text === 'start work') { original = frame; return completion.promise; }
+      return Promise.resolve({ queued: true });
+    });
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('start work');
+    const sending = workspace.send(); await tick();
+    original({ msg: { case: 'delta', value: { text: 'original reply' } } } as never);
+    await tick();
+    for (let count = 2; count <= 3; count++) {
+      workspace.setDraft('repeat this'); await workspace.send(); await tick();
+      expect(workspace.messages.filter((message) => message.role === 'you' && message.content === 'repeat this')).toHaveLength(count);
+      expect(workspace.messages).toContainEqual(expect.objectContaining({ content: 'original reply' }));
+      expect(workspace.sending).toBe(true);
+      expect(workspace.canCancel).toBe(true);
+    }
+    client.historyValue = { entries: [old, entry(11n, 'repeat this')] };
+    completion.resolve({}); await sending; await tick();
+    expect(workspace.messages.filter((message) => message.role === 'you' && message.content === 'repeat this')).toHaveLength(3);
+    client.historyValue = { entries: [old, entry(11n, 'repeat this'), entry(12n, 'repeat this')] };
+    workspace.resume(); await tick();
+    expect(workspace.messages.filter((message) => message.role === 'you' && message.content === 'repeat this')).toHaveLength(3);
+    expect(workspace.pendingInputs).toEqual([]);
+    workspace.dispose();
+  });
+
+  it('does not let a stale status snapshot overwrite newer shared activity', async () => {
+    const client = new FakeClient();
+    const status = defer<ReturnType<typeof create<typeof SessionStatusSchema>>>();
+    vi.spyOn(client, 'fetchStatus').mockImplementation(() => status.promise);
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    client.notification!({ event: { case: 'sessionActivity', value: { sessionId: 's1', running: true } } } as never);
+    expect(workspace.working).toBe(true);
+    status.resolve(create(SessionStatusSchema, { sessionId: 's1', turnRunning: false })); await tick();
+    expect(workspace.working).toBe(true);
+    expect(workspace.canCancel).toBe(true);
+    client.notification!({ event: { case: 'sessionActivity', value: { sessionId: 's1', running: false } } } as never);
+    expect(workspace.working).toBe(false);
+    workspace.dispose();
+  });
+
+  it.each(['rejected', 'uncertain'])('reports %s steer delivery without showing it as accepted', async (outcome) => {
+    const client = new FakeClient(undefined, undefined, async () => {
+      throw new ArcConnectionError('steer failed', outcome === 'rejected' ? false : 'unknown');
+    });
+    client.turnRunning = true;
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    workspace.setDraft('steer input'); await workspace.send(); await tick();
+    expect(workspace.uncertainInputs).toContainEqual(expect.objectContaining({ content: 'steer input', state: outcome }));
+    const echo = workspace.messages.find((message) => message.content === 'steer input');
+    if (outcome === 'rejected') expect(echo).toBeUndefined();
+    else expect(echo?.delivery).toBe('uncertain');
+    expect(workspace.canCancel).toBe(true);
+    workspace.dismissInput(workspace.uncertainInputs[0].id);
+    expect(workspace.messages.find((message) => message.content === 'steer input')).toBeUndefined();
+    expect(client.sends).toEqual(['steer input']);
+    workspace.dispose();
+  });
+
   it.each(['waiting', 'text', 'tool'])('cancels %s work without discarding the next draft or ending on acknowledgement', async (activity) => {
     const completion = defer<unknown>(), acknowledgement = defer<void>();
     let frame!: (value: never) => void;
@@ -253,13 +326,13 @@ describe('remote Workspace', () => {
     workspace.resume(); await tick();
     expect(workspace.activeSessionId).toBe('job');
     workspace.setDraft('follow up'); await workspace.send();
-    expect(client.sendIds).toEqual([]);
+    expect(client.sendIds).toEqual(['job']);
     await workspace.cancel();
     expect(cancelJob).toHaveBeenCalledExactlyOnceWith('job');
     expect(cancelTurn).not.toHaveBeenCalled();
     expect(workspace.cancelling).toBe(true);
     expect(workspace.working).toBe(true);
-    expect(workspace.draft).toBe('follow up');
+    expect(workspace.draft).toBe('');
     client.jobItems = [create(JobInfoSchema, { sessionId: 'job', title: 'Live job', state: 4 })];
     workspace.resume(); await tick();
     expect(workspace.working).toBe(false);
@@ -439,6 +512,19 @@ describe('remote Workspace', () => {
     expect(workspace.sessions).toMatchObject([{ id: 's1', title: 'Session' }, { id: 's2', title: 'Second' }]);
     expect(workspace.messages).toMatchObject([{ role: 'you', content: 'from history' }]);
     workspace.dispose(); expect(client.closed).toBe(true);
+  });
+
+  it('restores externally running activity from the status snapshot and permits steering', async () => {
+    const client = new FakeClient();
+    client.turnRunning = true;
+    const workspace = new Workspace(null, () => client as never, host);
+    workspace.initialize(); await tick();
+    expect(workspace.working).toBe(true);
+    workspace.setDraft('steer external work');
+    expect(workspace.canSubmit).toBe(true);
+    await workspace.send();
+    expect(client.sends).toEqual(['steer external work']);
+    workspace.dispose();
   });
 
   it('does not display a stale history response after selecting another session', async () => {
