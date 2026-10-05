@@ -131,7 +131,9 @@ for (const width of [320, 1100]) {
     const styles = await body.evaluate((element) => {
       const colour = (selector: string) => getComputedStyle(element.querySelector(selector)!).color;
       return {
-        heading: colour('h1'), inlineCode: colour('p code'), keyword: colour('.hljs-keyword'),
+        heading: colour('h1'), link: colour('a'), inlineCode: colour('p code'), keyword: colour('.hljs-keyword'),
+        linkUnderline: getComputedStyle(element.querySelector('a')!).textDecorationLine,
+        linkOffset: getComputedStyle(element.querySelector('a')!).textUnderlineOffset,
         string: colour('.hljs-string'), number: colour('.hljs-number'),
         comment: colour('.hljs-comment'), quote: colour('blockquote'),
         codeWhitespace: getComputedStyle(element.querySelector('pre')!).whiteSpace,
@@ -141,7 +143,8 @@ for (const width of [320, 1100]) {
       };
     });
     expect(styles).toEqual({
-      heading: 'rgb(254, 128, 25)', inlineCode: 'rgb(142, 192, 124)',
+      heading: 'rgb(235, 219, 178)', link: 'rgb(131, 165, 152)', inlineCode: 'rgb(142, 192, 124)',
+      linkUnderline: 'underline', linkOffset: '4px',
       keyword: 'rgb(251, 73, 52)', string: 'rgb(184, 187, 38)', number: 'rgb(211, 134, 155)',
       comment: 'rgb(146, 131, 116)', quote: 'rgb(189, 174, 147)', codeWhitespace: 'pre',
       codeOverflows: true, tableOverflows: true, pageOverflows: false,

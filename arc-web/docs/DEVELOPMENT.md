@@ -73,6 +73,7 @@ Daemon changes need a separate build/install and restart. Wait for active turns 
 - Keep the deployment origin, manifest identity, root scope, and `/arc` route stable so existing installations keep their state.
 - Drafts and uncertain input are host-scoped browser state. Never retry sends automatically or discard saved input during a storage migration.
 - Keep Markdown untrusted and user/tool text escaped.
+- JetBrains Mono is bundled for offline use under its OFL license.
 
 ## Remaining work
 

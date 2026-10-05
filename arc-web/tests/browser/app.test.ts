@@ -657,11 +657,23 @@ test('higher contrast and forced colours retain an explicit keyboard focus indic
   }
 });
 
-test('glass has an opaque higher-contrast fallback', async ({ page }) => {
+test('navigation controls and sheets use opaque matte surfaces', async ({ page }) => {
   await page.goto('/');
+  const font = await page.evaluate(async () => {
+    await document.fonts.load('12px "JetBrains Mono"');
+    return {
+      available: document.fonts.check('12px "JetBrains Mono"'),
+      bundled: await fetch('/jetbrains-mono-latin.woff2').then((response) => response.ok),
+      precached: (await fetch('/sw.js').then((response) => response.text())).includes('jetbrains-mono-latin.woff2'),
+    };
+  });
+  expect(font).toEqual({ available: true, bundled: true, precached: true });
   const settings = page.getByRole('button', { name: 'Settings', exact: true });
-  expect(await settings.evaluate((button) => getComputedStyle(button).backdropFilter)).not.toBe('none');
-  await page.emulateMedia({ contrast: 'more' });
+  const buttonStyle = await settings.evaluate((button) => {
+    const style = getComputedStyle(button);
+    return [style.backgroundColor, style.borderWidth, style.backdropFilter, style.boxShadow];
+  });
+  expect(buttonStyle).toEqual(['rgb(60, 56, 54)', '1px', 'none', 'none']);
   await settings.click();
   const appearance = await page.locator('.panel-surface').evaluate((surface) => {
     const style = getComputedStyle(surface);

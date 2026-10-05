@@ -264,15 +264,15 @@
 
   <main class="main">
     <header class="top">
-      <button class="icon-button glass mobile-only" aria-label="Open sessions" title="Sessions" onclick={(event) => open('sessions', event.currentTarget)}>
+      <button class="icon-button surface mobile-only" aria-label="Open sessions" title="Sessions" onclick={(event) => open('sessions', event.currentTarget)}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h11M4 18h16"/></svg>
       </button>
       <div class="title">{workspace.activeTitle}</div>
       <div class="header-actions">
-        <button class="icon-button glass" aria-label="New conversation" title="New conversation" onclick={newConversation}>
+        <button class="icon-button surface" aria-label="New conversation" title="New conversation" onclick={newConversation}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6m5-1 5 5-9 9-6 1 1-6 9-9Z"/></svg>
         </button>
-        <button class="icon-button glass" aria-label="Settings" title="Settings" onclick={(event) => open('settings', event.currentTarget)}>
+        <button class="icon-button surface" aria-label="Settings" title="Settings" onclick={(event) => open('settings', event.currentTarget)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--bg)"/><circle cx="15" cy="17" r="3" fill="var(--bg)"/></svg>
         </button>
       </div>
@@ -414,7 +414,7 @@
 
 <dialog class="panel-layer" bind:this={panel} onclose={dialogClosed} aria-labelledby="panel-title">
   <button class="panel-dismiss" tabindex="-1" aria-label="Dismiss panel" onclick={dismissBackdrop}></button>
-  <div class="panel-surface glass" class:list-panel={panelKind !== 'settings'} bind:this={panelSurface}>
+  <div class="panel-surface surface" class:list-panel={panelKind !== 'settings'} bind:this={panelSurface}>
   <div class="panel-header">
     <h2 id="panel-title" tabindex="-1" bind:this={panelTitle}>{panelKind === 'sessions' ? 'Sessions' : panelKind === 'settings' ? 'Settings' : panelKind === 'jobs' ? 'Jobs' : 'ARC status'}</h2>
     <button class="icon-button" aria-label="Close" title="Close panel" onclick={() => panel.close()}>
