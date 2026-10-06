@@ -40,7 +40,9 @@ impl Tool for Bash {
             description: "Run Bash in the session's working directory, falling back to the \
                           daemon's directory. The environment is scrubbed; daemon credentials \
                           are not inherited. Output keeps the last 16 KiB of each stream. \
-                          Prefer narrow queries and plain output."
+                          If the call is cancelled or dropped, the whole process group is \
+                          killed; a background job that redirects its output survives a \
+                          normal return. Prefer narrow queries and plain output."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -122,6 +124,7 @@ async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[Str
         }
     };
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
+    let mut group = KillGroup(pgid);
     let stdout_pipe = child.stdout.take().expect("stdout is piped");
     let stderr_pipe = child.stderr.take().expect("stderr is piped");
     let mut drains =
@@ -142,6 +145,7 @@ async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[Str
             drains.await
         }
         .unwrap_or_default();
+    group.disarm();
     match wait_result {
         Err(_) => {
             let header = format!("ERROR: timed out after {timeout_secs}s.");
@@ -160,6 +164,20 @@ fn kill_group(pgid: Option<i32>) {
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
+    }
+}
+
+struct KillGroup(Option<i32>);
+
+impl KillGroup {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        kill_group(self.0);
     }
 }
 
@@ -332,6 +350,24 @@ mod tests {
         serde_json::json!({ "command": command, "timeout_secs": timeout_secs }).to_string()
     }
 
+    // Process names may contain parentheses.
+    fn process_alive(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().next().map(str::to_owned))
+            })
+            .is_some_and(|state| state != "Z")
+    }
+
+    fn kill(pid: &str) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid])
+            .status();
+    }
+
     #[tokio::test]
     async fn an_echo_command_returns_its_stdout_verbatim() {
         let dir = TempDir::new().expect("tmp");
@@ -498,6 +534,53 @@ mod tests {
             assert!(reply.ok, "{}", reply.content);
             assert!(reply.content.contains("up"), "{}", reply.content);
         }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_kills_its_process_group() {
+        let dir = TempDir::new().expect("tmp");
+        let pid_file = dir.path().join("pid");
+        let command = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let tool = Bash::new();
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            tool.execute(args(&command), ctx_rw(dir.path())),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let alive = process_alive(&pid);
+        if alive {
+            kill(&pid);
+        }
+        assert!(!alive, "sleep {pid} outlived the dropped call");
+    }
+
+    #[tokio::test]
+    async fn a_redirected_background_job_survives_a_normal_return() {
+        let dir = TempDir::new().expect("tmp");
+        let pid_file = dir.path().join("pid");
+        let command = format!(
+            "nohup sleep 30 > /dev/null 2>&1 & echo $! > {}",
+            pid_file.display()
+        );
+        let tool = Bash::new();
+
+        let reply = tool.execute(args(&command), ctx_rw(dir.path())).await;
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the background job wrote its pid")
+            .trim()
+            .to_owned();
+        let alive = process_alive(&pid);
+        kill(&pid);
+        assert!(reply.ok, "{}", reply.content);
+        assert!(alive, "sleep {pid} did not survive a normal return");
     }
 
     #[tokio::test]

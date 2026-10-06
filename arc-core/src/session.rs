@@ -1908,9 +1908,7 @@ impl Engine {
             let dispatch = self
                 .registry
                 .dispatch(&call.name, call.arguments.clone(), ctx, sources);
-            // dropping `dispatch` here abandons whatever the tool was doing;
-            // a bash child keeps running to its own timeout regardless —
-            // threading cancel into tools themselves is later work
+            // Dropping dispatch kills Bash's process group.
             let outcome = tokio::select! {
                 outcome = dispatch => outcome,
                 _ = cancel_rx.changed() => {
