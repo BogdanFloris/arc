@@ -20,25 +20,62 @@ impl Edit {
 
 #[derive(Deserialize)]
 struct EditArgs {
+    #[serde(alias = "file_path")]
     path: String,
+    #[serde(default, deserialize_with = "replacement_shapes")]
     replacements: Option<Vec<Replacement>>,
+    #[serde(alias = "old_string")]
     old: Option<String>,
+    #[serde(alias = "new_string")]
     new: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Replacement {
+    #[serde(alias = "old_string")]
     old: String,
+    #[serde(alias = "new_string")]
     new: String,
+}
+
+fn replacement_shapes<'de, D>(deserializer: D) -> Result<Option<Vec<Replacement>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    fn shapes(value: serde_json::Value) -> Result<Vec<Replacement>, serde_json::Error> {
+        let value = match value {
+            serde_json::Value::String(text) => serde_json::from_str(&text)?,
+            other => other,
+        };
+        match value {
+            serde_json::Value::Array(items) => {
+                items.into_iter().map(serde_json::from_value).collect()
+            }
+            object @ serde_json::Value::Object(_) => {
+                serde_json::from_value(object).map(|one| vec![one])
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "replacements must be an array or an object, not {other}"
+            ))),
+        }
+    }
+
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(|value| shapes(value).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 impl Tool for Edit {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit".to_owned(),
-            description: "Replace several non-overlapping spans in one file. path must be \
-                          absolute. Each replacement's old text must appear exactly once in \
-                          the original file; include context to make it unique. All replacements \
+            description: "Replace several non-overlapping spans in one file. path (or \
+                          file_path) must be absolute. Each replacement's old (or old_string) \
+                          text must appear exactly once in the original file; include context \
+                          to make it unique. replacements accepts an array of {old, new} \
+                          objects, a single object, or a JSON string holding either; the \
+                          legacy top-level old and new (or old_string and new_string) also \
+                          work. All replacements \
                           are validated before writing. Requires having read the file using \
                           the `read` tool in this session, with no changes since. Reading \
                           through Bash does not count."
@@ -400,5 +437,156 @@ mod tests {
             "{}",
             reply.content
         );
+    }
+
+    async fn read_first(root: &std::path::Path, path: &std::path::Path) -> Arc<Workspace> {
+        let ws = workspace();
+        Read::new(Arc::clone(&ws))
+            .execute(read_args(path), ctx("s", root, Mode::ReadWrite))
+            .await;
+        ws
+    }
+
+    #[tokio::test]
+    async fn a_stringified_replacement_array_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "path": path,
+            "replacements": r#"[{"old": "alpha", "new": "A"}, {"old": "beta", "new": "B"}]"#,
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A B");
+    }
+
+    #[tokio::test]
+    async fn a_stringified_replacement_object_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "path": path,
+            "replacements": r#"{"old": "alpha", "new": "A"}"#,
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A beta");
+    }
+
+    #[tokio::test]
+    async fn a_bare_replacement_object_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "path": path,
+            "replacements": {"old": "alpha", "new": "A"},
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A beta");
+    }
+
+    #[tokio::test]
+    async fn replacement_item_aliases_are_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "path": path,
+            "replacements": [{"old_string": "alpha", "new_string": "A"}],
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A beta");
+    }
+
+    #[tokio::test]
+    async fn file_path_and_the_legacy_string_aliases_are_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "file_path": path,
+            "old_string": "alpha",
+            "new_string": "A",
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A beta");
+    }
+
+    #[tokio::test]
+    async fn a_replacements_string_that_is_not_json_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let request = serde_json::json!({"path": path, "replacements": "not json"}).to_string();
+
+        let reply = Edit::new(workspace())
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(!reply.ok);
+        assert!(
+            reply.content.contains("bad edit arguments"),
+            "{}",
+            reply.content
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn a_null_replacements_leaves_the_legacy_shape_working() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "alpha beta").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let request = serde_json::json!({
+            "path": path,
+            "replacements": null,
+            "old": "alpha",
+            "new": "A",
+        })
+        .to_string();
+        let reply = Edit::new(ws)
+            .execute(request, ctx("s", dir.path(), Mode::ReadWrite))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A beta");
     }
 }

@@ -20,6 +20,7 @@ impl Write {
 
 #[derive(Deserialize)]
 struct WriteArgs {
+    #[serde(alias = "file_path")]
     path: String,
     content: String,
 }
@@ -29,7 +30,8 @@ impl Tool for Write {
         ToolDefinition {
             name: "write".to_owned(),
             description: "Write a file's full contents, creating it if it does not exist. \
-                          path must be absolute. Missing parent directories are created. \
+                          path (or file_path) must be absolute. Missing parent directories are \
+                          created. \
                           Overwriting a file that already exists \
                           requires having read it using the `read` tool in this session, \
                           with no changes since. Reading through Bash does not count."
@@ -241,6 +243,22 @@ mod tests {
             fs::read_to_string(&path).expect("unchanged"),
             "changed by someone else"
         );
+    }
+
+    #[tokio::test]
+    async fn file_path_is_accepted_as_the_path_alias() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("f.txt");
+
+        let reply = Write::new(workspace())
+            .execute(
+                serde_json::json!({ "file_path": path, "content": "hello" }).to_string(),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
     }
 
     #[tokio::test]

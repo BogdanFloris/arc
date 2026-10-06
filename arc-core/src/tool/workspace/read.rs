@@ -23,6 +23,7 @@ impl Read {
 
 #[derive(Deserialize)]
 struct ReadArgs {
+    #[serde(alias = "file_path")]
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -32,7 +33,8 @@ impl Tool for Read {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_owned(),
-            description: "Read a file by absolute path, recording the version for later edits. \
+            description: "Read a file by absolute path (or file_path), recording the version \
+                          for later edits. \
                           Returns up to limit lines and 48 KiB. Truncated pages include \
                           the next offset."
                 .to_owned(),
@@ -173,6 +175,23 @@ mod tests {
 
     fn args(path: &std::path::Path) -> String {
         serde_json::json!({ "path": path }).to_string()
+    }
+
+    #[tokio::test]
+    async fn file_path_is_accepted_as_the_path_alias() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "hello").expect("write");
+
+        let reply = Read::new(workspace())
+            .execute(
+                serde_json::json!({ "file_path": path }).to_string(),
+                ctx("s-1", dir.path(), Mode::ReadOnly),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(reply.content, "hello");
     }
 
     #[tokio::test]
