@@ -29,7 +29,8 @@ impl Tool for Write {
         ToolDefinition {
             name: "write".to_owned(),
             description: "Write a file's full contents, creating it if it does not exist. \
-                          path must be absolute. Overwriting a file that already exists \
+                          path must be absolute. Missing parent directories are created. \
+                          Overwriting a file that already exists \
                           requires having read it using the `read` tool in this session, \
                           with no changes since. Reading through Bash does not count."
                 .to_owned(),
@@ -90,6 +91,15 @@ impl Tool for Write {
                     ensure_fresh(&self.workspace, &ctx.session_id, &resolved, &existing)
                 {
                     return ToolReply::error(format!("ERROR: {reason}"));
+                }
+            }
+
+            if let Some(parent) = resolved.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    return ToolReply::error(format!(
+                        "ERROR: could not create {} ({error}).",
+                        parent.display()
+                    ));
                 }
             }
 
@@ -231,6 +241,22 @@ mod tests {
             fs::read_to_string(&path).expect("unchanged"),
             "changed by someone else"
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_creates_missing_parent_directories() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("new/dir/f.txt");
+
+        let reply = Write::new(workspace())
+            .execute(
+                write_args(&path, "fresh"),
+                ctx("s-1", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fresh");
     }
 
     #[tokio::test]
