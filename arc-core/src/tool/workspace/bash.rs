@@ -109,6 +109,9 @@ impl Tool for Bash {
 }
 
 async fn run(command: &str, cwd: &Path, timeout_secs: u64, command_prefix: &[String]) -> ToolReply {
+    if patches_via_bash(command) {
+        tracing::warn!("the command starts apply_patch or applypatch; prefer the apply_patch tool");
+    }
     let (program, mut cmd) = prefixed(
         cwd,
         command_prefix,
@@ -167,6 +170,44 @@ fn kill_group(pgid: Option<i32>) {
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
+}
+
+fn patches_via_bash(command: &str) -> bool {
+    let mut rest = command.trim_start();
+    if rest.starts_with("cd ") || rest.starts_with("cd\t") {
+        match after_cd(rest) {
+            Some(tail) => rest = tail.trim_start(),
+            None => return false,
+        }
+    }
+    matches!(head_word(rest), Some("apply_patch" | "applypatch"))
+}
+
+// `apply_patch<<EOF` and `apply_patch; true` name the same command
+fn head_word(command: &str) -> Option<&str> {
+    let end = command
+        .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
+        .unwrap_or(command.len());
+    (!command[..end].is_empty()).then(|| &command[..end])
+}
+
+fn after_cd(command: &str) -> Option<&str> {
+    let mut quote = None;
+    let mut chars = command.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(opened), c) if c == opened => quote = None,
+            (None | Some('"'), '\\') => {
+                chars.next();
+            }
+            (None, '&') if command[index..].starts_with("&&") => {
+                return Some(&command[index + 2..]);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 struct KillGroup(Option<i32>);
@@ -337,6 +378,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::Bash;
+    use crate::testkit::WarningCapture;
     use crate::tool::workspace::{Grant, Grants, Mode};
     use crate::tool::{Tool as _, TurnContext};
 
@@ -588,6 +630,52 @@ mod tests {
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(reply.content, "(no output)");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_runs_apply_patch_through_bash_is_warned_about() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+        let capture = WarningCapture::start();
+
+        for command in [
+            "apply_patch",
+            "applypatch < patch.txt",
+            "cd '/a && b' && apply_patch",
+            "cd \"/a b\" && applypatch < patch.txt",
+            "apply_patch<<EOF",
+            "apply_patch; true",
+            "apply_patch&&true",
+            "cd /tmp && applypatch<<EOF",
+            "cd \"/a\\\" && b\" && apply_patch",
+        ] {
+            tool.execute(args(command), ctx_rw(dir.path())).await;
+        }
+
+        let warnings = capture.warnings();
+        assert_eq!(
+            warnings.matches("prefer the apply_patch tool").count(),
+            9,
+            "{warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_only_mentions_apply_patch_is_not_warned_about() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+        let capture = WarningCapture::start();
+
+        for command in [
+            "echo apply_patch",
+            "echo 'cd /tmp && applypatch'",
+            "applypatch_extra",
+            "cd \"x\\\" && apply_patch && echo hi\"",
+        ] {
+            tool.execute(args(command), ctx_rw(dir.path())).await;
+        }
+
+        assert!(capture.warnings().is_empty(), "{}", capture.warnings());
     }
 
     #[tokio::test]

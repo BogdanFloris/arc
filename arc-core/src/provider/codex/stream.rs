@@ -10,6 +10,7 @@ pub(super) struct Parser {
     building: BTreeMap<u32, Building>,
     finished: Vec<ToolCall>,
     reasoning: Option<Vec<u8>>,
+    encrypted_reasoning: u32,
     citations: Vec<serde_json::Value>,
 }
 
@@ -116,6 +117,7 @@ impl FrameParser for Parser {
                         });
                     }
                     "reasoning" if item.0.get("encrypted_content").is_some() => {
+                        self.encrypted_reasoning += 1;
                         self.reasoning = Some(item.0.to_string().into_bytes());
                     }
                     "web_search_call" => items.push(CompletionDelta::ServerResponse {
@@ -171,6 +173,13 @@ impl FrameParser for Parser {
                     }
                 });
                 let reasoning = self.reasoning.take().unwrap_or_default();
+                let encrypted = std::mem::take(&mut self.encrypted_reasoning);
+                if encrypted > 1 {
+                    tracing::warn!(
+                        count = encrypted,
+                        "the response carried several encrypted reasoning items; replay uses the last"
+                    );
+                }
                 let calls: Vec<CompletionDelta> = std::mem::take(&mut self.finished)
                     .into_iter()
                     .map(|mut call| {
@@ -323,8 +332,9 @@ mod tests {
     use tracing::Span;
 
     use super::Parser;
-    use crate::provider::stream::DeltaStream;
+    use crate::provider::stream::{DeltaStream, FrameParser};
     use crate::provider::{CompletionDelta, Error, Stop, Usage};
+    use crate::testkit::WarningCapture;
 
     fn sse(events: &[Value]) -> Vec<u8> {
         let mut out = String::new();
@@ -630,5 +640,89 @@ mod tests {
             [Err(Error::Refused(detail))] => assert_eq!(detail, "invalid_prompt: too long"),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn reasoning(id: &str, encrypted: &str) -> Value {
+        json!({"type": "response.output_item.done", "output_index": 0,
+               "item": {"type": "reasoning", "id": id, "summary": [],
+                        "encrypted_content": encrypted}})
+    }
+
+    fn function_call(name: &str) -> Value {
+        json!({"type": "response.output_item.done", "output_index": 1,
+               "item": {"type": "function_call", "call_id": "call_a", "name": name,
+                        "arguments": "{}"}})
+    }
+
+    fn frame(parser: &mut Parser, events: &[Value]) -> Vec<CompletionDelta> {
+        let mut items = Vec::new();
+        for event in events {
+            items.extend(parser.frame(&event.to_string()).expect("a frame").items);
+        }
+        items
+    }
+
+    #[test]
+    fn more_than_one_encrypted_reasoning_item_is_warned_about() {
+        let capture = WarningCapture::start();
+        let mut parser = Parser::default();
+
+        let items = frame(
+            &mut parser,
+            &[
+                reasoning("rs_1", "ENC1"),
+                reasoning("rs_2", "ENC2"),
+                function_call("f"),
+                completed(1, 1, 0),
+            ],
+        );
+
+        let call = items
+            .into_iter()
+            .find_map(|item| match item {
+                CompletionDelta::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("a tool call");
+        let replay: Value = serde_json::from_slice(&call.provider_roundtrip).expect("json");
+        assert_eq!(replay["id"], "rs_2", "the last item still replays");
+        assert_eq!(replay["encrypted_content"], "ENC2");
+
+        let warnings = capture.warnings();
+        assert_eq!(warnings.matches("count=2").count(), 1, "{warnings}");
+        assert!(
+            !warnings.contains("ENC1") && !warnings.contains("ENC2"),
+            "the payload stays out of the log: {warnings}"
+        );
+    }
+
+    #[test]
+    fn the_encrypted_reasoning_count_resets_between_responses() {
+        let capture = WarningCapture::start();
+        let mut parser = Parser::default();
+
+        for _ in 0..2 {
+            frame(
+                &mut parser,
+                &[
+                    reasoning("rs_1", "ENC"),
+                    reasoning("rs_2", "ENC"),
+                    completed(1, 1, 0),
+                ],
+            );
+        }
+
+        let warnings = capture.warnings();
+        assert_eq!(warnings.matches("count=2").count(), 2, "{warnings}");
+    }
+
+    #[test]
+    fn a_single_encrypted_reasoning_item_is_not_warned_about() {
+        let capture = WarningCapture::start();
+        let mut parser = Parser::default();
+
+        frame(&mut parser, &[reasoning("rs_1", "ENC"), completed(1, 1, 0)]);
+
+        assert!(capture.warnings().is_empty(), "{}", capture.warnings());
     }
 }

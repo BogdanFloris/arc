@@ -95,11 +95,7 @@ pub fn supported_thinking(provider: &str, model: &str) -> &'static [Thinking] {
         Thinking::Xhigh,
         Thinking::Max,
     ];
-    const GEMINI: &[Thinking] = &[
-        Thinking::Low,
-        Thinking::Medium,
-        Thinking::High,
-    ];
+    const GEMINI: &[Thinking] = &[Thinking::Low, Thinking::Medium, Thinking::High];
     const OPENAI_COMPAT: &[Thinking] = &[
         Thinking::Default,
         Thinking::Low,

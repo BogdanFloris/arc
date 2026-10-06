@@ -490,6 +490,54 @@ pub fn tools(entries: &[(&'static str, &'static str, bool)]) -> Registry {
 // captures can steal each other's records; one at a time is the fix
 static TRACE_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[derive(Clone)]
+struct Sink(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct WarningCapture {
+    _guard: tracing::subscriber::DefaultGuard,
+    sink: Arc<Mutex<Vec<u8>>>,
+}
+
+impl WarningCapture {
+    pub fn start() -> Self {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let writer = Sink(Arc::clone(&sink));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            _guard: guard,
+            sink,
+        }
+    }
+
+    pub fn warnings(&self) -> String {
+        let bytes = self
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 pub struct TraceCapture {
     _dir: TempDir,
     path: PathBuf,
