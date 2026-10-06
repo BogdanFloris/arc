@@ -78,9 +78,11 @@ impl Tool for Edit {
                           legacy top-level old and new (or old_string and new_string) also \
                           work. All replacements \
                           are validated before writing. A file whose newlines are all CRLF \
-                          keeps them. Requires having read the file using \
-                          the `read` tool in this session, with no changes since. Reading \
-                          through Bash does not count."
+                          keeps them. Without an exact match, whole lines are compared \
+                          ignoring trailing whitespace; a match that ignores indentation too \
+                          is reported with the file's exact lines and not written. Requires \
+                          having read the file using the `read` tool in this session, with no \
+                          changes since. Reading through Bash does not count."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -194,10 +196,26 @@ impl Tool for Edit {
                 }
                 let mut matches = hay.match_indices(&old);
                 let Some((start, _)) = matches.next() else {
-                    return ToolReply::error(format!(
-                        "ERROR: old text was not found in {}.",
-                        resolved.display()
-                    ));
+                    match locate_loosely(&hay, &old) {
+                        Loose::WholeLine(start, end) => {
+                            spans.push((start, end, new));
+                            continue;
+                        }
+                        Loose::Hint(first, last, text) => {
+                            return ToolReply::error(format!(
+                                "ERROR: old text was not found in {}; ignoring leading and \
+                                 trailing whitespace, lines {first}-{last} match. Retry with \
+                                 this exact text as old: {text}",
+                                resolved.display()
+                            ));
+                        }
+                        Loose::None => {
+                            return ToolReply::error(format!(
+                                "ERROR: old text was not found in {}.",
+                                resolved.display()
+                            ));
+                        }
+                    }
                 };
                 if matches.next().is_some() {
                     let occurrences = 2 + matches.count();
@@ -247,6 +265,63 @@ impl Tool for Edit {
             }
         })
     }
+}
+
+enum Loose {
+    WholeLine(usize, usize),
+    Hint(usize, usize, String),
+    None,
+}
+
+fn locate_loosely(hay: &str, old: &str) -> Loose {
+    let trailing = line_windows(hay, old, &|line, want| line.trim_end() == want.trim_end());
+    if let [span] = trailing[..] {
+        return Loose::WholeLine(span.0, span.1);
+    }
+    let loose = line_windows(hay, old, &|line, want| line.trim() == want.trim());
+    if let [span] = loose[..] {
+        let quoted = serde_json::to_string(&hay[span.0..span.1]).unwrap_or_default();
+        let first = hay[..span.0].matches('\n').count() + 1;
+        let last = first + old.split('\n').count() - usize::from(old.ends_with('\n')) - 1;
+        return Loose::Hint(first, last, quoted);
+    }
+    Loose::None
+}
+
+fn line_windows(hay: &str, old: &str, equal: &dyn Fn(&str, &str) -> bool) -> Vec<(usize, usize)> {
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for line in hay.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+    if hay.ends_with('\n') {
+        lines.pop();
+    }
+    let mut pattern: Vec<&str> = old.split('\n').collect();
+    if pattern.last() == Some(&"") {
+        pattern.pop();
+    }
+    if pattern.is_empty() || pattern.len() > lines.len() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    for start in 0..=lines.len() - pattern.len() {
+        let matches = pattern
+            .iter()
+            .enumerate()
+            .all(|(k, want)| equal(lines[start + k].1, want));
+        if !matches {
+            continue;
+        }
+        let last = &lines[start + pattern.len() - 1];
+        let mut end = last.0 + last.1.len();
+        if old.ends_with('\n') && hay[end..].starts_with('\n') {
+            end += 1;
+        }
+        spans.push((lines[start].0, end));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -663,6 +738,104 @@ mod tests {
 
         assert!(reply.ok, "{}", reply.content);
         assert_eq!(fs::read_to_string(&path).unwrap(), "A\nB\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_trailing_space_difference_applies_automatically() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a \nb\nc\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\nb", "A\nB"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A\nB\nc\n");
+    }
+
+    #[tokio::test]
+    async fn the_span_includes_the_newline_when_old_ends_with_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a \nb\nc\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\nb\n", "X\n"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "X\nc\n");
+    }
+
+    #[tokio::test]
+    async fn tabs_versus_spaces_returns_the_exact_text_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\n\tb\nc\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\n  b\n", "A\nB\n"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("lines 1-2"), "{}", reply.content);
+        assert!(reply.content.contains("a\\n\\tb"), "{}", reply.content);
+        assert!(reply.changed_paths.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\n\tb\nc\n");
+    }
+
+    #[tokio::test]
+    async fn two_whitespace_only_candidates_are_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "x\ny\nx\ny\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "x \ny ", "y"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(!reply.ok);
+        assert!(reply.content.contains("not found"), "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\ny\nx\ny\n");
+    }
+
+    #[tokio::test]
+    async fn a_fallback_span_that_overlaps_another_replacement_still_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a \nb\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                batch(&path, &[("a\nb", "X"), ("b", "Y")]),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("overlap"),
+            "{}",
+            reply.content
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a \nb\n");
     }
 
     #[tokio::test]
