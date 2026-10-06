@@ -12,7 +12,8 @@ use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
-const MAX_CAPTURE_BYTES: usize = 16 * 1024;
+const HEAD_BYTES: usize = 4 * 1024;
+const TAIL_BYTES: usize = 12 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MIN_TIMEOUT_SECS: u64 = 1;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -39,7 +40,8 @@ impl Tool for Bash {
             name: "bash".to_owned(),
             description: "Run Bash in the session's working directory, falling back to the \
                           daemon's directory. The environment is scrubbed; daemon credentials \
-                          are not inherited. Output keeps the last 16 KiB of each stream. \
+                          are not inherited. Output keeps the first 4 KiB and the last 12 KiB \
+                          of each stream, with a marker naming the bytes left out. \
                           If the call is cancelled or dropped, the whole process group is \
                           killed; a background job that redirects its output survives a \
                           normal return. Prefer narrow queries and plain output."
@@ -222,8 +224,6 @@ fn scrub_env(cmd: &mut Command) {
 #[derive(Default)]
 struct Captured {
     text: String,
-    // bytes dropped from the front to hold the tail within the cap; 0 means whole
-    dropped: usize,
 }
 
 // not str::is_char_boundary: the buffer as a whole may not be valid UTF-8
@@ -234,31 +234,63 @@ fn starts_a_char(byte: u8) -> bool {
 }
 
 async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> Captured {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut dropped: usize = 0;
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
     let mut chunk = [0u8; 8192];
     loop {
         let n = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_CAPTURE_BYTES {
-            let overflow = buf.len() - MAX_CAPTURE_BYTES;
-            let cut = (overflow..buf.len())
-                .find(|&i| starts_a_char(buf[i]))
-                .unwrap_or(buf.len());
-            dropped += cut;
-            buf.drain(..cut);
+        total += n;
+        let room = HEAD_BYTES.saturating_sub(head.len());
+        head.extend_from_slice(&chunk[..n.min(room)]);
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > TAIL_BYTES {
+            let overflow = tail.len() - TAIL_BYTES;
+            tail.drain(..overflow);
         }
     }
-    let text = match std::str::from_utf8(&buf) {
+
+    let tail_start = total - tail.len();
+    if tail_start <= head.len() {
+        let overlap = head.len() - tail_start;
+        let mut bytes = head;
+        bytes.extend_from_slice(&tail[overlap..]);
+        return Captured {
+            text: decode(&bytes),
+        };
+    }
+
+    let head_end = intact_len(&head);
+    let tail_skip = (0..tail.len())
+        .find(|&i| starts_a_char(tail[i]))
+        .unwrap_or(tail.len());
+    let omitted = tail_start + tail_skip - head_end;
+    Captured {
+        text: format!(
+            "{}\n[{omitted} bytes omitted]\n{}",
+            decode(&head[..head_end]),
+            decode(&tail[tail_skip..])
+        ),
+    }
+}
+
+fn intact_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) => error.valid_up_to(),
+    }
+}
+
+fn decode(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
         Ok(text) => text.to_owned(),
-        Err(error) => std::str::from_utf8(&buf[..error.valid_up_to()])
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()])
             .expect("valid_up_to bounds valid utf8")
             .to_owned(),
-    };
-    Captured { text, dropped }
+    }
 }
 
 fn reply_for(status: std::process::ExitStatus, stdout: &Captured, stderr: &Captured) -> ToolReply {
@@ -267,7 +299,7 @@ fn reply_for(status: std::process::ExitStatus, stdout: &Captured, stderr: &Captu
         if stdout.text.is_empty() {
             "(no output)".to_owned()
         } else {
-            mark(&stdout.text, stdout.dropped)
+            stdout.text.clone()
         }
     } else {
         let header = match code {
@@ -289,20 +321,12 @@ fn compose(header: Option<&str>, stdout: &Captured, stderr: &Captured) -> String
     if let Some(header) = header {
         parts.push(header.to_owned());
     }
-    parts.push(mark(&stdout.text, stdout.dropped));
+    parts.push(stdout.text.clone());
     if !stderr.text.is_empty() {
         parts.push("--- stderr ---".to_owned());
-        parts.push(mark(&stderr.text, stderr.dropped));
+        parts.push(stderr.text.clone());
     }
     parts.join("\n")
-}
-
-fn mark(text: &str, dropped: usize) -> String {
-    if dropped > 0 {
-        format!("[first {dropped} bytes dropped]\n{text}")
-    } else {
-        text.to_owned()
-    }
 }
 
 #[cfg(test)]
@@ -456,12 +480,114 @@ mod tests {
             .await;
 
         assert!(reply.ok, "{}", reply.content);
-        assert!(reply.content.contains("bytes dropped"), "{}", reply.content);
+        assert!(reply.content.contains("bytes omitted"), "{}", reply.content);
         assert!(
             reply.content.trim_end().ends_with("ERROR: something broke"),
             "the tail survives truncation: {}",
             reply.content
         );
+    }
+
+    #[tokio::test]
+    async fn an_error_at_the_start_survives_a_large_output() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(
+                args("echo ERROR: at the start; head -c 20000 /dev/zero | tr '\\0' 'y'; echo"),
+                ctx_rw(dir.path()),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(
+            reply.content.starts_with("ERROR: at the start\n"),
+            "the head survives truncation: {}",
+            reply.content
+        );
+        assert!(reply.content.contains("bytes omitted"), "{}", reply.content);
+        assert!(reply.content.trim_end().ends_with('y'), "{}", reply.content);
+    }
+
+    async fn drained(input: Vec<u8>) -> String {
+        super::drain(Box::leak(input.into_boxed_slice()) as &[u8])
+            .await
+            .text
+    }
+
+    #[tokio::test]
+    async fn drain_never_splits_a_multibyte_character_at_either_cut() {
+        // the accent straddles the head's cut at 4096
+        let mut input = vec![b'a'; 4095];
+        input.extend_from_slice("é".repeat(9_999).as_bytes());
+        let total = input.len();
+
+        let text = drained(input).await;
+
+        assert!(!text.contains('\u{FFFD}'), "{text:?}");
+        let mut lines = text.split('\n');
+        let head_line = lines.next().expect("a head");
+        assert_eq!(head_line.len(), 4095, "the head stops on a char boundary");
+        assert!(head_line.chars().all(|c| c == 'a'), "{head_line:?}");
+        let marker = lines.next().expect("a marker");
+        let omitted: usize = marker
+            .strip_prefix('[')
+            .and_then(|it| it.strip_suffix(" bytes omitted]"))
+            .expect("a count")
+            .parse()
+            .expect("a number");
+        let tail: String = lines.collect::<Vec<_>>().join("\n");
+        assert!(
+            tail.chars().all(|c| c == 'é'),
+            "the tail starts on a char boundary"
+        );
+        assert!(
+            !tail.is_empty() && head_line.len() + omitted + tail.len() == total,
+            "{marker} does not account for {total} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_output_within_the_budget_is_whole_and_unmarked() {
+        for size in [16 * 1024, 15 * 1024, 12 * 1024 + 1, 1024] {
+            let input = vec![b'z'; size];
+            let text = drained(input.clone()).await;
+            assert_eq!(text.len(), size, "{size} bytes come back whole");
+            assert_eq!(text.as_bytes(), input.as_slice());
+            assert!(!text.contains("omitted"), "no marker at {size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_output_within_the_budget_survives_a_character_across_the_head_cut() {
+        let mut input = vec![b'a'; 4095];
+        input.extend_from_slice("é".as_bytes());
+        input.resize(16 * 1024, b'b');
+        let expected = input.clone();
+
+        let text = drained(input).await;
+
+        let whole = text.as_bytes() == expected.as_slice();
+        assert!(
+            whole,
+            "the whole stream comes back unharmed; got {} of {} bytes",
+            text.len(),
+            expected.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_output_still_reports_no_output() {
+        let dir = TempDir::new().expect("tmp");
+        let tool = Bash::new();
+
+        let reply = tool
+            .execute(args("printf '\\xff'"), ctx_rw(dir.path()))
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(reply.content, "(no output)");
     }
 
     #[tokio::test]
