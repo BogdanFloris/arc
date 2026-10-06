@@ -40,7 +40,9 @@ impl Tool for ApplyPatch {
                           (optionally `*** Move to: path`) followed by `@@ context` headers and \
                           ` `, `-`, `+` lines. Paths are absolute or relative to the project \
                           root (the daemon's current directory if none). A hunk's context and \
-                          removed lines must match the file's current content; no prior read is \
+                          removed lines must match the file's current content, ignoring \
+                          surrounding whitespace and typing variants of dashes, quotes and \
+                          spaces; no prior read is \
                           required. A file whose newlines are all CRLF keeps them. Hunks for the \
                           same path apply in order, each seeing the \
                           earlier ones. All hunks are checked before any write; filesystem \
@@ -534,7 +536,16 @@ fn apply_chunks(text: &str, chunks: &[Chunk], path: &str) -> Result<String, Stri
     Ok(out)
 }
 
-// exact first, then ignoring trailing whitespace, then ignoring all edge whitespace
+fn ascii_punctuation(c: char) -> char {
+    match c {
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{2018}'..='\u{201b}' => '\'',
+        '\u{201c}'..='\u{201f}' => '"',
+        '\u{00a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
 fn seek(lines: &[String], pattern: &[String], start: usize, at_end: bool) -> Option<usize> {
     if pattern.is_empty() {
         return Some(start);
@@ -555,6 +566,11 @@ fn seek(lines: &[String], pattern: &[String], start: usize, at_end: bool) -> Opt
     matches(&|a, b| a == b)
         .or_else(|| matches(&|a, b| a.trim_end() == b.trim_end()))
         .or_else(|| matches(&|a, b| a.trim() == b.trim()))
+        .or_else(|| matches(&|a, b| typed(a.trim()) == typed(b.trim())))
+}
+
+fn typed(line: &str) -> String {
+    line.chars().map(ascii_punctuation).collect()
 }
 
 #[cfg(test)]
@@ -679,6 +695,66 @@ mod tests {
             fs::read_to_string(root.join("f.txt")).unwrap(),
             "A\nb\r\nc\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn ascii_dash_context_matches_an_em_dash_line() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "a — b\nsecond\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@ a - b\n-second\n+SECOND\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("f.txt")).unwrap(),
+            "a — b\nSECOND\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_quote_context_matches_curly_quotes() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "“quoted”\nsecond\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@ \"quoted\"\n-second\n+SECOND\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("f.txt")).unwrap(),
+            "“quoted”\nSECOND\n"
+        );
+    }
+
+    #[test]
+    fn unicode_punctuation_maps_to_ascii() {
+        assert_eq!(super::ascii_punctuation('—'), '-');
+        assert_eq!(super::ascii_punctuation('–'), '-');
+        assert_eq!(super::ascii_punctuation('−'), '-');
+        assert_eq!(super::ascii_punctuation('’'), '\'');
+        assert_eq!(super::ascii_punctuation('“'), '"');
+        assert_eq!(super::ascii_punctuation('”'), '"');
+        assert_eq!(super::ascii_punctuation('\u{a0}'), ' ');
+        assert_eq!(super::ascii_punctuation('\u{2009}'), ' ');
+        assert_eq!(super::ascii_punctuation('\u{3000}'), ' ');
+        assert_eq!(super::ascii_punctuation('a'), 'a');
     }
 
     #[test]
