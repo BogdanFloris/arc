@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Workspace, ensure_fresh, resolve_path};
+use super::{Workspace, ensure_fresh, resolve_path, to_crlf, to_lf, uses_crlf};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -76,7 +77,8 @@ impl Tool for Edit {
                           objects, a single object, or a JSON string holding either; the \
                           legacy top-level old and new (or old_string and new_string) also \
                           work. All replacements \
-                          are validated before writing. Requires having read the file using \
+                          are validated before writing. A file whose newlines are all CRLF \
+                          keeps them. Requires having read the file using \
                           the `read` tool in this session, with no changes since. Reading \
                           through Bash does not count."
                 .to_owned(),
@@ -168,15 +170,29 @@ impl Tool for Edit {
                 return ToolReply::error(format!("ERROR: {reason}"));
             }
 
+            let crlf = uses_crlf(text);
+            let hay = if crlf {
+                to_lf(text)
+            } else {
+                Cow::Borrowed(text)
+            };
             let mut spans = Vec::with_capacity(replacements.len());
             for replacement in &replacements {
-                if replacement.old.is_empty() {
+                let (old, new) = if crlf {
+                    (
+                        to_lf(&replacement.old).into_owned(),
+                        to_lf(&replacement.new).into_owned(),
+                    )
+                } else {
+                    (replacement.old.clone(), replacement.new.clone())
+                };
+                if old.is_empty() {
                     return ToolReply::error("ERROR: old must not be empty.".to_owned());
                 }
-                if replacement.old == replacement.new {
+                if old == new {
                     return ToolReply::error("ERROR: old and new must be different.".to_owned());
                 }
-                let mut matches = text.match_indices(&replacement.old);
+                let mut matches = hay.match_indices(&old);
                 let Some((start, _)) = matches.next() else {
                     return ToolReply::error(format!(
                         "ERROR: old text was not found in {}.",
@@ -191,11 +207,7 @@ impl Tool for Edit {
                         resolved.display()
                     ));
                 }
-                spans.push((
-                    start,
-                    start + replacement.old.len(),
-                    replacement.new.as_str(),
-                ));
+                spans.push((start, start + old.len(), new));
             }
             spans.sort_unstable_by_key(|span| span.0);
             if spans.windows(2).any(|pair| pair[0].1 > pair[1].0) {
@@ -203,15 +215,19 @@ impl Tool for Edit {
                     "ERROR: replacements overlap in the original file.".to_owned(),
                 );
             }
-            let mut updated = String::with_capacity(text.len());
+            let mut updated = String::with_capacity(hay.len());
             let mut end = 0;
             for (start, next, replacement) in spans {
-                updated.push_str(&text[end..start]);
-                updated.push_str(replacement);
+                updated.push_str(&hay[end..start]);
+                updated.push_str(&replacement);
                 end = next;
             }
-            updated.push_str(&text[end..]);
-            let updated_bytes = updated.into_bytes();
+            updated.push_str(&hay[end..]);
+            let updated_bytes = if crlf {
+                to_crlf(&updated).into_owned().into_bytes()
+            } else {
+                updated.into_bytes()
+            };
             if let Err(error) = std::fs::write(&resolved, &updated_bytes) {
                 return ToolReply::error(format!(
                     "ERROR: could not write {} ({error}).",
@@ -566,6 +582,87 @@ mod tests {
             reply.content
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn editing_a_crlf_file_keeps_its_line_endings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\nb", "A\nB"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A\r\nB\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn crlf_in_old_and_new_is_accepted_for_a_crlf_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\r\nb", "A\r\nB"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A\r\nB\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_second_edit_after_a_crlf_write_needs_no_new_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+        let tool = Edit::new(ws);
+
+        let first = tool
+            .execute(
+                edit_args(&path, "a\nb", "A\nB"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+        assert!(first.ok, "{}", first.content);
+
+        let second = tool
+            .execute(
+                edit_args(&path, "c", "C"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(second.ok, "{}", second.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A\r\nB\r\nC\r\n");
+    }
+
+    #[tokio::test]
+    async fn mixed_line_endings_are_matched_as_before() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\nb\r\nc\r\n").unwrap();
+        let ws = read_first(dir.path(), &path).await;
+
+        let reply = Edit::new(ws)
+            .execute(
+                edit_args(&path, "a\nb", "A\nB"),
+                ctx("s", dir.path(), Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "A\nB\r\nc\r\n");
     }
 
     #[tokio::test]

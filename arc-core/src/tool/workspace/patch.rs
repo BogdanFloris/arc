@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Workspace, resolve_path};
+use super::{Workspace, resolve_path, to_crlf, to_lf, uses_crlf};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -40,7 +41,8 @@ impl Tool for ApplyPatch {
                           ` `, `-`, `+` lines. Paths are absolute or relative to the project \
                           root (the daemon's current directory if none). A hunk's context and \
                           removed lines must match the file's current content; no prior read is \
-                          required. Hunks for the same path apply in order, each seeing the \
+                          required. A file whose newlines are all CRLF keeps them. Hunks for the \
+                          same path apply in order, each seeing the \
                           earlier ones. All hunks are checked before any write; filesystem \
                           errors during sequential writes may leave earlier changes applied. \
                           A failed result lists completed operations; a failed write may also \
@@ -192,10 +194,21 @@ impl ApplyPatch {
                 chunks,
             } => {
                 let resolved = resolve(&path)?;
-                let text = overlay
+                let raw = overlay
                     .text(&resolved)?
                     .ok_or_else(|| format!("{} does not exist.", resolved.display()))?;
-                let updated = apply_chunks(&text, &chunks, &path)?;
+                let crlf = uses_crlf(&raw);
+                let text = if crlf {
+                    to_lf(&raw)
+                } else {
+                    Cow::Borrowed(raw.as_str())
+                };
+                let updated = apply_chunks(text.as_ref(), &chunks, &path)?;
+                let updated = if crlf {
+                    to_crlf(&updated).into_owned()
+                } else {
+                    updated
+                };
                 let moved_to = match move_to.as_deref() {
                     None => None,
                     Some(dest) => {
@@ -578,6 +591,94 @@ mod tests {
             )
             .await;
         assert!(reply.ok, "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn updating_a_line_in_a_crlf_file_keeps_every_line_crlf() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "a\r\nb\r\nc\r\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Update File: f.txt\n-b\n+B\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("f.txt")).unwrap(),
+            "a\r\nB\r\nc\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_hunks_on_a_crlf_file_keep_their_line_endings() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "a\r\nb\r\nc\r\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: f.txt\n-a\n+A\n*** Update File: f.txt\n-c\n+C\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("f.txt")).unwrap(),
+            "A\r\nb\r\nC\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_moved_crlf_file_keeps_its_line_endings() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("m.txt"), "a\r\nb\r\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: m.txt\n*** Move to: new.txt\n-a\n+A\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "A\r\nb\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_line_endings_are_patched_as_before() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "a\nb\r\nc\r\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Update File: f.txt\n-a\n+A\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("f.txt")).unwrap(),
+            "A\nb\r\nc\r\n"
+        );
     }
 
     #[test]

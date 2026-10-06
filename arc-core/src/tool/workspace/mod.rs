@@ -4,6 +4,7 @@ pub mod patch;
 pub mod read;
 pub mod write;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
@@ -140,6 +141,27 @@ impl Workspace {
     }
 }
 
+pub(crate) fn uses_crlf(text: &str) -> bool {
+    let newlines = text.matches('\n').count();
+    newlines > 0 && text.matches("\r\n").count() == newlines
+}
+
+pub(crate) fn to_lf(text: &str) -> Cow<'_, str> {
+    if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub(crate) fn to_crlf(text: &str) -> Cow<'_, str> {
+    if text.contains('\n') {
+        Cow::Owned(text.replace('\n', "\r\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 pub(crate) fn hash_of(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -186,8 +208,21 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{Workspace, resolve_path};
+    use super::{Workspace, resolve_path, to_crlf, to_lf, uses_crlf};
     use crate::tool::ToolSource;
+
+    #[test]
+    fn only_all_crlf_files_are_converted() {
+        assert!(uses_crlf("a\r\nb\r\n"));
+        assert!(!uses_crlf(""));
+        assert!(!uses_crlf("abc"));
+        assert!(!uses_crlf("a\rb"));
+        assert!(!uses_crlf("a\nb"));
+        assert!(!uses_crlf("a\r\nb\nc\r\n"));
+        assert_eq!(to_lf("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(to_crlf("a\nb\n"), "a\r\nb\r\n");
+        assert!(matches!(to_lf("a\nb"), std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn freshness_errors_name_the_read_tool() {
