@@ -130,7 +130,7 @@ Codex defaults to `apply_patch`; other providers to `edit` and `write`. Presets 
 
 **File tools** accept absolute paths anywhere the daemon's user can access. Writing over an existing file and `edit` require a fresh read in the same session; `apply_patch` relies on the hunk's context and removed lines matching the file's current content.
 
-`edit` accepts unique, non-overlapping replacements against the original file; the single-replacement legacy shape remains valid. `apply_patch` preflights all hunks before writing. Filesystem failures during sequential writes can leave a partial patch; results name completed paths.
+`edit` accepts unique, non-overlapping replacements against the original file; the single-replacement legacy shape remains valid. `apply_patch` preflights all hunks before writing, planning against a per-path overlay so hunks for the same path apply in order and each sees the ones before it. Filesystem failures during sequential writes can leave a partial patch; results name completed paths.
 
 **Bash is not sandboxed.** It starts at the project's root, or the local launch directory without a project, with a scrubbed environment. Like the file tools, it runs as the user without a filesystem permission boundary. Keep credentials out of tool environments and logged results.
 

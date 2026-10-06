@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -39,10 +40,11 @@ impl Tool for ApplyPatch {
                           ` `, `-`, `+` lines. Paths are absolute or relative to the project \
                           root (the daemon's current directory if none). A hunk's context and \
                           removed lines must match the file's current content; no prior read is \
-                          required. Hunks are checked before writes; filesystem errors during \
-                          sequential writes may leave earlier changes applied. A failed result \
-                          lists completed operations; a failed write may also have modified its \
-                          target."
+                          required. Hunks for the same path apply in order, each seeing the \
+                          earlier ones. All hunks are checked before any write; filesystem \
+                          errors during sequential writes may leave earlier changes applied. \
+                          A failed result lists completed operations; a failed write may also \
+                          have modified its target."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -78,8 +80,9 @@ impl Tool for ApplyPatch {
             };
 
             let mut planned = Vec::with_capacity(hunks.len());
+            let mut overlay = Overlay::default();
             for hunk in hunks {
-                match Self::plan(hunk, &ctx) {
+                match Self::plan(hunk, &ctx, &mut overlay) {
                     Ok(change) => planned.push(change),
                     Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
                 }
@@ -136,7 +139,7 @@ impl Change {
 }
 
 impl ApplyPatch {
-    fn plan(hunk: Hunk, ctx: &TurnContext) -> Result<Change, String> {
+    fn plan(hunk: Hunk, ctx: &TurnContext, overlay: &mut Overlay) -> Result<Change, String> {
         let resolve = |path: &str| {
             let absolute = if Path::new(path).is_absolute() {
                 PathBuf::from(path)
@@ -154,12 +157,13 @@ impl ApplyPatch {
         match hunk {
             Hunk::Add { path, content } => {
                 let resolved = resolve(&path)?;
-                if resolved.exists() {
+                if overlay.presence(&resolved) != Presence::Missing {
                     return Err(format!(
                         "{} already exists; use an Update hunk.",
                         resolved.display()
                     ));
                 }
+                overlay.set(&resolved, Some(content.clone()));
                 Ok(Change::Add {
                     path: resolved,
                     content: content.into_bytes(),
@@ -167,7 +171,19 @@ impl ApplyPatch {
             }
             Hunk::Delete { path } => {
                 let resolved = resolve(&path)?;
-                require_file(&resolved)?;
+                match overlay.presence(&resolved) {
+                    Presence::File => {}
+                    Presence::Directory => {
+                        return Err(format!(
+                            "{} is a directory, not a file.",
+                            resolved.display()
+                        ));
+                    }
+                    Presence::Missing => {
+                        return Err(format!("{} does not exist.", resolved.display()));
+                    }
+                }
+                overlay.set(&resolved, None);
                 Ok(Change::Delete { path: resolved })
             }
             Hunk::Update {
@@ -176,24 +192,32 @@ impl ApplyPatch {
                 chunks,
             } => {
                 let resolved = resolve(&path)?;
-                let bytes = existing(&resolved)?;
-                let text = std::str::from_utf8(&bytes).map_err(|_| {
-                    format!("{} is not text (not valid UTF-8).", resolved.display())
-                })?;
-                let updated = apply_chunks(text, &chunks, &path)?;
-                let moved_to = move_to
-                    .as_deref()
-                    .map(|dest| {
+                let text = overlay
+                    .text(&resolved)?
+                    .ok_or_else(|| format!("{} does not exist.", resolved.display()))?;
+                let updated = apply_chunks(&text, &chunks, &path)?;
+                let moved_to = match move_to.as_deref() {
+                    None => None,
+                    Some(dest) => {
                         let dest = resolve(dest)?;
-                        if dest.exists() {
+                        if overlay.presence(&dest) != Presence::Missing {
                             return Err(format!(
                                 "cannot move to {}: it already exists.",
                                 dest.display()
                             ));
                         }
-                        Ok(dest)
-                    })
-                    .transpose()?;
+                        overlay.set(&dest, Some(updated.clone()));
+                        Some(dest)
+                    }
+                };
+                overlay.set(
+                    &resolved,
+                    if moved_to.is_some() {
+                        None
+                    } else {
+                        Some(updated.clone())
+                    },
+                );
                 Ok(Change::Update {
                     path: resolved,
                     moved_to,
@@ -216,7 +240,7 @@ impl ApplyPatch {
             }
             std::fs::write(path, bytes)
                 .map_err(|error| format!("could not write {} ({error}).", path.display()))?;
-            changed_paths.push(path.to_string_lossy().into_owned());
+            record_path(changed_paths, path);
             self.workspace.record_read(session_id, path, bytes);
             Ok::<(), String>(())
         };
@@ -230,7 +254,7 @@ impl ApplyPatch {
             Change::Delete { path } => {
                 std::fs::remove_file(path)
                     .map_err(|error| format!("could not delete {} ({error}).", path.display()))?;
-                changed_paths.push(path.to_string_lossy().into_owned());
+                record_path(changed_paths, path);
                 Ok(())
             }
             Change::Update {
@@ -245,26 +269,69 @@ impl ApplyPatch {
                         path.display()
                     )
                 })?;
-                changed_paths.push(path.to_string_lossy().into_owned());
+                record_path(changed_paths, path);
                 Ok(())
             }
         }
     }
 }
 
-fn require_file(path: &Path) -> Result<(), String> {
-    if path.is_dir() {
-        return Err(format!("{} is a directory, not a file.", path.display()));
-    }
-    if !path.exists() {
-        return Err(format!("{} does not exist.", path.display()));
-    }
-    Ok(())
+#[derive(Default)]
+struct Overlay {
+    entries: HashMap<PathBuf, Option<String>>,
 }
 
-fn existing(path: &Path) -> Result<Vec<u8>, String> {
-    require_file(path)?;
-    std::fs::read(path).map_err(|error| format!("could not read {} ({error}).", path.display()))
+#[derive(PartialEq, Eq)]
+enum Presence {
+    File,
+    Directory,
+    Missing,
+}
+
+impl Overlay {
+    fn presence(&self, path: &Path) -> Presence {
+        if let Some(entry) = self.entries.get(path) {
+            return match entry {
+                Some(_) => Presence::File,
+                None => Presence::Missing,
+            };
+        }
+        if path.is_dir() {
+            Presence::Directory
+        } else if path.exists() {
+            Presence::File
+        } else {
+            Presence::Missing
+        }
+    }
+
+    fn text(&self, path: &Path) -> Result<Option<String>, String> {
+        if let Some(entry) = self.entries.get(path) {
+            return Ok(entry.clone());
+        }
+        if path.is_dir() {
+            return Err(format!("{} is a directory, not a file.", path.display()));
+        }
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("could not read {} ({error}).", path.display()))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| format!("{} is not text (not valid UTF-8).", path.display()))
+    }
+
+    fn set(&mut self, path: &Path, content: Option<String>) {
+        self.entries.insert(path.to_path_buf(), content);
+    }
+}
+
+fn record_path(changed_paths: &mut Vec<String>, path: &Path) {
+    let path = path.to_string_lossy().into_owned();
+    if !changed_paths.contains(&path) {
+        changed_paths.push(path);
+    }
 }
 
 const BEGIN: &str = "*** Begin Patch";
@@ -726,6 +793,262 @@ mod tests {
             "the add hunk before it was not applied"
         );
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+    }
+
+    #[tokio::test]
+    async fn hunks_for_one_path_apply_in_order() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("f.txt"), "a\nb\nc\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: f.txt\n-a\n+A\n*** Update File: f.txt\n-c\n+C\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), "A\nb\nC\n");
+        assert_eq!(reply.changed_paths, [root.join("f.txt").to_string_lossy()]);
+    }
+
+    #[tokio::test]
+    async fn an_added_file_can_be_updated_later_in_the_same_patch() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Add File: n.txt\n+one\n*** Update File: n.txt\n-one\n+two\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(root.join("n.txt")).unwrap(), "two\n");
+    }
+
+    #[tokio::test]
+    async fn an_updated_file_can_be_deleted_later_in_the_same_patch() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("g.txt"), "x\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: g.txt\n-x\n+y\n*** Delete File: g.txt\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(!root.join("g.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_file_can_be_added_again_in_the_same_patch() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("d.txt"), "old\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Delete File: d.txt\n*** Add File: d.txt\n+new\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(root.join("d.txt")).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn a_moved_file_can_be_updated_at_its_destination() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("m.txt"), "a\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: m.txt\n*** Move to: new.txt\n-a\n+b\n*** Update File: new.txt\n-b\n+c\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "c\n");
+        assert!(!root.join("m.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn adding_the_same_path_twice_is_refused_before_writing() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Add File: b.txt\n+one\n*** Add File: b.txt\n+two\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(!reply.ok);
+        assert!(
+            reply.content.contains("already exists"),
+            "{}",
+            reply.content
+        );
+        assert!(!root.join("b.txt").exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_binary_file_needs_no_text() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Delete File: blob.bin\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(!root.join("blob.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_directory_is_refused() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::create_dir(root.join("sub")).expect("mkdir");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Delete File: sub\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("is a directory, not a file"),
+            "{}",
+            reply.content
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_over_a_binary_file_reports_that_it_already_exists() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        let blob = root.join("blob.bin");
+        fs::write(&blob, [0xff, 0xfe]).expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Add File: blob.bin\n+x\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("already exists"),
+            "{}",
+            reply.content
+        );
+        assert_eq!(fs::read(&blob).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[tokio::test]
+    async fn adding_a_path_that_is_a_directory_reports_that_it_already_exists() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::create_dir(root.join("sub")).expect("mkdir");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Add File: sub\n+x\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("already exists"),
+            "{}",
+            reply.content
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_onto_a_binary_file_is_refused() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("m.txt"), "a\n").expect("write");
+        let blob = root.join("blob.bin");
+        fs::write(&blob, [0xff, 0xfe]).expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args(
+                    "*** Begin Patch\n*** Update File: m.txt\n*** Move to: blob.bin\n-a\n+b\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("already exists"),
+            "{}",
+            reply.content
+        );
+        assert_eq!(fs::read_to_string(root.join("m.txt")).unwrap(), "a\n");
+        assert_eq!(fs::read(&blob).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[tokio::test]
+    async fn updating_a_binary_file_is_refused_as_not_text() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("blob.bin"), [0xff, 0xfe]).expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Update File: blob.bin\n-a\n+b\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(
+            !reply.ok && reply.content.contains("is not text"),
+            "{}",
+            reply.content
+        );
     }
 
     #[tokio::test]
