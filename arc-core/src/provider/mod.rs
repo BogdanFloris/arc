@@ -80,14 +80,14 @@ impl Thinking {
 
 pub fn supported_thinking(provider: &str, model: &str) -> &'static [Thinking] {
     const NONE: &[Thinking] = &[];
-    const ASTRA: &[Thinking] = &[
+    const SOL: &[Thinking] = &[
         Thinking::Low,
         Thinking::Medium,
         Thinking::High,
         Thinking::Xhigh,
         Thinking::Max,
     ];
-    const SOL: &[Thinking] = &[
+    const LUNA: &[Thinking] = &[
         Thinking::None,
         Thinking::Low,
         Thinking::Medium,
@@ -95,18 +95,22 @@ pub fn supported_thinking(provider: &str, model: &str) -> &'static [Thinking] {
         Thinking::Xhigh,
         Thinking::Max,
     ];
-    const GEMINI36: &[Thinking] = &[
-        Thinking::Minimal,
+    const GEMINI: &[Thinking] = &[
         Thinking::Low,
         Thinking::Medium,
         Thinking::High,
     ];
-    const GEMINI37: &[Thinking] = &[Thinking::Low, Thinking::Medium, Thinking::High];
+    const OPENAI_COMPAT: &[Thinking] = &[
+        Thinking::Default,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+    ];
     match (provider, model) {
-        ("codex", "gpt-6-astra" | "gpt-6.1-sol") => ASTRA,
-        ("codex", "gpt-6-sol" | "gpt-6-luna") => SOL,
-        ("gemini", "gemini-3.6-flash") => GEMINI36,
-        ("gemini", "gemini-3.7-flash") => GEMINI37,
+        ("codex", "gpt-6-astra" | "gpt-6.1-sol") => SOL,
+        ("codex", "gpt-6-luna") => LUNA,
+        ("gemini", "gemini-flash") => GEMINI,
+        ("openai-compat", _) => OPENAI_COMPAT,
         _ => NONE,
     }
 }
@@ -328,20 +332,21 @@ mod tests {
     };
 
     #[test]
-    fn gpt_6_1_sol_supported_thinking() {
+    fn openai_compat_supported_thinking_spans_models() {
+        let expected = [
+            Thinking::Default,
+            Thinking::Low,
+            Thinking::Medium,
+            Thinking::High,
+        ];
         assert_eq!(
-            supported_thinking("codex", "gpt-6.1-sol"),
-            [
-                Thinking::Low,
-                Thinking::Medium,
-                Thinking::High,
-                Thinking::Xhigh,
-                Thinking::Max,
-            ]
+            supported_thinking("openai-compat", "glm-5.3-flash"),
+            expected
         );
-        assert!(supported_thinking("codex", "gpt-6-sol").contains(&Thinking::None));
-        assert!(supported_thinking("codex", "unknown").is_empty());
-        assert!(supported_thinking("unknown", "gpt-6.1-sol").is_empty());
+        assert_eq!(
+            supported_thinking("openai-compat", "deepseek-v4.1-flash"),
+            expected
+        );
     }
 
     #[derive(Debug)]

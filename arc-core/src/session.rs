@@ -3114,6 +3114,30 @@ mod tests {
     }
 
     #[test]
+    fn openai_compat_sessions_accept_the_offered_levels_and_reject_the_hidden_ones() {
+        let dir = TempDir::new().unwrap();
+        let scripted = ScriptedProvider::scripted(Vec::new());
+        let (engine, _run) = engine(&scripted, &dir);
+        let runner = Runner {
+            provider: Arc::new(crate::provider::openai::OpenAiCompat::new(
+                "https://opencode.ai/zen/go",
+            )),
+            model: "glm-5.3-flash".to_owned(),
+            ..runner(&scripted)
+        };
+        let id = engine.create_session(&runner).unwrap();
+        engine.set_session_thinking(&id, "high").unwrap();
+        assert_eq!(
+            engine.session_thinking(&id, Thinking::Default).unwrap(),
+            Thinking::High
+        );
+        assert!(matches!(
+            engine.set_session_thinking(&id, "none"),
+            Err(Error::UnsupportedThinking { .. })
+        ));
+    }
+
+    #[test]
     fn thinking_updates_replay_and_forks_inherit_the_fork_point() {
         let dir = TempDir::new().unwrap();
         let provider = ScriptedProvider::scripted(Vec::new());

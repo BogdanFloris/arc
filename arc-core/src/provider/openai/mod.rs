@@ -485,6 +485,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chosen_thinking_level_reaches_the_body_and_default_omits_it() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.thinking = Thinking::High;
+        let (_, requests) = complete_against(template, req).await;
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
     async fn tools_are_offered_in_the_dialects_shape() {
         let mut req = request(None, &[(Role::User, "what do you know about arc?")]);
         req.tools = vec![ToolDefinition {
