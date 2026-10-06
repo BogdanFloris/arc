@@ -128,7 +128,7 @@ MCP/device sources wait for the phase that needs them.
 
 Codex defaults to `apply_patch`; other providers to `edit` and `write`. Presets or inline roles may override with `editing = "patch"` or `"replacement"`. Record the choice at session creation. Legacy sessions use their pinned provider, or the serving provider if unpinned.
 
-**File tools** accept absolute paths anywhere the daemon's user can access. Existing-file edits require a fresh read in the same session.
+**File tools** accept absolute paths anywhere the daemon's user can access. Writing over an existing file and `edit` require a fresh read in the same session; `apply_patch` relies on the hunk's context and removed lines matching the file's current content.
 
 `edit` accepts unique, non-overlapping replacements against the original file; the single-replacement legacy shape remains valid. `apply_patch` preflights all hunks before writing. Filesystem failures during sequential writes can leave a partial patch; results name completed paths.
 

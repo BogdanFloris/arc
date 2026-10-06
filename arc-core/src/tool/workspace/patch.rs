@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Workspace, ensure_fresh, resolve_path};
+use super::{Workspace, resolve_path};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext};
 
@@ -37,13 +37,12 @@ impl Tool for ApplyPatch {
                           by `+` lines, `*** Delete File: path`, or `*** Update File: path` \
                           (optionally `*** Move to: path`) followed by `@@ context` headers and \
                           ` `, `-`, `+` lines. Paths are absolute or relative to the project \
-                          root (the daemon's current directory if none). Updating or deleting \
-                          a file requires having read it using \
-                          the `read` tool in this session, with no changes since. Reading through \
-                          Bash does not count. Hunks are checked before writes; filesystem \
-                          errors during sequential writes may leave earlier changes applied. \
-                          A failed result lists completed operations; a failed write may also \
-                          have modified its target."
+                          root (the daemon's current directory if none). A hunk's context and \
+                          removed lines must match the file's current content; no prior read is \
+                          required. Hunks are checked before writes; filesystem errors during \
+                          sequential writes may leave earlier changes applied. A failed result \
+                          lists completed operations; a failed write may also have modified its \
+                          target."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -80,7 +79,7 @@ impl Tool for ApplyPatch {
 
             let mut planned = Vec::with_capacity(hunks.len());
             for hunk in hunks {
-                match self.plan(hunk, &ctx) {
+                match Self::plan(hunk, &ctx) {
                     Ok(change) => planned.push(change),
                     Err(reason) => return ToolReply::error(format!("ERROR: {reason}")),
                 }
@@ -137,7 +136,7 @@ impl Change {
 }
 
 impl ApplyPatch {
-    fn plan(&self, hunk: Hunk, ctx: &TurnContext) -> Result<Change, String> {
+    fn plan(hunk: Hunk, ctx: &TurnContext) -> Result<Change, String> {
         let resolve = |path: &str| {
             let absolute = if Path::new(path).is_absolute() {
                 PathBuf::from(path)
@@ -168,8 +167,7 @@ impl ApplyPatch {
             }
             Hunk::Delete { path } => {
                 let resolved = resolve(&path)?;
-                let bytes = existing(&resolved)?;
-                ensure_fresh(&self.workspace, &ctx.session_id, &resolved, &bytes)?;
+                require_file(&resolved)?;
                 Ok(Change::Delete { path: resolved })
             }
             Hunk::Update {
@@ -182,7 +180,6 @@ impl ApplyPatch {
                 let text = std::str::from_utf8(&bytes).map_err(|_| {
                     format!("{} is not text (not valid UTF-8).", resolved.display())
                 })?;
-                ensure_fresh(&self.workspace, &ctx.session_id, &resolved, &bytes)?;
                 let updated = apply_chunks(text, &chunks, &path)?;
                 let moved_to = move_to
                     .as_deref()
@@ -255,13 +252,18 @@ impl ApplyPatch {
     }
 }
 
-fn existing(path: &Path) -> Result<Vec<u8>, String> {
+fn require_file(path: &Path) -> Result<(), String> {
     if path.is_dir() {
         return Err(format!("{} is a directory, not a file.", path.display()));
     }
     if !path.exists() {
         return Err(format!("{} does not exist.", path.display()));
     }
+    Ok(())
+}
+
+fn existing(path: &Path) -> Result<Vec<u8>, String> {
+    require_file(path)?;
     std::fs::read(path).map_err(|error| format!("could not read {} ({error}).", path.display()))
 }
 
@@ -658,23 +660,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unread_file_is_refused_and_nothing_is_written() {
+    async fn an_unread_file_is_updated_when_the_context_lines_match() {
         let dir = TempDir::new().expect("tmp");
         let root = dir.path();
-        fs::write(root.join("a.txt"), "a\n").expect("write");
+        fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("write");
         let ws = Arc::new(Workspace::new());
         let tool = ApplyPatch::new(Arc::clone(&ws));
 
         let reply = tool
             .execute(
-                args("*** Begin Patch\n*** Add File: b.txt\n+b\n*** Update File: a.txt\n-a\n+A\n*** End Patch"),
+                args(
+                    "*** Begin Patch\n*** Update File: a.txt\n@@\n two\n-three\n+THREE\n*** End Patch",
+                ),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\nTHREE\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unread_file_is_deleted() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("gone.txt"), "bye\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch"),
+                ctx(root, Mode::ReadWrite),
+            )
+            .await;
+
+        assert!(reply.ok, "{}", reply.content);
+        assert!(!root.join("gone.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_mismatching_removed_line_is_refused_before_any_write() {
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "a\n").expect("write");
+        let tool = ApplyPatch::new(Arc::new(Workspace::new()));
+
+        let reply = tool
+            .execute(
+                args("*** Begin Patch\n*** Add File: b.txt\n+b\n*** Update File: a.txt\n-nope\n+A\n*** End Patch"),
                 ctx(root, Mode::ReadWrite),
             )
             .await;
 
         assert!(!reply.ok);
         assert!(
-            reply.content.contains("has not been read"),
+            reply.content.contains("could not find these lines"),
             "{}",
             reply.content
         );
@@ -682,6 +725,7 @@ mod tests {
             !root.join("b.txt").exists(),
             "the add hunk before it was not applied"
         );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
     }
 
     #[tokio::test]

@@ -156,7 +156,8 @@ pub(crate) fn ensure_fresh(
     match workspace.recorded_hash(session_id, path) {
         None => Err(format!(
             "{} has not been read in this session. Read it using the `read` tool before \
-             modifying it. Reading through Bash does not count.",
+             modifying it. Reading through Bash does not count. Read records reset when the \
+             daemon restarts.",
             path.display()
         )),
         Some(hash) if hash != hash_of(current_bytes) => Err(format!(
