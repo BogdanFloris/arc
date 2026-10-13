@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::archive::{Archive, Error};
+use crate::archive::{Archive, Error, SearchOptions, SearchOrder};
 use crate::provider::ToolDefinition;
 use crate::tool::{Tool, ToolReply, ToolSource, TurnContext, to_json};
 
@@ -23,6 +23,10 @@ struct SearchArgs {
     query: String,
     #[serde(default)]
     include_tool_results: bool,
+    after: Option<String>,
+    before: Option<String>,
+    #[serde(default)]
+    sort: SearchOrder,
 }
 
 impl Tool for SessionsSearch {
@@ -30,8 +34,14 @@ impl Tool for SessionsSearch {
         ToolDefinition {
             name: "sessions_search".to_owned(),
             description: "Search past conversations for missing context before saying you do \
-                          not know. Returns snippets and an anchor_seq for session_read. \
-                          Read around the anchor only if the snippets are insufficient."
+                          not know. Returns snippets and an anchor_seq for session_read; read \
+                          around the anchor only if the snippets are insufficient. Each hit \
+                          reports the matching message's role (user, assistant, tool_result, \
+                          or server_call), timestamp, and snippet — historical evidence, not \
+                          current fact. after and before filter that timestamp, not the \
+                          session's start; context and bookends can fall outside the bounds. \
+                          A null timestamp means the time is unknown: such a message matches \
+                          only unbounded searches and sorts last under newest."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -43,6 +53,30 @@ impl Tool for SessionsSearch {
                     "include_tool_results": {
                         "type": "boolean",
                         "description": "Also search tool output. Default false."
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Only matching messages at or after this time \
+                            (inclusive). RFC 3339 datetime or a date meaning midnight UTC. \
+                            Compares the matched message's timestamp, not the session's \
+                            start; null-timestamped messages are excluded, and surrounding \
+                            context can still fall outside the bounds."
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Only matching messages strictly before this time. \
+                            RFC 3339 datetime or a date meaning midnight UTC. Compares the \
+                            matched message's timestamp, not the session's start; \
+                            null-timestamped messages are excluded, and surrounding context \
+                            can still fall outside the bounds."
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["relevance", "newest"],
+                        "default": "relevance",
+                        "description": "relevance ranks by text match; newest orders \
+                            matching messages by timestamp, so later updates come first and \
+                            null-timestamped messages last."
                     }
                 },
                 "required": ["query"]
@@ -65,15 +99,27 @@ impl Tool for SessionsSearch {
                 Err(error) => {
                     return ToolReply::error(format!(
                         "ERROR: bad sessions_search arguments ({error}). \
-                         Pass {{\"query\": \"words to find\"}}."
+                         Pass {{\"query\": \"words to find\"}}; sort is \"relevance\" \
+                         or \"newest\"; after and before are RFC 3339 datetimes or \
+                         YYYY-MM-DD dates meaning midnight UTC."
                     ));
                 }
             };
+            let (after, before) = match parse_bounds(&args) {
+                Ok(bounds) => bounds,
+                Err(message) => return ToolReply::error(format!("ERROR: {message}")),
+            };
             let exclude = (!ctx.session_id.is_empty()).then_some(ctx.session_id.as_str());
-            match self
-                .archive
-                .search(&args.query, args.include_tool_results, exclude)
-            {
+            match self.archive.search(
+                &args.query,
+                args.include_tool_results,
+                exclude,
+                SearchOptions {
+                    after,
+                    before,
+                    sort: args.sort,
+                },
+            ) {
                 Ok(reply) if reply.sessions.is_empty() => ToolReply::ok("No results.".to_owned()),
                 Ok(reply) => ToolReply::ok(to_json(&reply)),
                 Err(Error::Query { message }) => ToolReply::ok(format!(
@@ -111,9 +157,11 @@ impl Tool for SessionRead {
         ToolDefinition {
             name: "session_read".to_owned(),
             description: "Read a narrow range of past messages, or opening/closing previews \
-                          with ends. Pages contain at most 8 KiB of JSON and 20 messages; \
-                          long messages span pages. To continue, use the next cursor's \
-                          start_seq and start_offset with the same end_seq. \
+                          with ends. Every message carries its role and timestamp; ts is \
+                          null when the log has no timestamp for it, which means the time is \
+                          unknown, not the session's start. Pages contain at most 8 KiB of \
+                          JSON and 20 messages; long messages span pages. To continue, use \
+                          the next cursor's start_seq and start_offset with the same end_seq. \
                           Fetch another page only if needed."
                 .to_owned(),
             parameters: serde_json::json!({
@@ -200,6 +248,36 @@ impl Tool for SessionRead {
     }
 }
 
+fn parse_bounds(args: &SearchArgs) -> Result<(Option<i64>, Option<i64>), String> {
+    let after = parse_bound(args.after.as_deref(), "after")?;
+    let before = parse_bound(args.before.as_deref(), "before")?;
+    if matches!((after, before), (Some(after), Some(before)) if after >= before) {
+        return Err(
+            "after must be earlier than before; after is inclusive, before exclusive.".to_owned(),
+        );
+    }
+    Ok((after, before))
+}
+
+fn parse_bound(raw: Option<&str>, name: &str) -> Result<Option<i64>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(dt.timestamp_micros()));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_micro_opt(0, 0, 0, 0)
+            .expect("a fixed time of day is always valid");
+        return Ok(Some(midnight.and_utc().timestamp_micros()));
+    }
+    Err(format!(
+        "{name} {raw:?} is not a recognized time — use an RFC 3339 datetime \
+         (e.g. 2026-03-15T14:00:00Z) or a bare date (e.g. 2026-03-15) meaning midnight UTC."
+    ))
+}
+
 fn unknown_session(session_id: &str) -> ToolReply {
     ToolReply::error(format!(
         "ERROR: no session {session_id}. Session ids come from sessions_search."
@@ -221,9 +299,9 @@ mod tests {
     use super::{SessionRead, SessionsSearch};
     use crate::testkit::{
         ScriptedProvider, archive_at, call, channel, done_reply, engine_with_tools_at, replay_log,
-        seed_log, tool_stop,
+        seed_log, seed_log_each, tool_stop,
     };
-    use crate::tool::{Registry, Tool as _, TurnContext};
+    use crate::tool::{Registry, Tool as _, ToolReply, TurnContext};
 
     fn created(id: &str, title: &str) -> session_event::Event {
         session_event::Event::SessionCreated(SessionCreated {
@@ -274,6 +352,10 @@ mod tests {
         registry
     }
 
+    fn search_tool(dir: &TempDir) -> SessionsSearch {
+        SessionsSearch::new(archive_at(dir))
+    }
+
     fn logged_results(dir: &TempDir) -> Vec<ToolResultRecorded> {
         replay_log(dir.path())
             .into_iter()
@@ -282,6 +364,77 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn at(rfc3339: &str) -> i64 {
+        let ts = chrono::DateTime::parse_from_rfc3339(rfc3339).expect("test timestamp");
+        ts.timestamp_micros()
+    }
+
+    fn cans(dir: &TempDir) {
+        seed_log_each(
+            dir,
+            [
+                (created("s-cans", ""), Some(at("2026-01-05T09:00:00Z"))),
+                (
+                    said("s-cans", Role::User, "the cans arrived"),
+                    Some(at("2026-01-05T10:00:00.123456Z")),
+                ),
+            ],
+        );
+    }
+
+    fn printer_history(dir: &TempDir) {
+        seed_log_each(
+            dir,
+            [
+                (
+                    created("s-first", "printer, first pass"),
+                    Some(at("2026-01-05T09:00:00Z")),
+                ),
+                (
+                    said("s-first", Role::User, "the printer"),
+                    Some(at("2026-01-05T10:00:00Z")),
+                ),
+                (
+                    created("s-later", "printer, second pass"),
+                    Some(at("2026-01-06T09:00:00Z")),
+                ),
+                (
+                    said("s-later", Role::User, "printer: prusa core one"),
+                    Some(at("2026-02-10T10:00:00Z")),
+                ),
+            ],
+        );
+    }
+
+    fn parsed(content: &str) -> serde_json::Value {
+        serde_json::from_str(content).unwrap_or_else(|error| panic!("{error}: {content}"))
+    }
+
+    fn hits(content: &str) -> Vec<serde_json::Value> {
+        if content == "No results." {
+            return Vec::new();
+        }
+        let reply = parsed(content);
+        reply["sessions"].as_array().expect("sessions").clone()
+    }
+
+    fn ids(found: &[serde_json::Value]) -> Vec<&str> {
+        found
+            .iter()
+            .map(|hit| hit["session_id"].as_str().expect("session id"))
+            .collect()
+    }
+
+    async fn raw(tool: &SessionsSearch, args: &str) -> ToolReply {
+        tool.execute(args.to_owned(), TurnContext::default()).await
+    }
+
+    async fn search(tool: &SessionsSearch, args: &str) -> Vec<serde_json::Value> {
+        let reply = raw(tool, args).await;
+        assert!(reply.ok, "{args}: {}", reply.content);
+        hits(&reply.content)
     }
 
     #[tokio::test]
@@ -320,12 +473,20 @@ mod tests {
 
         let results = logged_results(&dir);
         assert_eq!(results.len(), 1);
-        let content = &results[0].content;
         assert_eq!(results[0].outcome, ToolOutcome::Ok as i32);
-        assert!(content.contains("s-colors"), "{content}");
-        assert!(content.contains("gruvbox"), "{content}");
-        assert!(content.contains("anchor_seq"), "{content}");
-        assert!(!content.contains("s-deploy"), "{content}");
+        let found = hits(&results[0].content);
+        assert_eq!(
+            ids(&found),
+            ["s-colors"],
+            "only the gruvbox session matches"
+        );
+        let snippet = found[0]["snippet"].as_str().expect("a snippet");
+        assert!(snippet.contains("gruvbox"), "the snippet answers the turn");
+        let anchor = found[0]["anchor_seq"].as_i64();
+        assert!(
+            anchor.is_some_and(|seq| seq > 0),
+            "hits carry an anchor_seq"
+        );
     }
 
     #[tokio::test]
@@ -356,12 +517,10 @@ mod tests {
 
         let results = logged_results(&dir);
         assert_eq!(results.len(), 1);
-        let content = &results[0].content;
-        assert!(content.contains("s-colors"), "{content}");
-        assert!(
-            !content.contains(&reply.session_id),
-            "the current session leaked into its own search: {content}"
-        );
+        let found = hits(&results[0].content);
+        assert_eq!(ids(&found), ["s-colors"]);
+        let leaked = found.iter().any(|id| *id == reply.session_id.as_str());
+        assert!(!leaked, "the searching session appeared in its own results");
     }
 
     #[tokio::test]
@@ -403,31 +562,22 @@ mod tests {
         let results = logged_results(&dir);
         assert_eq!(results.len(), 3);
         let results = &results[1..];
-        assert_eq!(results[0].content, "No results.");
         assert_eq!(results[0].outcome, ToolOutcome::Ok as i32);
         assert!(
-            results[1].content.contains("s-tools"),
-            "{}",
-            results[1].content
+            hits(&results[0].content).is_empty(),
+            "tool output stays hidden"
         );
+        let found = hits(&results[1].content);
+        assert_eq!(
+            ids(&found),
+            ["s-tools"],
+            "the lifted filter finds the tool output"
+        );
+        let snippet = found[0]["snippet"].as_str().expect("a snippet");
         assert!(
-            results[1].content.contains("vulkanpin"),
-            "{}",
-            results[1].content
+            snippet.contains("vulkanpin"),
+            "the hit carries the tool output"
         );
-    }
-
-    fn seeded_dir() -> TempDir {
-        let dir = TempDir::new().expect("temp dir");
-        seed_log(
-            &dir,
-            vec![
-                created("s-01", ""),
-                said("s-01", Role::User, "the goal"),
-                said("s-01", Role::Assistant, "the resolution"),
-            ],
-        );
-        dir
     }
 
     #[tokio::test]
@@ -459,9 +609,14 @@ mod tests {
             assert!(reply.ok, "{}", reply.content);
             assert!(!reply.truncated);
             assert!(reply.content.len() <= 8 * 1024);
-            let page: serde_json::Value = serde_json::from_str(&reply.content).expect("valid JSON");
+            let page = parsed(&reply.content);
             let messages = page["messages"].as_array().expect("messages");
             assert_eq!(messages.len(), 1);
+            assert!(
+                messages[0]["ts"].is_null(),
+                "an unrecorded message time reads as null: {}",
+                messages[0]
+            );
             let fragment = messages[0]["content"].as_str().expect("fragment");
             assert!(!fragment.is_empty(), "every page makes progress");
             restored.push_str(fragment);
@@ -486,7 +641,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_read_ends_returns_the_bookends_shape() {
-        let dir = seeded_dir();
+        let dir = TempDir::new().expect("temp dir");
+        seed_log(
+            &dir,
+            vec![
+                created("s-01", ""),
+                said("s-01", Role::User, "the goal"),
+                said("s-01", Role::Assistant, "the resolution"),
+            ],
+        );
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool
@@ -496,15 +659,225 @@ mod tests {
             )
             .await;
 
-        assert!(reply.ok);
-        assert!(reply.content.contains("\"first\""), "{}", reply.content);
-        assert!(reply.content.contains("\"last\""), "{}", reply.content);
-        assert!(reply.content.contains("the goal"), "{}", reply.content);
+        assert!(reply.ok, "{}", reply.content);
+        let page = parsed(&reply.content);
+        let first = page["first"].as_array().expect("first bookend");
+        assert_eq!(first[0]["content"], "the goal", "{}", reply.content);
+        assert_eq!(first[1]["content"], "the resolution");
+        assert_eq!(page["last"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn date_bounds_select_the_matching_message_not_the_session() {
+        let dir = TempDir::new().expect("temp dir");
+        printer_history(&dir);
+        seed_log_each(
+            &dir,
+            [
+                (
+                    created("s-created-late", ""),
+                    Some(at("2026-03-01T09:00:00Z")),
+                ),
+                (
+                    said("s-created-late", Role::User, "an early printer note"),
+                    Some(at("2026-01-20T10:00:00Z")),
+                ),
+            ],
+        );
+        let tool = search_tool(&dir);
+
+        let bounded = search(&tool, r#"{"query":"printer","after":"2026-02-01"}"#).await;
+        assert_eq!(
+            ids(&bounded),
+            ["s-later"],
+            "the message date decides the match"
+        );
+
+        let before = search(&tool, r#"{"query":"printer","before":"2026-02-01"}"#).await;
+        let mut earlier = ids(&before);
+        earlier.sort_unstable();
+        assert_eq!(
+            earlier,
+            ["s-created-late", "s-first"],
+            "both early notes match"
+        );
+    }
+
+    #[tokio::test]
+    async fn utc_offsets_and_bare_dates_bound_the_same_instant() {
+        let dir = TempDir::new().expect("temp dir");
+        cans(&dir);
+        let tool = search_tool(&dir);
+
+        let found = search(&tool, r#"{"query":"cans"}"#).await;
+        assert_eq!(
+            found[0]["ts"], "2026-01-05T10:00:00.123456Z",
+            "a hit keeps the message's exact time"
+        );
+
+        for (args, matched) in [
+            (
+                r#"{"query":"cans","after":"2026-01-05T11:30:00+02:00"}"#,
+                true,
+            ),
+            (
+                r#"{"query":"cans","after":"2026-01-05T13:00:00+02:00"}"#,
+                false,
+            ),
+            (r#"{"query":"cans","after":"2026-01-05"}"#, true),
+            (r#"{"query":"cans","before":"2026-01-06"}"#, true),
+            (r#"{"query":"cans","before":"2026-01-05"}"#, false),
+            (
+                r#"{"query":"cans","after":"2026-01-05T10:00:00.123456Z"}"#,
+                true,
+            ),
+            (
+                r#"{"query":"cans","before":"2026-01-05T10:00:00.123456Z"}"#,
+                false,
+            ),
+        ] {
+            let found = search(&tool, args).await;
+            assert_eq!(!found.is_empty(), matched, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_dates_bounds_and_sorts_are_tool_errors() {
+        let dir = TempDir::new().expect("temp dir");
+        let tool = search_tool(&dir);
+
+        for (args, expected) in [
+            (r#"{"query":"cans","after":"last tuesday"}"#, "after"),
+            (r#"{"query":"cans","before":"2026-02-30"}"#, "before"),
+            (
+                r#"{"query":"cans","after":"2026-02-01","before":"2026-02-01"}"#,
+                "earlier",
+            ),
+            (
+                r#"{"query":"cans","after":"2026-03-01","before":"2026-02-01"}"#,
+                "earlier",
+            ),
+            (r#"{"query":"cans","sort":"oldest"}"#, "sort"),
+        ] {
+            let reply = raw(&tool, args).await;
+            assert!(!reply.ok, "{args}: {}", reply.content);
+            assert!(reply.content.contains(expected), "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn undated_messages_search_unbounded_but_never_satisfy_bounds() {
+        let dir = TempDir::new().expect("temp dir");
+        cans(&dir);
+        seed_log_each(
+            &dir,
+            [
+                (created("s-undated", ""), None),
+                (said("s-undated", Role::User, "an undated cans note"), None),
+            ],
+        );
+        let tool = search_tool(&dir);
+
+        let unbounded = search(&tool, r#"{"query":"cans","include_tool_results":false}"#).await;
+        assert_eq!(unbounded.len(), 2, "undated messages match without bounds");
+        let undated = unbounded
+            .iter()
+            .find(|hit| hit["session_id"] == "s-undated")
+            .expect("the undated session is still searchable");
+        assert!(undated["ts"].is_null(), "unknown time reads as null");
+
+        let newest = search(&tool, r#"{"query":"cans","sort":"newest"}"#).await;
+        assert_eq!(
+            ids(&newest),
+            ["s-cans", "s-undated"],
+            "the null time sorts last"
+        );
+
+        let bounded = search(&tool, r#"{"query":"cans","after":"2020-01-01"}"#).await;
+        assert_eq!(
+            ids(&bounded),
+            ["s-cans"],
+            "a null time cannot satisfy after"
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_sort_anchors_the_later_user_decision() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_log_each(
+            &dir,
+            [
+                (
+                    created("s-kit", "printer"),
+                    Some(at("2026-01-05T09:00:00Z")),
+                ),
+                (
+                    said(
+                        "s-kit",
+                        Role::Assistant,
+                        "options: the core one kit, the core one enclosure, or waiting",
+                    ),
+                    Some(at("2026-01-05T10:00:00Z")),
+                ),
+                (
+                    said("s-kit", Role::User, "decision: order the core one kit"),
+                    Some(at("2026-03-01T10:00:00Z")),
+                ),
+            ],
+        );
+        let tool = search_tool(&dir);
+
+        let suggestion = search(&tool, r#"{"query":"core one"}"#).await;
+        let hit = &suggestion[0];
+        assert_eq!(hit["anchor_seq"], 1, "relevance anchors the suggestion");
+        assert_eq!(hit["role"], "assistant");
+        assert_eq!(hit["ts"], "2026-01-05T10:00:00Z");
+
+        let decision = search(&tool, r#"{"query":"core one","sort":"newest"}"#).await;
+        let hit = &decision[0];
+        assert_eq!(hit["anchor_seq"], 2, "newest anchors the user decision");
+        assert_eq!(hit["role"], "user");
+        assert_eq!(hit["ts"], "2026-03-01T10:00:00Z");
+        let snippet = hit["snippet"].as_str().expect("a snippet");
+        assert!(snippet.contains("order the core one kit"), "{hit}");
+    }
+
+    #[tokio::test]
+    async fn a_live_turn_forwards_bounds_and_sort_to_the_archive() {
+        let dir = TempDir::new().expect("temp dir");
+        printer_history(&dir);
+        let provider = ScriptedProvider::scripted(vec![
+            vec![
+                Ok(call(
+                    "c1",
+                    0,
+                    "sessions_search",
+                    r#"{"query":"printer","after":"2026-02-01","sort":"newest"}"#,
+                )),
+                Ok(tool_stop()),
+            ],
+            done_reply("the printer is now the prusa core one"),
+        ]);
+        let registry = search_registry(&dir);
+        let (engine, run) = engine_with_tools_at(&provider, &dir, registry);
+        let (tx, _rx) = channel();
+
+        let reply = engine
+            .send_message(&run, None, "which printer did we settle on?", tx)
+            .await
+            .expect("send");
+
+        let results = logged_results(&dir);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcome::Ok as i32);
+        let found = hits(&results[0].content);
+        assert_eq!(ids(&found), ["s-later"], "the bound drops the first pass");
+        assert!(!ids(&found).contains(&reply.session_id.as_str()));
     }
 
     #[tokio::test]
     async fn session_read_refuses_a_whole_session_dump() {
-        let dir = seeded_dir();
+        let dir = TempDir::new().expect("temp dir");
         let tool = SessionRead::new(archive_at(&dir));
 
         let reply = tool

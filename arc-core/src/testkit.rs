@@ -245,6 +245,27 @@ pub fn seed_log(dir: &TempDir, events: Vec<session_event::Event>) {
     );
 }
 
+pub fn seed_log_each(
+    dir: &TempDir,
+    events: impl IntoIterator<Item = (session_event::Event, Option<i64>)>,
+) {
+    let mut log = Log::open(dir.path()).expect("open log");
+    for (event, micros) in events {
+        log.append(arc_proto::v1::Event {
+            seq: 0,
+            ts: micros.map(|micros| prost_types::Timestamp {
+                seconds: micros.div_euclid(1_000_000),
+                nanos: i32::try_from(micros.rem_euclid(1_000_000) * 1_000).expect("nanos"),
+            }),
+            source: arc_proto::v1::Source::System as i32,
+            payload: Some(arc_proto::v1::event::Payload::Session(
+                arc_proto::v1::SessionEvent { event: Some(event) },
+            )),
+        })
+        .expect("append");
+    }
+}
+
 pub fn seed_memory_log(dir: &TempDir, events: Vec<memory_event::Event>) {
     seed_log_payloads(
         dir,

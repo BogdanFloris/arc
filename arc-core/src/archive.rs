@@ -5,10 +5,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use arc_proto::v1::{Role, memory_record};
 use chrono::{DateTime, SecondsFormat};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::kind_name;
-use crate::projection::{KIND_MESSAGE, bad_json_column, links_from_json, provenance_from_json};
+use crate::projection::{
+    KIND_MESSAGE, KIND_SERVER_CALL, bad_json_column, links_from_json, provenance_from_json,
+};
 
 const MAX_QUERY_CHARS: usize = 256;
 const OVERFETCH: usize = 50; // hits collapse per session, so fetch extra
@@ -43,6 +45,30 @@ pub(crate) struct SearchReply {
     pub sessions: Vec<SessionHit>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SearchOrder {
+    #[default]
+    Relevance,
+    Newest,
+}
+
+impl SearchOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Relevance => "relevance",
+            Self::Newest => "newest",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SearchOptions {
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+    pub sort: SearchOrder,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionHit {
     pub session_id: String,
@@ -51,6 +77,8 @@ pub(crate) struct SessionHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     pub snippet: String,
+    pub role: String,
+    pub ts: Option<String>,
     pub anchor_seq: i64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ProseMessage>,
@@ -65,6 +93,7 @@ pub(crate) struct ProseMessage {
     pub seq: i64,
     pub role: String,
     pub content: String,
+    pub ts: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
 }
@@ -157,6 +186,9 @@ impl Archive {
             raw_hits = tracing::field::Empty,
             sessions = tracing::field::Empty,
             include_tool_results,
+            sort = tracing::field::Empty,
+            after = tracing::field::Empty,
+            before = tracing::field::Empty,
         )
     )]
     pub(crate) fn search(
@@ -164,10 +196,14 @@ impl Archive {
         raw_query: &str,
         include_tool_results: bool,
         exclude_session: Option<&str>,
+        options: SearchOptions,
     ) -> Result<SearchReply, Error> {
         let query = sanitize_query(raw_query);
         let span = tracing::Span::current();
         span.record("query", query.as_str());
+        span.record("sort", options.sort.as_str());
+        span.record("after", options.after);
+        span.record("before", options.before);
         if query.is_empty() {
             return Err(Error::Query {
                 message: "no searchable words in the query".to_owned(),
@@ -175,14 +211,7 @@ impl Archive {
         }
 
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT m.session_id, m.seq, snippet(messages_fts, 0, '', '', '…', 12)
-             FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
-             WHERE messages_fts MATCH ?1 AND (?2 OR m.kind = ?3)
-               AND (?5 IS NULL OR m.session_id != ?5)
-             ORDER BY bm25(messages_fts)
-             LIMIT ?4",
-        )?;
+        let mut stmt = conn.prepare(&search_sql(options.sort))?;
         let mapped = stmt
             .query_map(
                 rusqlite::params![
@@ -190,15 +219,11 @@ impl Archive {
                     include_tool_results,
                     KIND_MESSAGE,
                     limit(OVERFETCH),
-                    exclude_session
+                    exclude_session,
+                    options.after,
+                    options.before
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                hit_row,
             )
             .map_err(into_query_error)?;
         let mut hits = Vec::new();
@@ -208,24 +233,26 @@ impl Archive {
         span.record("raw_hits", hits.len());
 
         let mut sessions: Vec<SessionHit> = Vec::new();
-        for (session_id, anchor_seq, snippet) in hits {
-            if sessions.iter().any(|s| s.session_id == session_id) {
+        for hit in hits {
+            if sessions.iter().any(|s| s.session_id == hit.session_id) {
                 continue;
             }
             let (title, started_at) = conn
                 .query_row(
                     "SELECT coalesce(title, ''), started_at FROM sessions WHERE id = ?1",
-                    [&session_id],
+                    [&hit.session_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )
                 .optional()?
                 .unwrap_or((String::new(), None));
             sessions.push(SessionHit {
-                session_id,
+                session_id: hit.session_id,
                 title,
                 started_at: started_at.and_then(format_micros),
-                snippet,
-                anchor_seq,
+                snippet: hit.snippet,
+                role: hit.role,
+                ts: hit.ts,
+                anchor_seq: hit.seq,
                 context: Vec::new(),
                 first: Vec::new(),
                 last: Vec::new(),
@@ -272,7 +299,7 @@ impl Archive {
             return Ok(None);
         }
         let mut stmt = conn.prepare(
-            "SELECT seq, role, content, partial FROM messages
+            "SELECT seq, role, content, partial, ts FROM messages
              WHERE session_id = ?1 AND kind = ?2 AND seq BETWEEN ?3 AND ?4
              ORDER BY seq LIMIT ?5",
         )?;
@@ -612,12 +639,60 @@ fn session_exists(conn: &Connection, id: &str) -> Result<bool, Error> {
         .is_some())
 }
 
+// a NULL ts satisfies neither >= nor <, so bounds drop undated hits by themselves
+fn search_sql(sort: SearchOrder) -> String {
+    let order = match sort {
+        SearchOrder::Relevance => "bm25(messages_fts), m.seq DESC",
+        SearchOrder::Newest => "m.ts DESC, m.seq DESC",
+    };
+    format!(
+        "SELECT m.session_id, m.seq, m.kind, m.role, m.ts,
+                snippet(messages_fts, 0, '', '', '…', 12)
+         FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
+         WHERE messages_fts MATCH ?1 AND (?2 OR m.kind = ?3)
+           AND (?5 IS NULL OR m.session_id != ?5)
+           AND (?6 IS NULL OR m.ts >= ?6)
+           AND (?7 IS NULL OR m.ts < ?7)
+         ORDER BY {order}
+         LIMIT ?4"
+    )
+}
+
+struct HitRow {
+    session_id: String,
+    seq: i64,
+    role: String,
+    ts: Option<String>,
+    snippet: String,
+}
+
+fn hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HitRow> {
+    let kind: i64 = row.get(2)?;
+    Ok(HitRow {
+        session_id: row.get(0)?,
+        seq: row.get(1)?,
+        role: hit_role(row.get(3)?, kind),
+        ts: message_ts(row.get(4)?),
+        snippet: row.get(5)?,
+    })
+}
+
+fn hit_role(role: Option<i64>, kind: i64) -> String {
+    match role {
+        Some(role) => role_name(role),
+        // Only results and server calls lack indexed roles.
+        None if kind == KIND_SERVER_CALL => "server_call".to_owned(),
+        None => "tool_result".to_owned(),
+    }
+}
+
 fn prose_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProseMessage> {
     Ok(ProseMessage {
         seq: row.get(0)?,
         role: role_name(row.get(1)?),
         content: row.get(2)?,
         partial: row.get(3)?,
+        ts: message_ts(row.get(4)?),
     })
 }
 
@@ -627,7 +702,7 @@ fn prose_window(
     anchor_seq: i64,
 ) -> Result<Vec<ProseMessage>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT seq, role, content, partial FROM messages
+        "SELECT seq, role, content, partial, ts FROM messages
          WHERE session_id = ?1 AND kind = ?2 AND seq <= ?3
          ORDER BY seq DESC LIMIT ?4",
     )?;
@@ -648,7 +723,7 @@ fn prose_window(
     window.reverse();
 
     let mut stmt = conn.prepare(
-        "SELECT seq, role, content, partial FROM messages
+        "SELECT seq, role, content, partial, ts FROM messages
          WHERE session_id = ?1 AND kind = ?2 AND seq > ?3
          ORDER BY seq LIMIT ?4",
     )?;
@@ -668,7 +743,7 @@ fn bookends(
 ) -> Result<(Vec<ProseMessage>, Vec<ProseMessage>), Error> {
     let spoken = |order: &str| {
         format!(
-            "SELECT seq, role, content, partial FROM messages
+            "SELECT seq, role, content, partial, ts FROM messages
              WHERE session_id = ?1 AND kind = ?2 AND role IN (?3, ?4)
              ORDER BY seq {order} LIMIT ?5"
         )
@@ -781,6 +856,14 @@ fn format_micros(micros: i64) -> Option<String> {
     DateTime::from_timestamp_micros(micros).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
+// AutoSi drops trailing zeros, never precision
+fn message_ts(micros: Option<i64>) -> Option<String> {
+    micros.and_then(|micros| {
+        DateTime::from_timestamp_micros(micros)
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    })
+}
+
 fn limit(n: usize) -> i64 {
     i64::try_from(n).expect("row caps are small constants")
 }
@@ -796,10 +879,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{Archive, Error};
-    use crate::log::Log;
-    use crate::projection::{self, Projection};
+    use super::{Archive, Error, SearchOptions, SearchOrder};
     use crate::testkit;
+
+    const T0: i64 = 1_700_000_000_000_000;
 
     fn created(id: &str, title: &str) -> session_event::Event {
         session_event::Event::SessionCreated(SessionCreated {
@@ -844,16 +927,32 @@ mod tests {
         })
     }
 
-    fn archive_over(events: Vec<session_event::Event>) -> (TempDir, Archive) {
+    fn archive_over(events: Vec<session_event::Event>) -> (TempDir, Arc<Archive>) {
+        archive_over_at(events.into_iter().map(|event| (event, None)).collect())
+    }
+
+    fn archive_over_at(
+        events: Vec<(session_event::Event, Option<i64>)>,
+    ) -> (TempDir, Arc<Archive>) {
         let dir = TempDir::new().expect("temp dir");
-        testkit::seed_log(&dir, events);
-        let log = Log::open(dir.path()).expect("open log");
-        let index = dir.path().join("index.db");
-        let mut projection = Projection::open(&index).expect("open projection");
-        projection::replay(log.reader().expect("reader"), &mut projection).expect("replay");
-        drop(projection);
-        let archive = Archive::open(&index).expect("open archive");
+        testkit::seed_log_each(&dir, events);
+        let archive = testkit::archive_at(&dir);
         (dir, archive)
+    }
+
+    fn newest() -> SearchOptions {
+        SearchOptions {
+            sort: SearchOrder::Newest,
+            ..SearchOptions::default()
+        }
+    }
+
+    fn session_ids(reply: &super::SearchReply) -> Vec<&str> {
+        reply
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect()
     }
 
     #[test]
@@ -876,7 +975,9 @@ mod tests {
             "50%",
             "TODO: fix",
         ] {
-            let reply = archive.search(query, false, None).expect(query);
+            let reply = archive
+                .search(query, false, None, SearchOptions::default())
+                .expect(query);
             assert_eq!(reply.sessions.len(), 1, "query: {query}");
             assert_eq!(reply.sessions[0].session_id, "s-fix", "query: {query}");
         }
@@ -890,12 +991,12 @@ mod tests {
         ]);
 
         let err = archive
-            .search("prose AND OR bar", false, None)
+            .search("prose AND OR bar", false, None, SearchOptions::default())
             .expect_err("FTS must reject doubled operators");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
 
         let err = archive
-            .search("%%%", false, None)
+            .search("%%%", false, None, SearchOptions::default())
             .expect_err("nothing searchable must be a query error");
         assert!(matches!(err, Error::Query { .. }), "got: {err:?}");
     }
@@ -925,7 +1026,9 @@ mod tests {
         ];
         let (_dir, archive) = archive_over(events);
 
-        let reply = archive.search("quixotic", false, None).expect("search");
+        let reply = archive
+            .search("quixotic", false, None, SearchOptions::default())
+            .expect("search");
         assert_eq!(
             reply.sessions.first().map(|s| s.session_id.as_str()),
             Some("s-dead"),
@@ -951,7 +1054,9 @@ mod tests {
         }
         let (_dir, archive) = archive_over(events);
 
-        let reply = archive.search("zebra", false, None).expect("search");
+        let reply = archive
+            .search("zebra", false, None, SearchOptions::default())
+            .expect("search");
 
         assert_eq!(reply.sessions.len(), 5, "seven matching sessions cap at 5");
         let mut ids: Vec<&str> = reply
@@ -987,7 +1092,9 @@ mod tests {
         events.push(said("s-other", Role::User, "a quasar aside"));
         let (_dir, archive) = archive_over(events);
 
-        let reply = archive.search("quasar", false, None).expect("search");
+        let reply = archive
+            .search("quasar", false, None, SearchOptions::default())
+            .expect("search");
 
         let top = &reply.sessions[0];
         assert_eq!(top.session_id, "s-long");
@@ -1028,13 +1135,17 @@ mod tests {
             tool_answered("s-01", "vulkanpin gpu listing output"),
         ]);
 
-        let reply = archive.search("vulkanpin", false, None).expect("search");
+        let reply = archive
+            .search("vulkanpin", false, None, SearchOptions::default())
+            .expect("search");
         assert!(
             reply.sessions.is_empty(),
             "the default filter excludes tool output"
         );
 
-        let reply = archive.search("vulkanpin", true, None).expect("search");
+        let reply = archive
+            .search("vulkanpin", true, None, SearchOptions::default())
+            .expect("search");
         assert_eq!(reply.sessions.len(), 1);
         assert_eq!(
             reply.sessions[0].anchor_seq, 2,
@@ -1048,6 +1159,108 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
+    }
+
+    #[test]
+    fn hits_previews_reads_and_ends_carry_roles_and_timestamps() {
+        let (_dir, archive) = archive_over_at(vec![
+            (created("s-01", "listing"), Some(T0)),
+            (
+                said("s-01", Role::User, "list the devices"),
+                Some(T0 + 1_000_000),
+            ),
+            (
+                tool_answered("s-01", "vulkanpin gpu listing output"),
+                Some(T0 + 2_000_000),
+            ),
+            (
+                said("s-01", Role::Assistant, "two devices, as you can see"),
+                None,
+            ),
+        ]);
+
+        let reply = archive
+            .search("vulkanpin", true, None, SearchOptions::default())
+            .expect("search");
+        let hit = &reply.sessions[0];
+        assert_eq!(hit.session_id, "s-01");
+        assert_eq!(hit.role, "tool_result");
+        assert_eq!(hit.ts.as_deref(), Some("2023-11-14T22:13:22Z"));
+        assert_eq!(
+            messages(&hit.context),
+            [
+                ("user", "list the devices"),
+                ("assistant", "two devices, as you can see")
+            ]
+        );
+        assert_eq!(hit.context[0].ts.as_deref(), Some("2023-11-14T22:13:21Z"));
+        assert_eq!(hit.context[1].ts, None);
+
+        let ends = archive.ends("s-01").expect("ends").expect("session exists");
+        assert_eq!(ends.first, hit.context);
+        assert!(ends.last.is_empty());
+
+        let read = archive
+            .read_range("s-01", 0, i64::MAX, 0)
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(read.messages, hit.context);
+    }
+
+    #[test]
+    fn equal_ranks_tie_break_on_seq_and_sessions_anchor_their_newest_hit() {
+        let (_dir, archive) = archive_over_at(vec![
+            (created("s-01", ""), Some(T0)),
+            (
+                said("s-01", Role::User, "the tiebreaker run"),
+                Some(T0 + 40_000_000),
+            ),
+            (
+                said("s-01", Role::User, "the tiebreaker run"),
+                Some(T0 + 10_000_000),
+            ),
+            (created("s-02", ""), Some(T0)),
+            (
+                said("s-02", Role::User, "the tiebreaker run"),
+                Some(T0 + 30_000_000),
+            ),
+        ]);
+
+        let query = "tiebreaker run";
+        let relevant = archive
+            .search(query, false, None, SearchOptions::default())
+            .expect("search");
+        assert_eq!(
+            session_ids(&relevant),
+            ["s-02", "s-01"],
+            "equal bm25 falls back to seq DESC"
+        );
+        assert_eq!(
+            relevant.sessions[1].ts.as_deref(),
+            Some("2023-11-14T22:13:30Z"),
+            "equal bm25 falls back to the later message"
+        );
+
+        let newest = archive
+            .search(query, false, None, newest())
+            .expect("search");
+        assert_eq!(
+            session_ids(&newest),
+            ["s-01", "s-02"],
+            "newest ranks by message time"
+        );
+        assert_eq!(
+            newest.sessions[0].ts.as_deref(),
+            Some("2023-11-14T22:14:00Z"),
+            "the session anchors its newest hit"
+        );
+    }
+
+    fn messages(messages: &[super::ProseMessage]) -> Vec<(&str, &str)> {
+        messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect()
     }
 
     #[test]
@@ -1065,14 +1278,18 @@ mod tests {
         .cycle()
         .take(28)
         .collect();
-        let mut events = vec![created("s-01", "")];
-        for content in &originals {
-            events.push(tool_answered("s-01", "not prose"));
-            events.push(said("s-01", Role::Assistant, content));
+        let mut events = vec![(created("s-01", ""), Some(T0))];
+        for (i, content) in originals.iter().enumerate() {
+            let micros = T0 + i64::try_from(i + 1).expect("small fixture") * 1_000_000;
+            events.push((tool_answered("s-01", "not prose"), Some(micros)));
+            events.push((said("s-01", Role::Assistant, content), Some(micros)));
         }
         let last_seq = i64::try_from(events.len() - 1).expect("small fixture");
-        events.push(said("s-01", Role::User, "outside the requested range"));
-        let (_dir, archive) = archive_over(events);
+        events.push((
+            said("s-01", Role::User, "outside the requested range"),
+            Some(T0),
+        ));
+        let (_dir, archive) = archive_over_at(events);
         let mut cursor = super::ReadCursor {
             start_seq: 0,
             start_offset: 0,
@@ -1089,6 +1306,11 @@ mod tests {
             assert!(!reply.messages.is_empty());
             for message in reply.messages {
                 assert_eq!(message.role, "assistant");
+                assert_eq!(
+                    message.ts,
+                    super::message_ts(Some(message_time(message.seq))),
+                    "every page of a message repeats its timestamp"
+                );
                 if let Some(last) = restored.last_mut().filter(|last| last.seq == message.seq) {
                     last.content.push_str(&message.content);
                 } else {
@@ -1114,6 +1336,11 @@ mod tests {
             restored.into_iter().map(|m| m.content).collect::<Vec<_>>(),
             originals
         );
+    }
+
+    // Paired events place prose at even sequence numbers.
+    fn message_time(seq: i64) -> i64 {
+        T0 + (seq / 2) * 1_000_000
     }
 
     #[test]

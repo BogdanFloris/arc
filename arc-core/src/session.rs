@@ -27,6 +27,18 @@ use crate::tool::{ContinueRequest, DispatchOutcome, Intent, Registry, ToolSource
 
 const MAX_EXECUTOR_TOOL_STEPS: usize = 256;
 
+const RETRIEVAL_RULES: &str = "[Retrieval rules]\n\
+- Distinguish what you know now from what was said earlier: an earlier statement describes the past.\n\
+- memory_search/memory_read for established preferences and decisions; an ACTIVE record is not verified current.\n\
+- Files and live system observations for current local state.\n\
+- sessions_search/session_read for past reasoning and discussions, not current facts.\n\
+- Verify changeable external facts against a current source before relying on them.\n\
+- An assistant suggestion is not a user decision.\n\
+- For a changeable fact from history, look for later evidence on the same subject: sessions_search with sort \"newest\", optionally after a known timestamp, or verify the live source.\n\
+- Returned timestamps are UTC. Resolve relative dates against the system clock and the relevant timezone; never guess a date bound.\n\
+- Say whether later evidence confirms, replaces, or contradicts the earlier statement.\n\
+- No later matches does not mean it still holds; its current status is unverified.";
+
 fn max_tool_steps(role: SessionRole) -> usize {
     match role {
         SessionRole::Chat | SessionRole::Executor => MAX_EXECUTOR_TOOL_STEPS,
@@ -2071,16 +2083,16 @@ impl Engine {
 
     // stable first, volatile after: everything here is prefix the provider caches,
     // so anything that changes per turn has to go in the messages instead
-    fn system_prompt(runner: &Runner, memory_index: Option<&str>) -> Option<String> {
+    fn system_prompt(runner: &Runner, memory_index: Option<&str>) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(identity) = &runner.system {
             parts.push(identity);
         }
+        parts.push(RETRIEVAL_RULES);
         if let Some(index) = memory_index {
             parts.push(index);
         }
-        let prompt = parts.join("\n\n");
-        (!prompt.is_empty()).then_some(prompt)
+        parts.join("\n\n")
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
@@ -2502,7 +2514,7 @@ impl Engine {
             ))
         })?;
         let system = Self::system_prompt(runner, render_memory_index(&memory_index).as_deref());
-        Ok((rebuild_transcript(&rows), system))
+        Ok((rebuild_transcript(&rows), Some(system)))
     }
 
     fn completion_request(
@@ -3024,8 +3036,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, ProjectSpec, Runner,
-        max_tool_steps, web_tool_sources,
+        ContinuedJob, DispatchedJob, Engine, EngineEvent, Error, ProjectSpec, RETRIEVAL_RULES,
+        Runner, max_tool_steps, web_tool_sources,
     };
     use crate::log::Log;
     use crate::projection::Projection;
@@ -4776,6 +4788,11 @@ mod tests {
             system.ends_with("(id: mr-fact)"),
             "the record index renders last, so nothing volatile precedes it: {system}"
         );
+        assert!(
+            system.find(RETRIEVAL_RULES) > system.find("be terse")
+                && system.find(RETRIEVAL_RULES) < system.find("[Memory index"),
+            "identity, then the stable rules, then the record index: {system}"
+        );
 
         // the index is rebuilt by replay, so a restart is where an ordering bug shows
         let restarted = ScriptedProvider::scripted(vec![done_reply("third")]);
@@ -4806,10 +4823,43 @@ mod tests {
             .await
             .expect("send");
 
+        let system = provider.requests()[0]
+            .system
+            .clone()
+            .expect("a system prompt");
         assert_eq!(
-            provider.requests()[0].system,
-            Some(format!("be terse\n\n{}", seeded_block()))
+            system,
+            format!("be terse\n\n{RETRIEVAL_RULES}\n\n{}", seeded_block())
         );
+        assert!(
+            !system.contains("a body the index must never carry"),
+            "only index lines enter the prompt: {system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_rules_reach_direct_turns_and_jobs_without_identity() {
+        for role in [SessionRole::Chat, SessionRole::Executor] {
+            let provider = ScriptedProvider::scripted(vec![done_reply("ok")]);
+            let dir = TempDir::new().expect("temp dir");
+            let (engine, run) = engine_with_role(&provider, &dir, role);
+            let run = Runner {
+                system: None,
+                ..run
+            };
+            let (tx, _rx) = channel();
+
+            engine
+                .send_message(&run, None, "hi", tx)
+                .await
+                .expect("send");
+
+            assert_eq!(
+                provider.requests()[0].system,
+                Some(RETRIEVAL_RULES.to_owned()),
+                "no identity and no records still leaves the harness rules"
+            );
+        }
     }
 
     const SEARCH_HIT: &str = r#"{"records":[{"id":"mr-pal","namespace":"global","kind":"fact","title":"Gruvbox","summary":"the palette"}]}"#;

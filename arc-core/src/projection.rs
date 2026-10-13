@@ -181,7 +181,7 @@ const KIND_TOOL_CALL: i64 = 1;
 
 const KIND_TOOL_RESULT: i64 = 2;
 
-const KIND_SERVER_CALL: i64 = 3;
+pub(crate) const KIND_SERVER_CALL: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

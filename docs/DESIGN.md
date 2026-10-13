@@ -213,7 +213,13 @@ Review verdicts have source USER: accept appends `MemoryRecordReviewed`, fix sup
 
 ### 5.5 Retrieval
 
-Memory is tools, not silent RAG: `memory_read`, `memory_search`, `memory_write`, `memory_supersede`, `sessions_search`, and `session_read`. Nothing is automatically injected except identity and the record index.
+Memory is tools, not silent RAG: `memory_read`, `memory_search`, `memory_write`, `memory_supersede`, `sessions_search`, and `session_read`. Only identity and the record index enter automatically as memory context.
+
+Stable retrieval instructions belong to the harness, after identity and before the record index. Use distilled memory for established preferences and decisions, live files or system observations for current local state, the archive for past discussions, and current external sources for changeable external facts. An assistant suggestion is not a user decision; an ACTIVE memory record is not proof that a fact is still current.
+
+Archive search defaults to text relevance, with deterministic ties. Optional `sort: "newest"` orders matching messages by their event timestamps, then sequence; unknown timestamps sort last. Optional `after` (inclusive) and `before` (exclusive) filter matching message timestamps, not session start dates. Both accept RFC 3339 datetimes or dates meaning midnight UTC. Undated messages remain searchable without bounds but cannot satisfy a date filter. Results identify the matching message's role and timestamp; surrounding context, bookends, and range reads carry message timestamps too. Context can fall outside search bounds.
+
+For changeable facts retrieved from history, search for later updates on the same subject or verify the current source. Use known evidence timestamps for date bounds, or newest-first without a bound. Resolve relative dates against the system clock and the relevant timezone; do not guess dates. Report whether later evidence confirms, replaces, or contradicts the earlier statement. If no later evidence is found, current status remains unverified. Date and recency controls support this check; they do not automatically reconcile contradictions, expire records, or rank truth.
 
 Search cheaply, then read targeted context. Archive ranges cap at 8 KiB of JSON and 20 messages. Continuations carry sequence and UTF-8 byte offset; preserve the original end sequence. Long messages paginate losslessly; search previews and bookends stay clipped. Stop once answered. Trace retrieval like any tool call.
 
