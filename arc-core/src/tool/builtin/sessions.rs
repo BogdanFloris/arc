@@ -41,7 +41,12 @@ impl Tool for SessionsSearch {
                           current fact. after and before filter that timestamp, not the \
                           session's start; context and bookends can fall outside the bounds. \
                           A null timestamp means the time is unknown: such a message matches \
-                          only unbounded searches and sorts last under newest."
+                          only unbounded searches and sorts last under newest. Session \
+                          origin identifies conversation, job, or unknown, with \
+                          dispatched_by when recorded. Message source (user, model, \
+                          system, or unknown) is independent of role; a user role alone \
+                          does not mean the human wrote it. Older job instructions were \
+                          incorrectly user-sourced; check their context before attribution."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -157,7 +162,11 @@ impl Tool for SessionRead {
         ToolDefinition {
             name: "session_read".to_owned(),
             description: "Read a narrow range of past messages, or opening/closing previews \
-                          with ends. Every message carries its role and timestamp; ts is \
+                          with ends. Replies include session origin; each message carries \
+                          role, source, and timestamp. Source records user, model, \
+                          system, or unknown origin independently of role; older jobs can \
+                          contain model-written instructions tagged user. Check context \
+                          before human attribution inside a job. ts is \
                           null when the log has no timestamp for it, which means the time is \
                           unknown, not the session's start. Pages contain at most 8 KiB of \
                           JSON and 20 messages; long messages span pages. To continue, use \

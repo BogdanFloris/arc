@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use arc_proto::v1::{Role, memory_record};
+use arc_proto::v1::{Role, Source, memory_record};
 use chrono::{DateTime, SecondsFormat};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -72,12 +72,14 @@ pub(crate) struct SearchOptions {
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionHit {
     pub session_id: String,
+    pub origin: SessionOrigin,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     pub snippet: String,
     pub role: String,
+    pub source: &'static str,
     pub ts: Option<String>,
     pub anchor_seq: i64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -92,6 +94,7 @@ pub(crate) struct SessionHit {
 pub(crate) struct ProseMessage {
     pub seq: i64,
     pub role: String,
+    pub source: &'static str,
     pub content: String,
     pub ts: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -101,6 +104,7 @@ pub(crate) struct ProseMessage {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadReply {
     pub session_id: String,
+    pub origin: SessionOrigin,
     pub messages: Vec<ProseMessage>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub clipped: bool,
@@ -117,8 +121,31 @@ pub(crate) struct ReadCursor {
 #[derive(Debug, Serialize)]
 pub(crate) struct EndsReply {
     pub session_id: String,
+    pub origin: SessionOrigin,
     pub first: Vec<ProseMessage>,
     pub last: Vec<ProseMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionOrigin {
+    pub kind: &'static str,
+    pub dispatched_by: Option<String>,
+}
+
+impl SessionOrigin {
+    fn new(source: i32, dispatched_by: Option<String>) -> Self {
+        let kind = if dispatched_by.is_some() || source == Source::Model as i32 {
+            "job"
+        } else if source == Source::User as i32 {
+            "conversation"
+        } else {
+            "unknown"
+        };
+        Self {
+            kind,
+            dispatched_by,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -237,20 +264,30 @@ impl Archive {
             if sessions.iter().any(|s| s.session_id == hit.session_id) {
                 continue;
             }
-            let (title, started_at) = conn
+            let (title, started_at, source, dispatched_by) = conn
                 .query_row(
-                    "SELECT coalesce(title, ''), started_at FROM sessions WHERE id = ?1",
+                    "SELECT coalesce(title, ''), started_at, source, dispatched_by
+                     FROM sessions WHERE id = ?1",
                     [&hit.session_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i32>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )
                 .optional()?
-                .unwrap_or((String::new(), None));
+                .unwrap_or_default();
             sessions.push(SessionHit {
                 session_id: hit.session_id,
+                origin: SessionOrigin::new(source, dispatched_by),
                 title,
                 started_at: started_at.and_then(format_micros),
                 snippet: hit.snippet,
                 role: hit.role,
+                source: hit.source,
                 ts: hit.ts,
                 anchor_seq: hit.seq,
                 context: Vec::new(),
@@ -295,11 +332,11 @@ impl Archive {
         start_offset: usize,
     ) -> Result<Option<ReadReply>, Error> {
         let conn = self.lock();
-        if !session_exists(&conn, session_id)? {
+        let Some(origin) = session_origin(&conn, session_id)? else {
             return Ok(None);
-        }
+        };
         let mut stmt = conn.prepare(
-            "SELECT seq, role, content, partial, ts FROM messages
+            "SELECT seq, role, content, partial, ts, source FROM messages
              WHERE session_id = ?1 AND kind = ?2 AND seq BETWEEN ?3 AND ?4
              ORDER BY seq LIMIT ?5",
         )?;
@@ -332,6 +369,7 @@ impl Archive {
         }
         let mut reply = ReadReply {
             session_id: session_id.to_owned(),
+            origin,
             messages: Vec::new(),
             clipped: false,
             next: None,
@@ -412,12 +450,13 @@ impl Archive {
     )]
     pub(crate) fn ends(&self, session_id: &str) -> Result<Option<EndsReply>, Error> {
         let conn = self.lock();
-        if !session_exists(&conn, session_id)? {
+        let Some(origin) = session_origin(&conn, session_id)? else {
             return Ok(None);
-        }
+        };
         let (first, last) = bookends(&conn, session_id)?;
         Ok(Some(EndsReply {
             session_id: session_id.to_owned(),
+            origin,
             first,
             last,
         }))
@@ -632,11 +671,23 @@ fn into_query_error(source: rusqlite::Error) -> Error {
     }
 }
 
-fn session_exists(conn: &Connection, id: &str) -> Result<bool, Error> {
+fn session_origin(conn: &Connection, id: &str) -> Result<Option<SessionOrigin>, Error> {
     Ok(conn
-        .query_row("SELECT 1 FROM sessions WHERE id = ?1", [id], |_| Ok(()))
-        .optional()?
-        .is_some())
+        .query_row(
+            "SELECT source, dispatched_by FROM sessions WHERE id = ?1",
+            [id],
+            |row| Ok(SessionOrigin::new(row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn event_source(source: Option<i32>) -> &'static str {
+    match source.and_then(|source| Source::try_from(source).ok()) {
+        Some(Source::User) => "user",
+        Some(Source::Model) => "model",
+        Some(Source::System) => "system",
+        _ => "unknown",
+    }
 }
 
 // a NULL ts satisfies neither >= nor <, so bounds drop undated hits by themselves
@@ -647,7 +698,7 @@ fn search_sql(sort: SearchOrder) -> String {
     };
     format!(
         "SELECT m.session_id, m.seq, m.kind, m.role, m.ts,
-                snippet(messages_fts, 0, '', '', '…', 12)
+                snippet(messages_fts, 0, '', '', '…', 12), m.source
          FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
          WHERE messages_fts MATCH ?1 AND (?2 OR m.kind = ?3)
            AND (?5 IS NULL OR m.session_id != ?5)
@@ -662,6 +713,7 @@ struct HitRow {
     session_id: String,
     seq: i64,
     role: String,
+    source: &'static str,
     ts: Option<String>,
     snippet: String,
 }
@@ -672,6 +724,7 @@ fn hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HitRow> {
         session_id: row.get(0)?,
         seq: row.get(1)?,
         role: hit_role(row.get(3)?, kind),
+        source: event_source(row.get(6)?),
         ts: message_ts(row.get(4)?),
         snippet: row.get(5)?,
     })
@@ -690,6 +743,7 @@ fn prose_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProseMessage> {
     Ok(ProseMessage {
         seq: row.get(0)?,
         role: role_name(row.get(1)?),
+        source: event_source(row.get(5)?),
         content: row.get(2)?,
         partial: row.get(3)?,
         ts: message_ts(row.get(4)?),
@@ -702,7 +756,7 @@ fn prose_window(
     anchor_seq: i64,
 ) -> Result<Vec<ProseMessage>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT seq, role, content, partial, ts FROM messages
+        "SELECT seq, role, content, partial, ts, source FROM messages
          WHERE session_id = ?1 AND kind = ?2 AND seq <= ?3
          ORDER BY seq DESC LIMIT ?4",
     )?;
@@ -723,7 +777,7 @@ fn prose_window(
     window.reverse();
 
     let mut stmt = conn.prepare(
-        "SELECT seq, role, content, partial, ts FROM messages
+        "SELECT seq, role, content, partial, ts, source FROM messages
          WHERE session_id = ?1 AND kind = ?2 AND seq > ?3
          ORDER BY seq LIMIT ?4",
     )?;
@@ -743,7 +797,7 @@ fn bookends(
 ) -> Result<(Vec<ProseMessage>, Vec<ProseMessage>), Error> {
     let spoken = |order: &str| {
         format!(
-            "SELECT seq, role, content, partial, ts FROM messages
+            "SELECT seq, role, content, partial, ts, source FROM messages
              WHERE session_id = ?1 AND kind = ?2 AND role IN (?3, ?4)
              ORDER BY seq {order} LIMIT ?5"
         )
@@ -875,7 +929,8 @@ mod tests {
     use arc_proto::v1::{
         MemoryRecord, MemoryRecordCreated, MemoryRecordDeleted, MemoryRecordSuperseded,
         MemoryRecordUpdated, MessageAppended, Provenance, ProvenanceEntry, Role, SessionCreated,
-        SessionRole, ToolOutcome, ToolResultRecorded, memory_event, memory_record, session_event,
+        SessionRole, Source, ToolOutcome, ToolResultRecorded, memory_event, memory_record,
+        session_event,
     };
     use tempfile::TempDir;
 
@@ -1185,6 +1240,7 @@ mod tests {
         let hit = &reply.sessions[0];
         assert_eq!(hit.session_id, "s-01");
         assert_eq!(hit.role, "tool_result");
+        assert_eq!(hit.source, "unknown");
         assert_eq!(hit.ts.as_deref(), Some("2023-11-14T22:13:22Z"));
         assert_eq!(
             messages(&hit.context),
@@ -1205,6 +1261,122 @@ mod tests {
             .expect("read")
             .expect("session exists");
         assert_eq!(read.messages, hit.context);
+    }
+
+    #[test]
+    fn retrieval_distinguishes_authorship_from_role_and_session_origin() {
+        let dir = TempDir::new().expect("temp dir");
+        let session = |id: &str, role: SessionRole, parent: &str| {
+            session_event::Event::SessionCreated(SessionCreated {
+                session_id: id.to_owned(),
+                role: role as i32,
+                dispatched_by: parent.to_owned(),
+                ..Default::default()
+            })
+        };
+        let events = [
+            (session("human", SessionRole::Executor, ""), Source::User),
+            (said("human", Role::User, "human choice"), Source::User),
+            (said("human", Role::User, "system handback"), Source::System),
+            (
+                session("job", SessionRole::Executor, "human"),
+                Source::Model,
+            ),
+            (said("job", Role::User, "job brief"), Source::Model),
+            (said("job", Role::User, "human update"), Source::User),
+            (
+                session("old-job", SessionRole::Executor, "human"),
+                Source::Model,
+            ),
+            (
+                said("old-job", Role::User, "old job instruction"),
+                Source::User,
+            ),
+            (
+                session("legacy", SessionRole::Chat, ""),
+                Source::Unspecified,
+            ),
+            (
+                said("legacy", Role::User, "legacy note"),
+                Source::Unspecified,
+            ),
+        ];
+        testkit::seed_events(
+            &dir,
+            events
+                .into_iter()
+                .map(|(event, source)| arc_proto::v1::Event {
+                    source: source as i32,
+                    payload: Some(arc_proto::v1::event::Payload::Session(
+                        arc_proto::v1::SessionEvent { event: Some(event) },
+                    )),
+                    ..Default::default()
+                }),
+        );
+        let archive = testkit::archive_at(&dir);
+
+        for (query, id, kind, parent, source) in [
+            ("human choice", "human", "conversation", None, "user"),
+            ("system handback", "human", "conversation", None, "system"),
+            ("job brief", "job", "job", Some("human"), "model"),
+            ("human update", "job", "job", Some("human"), "user"),
+            (
+                "old job instruction",
+                "old-job",
+                "job",
+                Some("human"),
+                "user",
+            ),
+            ("legacy note", "legacy", "unknown", None, "unknown"),
+        ] {
+            let reply = archive
+                .search(query, false, None, SearchOptions::default())
+                .expect("search");
+            let hit = &reply.sessions[0];
+            assert_eq!(hit.session_id, id);
+            assert_eq!(hit.origin.kind, kind);
+            assert_eq!(hit.origin.dispatched_by.as_deref(), parent);
+            assert_eq!(hit.role, "user");
+            assert_eq!(hit.source, source);
+            let json = serde_json::to_value(hit).expect("serialized hit");
+            assert_eq!(json["origin"]["kind"], kind);
+            assert_eq!(json["source"], source);
+            assert!(hit.context.iter().any(|message| {
+                message.content == query && message.role == "user" && message.source == source
+            }));
+            let read = archive.read_range(id, 0, i64::MAX, 0).unwrap().unwrap();
+            let ends = archive.ends(id).unwrap().unwrap();
+            assert_eq!(read.origin, hit.origin);
+            assert_eq!(ends.origin, hit.origin);
+            assert!(
+                read.messages
+                    .iter()
+                    .any(|message| { message.content == query && message.source == source })
+            );
+            assert!(
+                ends.first
+                    .iter()
+                    .any(|message| { message.content == query && message.source == source })
+            );
+        }
+    }
+
+    #[test]
+    fn session_origin_keeps_unrecorded_provenance_unknown() {
+        for (source, parent, kind) in [
+            (Source::User, None, "conversation"),
+            (Source::Model, None, "job"),
+            (Source::Unspecified, Some("parent"), "job"),
+            (Source::User, Some("parent"), "job"),
+            (Source::Unspecified, None, "unknown"),
+            (Source::System, None, "unknown"),
+        ] {
+            let origin = super::SessionOrigin::new(source as i32, parent.map(str::to_owned));
+            assert_eq!(origin.kind, kind);
+            assert_eq!(origin.dispatched_by.as_deref(), parent);
+        }
+        assert_eq!(super::event_source(None), "unknown");
+        assert_eq!(super::event_source(Some(99)), "unknown");
     }
 
     #[test]
