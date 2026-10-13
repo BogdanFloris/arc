@@ -102,7 +102,7 @@ impl<S, P: FrameParser> DeltaStream<S, P> {
                 outcome = "error",
                 counter.input_tokens = input,
                 counter.output_tokens = output,
-                error = %error,
+                error = ?error,
                 "stream failed"
             ),
         });
@@ -148,7 +148,9 @@ where
             match Pin::new(&mut this.bytes).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(chunk))) => this.frames.push(chunk.as_ref()),
-                Poll::Ready(Some(Err(error))) => return this.fail(Error::Transport(error)),
+                Poll::Ready(Some(Err(error))) => {
+                    return this.fail(Error::Transport(error.without_url()));
+                }
                 Poll::Ready(None) => {
                     this.end(Outcome::Cut);
                     return Poll::Ready(None);
