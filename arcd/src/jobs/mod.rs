@@ -562,7 +562,7 @@ fn spawn_job(shared: &Shared, job: DispatchedJob, initial_spent_tokens: u64) -> 
     let task = Task {
         job,
         dispatched: true,
-        source: Source::User,
+        source: Source::Model,
         attachments: Vec::new(),
         attached: None,
         spent_tokens: initial_spent_tokens,
@@ -1301,6 +1301,27 @@ mod tests {
         });
         supervisor.shutdown().await;
 
+        let inputs: Vec<_> = arc_core::testkit::replay_events(dir.path())
+            .into_iter()
+            .filter_map(|event| match event.payload? {
+                arc_proto::v1::event::Payload::Session(session) => match session.event? {
+                    arc_proto::v1::session_event::Event::MessageAppended(message)
+                        if message.session_id == child_id && message.role == Role::User as i32 =>
+                    {
+                        Some((message.content, event.source))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            [
+                ("fix the failing test".to_owned(), Source::Model as i32),
+                ("also check the linter".to_owned(), Source::Model as i32),
+            ]
+        );
         assert_eq!(
             child_user_messages(dir.path(), &child_id),
             [
