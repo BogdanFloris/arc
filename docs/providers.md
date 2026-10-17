@@ -54,7 +54,7 @@ Codex defaults to `read`, `bash`, `apply_patch`; other providers to `read`, `bas
 
 ## 4. Provider-specific operation
 
-**Codex.** `provider = "codex"`; `key` names the credential under `data/secrets/`. Run `arcd login codex` for device-code login, then restart the daemon after a fresh login. Refresh updates the credential in place. Responses use `store: false`; encrypted reasoning is preserved in tool-call roundtrip bytes. `thinking` maps to reasoning effort with `low` as floor; `default` omits it. Usage-limit errors report reset times. The plan meters rolling allowance windows, not token dollars.
+**Codex.** `provider = "codex"`; `key` names the credential under `data/secrets/`. Run `arcd login codex` for device-code login, then restart the daemon after a fresh login. Refresh updates the credential in place. Responses use `store: false`; encrypted reasoning is preserved in tool-call roundtrip bytes. Requests carry ARC's session ID in `session-id`, the header codex-rs uses for the ChatGPT backend's prompt-cache affinity, and in `thread-id`, which codex-rs populates from its own thread identity. `thinking` maps to reasoning effort with `low` as floor; `default` omits it. Usage-limit errors report reset times. The plan meters rolling allowance windows, not token dollars.
 
 ```toml
 [roles.executor]
@@ -90,6 +90,14 @@ Measured 2026-08-26–28, from durable turn usage (archivist from spans). Two da
 Executor steps showed about 99% cached input in spans/journal; the projection totals did not store the cached share. Provider dashboards remain the authority for actual charges. The old Claude workload was about 4.4M input, 19M output, and 640M cache-read tokens/month; extrapolating that output volume to ARC proved too high.
 
 **Gemini probe, 2026-08-24:** five runs gave 28–33 output tokens on 3.6 `minimal`, 31–337 on 3.7 `low`, and 334–410 on 3.6 `low`. `minimal` was unsupported on 3.7 in the tested paths. Thinking was billed but not streamed; use `total_tokens - prompt_tokens`, not just `completion_tokens`, when accounting for it. These results supported low-latency chat, not a blanket recommendation for today's model lineup.
+
+**Codex cache affinity, 2026-10-17:** one 11-call `gpt-6.1-sol` session after `session-id`/`thread-id` were added cached 0.547 of its billed input (median 0.523, retention ≥0.9 on 3 of 10 calls). The 30-day baseline before the headers was 0.540 aggregate, 0.600 median, retention ≥0.9 on 34% of calls. The two are not distinguishable; affinity headers alone are not a demonstrated fix, and a larger sample is needed to rule out a moderate gain. `cached_tokens` still recurs at 3712 and plateaus near 29k on prompts up to 56k. Re-measure once a few days of ordinary sessions accumulate, then revert the headers if the aggregate stays near 0.54. The split by provider matters — the codex and openai lines differ by more than 0.4 and blending them once produced a wrong number:
+
+```sh
+journalctl --user -u arcd --since "-7 days" --no-pager | grep "prompt cache hit" \
+  | sed -E 's/.*provider::([a-z]+)::stream.*cached_tokens=([0-9]+) counter.prompt_tokens=([0-9]+)/\1 \2 \3/' \
+  | awk '{by[$1]+=$2; tot[$1]+=$3} END {for (p in by) print p, by[p]/tot[p]}'
+```
 
 ## 6. Rejected options
 
