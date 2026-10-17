@@ -102,7 +102,7 @@ impl Codex {
 
     async fn send(&self, payload: &Payload<'_>) -> Result<reqwest::Response, Error> {
         let (token, account) = self.tokens.bearer().await?;
-        Ok(self
+        let mut request = self
             .http
             .post(format!("{}{RESPONSES_PATH}", self.endpoint))
             .header(ACCEPT, "text/event-stream")
@@ -110,10 +110,14 @@ impl Codex {
             .header(ACCOUNT_HEADER, account)
             .header("originator", "arc")
             .header("OpenAI-Beta", "responses=experimental")
-            .header(USER_AGENT, format!("arc/{}", crate::VERSION))
-            .json(payload)
-            .send()
-            .await?)
+            .header(USER_AGENT, format!("arc/{}", crate::VERSION));
+        // the ChatGPT backend routes cache affinity on session-id; codex-rs sends both
+        if let Some(session) = payload.prompt_cache_key {
+            request = request
+                .header("session-id", session)
+                .header("thread-id", session);
+        }
+        Ok(request.json(payload).send().await?)
     }
 }
 
@@ -787,6 +791,21 @@ mod tests {
         let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
         let (_, requests) = complete_against(template, req).await;
         assert_eq!(body(&requests)["prompt_cache_key"], "session-7");
+    }
+
+    #[tokio::test]
+    async fn the_cache_key_goes_out_as_both_affinity_headers_and_none_sends_neither() {
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, request(None, &[(Role::User, "hi")])).await;
+        assert!(!requests[0].headers.contains_key("session-id"));
+        assert!(!requests[0].headers.contains_key("thread-id"));
+
+        let mut req = request(None, &[(Role::User, "hi")]);
+        req.cache_key = Some("session-7".to_owned());
+        let template = ResponseTemplate::new(200).set_body_string(sse_body("ok"));
+        let (_, requests) = complete_against(template, req).await;
+        assert_eq!(requests[0].headers["session-id"], "session-7");
+        assert_eq!(requests[0].headers["thread-id"], "session-7");
     }
 
     #[tokio::test]
