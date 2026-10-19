@@ -515,7 +515,7 @@ key      = "codex"
 
 "#;
 
-        let roles = with_secrets(config, dir.path(), &[("opencode-go", "sk-go")])
+        let roles = with_secrets(config, dir.path(), &[("opencode-go", "oc-sk")])
             .expect("the default choice resolves; the codex credential is only missing");
         let executor = roles.executor();
         assert_eq!(executor.provider.name(), "openai-compat");
