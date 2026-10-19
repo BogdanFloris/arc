@@ -1252,24 +1252,29 @@ impl App {
             self.last_error = Some("fork: no open session".to_owned());
             return None;
         };
-        let is_message = matches!(
-            self.transcript.get(index).map(|entry| &entry.block),
-            Some(Block::You(_) | Block::Arc { .. })
-        );
-        if let (true, Some(fork_point)) = (
-            is_message,
-            self.transcript.get(index).and_then(|entry| entry.seq),
-        ) {
-            Some(Command::ForkSession {
-                session_id,
-                fork_point,
-                choice: String::new(),
-            })
-        } else {
+        let Some(fork_point) = self.message_seq_at_or_above(index) else {
             self.last_error =
-                Some("fork: select a sent message, not a tool or live block".to_owned());
-            None
-        }
+                Some("fork: no sent message above the selection to fork at".to_owned());
+            return None;
+        };
+        Some(Command::ForkSession {
+            session_id,
+            fork_point,
+            choice: String::new(),
+        })
+    }
+
+    // a finished turn ends on its cost line and a branch signpost sits below
+    // the last message, so pointing at either forks at the message above
+    fn message_seq_at_or_above(&self, index: usize) -> Option<u64> {
+        let last = self.transcript.len().saturating_sub(1);
+        self.transcript
+            .get(..=index.min(last))
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .filter(|entry| matches!(entry.block, Block::You(_) | Block::Arc { .. }))
+            .find_map(|entry| entry.seq)
     }
 
     fn compact_session(&mut self) -> Option<Command> {
@@ -1528,11 +1533,11 @@ impl App {
                     Some("Session metadata unavailable; retry after refresh".to_owned());
                 return None;
             };
-            let fork_point = self.transcript.iter().rev().find_map(|entry| {
-                matches!(entry.block, Block::You(_) | Block::Arc { .. })
-                    .then_some(entry.seq)
-                    .flatten()
-            });
+            let fork_point = self
+                .transcript
+                .len()
+                .checked_sub(1)
+                .and_then(|last| self.message_seq_at_or_above(last));
             if let Some(fork_point) = fork_point {
                 self.pending_model = Some(PendingModel::Fork(role, project));
                 return Some(Command::ForkSession {
@@ -5554,6 +5559,99 @@ mod tests {
             })
         );
         assert_eq!(app.mode, Mode::Normal, "the command consumes the selection");
+    }
+
+    #[test]
+    fn fork_on_a_trailing_tool_block_forks_the_message_above_it() {
+        let mut app = conversation_from_history();
+
+        app.on_key(key(KeyCode::Char('V')));
+        assert!(
+            matches!(
+                app.transcript.last().map(|entry| &entry.block),
+                Some(Block::Tool { .. })
+            ),
+            "a turn ends on its last tool block"
+        );
+        let command = app.on_key(key(KeyCode::Char('f')));
+
+        assert_eq!(
+            command,
+            Some(Command::ForkSession {
+                session_id: "s-1".to_owned(),
+                fork_point: 4,
+                choice: String::new(),
+            }),
+            "the point resolves up to the assistant's answer"
+        );
+    }
+
+    #[test]
+    fn fork_on_a_trailing_cost_line_forks_the_reply_above_it() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        let mut answer = prose_entry_at(4, Role::Assistant as i32, "answer", false);
+        if let Some(history_entry::Entry::Message(message)) = &mut answer.entry {
+            message.input_tokens = 120;
+            message.output_tokens = 8;
+        }
+        app.on_net(NetEvent::History {
+            session_id: "s-1".to_owned(),
+            entries: vec![
+                prose_entry_at(3, Role::User as i32, "question", false),
+                answer,
+            ],
+            parent_session: String::new(),
+            fork_point: 0,
+            branches: Vec::new(),
+        });
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_key(key(KeyCode::Char('V')));
+        assert!(
+            matches!(
+                app.transcript.last().map(|entry| &entry.block),
+                Some(Block::Cost { .. })
+            ),
+            "the cost line is the last block, and it carries no seq"
+        );
+        let command = app.on_key(key(KeyCode::Char('f')));
+
+        assert_eq!(
+            command,
+            Some(Command::ForkSession {
+                session_id: "s-1".to_owned(),
+                fork_point: 4,
+                choice: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn fork_with_no_message_above_the_selection_reports_it() {
+        let mut app = App::new();
+        app.session_id = Some("s-1".to_owned());
+        app.on_key(key(KeyCode::Esc));
+        app.transcript = vec![Entry {
+            block: Block::Tool {
+                call_id: "t1".to_owned(),
+                name: "bash".to_owned(),
+                args: String::new(),
+                outcome: Some("ok"),
+                content: String::new(),
+                open: false,
+            },
+            seq: Some(5),
+        }];
+
+        app.on_key(key(KeyCode::Char('V')));
+        let command = app.on_key(key(KeyCode::Char('f')));
+
+        assert_eq!(command, None);
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("fork: no sent message above the selection to fork at")
+        );
     }
 
     // built through History with two full turns, so a preceding message
